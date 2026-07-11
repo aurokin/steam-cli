@@ -392,6 +392,76 @@ def test_deals_query_preserves_last_good_across_failure_then_marks_stale(
     )
 
 
+def test_deals_query_marks_retained_attempt_expired_after_subject_hard_expiry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    database = data_dir / "steam-agent.sqlite3"
+    with Storage(database) as storage:
+        account_id, wishlist_run, demand = wishlist(
+            storage, observations=(WishlistObservation(10, 0, 100, NOW),)
+        )
+        configure_gg_metadata(storage, database)
+        run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=None,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            run.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, provider="gg-deals", amount_minor=500),),
+            completed_at=NOW + timedelta(minutes=5),
+            status="complete",
+        )
+
+    # Price subjects expire seven days after their underlying observation. The
+    # coarse attempt lineage is retained until seven days after completion, so
+    # this exercises the short interval where demand remains but evidence does not.
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW + timedelta(days=7, seconds=1))
+    code, result, stderr = invoke(
+        data_dir,
+        [
+            "deals",
+            "query",
+            "--scope",
+            "wishlist",
+            "--account",
+            "primary",
+            "--country",
+            "US",
+        ],
+        capsys,
+    )
+
+    assert code == 0 and stderr == ""
+    assert result["completeness"]["status"] == "partial"  # type: ignore[index]
+    assert (  # type: ignore[index]
+        "prices.wishlist.read" in result["completeness"]["stale_capabilities"]
+    )
+    assert "STALE_PRICE_EVIDENCE" in {
+        warning["code"]
+        for warning in result["completeness"]["warnings"]  # type: ignore[index]
+    }
+    prices = result["data"]["snapshots"]["prices"]  # type: ignore[index]
+    gg_state = next(
+        provider
+        for provider in prices["providers"]
+        if provider["provider"] == "gg-deals"
+    )
+    assert gg_state["state_counts"]["expired"] == 1
+    assert prices["fact_count"] == 0
+    assert (  # type: ignore[index]
+        result["data"]["items"][0]["deal"]["current_offer"] is None
+    )
+
+
 def test_deals_query_reflects_provider_and_account_deletion(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

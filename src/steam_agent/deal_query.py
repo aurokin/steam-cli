@@ -41,6 +41,7 @@ ProviderName = Literal["gg-deals", "cheapshark"]
 ProviderState = Literal[
     "ready",
     "not_found",
+    "expired",
     "unevaluated",
     "failed",
     "running",
@@ -500,13 +501,13 @@ def _stored_provider_states(
                     result.append(
                         _subject_state(candidate.appid, provider, subject)
                         if subject is not None
-                        else ProviderStateInput(candidate.appid, provider, "not_found")
+                        else ProviderStateInput(candidate.appid, provider, "expired")
                     )
                 else:
                     result.append(
                         _subject_state(candidate.appid, provider, subject)
                         if subject is not None
-                        else ProviderStateInput(candidate.appid, provider, "ready")
+                        else ProviderStateInput(candidate.appid, provider, "expired")
                     )
             else:
                 stopped_early = run.error_code is not None
@@ -706,6 +707,7 @@ def _states(
         if state.state not in {
             "ready",
             "not_found",
+            "expired",
             "unevaluated",
             "failed",
             "running",
@@ -890,6 +892,7 @@ def _ranking_attempt(state: ProviderStateInput, now: datetime) -> ProviderAttemp
             state.error_code or "PROVIDER_UNAVAILABLE",
         )
     code = {
+        "expired": "STALE_PRICE_EVIDENCE",
         "unevaluated": "PRICE_EVIDENCE_NOT_EVALUATED",
         "running": "SYNC_IN_PROGRESS",
         "abandoned": "SYNC_ABANDONED",
@@ -922,14 +925,18 @@ def _state_fresh(state: ProviderStateInput, now: datetime) -> bool:
 
 def _state_is_stale(state: ProviderStateInput, now: datetime) -> bool:
     return (
-        state.state in {"ready", "not_found"}
-        and state.fresh_until is not None
-        and not _fresh(state.fresh_until, now)
+        state.state == "expired"
+        or (
+            state.state in {"ready", "not_found"}
+            and state.fresh_until is not None
+            and not _fresh(state.fresh_until, now)
+        )
     )
 
 
 def _state_warnings(state: ProviderStateInput, warnings: dict[str, str]) -> None:
     code = {
+        "expired": "STALE_PRICE_EVIDENCE",
         "unevaluated": "PRICE_EVIDENCE_NOT_EVALUATED",
         "failed": state.error_code or "PROVIDER_UNAVAILABLE",
         "running": "SYNC_IN_PROGRESS",
@@ -1164,6 +1171,7 @@ def _price_snapshot_json(
             for name in (
                 "ready",
                 "not_found",
+                "expired",
                 "unevaluated",
                 "failed",
                 "running",
