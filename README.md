@@ -41,6 +41,7 @@ uv run steam-agent --version
 uv run python -m steam_agent --help
 uv run pytest
 uv build
+uv run python scripts/package_smoke.py
 ```
 
 ## M1 usage
@@ -234,6 +235,7 @@ are added.
 ## Design documents
 
 - [Project governance and the repo/Linear boundary](docs/project-governance.md)
+- [Testing and deterministic acceptance](docs/testing.md)
 - [Product questions](docs/design/product-questions.md)
 - [Evidence and provider matrix](docs/design/evidence-matrix.md)
 - [Steam account data lifecycle and deletion gates](docs/design/steam-data-lifecycle.md)

@@ -22,4 +22,5 @@ steam-agent = "steam_agent.__main__:main"
 dev = [
     "jsonschema>=4.23",
     "pytest>=8.3",
+    "ruff>=0.12,<1",
 ]
