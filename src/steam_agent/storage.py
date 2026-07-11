@@ -15,12 +15,30 @@ import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Literal, Mapping
+import uuid
 
 from steam_agent.local_accounts import validate_steam_id64
 
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
 TerminalSyncStatus = Literal["complete", "partial", "failed"]
+STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID(
+    "d95b6568-2886-5d15-aa84-1986e4ac511e"
+)
+
+
+def steam_application_stable_id(appid: int | str) -> str:
+    """Return the stable UUIDv5 for one typed Steam application identity."""
+
+    text = str(appid)
+    if not text.isdecimal() or not 1 <= int(text) <= (1 << 32) - 1:
+        raise ValueError("Steam application AppID is invalid")
+    return str(
+        uuid.uuid5(
+            STEAM_APPLICATION_IDENTITY_NAMESPACE,
+            f"steam:application_appid:{int(text)}",
+        )
+    )
 
 
 class StorageError(RuntimeError):
@@ -113,6 +131,7 @@ class EvidenceInput:
     payload: Mapping[str, Any]
     context: Mapping[str, Any] | None = None
     effective_at: str | datetime | None = None
+    account_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +206,7 @@ class OwnedSnapshot:
     latest: SyncRun | None
     latest_complete: SyncRun | None
     latest_complete_provenance: OwnedSnapshotProvenance | None
+    stable_game_ids_by_appid: tuple[tuple[int, str], ...]
 
 
 @dataclass(frozen=True)
@@ -194,13 +214,13 @@ class OwnedSnapshotProvenance:
     sync_run_id: int
     provider: str
     support_level: str
-    include_appinfo: bool
-    base_include_played_free_games: bool
-    base_retrieved_at: str
-    base_reported_count: int
-    expanded_include_played_free_games: bool
+    include_appinfo: bool | None
+    base_include_played_free_games: bool | None
+    base_retrieved_at: str | None
+    base_reported_count: int | None
+    expanded_include_played_free_games: bool | None
     expanded_retrieved_at: str
-    expanded_reported_count: int
+    expanded_reported_count: int | None
     classification_method: str
 
 
@@ -246,7 +266,7 @@ class LibrarySnapshot:
 
     owned: OwnedSnapshot
     installed: InstalledSnapshot
-    entity_ids_by_appid: tuple[tuple[int, int], ...]
+    stable_game_ids_by_appid: tuple[tuple[int, str], ...]
 
 
 def _timestamp(value: str | datetime) -> str:
@@ -297,6 +317,12 @@ class Storage:
     def _open_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path))
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "steam_application_uuid_v5",
+            1,
+            steam_application_stable_id,
+            deterministic=True,
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA secure_delete = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -879,12 +905,16 @@ class Storage:
         base_reported_count: int,
         expanded_reported_count: int,
         support_level: str = "official_documented",
+        _manage_transaction: bool = True,
     ) -> tuple[int, ...]:
         """Atomically record one normalized GetOwnedGames response.
 
         Evidence payloads are constructed here from the allowlisted normalized
         fields. Callers cannot pass a raw provider object through this method.
         """
+
+        if not _manage_transaction and not self._connection.in_transaction:
+            raise StorageError("managed owned recording requires a transaction")
 
         base_retrieved = _timestamp(base_retrieved_at)
         expanded_retrieved = _timestamp(expanded_retrieved_at)
@@ -930,7 +960,8 @@ class Storage:
         ):
             raise ValueError("owned reported counts do not match normalized records")
 
-        self._connection.execute("BEGIN IMMEDIATE")
+        if _manage_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
         try:
             run = self._require_running_owned_sync(sync_run_id)
             already_recorded = self._connection.execute(
@@ -1007,6 +1038,7 @@ class Storage:
                             },
                         },
                         payload=payload,
+                        account_id=run.account_id,
                     )
                 )
                 self._ensure_steam_application_identity(
@@ -1035,14 +1067,82 @@ class Storage:
                 "UPDATE sync_runs SET records_seen = ? WHERE id = ?",
                 (len(normalized), sync_run_id),
             )
-            self._connection.commit()
+            if _manage_transaction:
+                self._connection.commit()
             return tuple(evidence_ids)
+        except BaseException:
+            if _manage_transaction:
+                try:
+                    self._rollback_or_reopen()
+                except BaseException:
+                    pass
+            raise
+
+    def complete_owned_snapshot(
+        self,
+        sync_run_id: int,
+        observations: list[OwnedObservation] | tuple[OwnedObservation, ...],
+        *,
+        base_retrieved_at: str | datetime,
+        expanded_retrieved_at: str | datetime,
+        base_reported_count: int,
+        expanded_reported_count: int,
+        completed_at: str | datetime,
+        support_level: str = "official_documented",
+    ) -> SyncRun:
+        """Record, promote, prune, and finish one owned snapshot atomically."""
+
+        completed = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._require_running_owned_sync(sync_run_id)
+            self.record_owned_snapshot(
+                sync_run_id,
+                observations,
+                base_retrieved_at=base_retrieved_at,
+                expanded_retrieved_at=expanded_retrieved_at,
+                base_reported_count=base_reported_count,
+                expanded_reported_count=expanded_reported_count,
+                support_level=support_level,
+                _manage_transaction=False,
+            )
+            newer_complete = self._connection.execute(
+                """
+                SELECT 1 FROM sync_runs
+                WHERE capability = 'owned.visible.read' AND account_id = ?
+                  AND id > ? AND status = 'complete'
+                LIMIT 1
+                """,
+                (existing.account_id, sync_run_id),
+            ).fetchone()
+            promoted = 0
+            if newer_complete is None:
+                self._promote_owned(existing.account_id, sync_run_id)
+                promoted = 1
+                self._prune_owned_payloads(
+                    existing.account_id, keep_sync_run_id=sync_run_id
+                )
+            else:
+                self._prune_owned_payloads(
+                    existing.account_id, only_sync_run_id=sync_run_id
+                )
+            self._connection.execute(
+                """
+                UPDATE sync_runs
+                SET status = 'complete', completed_at = ?, promoted = ?,
+                    error_code = NULL, error_detail = NULL
+                WHERE id = ?
+                """,
+                (completed, promoted, sync_run_id),
+            )
+            self._connection.commit()
         except BaseException:
             try:
                 self._rollback_or_reopen()
             except BaseException:
                 pass
             raise
+        return self.get_sync_run(sync_run_id)
 
     def finish_owned_sync(
         self,
@@ -1359,17 +1459,17 @@ class Storage:
                     status="complete",
                 ),
             )
-            self._connection.commit()
-            entity_ids_by_appid = self._entity_ids_for_appids(
+            stable_game_ids_by_appid = self._stable_game_ids_for_appids(
                 {
                     *(game.appid for game in owned.games),
                     *(game.appid for game in installed.games),
                 }
             )
+            self._connection.commit()
             return LibrarySnapshot(
                 owned=owned,
                 installed=installed,
-                entity_ids_by_appid=entity_ids_by_appid,
+                stable_game_ids_by_appid=stable_game_ids_by_appid,
             )
         except BaseException:
             try:
@@ -1430,7 +1530,7 @@ class Storage:
                 "DELETE FROM accounts WHERE id = ? AND provider = 'steam'",
                 (account_id,),
             )
-            evidence_removed = 0
+            evidence_removed = len(evidence_ids)
             if evidence_ids:
                 placeholders = ",".join("?" for _ in evidence_ids)
                 evidence_cursor = self._connection.execute(
@@ -1456,7 +1556,7 @@ class Storage:
                     """,
                     evidence_ids,
                 )
-                evidence_removed = evidence_cursor.rowcount
+                evidence_removed = max(evidence_removed, evidence_cursor.rowcount)
             orphan_apps_removed = 0
             if appids:
                 placeholders = ",".join("?" for _ in appids)
@@ -1612,7 +1712,9 @@ class Storage:
             account_cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE provider = 'steam'"
             )
-            evidence_removed = self._delete_orphan_owned_evidence(evidence_ids)
+            evidence_removed = max(
+                len(evidence_ids), self._delete_orphan_owned_evidence(evidence_ids)
+            )
             orphan_apps_removed = self._delete_orphan_apps(appids)
             credential_refs_removed = self._remove_credential_identity(
                 credential_provider, credential_kind, credential_profile_id
@@ -1700,6 +1802,7 @@ class Storage:
         return None if row is None else SteamApp(**dict(row))
 
     def _read_owned_snapshot(self, account_id: int) -> OwnedSnapshot:
+        games = tuple(self.list_owned(account_id))
         latest = self.latest_account_sync(
             capability="owned.visible.read", account_id=account_id
         )
@@ -1709,13 +1812,16 @@ class Storage:
             status="complete",
         )
         return OwnedSnapshot(
-            games=tuple(self.list_owned(account_id)),
+            games=games,
             latest=latest,
             latest_complete=latest_complete,
             latest_complete_provenance=(
                 None
                 if latest_complete is None
                 else self._owned_snapshot_provenance(latest_complete.id)
+            ),
+            stable_game_ids_by_appid=self._stable_game_ids_for_appids(
+                {game.appid for game in games}
             ),
         )
 
@@ -1743,7 +1849,8 @@ class Storage:
             "base_include_played_free_games",
             "expanded_include_played_free_games",
         ):
-            values[key] = bool(values[key])
+            if values[key] is not None:
+                values[key] = bool(values[key])
         return OwnedSnapshotProvenance(**values)
 
     def _ensure_steam_application_identity(
@@ -1771,10 +1878,10 @@ class Storage:
             return int(row[0])
         cursor = self._connection.execute(
             """
-            INSERT INTO game_entities(entity_kind, created_at, updated_at)
-            VALUES ('application', ?, ?)
+            INSERT INTO game_entities(entity_kind, created_at, updated_at, stable_id)
+            VALUES ('application', ?, ?, ?)
             """,
-            (observed_at, observed_at),
+            (observed_at, observed_at, steam_application_stable_id(appid)),
         )
         entity_id = int(cursor.lastrowid)
         self._connection.execute(
@@ -1787,7 +1894,7 @@ class Storage:
         )
         return entity_id
 
-    def _entity_ids_for_appids(
+    def _stable_game_ids_for_appids(
         self, appids: set[int]
     ) -> tuple[tuple[int, int], ...]:
         if not appids:
@@ -1796,8 +1903,9 @@ class Storage:
         placeholders = ",".join("?" for _ in external_ids)
         rows = self._connection.execute(
             f"""
-            SELECT CAST(external_id AS INTEGER) AS appid, game_entity_id
+            SELECT CAST(external_id AS INTEGER) AS appid, stable_id
             FROM external_game_identities
+            JOIN game_entities ON game_entities.id = game_entity_id
             WHERE provider = 'steam'
               AND identity_kind = 'application_appid'
               AND external_id IN ({placeholders})
@@ -1805,7 +1913,10 @@ class Storage:
             """,
             external_ids,
         )
-        return tuple((int(row[0]), int(row[1])) for row in rows)
+        result = tuple((int(row[0]), str(row[1])) for row in rows)
+        if len(result) != len(appids):
+            raise StorageError("Steam application identity mapping is incomplete")
+        return result
 
     def _count_where(self, table: str, column: str, value: object) -> int:
         allowed = {
@@ -2042,8 +2153,9 @@ class Storage:
             """
             INSERT INTO evidence(
                 provider, capability, source_kind, source_locator, retrieved_at,
-                effective_at, support_level, context_json, payload_json, content_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                effective_at, support_level, context_json, payload_json, content_hash,
+                account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT DO NOTHING
             """,
             (
@@ -2057,6 +2169,7 @@ class Storage:
                 context_json,
                 payload_json,
                 content_hash,
+                evidence.account_id,
             ),
         )
         row = self._connection.execute(
@@ -2065,6 +2178,7 @@ class Storage:
             WHERE provider = ? AND capability = ? AND source_kind = ?
               AND source_locator = ? AND retrieved_at = ? AND context_json = ?
               AND content_hash = ?
+              AND account_id IS ?
             """,
             (
                 evidence.provider,
@@ -2074,6 +2188,7 @@ class Storage:
                 retrieved_at,
                 context_json,
                 content_hash,
+                evidence.account_id,
             ),
         ).fetchone()
         assert row is not None
@@ -2203,6 +2318,7 @@ __all__ = [
     "StorageError",
     "SyncRun",
     "UnknownSyncRun",
+    "steam_application_stable_id",
 ]
 
 

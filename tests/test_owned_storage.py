@@ -14,6 +14,7 @@ from steam_agent.storage import (
     Machine,
     OwnedObservation,
     Storage,
+    steam_application_stable_id,
 )
 
 
@@ -26,6 +27,12 @@ T3 = "2026-07-11T12:03:00Z"
 def _apply_migrations_through(
     connection: sqlite3.Connection, latest_version: int
 ) -> None:
+    connection.create_function(
+        "steam_application_uuid_v5",
+        1,
+        steam_application_stable_id,
+        deterministic=True,
+    )
     migrations = resources.files("steam_agent").joinpath("migrations")
     connection.execute(
         "CREATE TABLE schema_migrations "
@@ -90,7 +97,7 @@ def _complete_owned(
         account_id=account_id,
         started_at=start,
     )
-    storage.record_owned_snapshot(
+    storage.complete_owned_snapshot(
         run.id,
         games,
         base_retrieved_at=start,
@@ -99,8 +106,8 @@ def _complete_owned(
             game.inclusion_basis == "visible_owned" for game in games
         ),
         expanded_reported_count=len(games),
+        completed_at=end,
     )
-    storage.finish_owned_sync(run.id, status="complete", completed_at=end)
     return run.id
 
 
@@ -125,7 +132,7 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
 
 
 def test_populated_v5_upgrade_backfills_steam_application_identities(
@@ -164,10 +171,10 @@ def test_populated_v5_upgrade_backfills_steam_application_identities(
         assert storage.get_account("primary") is not None
         assert storage._connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 7
+        ).fetchone()[0] == 8
 
 
-def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
+def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "v6-upgrade.sqlite3"
@@ -188,7 +195,7 @@ def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
         connection.executemany(
             "INSERT INTO steam_apps(appid, name, app_type, updated_at) "
             "VALUES (?, NULL, 'unknown', ?)",
-            ((10, T0), (20, T0)),
+            ((10, T0), (20, T0), (30, T0)),
         )
         run_id = int(
             connection.execute(
@@ -221,16 +228,22 @@ def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
                         provider, capability, source_kind, source_locator,
                         retrieved_at, support_level, context_json, payload_json,
                         content_hash
-                    ) VALUES (
-                        'steam_web_api', 'owned.visible.read', 'steam_web_api',
-                        ?, ?, 'official_documented', '{}', ?, ?
+                        ) VALUES (
+                            'steam_web_api', 'owned.visible.read', 'steam_web_api',
+                            ?, ?, 'official_documented', ?, ?, ?
                     )
                     """,
                     (
                         f"GetOwnedGames:app:{appid}",
                         T0,
-                        json.dumps({"appid": appid}),
-                        f"hash-{appid}",
+                            json.dumps(
+                                {
+                                    "include_appinfo": True,
+                                    "include_played_free_games": False,
+                                }
+                            ),
+                            json.dumps({"appid": appid}),
+                            f"hash-{appid}",
                     ),
                 ).lastrowid
             )
@@ -252,6 +265,54 @@ def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
                 """,
                 (account_id, appid, evidence_id, run_id, f"Game {appid}", basis, T0),
             )
+        failed_run_id = int(
+            connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    provider, capability, account_id, started_at, completed_at,
+                    status, promoted, records_seen, error_code
+                ) VALUES (
+                    'steam_web_api', 'owned.visible.read', ?, ?, ?,
+                    'failed', 0, 1, 'SYNC_FAILED'
+                )
+                """,
+                (account_id, T2, T3),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO owned_sync_metadata(
+                sync_run_id, account_id, retrieved_at, include_appinfo,
+                include_played_free_games, support_level
+            ) VALUES (?, ?, ?, 1, 0, 'official_documented')
+            """,
+            (failed_run_id, account_id, T2),
+        )
+        failed_evidence_id = int(
+            connection.execute(
+                """
+                INSERT INTO evidence(
+                    provider, capability, source_kind, source_locator,
+                    retrieved_at, support_level, context_json, payload_json,
+                    content_hash
+                ) VALUES (
+                    'steam_web_api', 'owned.visible.read', 'steam_web_api',
+                    'GetOwnedGames:app:30', ?, 'official_documented', '{}',
+                    '{"appid":30}', 'hash-30'
+                )
+                """,
+                (T2,),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO owned_observations(
+                sync_run_id, evidence_id, account_id, appid, name,
+                playtime_forever_minutes, inclusion_basis, observed_at
+            ) VALUES (?, ?, ?, 30, 'Failed Game', 1, 'visible_owned', ?)
+            """,
+            (failed_run_id, failed_evidence_id, account_id, T2),
+        )
         connection.commit()
 
     with Storage(path) as storage:
@@ -260,17 +321,31 @@ def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
         provenance = snapshot.latest_complete_provenance
         assert provenance is not None
         assert provenance.provider == "steam_web_api"
-        assert provenance.base_retrieved_at == T0
+        assert provenance.base_retrieved_at is None
         assert provenance.expanded_retrieved_at == T0
-        assert provenance.base_reported_count == 1
-        assert provenance.expanded_reported_count == 2
-        assert provenance.classification_method == "legacy_v6_inferred_pair"
+        assert provenance.base_reported_count is None
+        assert provenance.expanded_reported_count is None
+        assert provenance.base_include_played_free_games is None
+        assert provenance.expanded_include_played_free_games is False
+        assert provenance.classification_method == "legacy_single_snapshot"
         assert storage._connection.execute(
             "SELECT COUNT(*) FROM game_entities"
+        ).fetchone()[0] == 3
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM evidence WHERE account_id = ?", (account_id,)
+        ).fetchone()[0] == 2
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_observations"
+        ).fetchone()[0] == 2
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_sync_metadata"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM sync_runs WHERE account_id = ?", (account_id,)
         ).fetchone()[0] == 2
         assert storage._connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 7
+        ).fetchone()[0] == 8
 
 
 def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
@@ -576,6 +651,80 @@ def test_owned_bulk_write_rolls_back_after_late_failure(tmp_path: Path) -> None:
         )
 
 
+def test_atomic_owned_completion_rolls_back_payload_and_promotion(
+    tmp_path: Path,
+) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = _account(storage)
+        _consent(storage, account_id)
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account_id,
+            started_at=T0,
+        )
+        storage._connection.execute(
+            """
+            CREATE TRIGGER reject_owned_promotion
+            BEFORE INSERT ON owned_current
+            BEGIN
+                SELECT RAISE(ABORT, 'promotion failure');
+            END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="promotion failure"):
+            storage.complete_owned_snapshot(
+                run.id,
+                [_owned(10, T0)],
+                base_retrieved_at=T0,
+                expanded_retrieved_at=T1,
+                base_reported_count=1,
+                expanded_reported_count=1,
+                completed_at=T2,
+            )
+
+        assert storage.get_sync_run(run.id).status == "running"
+        for table in (
+            "owned_observations",
+            "owned_current",
+            "owned_sync_metadata",
+            "evidence",
+        ):
+            assert storage._connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        storage.finish_owned_sync(
+            run.id,
+            status="failed",
+            completed_at=T3,
+            error_code="SYNC_FAILED",
+        )
+        assert storage.get_sync_run(run.id).status == "failed"
+
+
+def test_stable_game_id_survives_account_deletion_and_readdition(
+    tmp_path: Path,
+) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        first_account = _account(storage)
+        _consent(storage, first_account)
+        _complete_owned(storage, first_account, [_owned(10, T0)], T0, T1)
+        first_id = dict(
+            storage.read_owned_snapshot(first_account).stable_game_ids_by_appid
+        )[10]
+        storage.delete_steam_account_data(first_account)
+
+        second_account = _account(storage, alias="replacement", suffix=1)
+        _consent(storage, second_account)
+        _complete_owned(storage, second_account, [_owned(10, T2)], T2, T3)
+        second_id = dict(
+            storage.read_owned_snapshot(second_account).stable_game_ids_by_appid
+        )[10]
+
+        assert first_id == second_id == steam_application_stable_id(10)
+
+
 def test_joined_library_snapshot_reads_both_projections(tmp_path: Path) -> None:
     with Storage(tmp_path / "db.sqlite3") as storage:
         account_id = _account(storage)
@@ -613,9 +762,41 @@ def test_joined_library_snapshot_reads_both_projections(tmp_path: Path) -> None:
         assert [game.appid for game in joined.installed.games] == [10]
         assert joined.owned.latest_complete is not None
         assert joined.installed.latest_complete is not None
-        assert len(joined.entity_ids_by_appid) == 1
-        assert joined.entity_ids_by_appid[0][0] == 10
-        assert joined.entity_ids_by_appid[0][1] > 0
+        assert joined.stable_game_ids_by_appid == (
+            (10, steam_application_stable_id(10)),
+        )
+        assert joined.owned.stable_game_ids_by_appid == (
+            (10, steam_application_stable_id(10)),
+        )
+        assert storage._connection.execute(
+            "SELECT account_id FROM evidence WHERE capability = 'installed'"
+        ).fetchone()[0] is None
+
+
+def test_stable_identity_lookup_occurs_inside_library_read_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = _account(storage)
+        _consent(storage, account_id)
+        _complete_owned(storage, account_id, [_owned(10, T0)], T0, T1)
+        original = Storage._stable_game_ids_for_appids
+        observed_transaction: list[bool] = []
+
+        def checked(
+            instance: Storage, appids: set[int]
+        ) -> tuple[tuple[int, str], ...]:
+            observed_transaction.append(instance._connection.in_transaction)
+            return original(instance, appids)
+
+        monkeypatch.setattr(Storage, "_stable_game_ids_for_appids", checked)
+        snapshot = storage.read_library_snapshot(account_id, "local")
+
+        assert observed_transaction and all(observed_transaction)
+        assert snapshot.stable_game_ids_by_appid == (
+            (10, steam_application_stable_id(10)),
+        )
 
 
 def test_account_deletion_removes_account_data_but_preserves_m1_and_shared_key(
