@@ -24,6 +24,7 @@ them.
 | D016 | Browser reference access modes | Proposed direction | Moderate | Provider permissions for manual link, human-open, agent-read, and ingestion |
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
 | D018 | M2 credential storage boundary | [Accepted: native `keyring` with explicit protected-file fallback](0003-credential-storage.md) | Moderate | Native backend probes, file-safety tests, redaction tests, and M2 capability review |
+| D019 | Preconfigure optional provider API keys before adapter milestones | Implemented credential checkpoint only; provider adapters remain gated | Easy | Hidden-input tests, provider-isolated references, non-retaining fixed-host probes, and provider terms review |
 
 ## When to create an ADR
 

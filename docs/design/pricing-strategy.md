@@ -1,6 +1,6 @@
 # Historical pricing strategy
 
-Status: working provider and outreach plan, verified 2026-07-10
+Status: working provider and outreach plan, reverified 2026-07-11
 
 Historical pricing must work for a new installation. Local observations are
 supplemental evidence for outages, personalized prices, and recent changes; they
@@ -30,7 +30,7 @@ price for ordinary API access; it does not promise perpetual free service.
 
 | Provider | Published cost | Minimum test setup | Budget implication |
 | --- | --- | --- | --- |
-| ITAD | No API fee or usage-credit price is published | Register an app, verify email, request private-use approval; default verified quota is 1,000 requests per 5 minutes | Expect `$0` for an approved development test; higher limits/terms are negotiated, not self-serve credits |
+| ITAD | No API fee or usage-credit price is published | Register an app and verify email; public apps receive credentials, while private apps must request approval. This app dashboard currently grants 100 requests per 5 minutes. | Expect `$0` for an approved development test; cache to the account-specific limit and do not assume the documented default |
 | GG.deals Free | `$0` for personal, hobby, and open-source projects, with attribution and preserved affiliate/referral links | Free account/API key | Best first authenticated E2E provider; no funds required |
 | GG.deals Premium | Custom quote; not self-serve | Contact from a commercial email with use case | Needed only for commercial use, higher limits, faster refresh, store-granular prices, or top-ten offers |
 | CheapShark | `$0`, no API key | Descriptive `User-Agent`; on-demand requests; CheapShark redirect links | Immediate zero-cost fallback test |
@@ -41,6 +41,11 @@ price for ordinary API access; it does not promise perpetual free service.
 The current testing budget is therefore **zero dollars** for the useful first
 round. There is no need to preload balances. The gating work is account creation,
 attribution, and provider approval—not buying API credits.
+
+Credential preconfiguration is implemented for ITAD, GG.deals, and SteamGridDB
+behind the accepted OS credential boundary. This is not M3 activation. It stores
+only API keys, not ITAD OAuth client secrets. Live ITAD use remains blocked until
+the resulting application has a canonical public URL or private-use approval.
 
 Two unauthenticated smoke probes were successful during research:
 

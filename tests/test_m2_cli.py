@@ -199,8 +199,8 @@ def test_provider_request_budget_is_global_across_data_profiles(
     monkeypatch.setattr(cli, "_provider_budget_database_path", lambda: budget)
     requested = datetime(2026, 7, 10, tzinfo=timezone.utc)
 
-    assert cli._reserve_provider_request(requested)
-    assert not cli._reserve_provider_request(requested)
+    assert cli._reserve_provider_request("steam-web-api", requested, 1.0)
+    assert not cli._reserve_provider_request("steam-web-api", requested, 1.0)
 
 
 def test_provider_budget_path_ignores_data_directory_override(

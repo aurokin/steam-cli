@@ -117,6 +117,24 @@ uv run steam-agent auth set steam-web-api
 uv run steam-agent owned probe --account primary
 ```
 
+The same hidden-input boundary can preconfigure optional provider keys without
+activating their later data adapters:
+
+```text
+uv run steam-agent auth set isthereanydeal
+uv run steam-agent auth set steamgriddb
+uv run steam-agent auth set gg-deals
+uv run steam-agent auth status isthereanydeal
+uv run steam-agent auth probe steamgriddb
+uv run steam-agent auth probe gg-deals
+```
+
+Third-party probes are separate, explicit, read-only calls. They use one known
+Steam AppID, retain no response body, and do not fetch or persist price/artwork
+data. ITAD live use remains gated on a canonical public project URL or private
+approval; its API key can still be stored and resolved locally now. OAuth client
+secrets are not needed for public pricing endpoints and are not stored.
+
 The default backend is the native OS credential store. POSIX users can select
 the unencrypted permission-protected fallback only with both `--backend file`
 and `--yes-file-risk`. There is no automatic downgrade. An owned capability

@@ -6,7 +6,8 @@ Date: 2026-07-10
 
 ## Context
 
-M2 needs a user-supplied Steam Web API key. Secrets must remain outside command
+M2 needs a user-supplied Steam Web API key, and later provider checkpoints need
+user-supplied ITAD, SteamGridDB, and GG.deals API keys. Secrets must remain outside command
 arguments, logs, fixtures, normal output, SQLite evidence, and committed files.
 The design must support a macOS-first CLI without making the provider layer
 depend directly on one platform API.
@@ -43,6 +44,9 @@ be readable by any process running as the user and may be included in backups.
   path so separate `--data-dir` profiles cannot overwrite or delete each
   other's key. Keychain labels and lookup attributes contain no secret or path
   material.
+- Keep every provider in a distinct credential reference. Third-party key
+  changes do not invalidate Steam account capability evidence. ITAD OAuth
+  client secrets remain out of scope because pricing endpoints use its API key.
 - Persist the exact approved native backend identity used to create a key and
   require that same backend for later resolution/removal. Backend drift fails
   closed instead of orphaning a secret in another wallet.

@@ -41,6 +41,10 @@ steam-agent accounts remove [--alias ALIAS] --yes
 steam-agent auth set steam-web-api [--backend os|file] [--yes-file-risk]
 steam-agent auth status steam-web-api
 steam-agent auth remove steam-web-api --yes
+steam-agent auth set <isthereanydeal|steamgriddb|gg-deals> [--backend os|file] [--yes-file-risk]
+steam-agent auth status <isthereanydeal|steamgriddb|gg-deals>
+steam-agent auth probe <steamgriddb|gg-deals>
+steam-agent auth remove <isthereanydeal|steamgriddb|gg-deals> --yes
 steam-agent owned capability [--account ALIAS]
 steam-agent owned probe [--account ALIAS]
 ```
@@ -58,6 +62,16 @@ SteamID64, source kind, and timestamps. `accounts status` requires the explicit
 backend is a POSIX-only, permission-protected but unencrypted fallback and
 requires `--yes-file-risk`; it is never selected automatically. `auth remove`
 removes the local credential but does not claim to revoke the key at Valve.
+
+Optional third-party keys use distinct provider-scoped Keychain entries. `auth
+status` is network-free and proves only local resolvability. `auth probe` is an
+explicit fixed-host HTTPS validation request whose bounded response is discarded.
+ITAD and SteamGridDB authenticate in headers. GG.deals documents only query-key
+authentication, so its constructed request target is confined to the transport
+boundary and is never returned in output or exception text. These credential
+commands do not activate pricing/artwork adapters or persist provider data.
+ITAD credential storage/status are available, but its live probe is deliberately
+disabled until a canonical public project URL or private-use approval exists.
 
 `owned capability` is read-only and makes no provider request. It reports
 support, identity, credential, and last-probe state as separate axes.

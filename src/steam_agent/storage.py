@@ -456,15 +456,17 @@ class Storage:
         backend: str,
         backend_locator: str | None,
         configured_at: str | datetime,
-        capability: str,
+        capability: str | None,
     ) -> None:
         """Commit credential metadata and dependent-probe invalidation together."""
 
         if backend not in ("os", "file"):
             raise ValueError("backend must be os or file")
-        for value in (provider, kind, profile_id, capability):
+        for value in (provider, kind, profile_id):
             if not value or len(value) > 128:
                 raise ValueError("credential metadata inputs are invalid")
+        if capability is not None and (not capability or len(capability) > 128):
+            raise ValueError("credential capability input is invalid")
         timestamp = _timestamp(configured_at)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -489,9 +491,10 @@ class Storage:
                     backend_locator,
                 ),
             )
-            self._connection.execute(
-                "DELETE FROM provider_probes WHERE capability = ?", (capability,)
-            )
+            if capability is not None:
+                self._connection.execute(
+                    "DELETE FROM provider_probes WHERE capability = ?", (capability,)
+                )
             self._connection.commit()
         except BaseException:
             self._connection.rollback()
@@ -503,15 +506,16 @@ class Storage:
         provider: str,
         kind: str,
         profile_id: str,
-        capability: str,
+        capability: str | None,
     ) -> bool:
         """Remove credential metadata and dependent probes atomically."""
 
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            self._connection.execute(
-                "DELETE FROM provider_probes WHERE capability = ?", (capability,)
-            )
+            if capability is not None:
+                self._connection.execute(
+                    "DELETE FROM provider_probes WHERE capability = ?", (capability,)
+                )
             cursor = self._connection.execute(
                 """
                 DELETE FROM credential_refs

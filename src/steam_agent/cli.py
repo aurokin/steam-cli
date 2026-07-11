@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
 import getpass
@@ -56,6 +57,7 @@ from steam_agent.local_accounts import (
     select_primary_local_account,
 )
 from steam_agent.steam_web_api import SteamApiError, SteamWebApiClient
+from steam_agent.provider_auth import ProviderAuthClient, ProviderAuthError
 
 
 EXIT_OK = 0
@@ -68,6 +70,49 @@ _SAFE_WARNING_SOURCE = re.compile(r"(?:libraryfolders\.vdf|appmanifest_\d+\.acf)
 _OWNED_CAPABILITY = "owned.visible.read"
 _OWNED_PROBE_FRESHNESS_SECONDS = 24 * 60 * 60
 _PROVIDER_MINIMUM_INTERVAL_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialProviderSpec:
+    cli_name: str
+    storage_provider: str
+    kind: str
+    prompt_label: str
+    display_label: str
+    missing_capability: str
+    dependent_capability: str | None = None
+
+
+_CREDENTIAL_PROVIDERS = {
+    spec.cli_name: spec
+    for spec in (
+        _CredentialProviderSpec(
+            "steam-web-api", "steam", "web-api-key", "Steam Web API key",
+            "Steam Web API user key", "credential:steam_web_api_user_key",
+            _OWNED_CAPABILITY,
+        ),
+        _CredentialProviderSpec(
+            "isthereanydeal", "isthereanydeal", "api-key",
+            "IsThereAnyDeal API key", "IsThereAnyDeal API key",
+            "credential:isthereanydeal_api_key",
+        ),
+        _CredentialProviderSpec(
+            "steamgriddb", "steamgriddb", "api-key", "SteamGridDB API key",
+            "SteamGridDB API key", "credential:steamgriddb_api_key",
+        ),
+        _CredentialProviderSpec(
+            "gg-deals", "gg-deals", "api-key", "GG.deals API key",
+            "GG.deals API key", "credential:gg_deals_api_key",
+        ),
+    )
+}
+_AUTH_PROVIDER_NAMES = tuple(_CREDENTIAL_PROVIDERS)
+_AUTH_PROBE_PROVIDER_NAMES = ("steamgriddb", "gg-deals")
+_AUTH_PROBE_INTERVAL_SECONDS = {
+    "isthereanydeal": 3.0,
+    "steamgriddb": 1.0,
+    "gg-deals": 1.0,
+}
 
 
 class CliUsageError(ValueError):
@@ -148,15 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
     auth_set = auth_commands.add_parser("set", help="Store a credential from hidden input.")
     _add_leaf_format(auth_set)
-    auth_set.add_argument("provider", choices=("steam-web-api",))
+    auth_set.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
     auth_set.add_argument("--backend", choices=("os", "file"), default="os")
     auth_set.add_argument("--yes-file-risk", action="store_true")
     auth_status = auth_commands.add_parser("status", help="Show redacted credential status.")
     _add_leaf_format(auth_status)
-    auth_status.add_argument("provider", choices=("steam-web-api",))
+    auth_status.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
+    auth_probe = auth_commands.add_parser(
+        "probe", help="Explicitly validate a third-party credential without retaining a body."
+    )
+    _add_leaf_format(auth_probe)
+    auth_probe.add_argument("provider", choices=_AUTH_PROBE_PROVIDER_NAMES)
     auth_remove = auth_commands.add_parser("remove", help="Remove a locally stored credential.")
     _add_leaf_format(auth_remove)
-    auth_remove.add_argument("provider", choices=("steam-web-api",))
+    auth_remove.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
     auth_remove.add_argument("--yes", action="store_true")
 
     owned = commands.add_parser("owned", help="Inspect visible-owned capability state.")
@@ -658,7 +708,8 @@ def _dispatch_auth(args: argparse.Namespace, database_path: Path) -> int:
 
 
 def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
-    credential_ref = _steam_credential_ref(database_path)
+    spec = _CREDENTIAL_PROVIDERS[args.provider]
+    credential_ref = _provider_credential_ref(database_path, spec)
     if args.auth_command == "set":
         if args.backend == "file" and not args.yes_file_risk:
             return _emit_error(
@@ -684,8 +735,8 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                 message="Credential setup requires a terminal with hidden input.",
             )
         try:
-            first = _hidden_input("Steam Web API key: ")
-            second = _hidden_input("Confirm Steam Web API key: ")
+            first = _hidden_input(f"{spec.prompt_label}: ")
+            second = _hidden_input(f"Confirm {spec.prompt_label}: ")
         except getpass.GetPassWarning:
             return _emit_error(
                 args,
@@ -733,7 +784,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                     backend=args.backend,
                     backend_locator=store_probe.backend,
                     configured_at=_utc_now(),
-                    capability=_OWNED_CAPABILITY,
+                    capability=spec.dependent_capability,
                 )
             except BaseException:
                 try:
@@ -776,7 +827,9 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
             if snapshot["state"] == "configured"
             else CompletenessStatus.UNAVAILABLE
         )
-        warnings = _credential_warnings(snapshot["state"])
+        warnings = _credential_warnings(
+            snapshot["state"], credential_label=spec.display_label
+        )
         return _emit_success(
             args,
             command="auth.status",
@@ -784,7 +837,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                 status,
                 warnings=warnings,
                 missing_capabilities=(
-                    ["credential:steam_web_api_user_key"]
+                    [spec.missing_capability]
                     if status == CompletenessStatus.UNAVAILABLE
                     else []
                 ),
@@ -795,6 +848,72 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                 "state": snapshot["state"],
                 "backend": snapshot["backend"],
                 "protection": snapshot["protection"],
+                "secret_included": False,
+            },
+        )
+    if args.auth_command == "probe":
+        with Storage(database_path) as storage:
+            metadata = storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+        resolved = (
+            {"state": "missing", "secret": None, "error_code": None}
+            if metadata is None
+            else _resolve_credential(metadata, credential_ref)
+        )
+        if resolved["state"] != "configured":
+            if resolved["state"] == "store_locked":
+                code = ErrorCode.CREDENTIAL_STORE_LOCKED
+                message = "The configured credential store is locked."
+            elif resolved["state"] == "store_unavailable":
+                code = ErrorCode.CREDENTIAL_STORE_UNAVAILABLE
+                message = "The configured credential store is unavailable."
+            else:
+                code = ErrorCode.AUTH_REQUIRED
+                message = f"A {spec.display_label} has not been configured."
+            return _emit_error(
+                args,
+                command="auth.probe",
+                code=code,
+                message=message,
+            )
+        now = _utc_now()
+        if not _reserve_provider_request(
+            args.provider,
+            now,
+            _AUTH_PROBE_INTERVAL_SECONDS[args.provider],
+        ):
+            return _emit_error(
+                args,
+                command="auth.probe",
+                code=ErrorCode.REQUEST_THROTTLED,
+                message="The local provider request interval has not elapsed.",
+                retryable=True,
+            )
+        try:
+            result = _provider_auth_client().probe(
+                provider=args.provider,
+                api_key=resolved["secret"],
+            )
+        except ProviderAuthError as exc:
+            return _emit_error(
+                args,
+                command="auth.probe",
+                code=exc.code,
+                message="The provider credential probe did not succeed.",
+                retryable=exc.retryable,
+            )
+        return _emit_success(
+            args,
+            command="auth.probe",
+            data={
+                "provider": args.provider,
+                "validation_state": result.state,
+                "validated": True,
+                "retryable": result.retryable,
+                "response_retained": False,
                 "secret_included": False,
             },
         )
@@ -834,7 +953,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                         provider=credential_ref.provider,
                         kind=credential_ref.kind,
                         profile_id=credential_ref.profile_id,
-                        capability=_OWNED_CAPABILITY,
+                        capability=spec.dependent_capability,
                     )
                 except BaseException:
                     if previous_secret is not None:
@@ -850,15 +969,17 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                         ) from None
                     raise
                 removed = True
+        data = {
+            "provider": args.provider,
+            "removed": removed,
+            "secret_included": False,
+        }
+        if args.provider == "steam-web-api":
+            data["valve_key_revoked"] = False
         return _emit_success(
             args,
             command="auth.remove",
-            data={
-                "provider": args.provider,
-                "removed": removed,
-                "valve_key_revoked": False,
-                "secret_included": False,
-            },
+            data=data,
         )
     raise AssertionError("unhandled auth command")
 
@@ -890,7 +1011,9 @@ def _dispatch_owned_locked(args: argparse.Namespace, database_path: Path) -> int
             credential = _resolve_credential(metadata, credential_ref)
             if credential["state"] == "configured":
                 now = _utc_now()
-                if not _reserve_provider_request(now):
+                if not _reserve_provider_request(
+                    "steam-web-api", now, _PROVIDER_MINIMUM_INTERVAL_SECONDS
+                ):
                     return _emit_error(
                         args,
                         command="owned.probe",
@@ -943,12 +1066,19 @@ def _account_steam_root(args: argparse.Namespace) -> Path:
     return Path(root)
 
 
-def _steam_credential_ref(database_path: Path) -> CredentialRef:
-    """Scope an opaque OS-store account to one local data profile."""
-
+def _provider_credential_ref(
+    database_path: Path, spec: _CredentialProviderSpec
+) -> CredentialRef:
+    """Scope an opaque provider credential to one local data profile."""
     canonical = str(database_path.expanduser().resolve(strict=False)).encode("utf-8")
     profile_id = f"data-{hashlib.sha256(canonical).hexdigest()[:32]}"
-    return CredentialRef("steam", "web-api-key", profile_id)
+    return CredentialRef(spec.storage_provider, spec.kind, profile_id)
+
+
+def _steam_credential_ref(database_path: Path) -> CredentialRef:
+    return _provider_credential_ref(
+        database_path, _CREDENTIAL_PROVIDERS["steam-web-api"]
+    )
 
 
 @contextmanager
@@ -1070,7 +1200,9 @@ def _resolve_credential(
     return {"state": "configured", "secret": secret, "error_code": None}
 
 
-def _credential_warnings(state: str) -> list[WarningRecord]:
+def _credential_warnings(
+    state: str, *, credential_label: str = "Steam Web API user key"
+) -> list[WarningRecord]:
     if state == "configured":
         return []
     if state == "store_locked":
@@ -1090,7 +1222,7 @@ def _credential_warnings(state: str) -> list[WarningRecord]:
     return [
         WarningRecord(
             code=ErrorCode.AUTH_REQUIRED,
-            message="A Steam Web API user key has not been configured.",
+            message=f"A {credential_label} has not been configured.",
         )
     ]
 
@@ -1239,14 +1371,22 @@ def _provider_budget_database_path() -> Path:
     return default_credential_dir().parent / "provider-request-budget.sqlite3"
 
 
-def _reserve_provider_request(requested_at: datetime) -> bool:
+def _reserve_provider_request(
+    provider: str,
+    requested_at: datetime,
+    minimum_interval_seconds: float,
+) -> bool:
     with Storage(_provider_budget_database_path()) as storage:
         return storage.reserve_provider_request(
-            provider="steam-web-api",
+            provider=provider,
             budget_scope="user-key",
             requested_at=requested_at,
-            minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
+            minimum_interval_seconds=minimum_interval_seconds,
         )
+
+
+def _provider_auth_client() -> ProviderAuthClient:
+    return ProviderAuthClient()
 
 
 def _utc_now() -> datetime:
