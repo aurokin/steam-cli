@@ -1,7 +1,6 @@
 # M3 wishlist and deal evidence execution plan
 
-Status: active 2026-07-11; AUR-632 and AUR-636 implementation available for
-acceptance; milestone not yet accepted
+Status: accepted 2026-07-11
 
 ## Outcome and sequence
 
@@ -79,8 +78,8 @@ confirmed empty list; a valid empty projection is complete; stale, failed, and
 abandoned last-good projections are partial; a fresh last-good projection under
 an active refresh can remain complete with `SYNC_IN_PROGRESS`. Price states
 remain distinct per AppID and provider: `ready`, `not_found`, `unevaluated`,
-`failed`, `running`, `abandoned`, and `not_synced`. A primary `not_found` does
-not complete the ladder until the fallback is evaluated. A fresh fallback
+`failed`, `running`, `abandoned`, `expired`, and `not_synced`. A primary
+`not_found` does not complete the ladder until the fallback is evaluated. A fresh fallback
 `not_found` completes with price unknown, not free. Stale evidence is reported
 as stale; absent or incomplete evaluation is reported as missing.
 
@@ -110,3 +109,34 @@ Opt-in live acceptance records only coarse aggregates and schema states:
 
 Live prices and wishlist counts are volatile and are not asserted in normal CI.
 ITAD is not part of the M3 live gate until its approval condition is satisfied.
+
+## Acceptance evidence collected 2026-07-11
+
+- Deterministic CI covers the full wishlist-to-deal tracer, explicit GG.deals
+  failure/not-found fallback, bounded partial scans, freshness and hard expiry,
+  migration upgrades, credential and provider deletion, redaction, URL
+  allowlists, persisted `Retry-After`, and CheapShark seller attribution.
+- The final suite passes 615 tests, Ruff, source/wheel construction, and an
+  isolated installed-wheel subprocess smoke on the supported Python baseline.
+- Live primary-account acceptance synchronized 238 wishlist AppIDs and 238
+  GG.deals demand subjects. The cache-only query reconstructed 238 candidates
+  with complete current coverage and no secret, credential, API-key, SteamID64,
+  raw-body, or local-path fields.
+- A live bounded CheapShark call evaluated and observed one demanded AppID,
+  retained no raw payload, and reconstructed ten attributed offers with ten
+  bounded seller identifiers. Volatile AppIDs, titles, and prices were not
+  recorded in this document.
+- The final full-scope live sync evaluated all 238 wishlist subjects: GG.deals
+  supplied current evidence for 211 and returned 27 truthful current-price
+  misses; all 27 misses traversed CheapShark. The resulting cache-only query was
+  complete while preserving each provider's distinct `ready`, `not_found`, and
+  `unevaluated` states.
+- Iterative two-reviewer Diff Warden passes exposed expiry, completeness,
+  fallback scheduling, membership churn, provider-ordering, parsing,
+  attribution, and multi-account edge cases. Each valid finding received a
+  deterministic regression; the final release-gate pass returned zero P1/P2
+  findings.
+
+Acceptance remains deliberately narrow: it does not activate full price-event
+history, preference recommendations, compatibility, purchases, browser reads,
+wishlist mutation, or Steam client actions.

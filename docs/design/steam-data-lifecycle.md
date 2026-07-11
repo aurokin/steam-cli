@@ -1,7 +1,6 @@
 # Steam account data lifecycle
 
-Status: accepted M2 policy boundary; active M3 wishlist and deal-evidence
-extension implemented for acceptance but not yet accepted
+Status: accepted M2 and M3 policy boundary
 
 This document governs Steam account data obtained through Valve's Web API. It
 does not change the accepted M1 local installed-library contract. It is the

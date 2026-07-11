@@ -1,8 +1,7 @@
 # Architecture decision register
 
-Only decisions required to bootstrap the M1 implementation are accepted. This
-register keeps later product and provider choices open until evidence supports
-them.
+Only decisions required by accepted M1–M3 slices are accepted. This register
+keeps later product and provider choices open until evidence supports them.
 
 | ID | Decision | State | Reversibility | Evidence needed before ADR |
 | --- | --- | --- | --- | --- |
@@ -16,15 +15,15 @@ them.
 | D008 | SteamGridDB integration | Optional | Easy | Art use cases and terms/attribution review |
 | D009 | High-trust SteamKit/SteamCMD mode | Deferred | Moderate | Private-data value vs account/session risk |
 | D010 | MCP surface | Deferred until CLI stabilizes | Easy | Multiple consumers needing typed live tools |
-| D011 | Raw-response retention and deletion | M2 accepted; M3 extension active | Costly for privacy | M3 stores no raw bodies and bounds third-party normalized cache retention |
-| D012 | Ranking recipe semantics | Narrow `deal-evidence/0.1` recipe active for M3 only | Costly once agents depend on it | Golden comparison, mismatch, fallback, and deterministic-order scenarios |
+| D011 | Raw-response retention and deletion | M2 and M3 accepted | Costly for privacy | M3 stores no raw bodies and bounds third-party normalized cache retention |
+| D012 | Ranking recipe semantics | Narrow `deal-evidence/0.1` recipe accepted for M3 only | Costly once agents depend on it | Golden comparison, mismatch, fallback, and deterministic-order scenarios |
 | D013 | Public binary/package name | [Accepted: `steam-agent`](0002-steam-agent-command-name.md) | Costly after release | Avoids the known `steam` client collision |
 | D014 | Read/plan/open/execute action boundary | Proposed direction | Costly and safety-critical | Steam policy review and action-specific capability probes |
 | D015 | Provider-neutral game/offer/license identity graph | [M3 exact-AppID offer slice accepted](0006-m3-offer-identity.md); broader joins open | Costly | App/package/bundle/edition mismatch and ambiguity fixtures |
 | D016 | Browser reference access modes | M3 manual-only/API distinction accepted | Moderate | URL allowlist and no-follow tests; broader agent-read/open behavior remains open |
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
 | D018 | M2 credential storage boundary | [Accepted: native `keyring` with explicit protected-file fallback](0003-credential-storage.md) | Moderate | Native backend probes, file-safety tests, redaction tests, and M2 capability review |
-| D019 | Preconfigure optional provider API keys before adapter milestones | Implemented credential checkpoint only; provider adapters remain gated | Easy | Hidden-input tests, provider-isolated references, non-retaining fixed-host probes, and provider terms review |
+| D019 | Preconfigure optional provider API keys before adapter milestones | Implemented; GG.deals active in M3, other adapters remain gated | Easy | Hidden-input tests, provider-isolated references, non-retaining fixed-host probes, and provider terms review |
 
 ## When to create an ADR
 

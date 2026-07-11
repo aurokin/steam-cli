@@ -1,7 +1,6 @@
 # CLI and JSON contract
 
-Status: M1 and M2 contracts implemented and accepted; M3 wishlist and deal
-evidence active, implemented for acceptance, and not yet accepted
+Status: M1, M2, and M3 contracts implemented and accepted
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -195,8 +194,7 @@ removed transactionally.
 
 ## Implemented M3 wishlist and deal-evidence commands
 
-The following commands are implemented while M3 remains active and not finally
-accepted:
+The following commands are accepted for M3:
 
 ```text
 steam-agent sync wishlist --account ALIAS [--acknowledge-local-storage]
@@ -254,8 +252,8 @@ as completed API evidence.
   A fresh CheapShark `ready` or `not_found` completes the fallback rung; two
   `not_found` results produce a complete deal bucket of `unknown`, never a free
   price claim.
-- Unevaluated, failed, running, abandoned, or unsynchronized evidence remains a
-  typed provider attempt. If no completed rung covers that AppID, the query is
+- Unevaluated, failed, running, abandoned, expired, or unsynchronized evidence
+  remains a typed provider attempt. If no completed rung covers that AppID, the query is
   `partial` and reports `prices.wishlist.read` missing. Expired facts or
   terminal subjects are `partial` with `prices.wishlist.read` stale, not
   missing solely because they are stale.

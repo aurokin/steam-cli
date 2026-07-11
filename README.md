@@ -18,11 +18,11 @@ queries. **The M2 truthful-account-inventory milestone is implemented and
 accepted:** local account selection, secure key storage, live provider
 classification, durable visible-owned synchronization, joined owned/installed
 and bounded catalog queries, truthful freshness, and transactional deletion are
-available. **M3 wishlist and deal evidence is active but not yet accepted:**
+available. **M3 wishlist and deal evidence is implemented and accepted:**
 provisional wishlist synchronization, bounded US price-summary synchronization,
 provider-scoped deletion, and the cache-only attributed deal query are
-implemented for acceptance work. Recommendations, compatibility, artwork, and
-Steam actions remain proposed design work behind later activation checkpoints.
+available. Recommendations, compatibility, artwork, and Steam actions remain
+proposed design work behind later activation checkpoints.
 
 ## Install and develop
 
@@ -199,7 +199,7 @@ queries continue returning the last known-good result. See the
 [M1 execution plan](docs/design/m1-execution.md) and
 [CLI contract](docs/design/cli-contract.md) for exact status and exit behavior.
 
-## Active M3 wishlist and deal evidence
+## M3 wishlist and deal evidence
 
 M3 separates explicit network synchronization from local querying:
 
@@ -240,8 +240,8 @@ Account-scoped Steam deletion also removes that account's wishlist, price
 demand, observations, subjects, evidence, and attempts. Deleted evidence is not
 reconstructed by `deals query`; a later query reports the remaining cache truth
 and typed missing/unsynchronized states. See the
-[M3 execution plan](docs/design/m3-execution.md) for the still-open milestone
-acceptance harness.
+[M3 execution plan](docs/design/m3-execution.md) for the accepted evidence and
+scope boundary.
 
 The current working direction is:
 
@@ -304,8 +304,6 @@ The design documents call out places where current research corrected it.
 ## Deliberately unresolved
 
 - Long-term storage schema and migration policy beyond the implemented M1 tables.
-- Whether the provisional wishlist contract and live M3 provider evidence pass
-  the final M3 acceptance gate.
 - Which approved provider may support a future full historical price-event
   graph; M3 retains only attributed low summaries.
 - Which Steam actions may be executed rather than planned/opened for a human.

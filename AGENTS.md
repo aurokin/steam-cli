@@ -5,10 +5,11 @@
 - M1 installed-library is accepted; preserve its schema `0.1` behavior and last-good rule.
 - M2 truthful account inventory is accepted; preserve its account capability,
   visible-owned, joined-library, freshness, deletion, and schema `0.1` behavior.
-- M3 wishlist and deal evidence is active. Keep it read-only and bounded to
-  provisional wishlist reads, exact AppID offers, attributed low summaries,
-  explicit fallbacks, and the retention rules in `docs/design/m3-execution.md`.
-- Keep wishlist, pricing, recommendation, compatibility, artwork, and action capabilities in design until their Linear milestone is explicitly activated.
+- M3 wishlist and deal evidence is accepted. Preserve its read-only boundary,
+  explicit country/store context, cache-only query, attributed evidence,
+  typed fallback states, and retention rules in `docs/design/m3-execution.md`.
+- Keep recommendation, compatibility, artwork, and action capabilities in
+  design until their Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
 - Preserve the M1 last-good rule: partial or failed scans must not replace a complete installed projection.
