@@ -121,7 +121,7 @@ def test_golden_ranking_preserves_all_candidates_and_ordering_contract() -> None
     result = rank_deals(values, context=US_OFFICIAL)
 
     assert result.schema == DEAL_EVIDENCE_SCHEMA == "deal-evidence/0.1"
-    assert [item.steam_appid for item in result.candidates] == [10, 20, 30, 40, 5, 50]
+    assert [item.steam_appid for item in result.candidates] == [10, 20, 40, 30, 5, 50]
     assert [item.bucket for item in result.candidates] == [
         "at_or_below_low",
         "within_5_percent",
@@ -130,7 +130,7 @@ def test_golden_ranking_preserves_all_candidates_and_ordering_contract() -> None
         "noncomparable",
         "unknown",
     ]
-    assert result.candidates[2].discount_bps == 4_000
+    assert result.candidates[2].discount_bps == 5_000
     assert result.candidates[1].distance_above_low_bps == 400
     cheapshark = result.candidates[4]
     assert cheapshark.evidence_grade == "degraded"
@@ -139,21 +139,21 @@ def test_golden_ranking_preserves_all_candidates_and_ordering_contract() -> None
 
 
 @pytest.mark.parametrize(
-    ("change", "expected_bucket"),
+    ("change", "expected_bucket", "expected_grade"),
     [
-        ({"country": "CA"}, "noncomparable"),
-        ({"currency": "CAD"}, "noncomparable"),
-        ({"store_class": "keyshop"}, "noncomparable"),
-        ({"scope": "all_time_keyshops"}, "current_only"),
+        ({"country": "CA"}, "noncomparable", "degraded"),
+        ({"currency": "CAD"}, "noncomparable", "degraded"),
+        ({"store_class": "keyshop"}, "noncomparable", "degraded"),
+        ({"scope": "all_time_keyshops"}, "current_only", "exact"),
     ],
 )
 def test_each_comparison_dimension_is_checked(
-    change: dict[str, str], expected_bucket: str
+    change: dict[str, str], expected_bucket: str, expected_grade: str
 ) -> None:
     evidence = snapshot(10, current=500, low=500, **change)
     result = rank_deals([candidate(10, evidence)], context=US_OFFICIAL).candidates[0]
     assert result.bucket == expected_bucket
-    assert result.evidence_grade == "degraded"
+    assert result.evidence_grade == expected_grade
 
 
 def test_provider_and_provider_product_mismatches_do_not_form_exact_pair() -> None:
@@ -183,7 +183,7 @@ def test_provider_and_provider_product_mismatches_do_not_form_exact_pair() -> No
     ).candidates[0]
 
     assert cross_provider.bucket == "current_only"
-    assert cross_provider.evidence_grade == "degraded"
+    assert cross_provider.evidence_grade == "exact"
     assert cross_product.bucket == "current_only"
 
 
@@ -198,6 +198,29 @@ def test_normalized_evidence_can_rank_but_never_becomes_exact() -> None:
 
     assert [item.steam_appid for item in result.candidates] == [20, 10]
     assert result.candidates[1].bucket == "at_or_below_low"
+    assert result.candidates[1].evidence_grade == "normalized"
+
+
+def test_exact_current_only_ranks_before_normalized_current_and_low() -> None:
+    exact_current = candidate(10, snapshot(10, current=700, low=None))
+    normalized_pair = candidate(
+        20,
+        snapshot(
+            20,
+            current=500,
+            low=500,
+            comparability="normalized_game",
+        ),
+    )
+
+    result = rank_deals([normalized_pair, exact_current], context=US_OFFICIAL)
+
+    assert [item.steam_appid for item in result.candidates] == [10, 20]
+    assert result.candidates[0].bucket == "current_only"
+    assert result.candidates[0].evidence_grade == "exact"
+    assert "requested_comparison_dimensions_are_not_fully_supported" not in (
+        result.candidates[0].tradeoffs
+    )
     assert result.candidates[1].evidence_grade == "normalized"
 
 
@@ -315,3 +338,16 @@ def test_invalid_candidate_metadata_is_rejected() -> None:
             [candidate(10), candidate(10)],
             context=US_OFFICIAL,
         )
+    with pytest.raises(ValueError, match="status"):
+        ProviderAttempt("provider", 0, "bogus")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("currency", "country"),
+    [("U$D", "US"), ("USD", "U1"), ("ÜSD", "US"), ("USD", "ÜS")],
+)
+def test_money_dimensions_require_ascii_alphabetic_codes(
+    currency: str, country: str
+) -> None:
+    with pytest.raises(ValueError):
+        Money(100, currency, country)

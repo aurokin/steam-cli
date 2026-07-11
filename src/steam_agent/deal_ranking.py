@@ -51,6 +51,8 @@ class ProviderAttempt:
             or not 0 <= self.fallback_rung <= MAX_SIGNED_64
         ):
             raise ValueError("fallback_rung must be a non-negative integer")
+        if self.status not in {"ready", "not_found", "failed", "unavailable"}:
+            raise ValueError("provider attempt status is invalid")
         if self.error_code is not None and len(self.error_code) > 128:
             raise ValueError("error_code must not exceed 128 characters")
         if self.status == "ready" and self.error_code is not None:
@@ -158,7 +160,14 @@ def _rank_candidate(
     else:
         offer = _best_current(candidate.steam_appid, offers, context)
         low = None
-        grade = "degraded" if offers or lows else "unknown"
+        if offer is None:
+            grade = "degraded" if offers or lows else "unknown"
+        elif offer.comparability == "exact_product":
+            grade = "exact"
+        elif offer.comparability == "normalized_game":
+            grade = "normalized"
+        else:
+            grade = "degraded"
 
     discount_bps = None if offer is None else _discount_bps(offer)
     distance_bps = (

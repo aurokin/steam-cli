@@ -262,7 +262,6 @@ def _normalize_game(
                 cheapest,
                 product=product,
                 observed_at=observed_at,
-                fallback_url=offers[0].provider_url if offers else None,
             ),
         )
     return DealEvidenceSnapshot(
@@ -312,14 +311,16 @@ def _normalize_history_low(
     *,
     product: ProductIdentity,
     observed_at: str,
-    fallback_url: ManualReference | None,
 ) -> HistoricalLowSummary:
     if not isinstance(payload, dict):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     effective_at = _unix_timestamp(payload.get("date"))
-    reference = fallback_url or ManualReference(
-        url="https://www.cheapshark.com/",
-        purpose="open CheapShark for a human",
+    reference = ManualReference(
+        url=(
+            "https://www.cheapshark.com/search?"
+            + urlencode({"steamAppID": product.steam_appid})
+        ),
+        purpose="open the CheapShark game search for historical context",
     )
     return HistoricalLowSummary(
         provider="cheapshark",

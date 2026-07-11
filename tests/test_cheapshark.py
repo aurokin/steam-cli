@@ -135,6 +135,12 @@ def test_lookup_is_fixed_host_bounded_on_demand_and_normalized() -> None:
     )
     assert len(result.history_lows) == 1
     low = result.history_lows[0]
+    assert low.provider_url.url == (
+        "https://www.cheapshark.com/search?steamAppID=220"
+    )
+    assert low.provider_url.url != offer.provider_url.url
+    assert low.provider_url.access_mode == "manual_only"
+    assert low.provider_url.automation_supported is False
     assert low.price.amount_minor == 125
     assert low.scope == "all_time_any_store"
     assert low.effective_at == "2023-11-14T22:13:20Z"

@@ -48,9 +48,19 @@ class Money:
             or self.amount_minor > (1 << 63) - 1
         ):
             raise ValueError("amount_minor must be a non-negative 64-bit integer")
-        if len(self.currency) != 3 or not self.currency.isupper():
+        if (
+            len(self.currency) != 3
+            or not self.currency.isascii()
+            or not self.currency.isalpha()
+            or not self.currency.isupper()
+        ):
             raise ValueError("currency must be an uppercase ISO-style code")
-        if len(self.country) != 2 or not self.country.isupper():
+        if (
+            len(self.country) != 2
+            or not self.country.isascii()
+            or not self.country.isalpha()
+            or not self.country.isupper()
+        ):
             raise ValueError("country must be an uppercase country code")
 
 
