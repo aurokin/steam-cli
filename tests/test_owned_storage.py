@@ -23,6 +23,27 @@ T2 = "2026-07-11T12:02:00Z"
 T3 = "2026-07-11T12:03:00Z"
 
 
+def _apply_migrations_through(
+    connection: sqlite3.Connection, latest_version: int
+) -> None:
+    migrations = resources.files("steam_agent").joinpath("migrations")
+    connection.execute(
+        "CREATE TABLE schema_migrations "
+        "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for version in range(1, latest_version + 1):
+        migration = next(
+            item
+            for item in migrations.iterdir()
+            if item.name.startswith(f"{version:03d}_")
+        )
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, T0),
+        )
+
+
 def _account(storage: Storage, alias: str = "primary", suffix: int = 0) -> int:
     return storage.configure_steam_account(
         alias=alias,
@@ -104,30 +125,15 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (6,)
+        ).fetchone() == (7,)
 
 
 def test_populated_v5_upgrade_backfills_steam_application_identities(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "upgrade.sqlite3"
-    migrations = resources.files("steam_agent").joinpath("migrations")
     with sqlite3.connect(path) as connection:
-        connection.execute(
-            "CREATE TABLE schema_migrations "
-            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-        )
-        for version in range(1, 6):
-            migration = next(
-                item
-                for item in migrations.iterdir()
-                if item.name.startswith(f"{version:03d}_")
-            )
-            connection.executescript(migration.read_text(encoding="utf-8"))
-            connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (version, T0),
-            )
+        _apply_migrations_through(connection, 5)
         connection.executemany(
             "INSERT INTO steam_apps(appid, name, app_type, updated_at) "
             "VALUES (?, ?, 'unknown', ?)",
@@ -158,7 +164,113 @@ def test_populated_v5_upgrade_backfills_steam_application_identities(
         assert storage.get_account("primary") is not None
         assert storage._connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 6
+        ).fetchone()[0] == 7
+
+
+def test_original_populated_v6_upgrade_preserves_payload_and_infers_pair(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v6-upgrade.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        _apply_migrations_through(connection, 6)
+        connection.execute(
+            "INSERT INTO accounts(alias, provider, provider_account_id, source_kind, "
+            "created_at, updated_at) VALUES "
+            "('primary', 'steam', '76561198000000000', 'upgrade-test', ?, ?)",
+            (T0, T0),
+        )
+        account_id = int(
+            connection.execute(
+                "SELECT id FROM accounts WHERE alias = 'primary'"
+            ).fetchone()[0]
+        )
+        connection.executemany(
+            "INSERT INTO steam_apps(appid, name, app_type, updated_at) "
+            "VALUES (?, NULL, 'unknown', ?)",
+            ((10, T0), (20, T0)),
+        )
+        run_id = int(
+            connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    provider, capability, account_id, started_at, completed_at,
+                    status, promoted, records_seen
+                ) VALUES (
+                    'steam_web_api', 'owned.visible.read', ?, ?, ?,
+                    'complete', 1, 2
+                )
+                """,
+                (account_id, T0, T1),
+            ).lastrowid
+        )
+        connection.execute(
+            """
+            INSERT INTO owned_sync_metadata(
+                sync_run_id, account_id, retrieved_at, include_appinfo,
+                include_played_free_games, support_level
+            ) VALUES (?, ?, ?, 1, 1, 'official_documented')
+            """,
+            (run_id, account_id, T0),
+        )
+        for appid, basis in ((10, "visible_owned"), (20, "played_free")):
+            evidence_id = int(
+                connection.execute(
+                    """
+                    INSERT INTO evidence(
+                        provider, capability, source_kind, source_locator,
+                        retrieved_at, support_level, context_json, payload_json,
+                        content_hash
+                    ) VALUES (
+                        'steam_web_api', 'owned.visible.read', 'steam_web_api',
+                        ?, ?, 'official_documented', '{}', ?, ?
+                    )
+                    """,
+                    (
+                        f"GetOwnedGames:app:{appid}",
+                        T0,
+                        json.dumps({"appid": appid}),
+                        f"hash-{appid}",
+                    ),
+                ).lastrowid
+            )
+            connection.execute(
+                """
+                INSERT INTO owned_observations(
+                    sync_run_id, evidence_id, account_id, appid, name,
+                    playtime_forever_minutes, inclusion_basis, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, evidence_id, account_id, appid, f"Game {appid}", 0, basis, T0),
+            )
+            connection.execute(
+                """
+                INSERT INTO owned_current(
+                    account_id, appid, evidence_id, promoted_sync_run_id, name,
+                    playtime_forever_minutes, inclusion_basis, observed_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (account_id, appid, evidence_id, run_id, f"Game {appid}", basis, T0),
+            )
+        connection.commit()
+
+    with Storage(path) as storage:
+        snapshot = storage.read_owned_snapshot(account_id)
+        assert [game.appid for game in snapshot.games] == [10, 20]
+        provenance = snapshot.latest_complete_provenance
+        assert provenance is not None
+        assert provenance.provider == "steam_web_api"
+        assert provenance.base_retrieved_at == T0
+        assert provenance.expanded_retrieved_at == T0
+        assert provenance.base_reported_count == 1
+        assert provenance.expanded_reported_count == 2
+        assert provenance.classification_method == "legacy_v6_inferred_pair"
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM game_entities"
+        ).fetchone()[0] == 2
+        assert storage._connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
 
 
 def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
