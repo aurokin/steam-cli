@@ -78,6 +78,7 @@ from steam_agent.provider_auth import ProviderAuthClient, ProviderAuthError
 from steam_agent.gg_deals import GgDealsClient, GgDealsError
 from steam_agent.cheapshark import CheapSharkClient, CheapSharkError
 from steam_agent.price_library import PriceSyncError, sync_wishlist_prices
+from steam_agent.deal_query import build_deal_query_from_snapshot
 
 
 EXIT_OK = 0
@@ -247,6 +248,21 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
     query.add_argument("--include-paths", action="store_true")
+
+    deals = commands.add_parser("deals", help="Query cached wishlist deal evidence.")
+    deal_commands = deals.add_subparsers(dest="deals_command", required=True)
+    deal_query = deal_commands.add_parser(
+        "query", help="Rank cached deal evidence for a wishlist."
+    )
+    _add_leaf_format(deal_query)
+    deal_query.add_argument("--scope", choices=("wishlist",), required=True)
+    deal_query.add_argument("--account", required=True)
+    deal_query.add_argument("--country", required=True)
+    deal_query.add_argument(
+        "--store-class",
+        choices=("official", "keyshop", "unknown"),
+        default="official",
+    )
 
     accounts = commands.add_parser(
         "accounts", help="Configure Steam account identities."
@@ -647,6 +663,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
                 "snapshot": snapshot,
             },
         )
+    if args.command == "deals" and args.deals_command == "query":
+        return _dispatch_deals_query(args, database_path)
     if args.command == "accounts":
         return _dispatch_accounts(args, database_path)
     if args.command == "auth":
@@ -656,6 +674,130 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
     if args.command == "data":
         return _dispatch_data(args, database_path)
     raise AssertionError("argparse accepted an unhandled command")
+
+
+def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
+    country = args.country.upper()
+    if (
+        len(country) != 2
+        or not country.isascii()
+        or not country.isalpha()
+        or country != "US"
+    ):
+        return _emit_error(
+            args,
+            command="deals.query",
+            code=(
+                "UNSUPPORTED_COUNTRY"
+                if len(country) == 2 and country.isascii() and country.isalpha()
+                else ErrorCode.INVALID_ARGUMENT
+            ),
+            message=(
+                "Cached GG.deals and CheapShark evidence is currently US/USD only."
+                if len(country) == 2 and country.isascii() and country.isalpha()
+                else "Country must be a two-letter code."
+            ),
+            exit_code=2,
+        )
+    generated_at = _utc_now()
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            return _emit_error(
+                args,
+                command="deals.query",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
+        if account is None:
+            return _emit_success(
+                args,
+                command="deals.query",
+                generated_at=generated_at,
+                context={
+                    "account_alias": args.account,
+                    "scopes": ["wishlist", "deals"],
+                    "country": country,
+                    "currency": "USD",
+                    "store_class": args.store_class,
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["account.identity"],
+                    warnings=[
+                        WarningRecord(
+                            code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                            message="The requested account alias is not configured.",
+                        )
+                    ],
+                ),
+                data={
+                    "items": [],
+                    "empty": False,
+                    "next_cursor": None,
+                    "ranking": {
+                        "schema": "deal-evidence/0.1",
+                        "deterministic_order": True,
+                    },
+                    "snapshots": {"wishlist": None, "prices": None},
+                    "fallback": {
+                        "ladder": [
+                            {"rung": 0, "provider": "gg-deals", "mode": "api"},
+                            {
+                                "rung": 1,
+                                "provider": "cheapshark",
+                                "mode": "api",
+                            },
+                            {
+                                "rung": 2,
+                                "provider": "manual-reference",
+                                "mode": "manual_only",
+                            },
+                        ],
+                        "providers_attempted": [],
+                        "providers_used": [],
+                    },
+                    "limitations": [
+                        "price evidence is US/USD only",
+                        "historical lows are summaries rather than a full event graph",
+                        "manual references are never read or fetched by Steam Agent",
+                    ],
+                },
+            )
+        spec = _CREDENTIAL_PROVIDERS["gg-deals"]
+        credential_ref = _provider_credential_ref(database_path, spec)
+        gg_configured = (
+            storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            is not None
+        )
+        snapshot = storage.read_wishlist_deal_snapshot(
+            account_id=account.id,
+            country=country,
+            now=generated_at,
+        )
+    result = build_deal_query_from_snapshot(
+        snapshot,
+        account_alias=account.alias,
+        country=country,
+        store_class=args.store_class,
+        generated_at=generated_at,
+        gg_credential_configured=gg_configured,
+    )
+    return _emit_success(
+        args,
+        command="deals.query",
+        generated_at=generated_at,
+        context=result["context"],  # type: ignore[arg-type]
+        completeness_value=result["completeness"],  # type: ignore[arg-type]
+        data=result["data"],  # type: ignore[arg-type]
+    )
 
 
 def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
@@ -2064,14 +2206,19 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                     account = storage.get_account(args.account)
                 except ValueError:
                     return _emit_error(
-                        args, command="data.delete", code=ErrorCode.INVALID_ARGUMENT,
-                        message="The account alias is invalid.", exit_code=2,
+                        args,
+                        command="data.delete",
+                        code=ErrorCode.INVALID_ARGUMENT,
+                        message="The account alias is invalid.",
+                        exit_code=2,
                     )
                 if account is None:
                     return _emit_success(
-                        args, command="data.delete",
+                        args,
+                        command="data.delete",
                         data={
-                            "scope": "account-provider", "provider": args.provider,
+                            "scope": "account-provider",
+                            "provider": args.provider,
                             "account_alias": args.account,
                             "price_observations_removed": 0,
                             "price_current_removed": 0,
@@ -2087,9 +2234,11 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                     provider=args.provider, account_id=account.id
                 )
             return _emit_success(
-                args, command="data.delete",
+                args,
+                command="data.delete",
                 data={
-                    "scope": "account-provider", "provider": args.provider,
+                    "scope": "account-provider",
+                    "provider": args.provider,
                     "account_alias": args.account,
                     "price_observations_removed": deletion.observations_removed,
                     "price_current_removed": deletion.current_removed,
@@ -2112,7 +2261,8 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
             )
             with Storage(database_path) as storage:
                 metadata = storage.get_credential_reference(
-                    provider=credential_ref.provider, kind=credential_ref.kind,
+                    provider=credential_ref.provider,
+                    kind=credential_ref.kind,
                     profile_id=credential_ref.profile_id,
                 )
             if metadata is not None:
@@ -2136,15 +2286,18 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                     store.put(credential_ref, previous_secret)
                 except BaseException:
                     return _emit_error(
-                        args, command="data.delete",
+                        args,
+                        command="data.delete",
                         code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
                         message="Provider deletion failed and the key could not be restored.",
                     )
             raise
         return _emit_success(
-            args, command="data.delete",
+            args,
+            command="data.delete",
             data={
-                "scope": "provider-all", "provider": args.provider,
+                "scope": "provider-all",
+                "provider": args.provider,
                 "price_observations_removed": deletion.observations_removed,
                 "price_current_removed": deletion.current_removed,
                 "price_subjects_removed": deletion.subjects_removed,
@@ -3246,6 +3399,7 @@ def _command_name(args: argparse.Namespace) -> str:
     for name in (
         "sync_command",
         "games_command",
+        "deals_command",
         "accounts_command",
         "auth_command",
         "owned_command",
@@ -3330,6 +3484,36 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "deals.query":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for capability in query_completeness["missing_capabilities"]:
+            _print_table_fields("MISSING_CAPABILITY", capability)
+        for capability in query_completeness["stale_capabilities"]:
+            _print_table_fields("STALE_CAPABILITY", capability)
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields(
+            "APPID",
+            "BUCKET",
+            "GRADE",
+            "CURRENT_MINOR",
+            "LOW_MINOR",
+            "FALLBACK_RUNG",
+        )
+        for item in envelope["data"]["items"]:
+            deal = item["deal"]
+            current = deal["current_offer"]
+            low = deal["historical_low"]
+            _print_table_fields(
+                item["appid"],
+                deal["bucket"],
+                deal["evidence_grade"],
+                "" if current is None else current["price"]["amount_minor"],
+                "" if low is None else low["price"]["amount_minor"],
+                deal["fallback_rung"],
+            )
+        return
     if command == "games.query":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])

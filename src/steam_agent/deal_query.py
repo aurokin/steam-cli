@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import re
 from typing import Literal
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 from steam_agent.deal_evidence import (
     DealEvidenceSnapshot,
@@ -67,6 +68,28 @@ _PROVIDER_LIMITATIONS: dict[str, tuple[str, ...]] = {
     ),
 }
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
+_SAFE_ERROR_CODES = frozenset(
+    {
+        "AUTHENTICATION_FAILED",
+        "AUTH_REQUIRED",
+        "GAME_NOT_FOUND",
+        "INTERNAL_ERROR",
+        "NOT_SYNCED",
+        "PRODUCT_NOT_FOUND",
+        "PROVIDER_ACCESS_DENIED",
+        "PROVIDER_CONTEXT_MISMATCH",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_RESPONSE_INVALID",
+        "PROVIDER_REQUEST_INVALID",
+        "PROVIDER_UNAVAILABLE",
+        "REQUEST_THROTTLED",
+        "SYNC_ABANDONED",
+        "UNSUPPORTED_COUNTRY",
+        "WISHLIST_INACCESSIBLE_OR_AUTH_AMBIGUOUS",
+        "WISHLIST_REFRESH_FAILED",
+    }
+)
+_GG_PATH = re.compile(r"/(?:game|dlc|pack)/[A-Za-z0-9][A-Za-z0-9._~-]*/?\Z")
 _WISHLIST_FRESHNESS_SECONDS = 24 * 60 * 60
 _ABANDONED_SECONDS = 15 * 60
 
@@ -143,6 +166,9 @@ def build_deal_query(value: DealQueryInput) -> dict[str, object]:
     now = _aware_utc(value.generated_at)
     if value.country != "US":
         raise ValueError("deal query currently supports only US")
+    if value.store_class not in _STORE_SCOPE:
+        raise ValueError("deal query store class is invalid")
+    _validate_wishlist_state(value.wishlist)
     history_scope = _STORE_SCOPE[value.store_class]
     comparison = DealComparisonContext(
         country="US",
@@ -190,14 +216,15 @@ def build_deal_query(value: DealQueryInput) -> dict[str, object]:
             provider_states=states,
         )
 
-    snapshots_by_appid, evidence_objects = _snapshots(facts)
+    ranking_facts = tuple(fact for fact in facts if _fresh(fact.fresh_until, now))
+    snapshots_by_appid, evidence_objects = _snapshots(ranking_facts)
     ranking_candidates: list[DealCandidate] = []
     price_missing = False
     price_stale = False
     used_fallback = False
     for appid in sorted(candidates):
         attempts = tuple(
-            _ranking_attempt(states[(appid, provider)])
+            _ranking_attempt(states[(appid, provider)], now)
             for provider in ("gg-deals", "cheapshark")
         )
         ranking_candidates.append(
@@ -307,6 +334,7 @@ def build_deal_query_from_snapshot(
     country: str,
     store_class: StoreClass,
     generated_at: datetime,
+    gg_credential_configured: bool | None = None,
 ) -> dict[str, object]:
     """Adapt the atomic storage snapshot without exposing account identifiers."""
 
@@ -345,7 +373,12 @@ def build_deal_query_from_snapshot(
         for game in snapshot.wishlist.games
     )
     facts = tuple(_stored_fact(fact) for fact in snapshot.prices.facts)
-    provider_states = _stored_provider_states(snapshot, candidates, now)
+    provider_states = _stored_provider_states(
+        snapshot,
+        candidates,
+        now,
+        gg_credential_configured=gg_credential_configured,
+    )
     return build_deal_query(
         DealQueryInput(
             account_alias=account_alias,
@@ -401,6 +434,8 @@ def _stored_provider_states(
     snapshot: WishlistDealSnapshot,
     candidates: tuple[WishlistCandidateInput, ...],
     now: datetime,
+    *,
+    gg_credential_configured: bool | None,
 ) -> tuple[ProviderStateInput, ...]:
     subjects = {
         (subject.appid, subject.provider): subject
@@ -417,6 +452,16 @@ def _stored_provider_states(
             item = relevant.get((candidate.appid, provider))
             if item is None:
                 if subject is None:
+                    if provider == "gg-deals" and gg_credential_configured is False:
+                        result.append(
+                            ProviderStateInput(
+                                candidate.appid,
+                                provider,
+                                "failed",
+                                "AUTH_REQUIRED",
+                            )
+                        )
+                        continue
                     result.append(
                         ProviderStateInput(
                             candidate.appid, provider, "not_synced", "NOT_SYNCED"
@@ -424,6 +469,13 @@ def _stored_provider_states(
                     )
                 else:
                     result.append(_subject_state(candidate.appid, provider, subject))
+                continue
+            if not item.demand.targeted:
+                result.append(
+                    _subject_state(candidate.appid, provider, subject)
+                    if subject is not None
+                    else ProviderStateInput(candidate.appid, provider, "unevaluated")
+                )
                 continue
             run = item.attempt.run
             if run.status == "running":
@@ -457,11 +509,7 @@ def _stored_provider_states(
                         else ProviderStateInput(candidate.appid, provider, "ready")
                     )
             else:
-                attempted_limit = item.attempt.requested_limit
-                stopped_early = run.error_code is not None and (
-                    attempted_limit is None
-                    or item.attempt.evaluated_count < attempted_limit
-                )
+                stopped_early = run.error_code is not None
                 result.append(
                     ProviderStateInput(
                         candidate.appid,
@@ -530,6 +578,36 @@ def _candidates(
     return result
 
 
+def _validate_wishlist_state(state: WishlistStateInput) -> None:
+    if state.latest_attempt not in {
+        "none",
+        "complete",
+        "failed",
+        "running",
+        "abandoned",
+    }:
+        raise ValueError("wishlist attempt state is invalid")
+    if state.last_attempt_error_code is not None:
+        _validate_error_code(state.last_attempt_error_code)
+    if state.last_successful_sync_at is not None:
+        _parse_timestamp(state.last_successful_sync_at)
+    if state.last_good_fresh and not state.last_good_available:
+        raise ValueError("unavailable wishlist cannot be fresh")
+    if state.last_good_available != (state.last_successful_sync_at is not None):
+        raise ValueError("wishlist last-good availability is inconsistent")
+    if state.latest_attempt == "complete" and not state.last_good_available:
+        raise ValueError("complete wishlist attempt requires a last-good snapshot")
+    if state.latest_attempt == "failed" and state.last_attempt_error_code is None:
+        raise ValueError("failed wishlist attempt requires an error code")
+    if state.latest_attempt != "failed" and state.last_attempt_error_code is not None:
+        raise ValueError("non-failed wishlist attempt cannot carry an error code")
+
+
+def _validate_error_code(value: str) -> None:
+    if _ERROR_CODE.fullmatch(value) is None or value not in _SAFE_ERROR_CODES:
+        raise ValueError("provider error code is not sanitized")
+
+
 def _facts(
     values: tuple[DealFactInput, ...], candidates: dict[int, WishlistCandidateInput]
 ) -> tuple[DealFactInput, ...]:
@@ -543,6 +621,27 @@ def _facts(
             raise ValueError("deal fact provider is unsupported")
         if fact.fact_kind not in {"offer", "historical_low"}:
             raise ValueError("deal fact kind is invalid")
+        if fact.store_class not in _STORE_SCOPE:
+            raise ValueError("deal fact store class is invalid")
+        if fact.comparability not in {"exact_product", "normalized_game", "unknown"}:
+            raise ValueError("deal fact comparability is invalid")
+        if (
+            not isinstance(fact.provider_product_id, str)
+            or not 1 <= len(fact.provider_product_id) <= 512
+            or any(ord(character) < 32 for character in fact.provider_product_id)
+            or isinstance(fact.amount_minor, bool)
+            or not isinstance(fact.amount_minor, int)
+            or not 0 <= fact.amount_minor <= (1 << 63) - 1
+            or fact.currency != "USD"
+            or fact.country != "US"
+        ):
+            raise ValueError("deal fact price identity is invalid")
+        if fact.regular_amount_minor is not None and (
+            isinstance(fact.regular_amount_minor, bool)
+            or not isinstance(fact.regular_amount_minor, int)
+            or not 0 <= fact.regular_amount_minor <= (1 << 63) - 1
+        ):
+            raise ValueError("deal fact regular amount is invalid")
         if (
             isinstance(fact.ordinal, bool)
             or not isinstance(fact.ordinal, int)
@@ -562,12 +661,29 @@ def _facts(
             or fact.automation_supported is not False
         ):
             raise ValueError("deal fact attribution fields are invalid")
+        if fact.discount_percent is not None and (
+            isinstance(fact.discount_percent, bool)
+            or not isinstance(fact.discount_percent, int)
+            or not 0 <= fact.discount_percent <= 100
+        ):
+            raise ValueError("deal fact discount is invalid")
+        if fact.fact_kind == "offer":
+            if fact.low_scope is not None or fact.effective_at is not None:
+                raise ValueError("offer cannot carry historical-low fields")
+        elif (
+            fact.low_scope not in set(_STORE_SCOPE.values())
+            or fact.regular_amount_minor is not None
+            or fact.discount_percent is not None
+        ):
+            raise ValueError("historical-low fact fields are invalid")
         observed = _parse_timestamp(fact.observed_at)
         fresh_until = _parse_timestamp(fact.fresh_until)
         if fresh_until < observed:
             raise ValueError("deal fact freshness precedes observation")
         if fact.effective_at is not None:
-            _parse_timestamp(fact.effective_at)
+            if _parse_timestamp(fact.effective_at) > observed:
+                raise ValueError("deal fact effective time follows observation")
+        _validate_provider_url(fact.provider, fact.provider_url, fact.appid)
         key = (fact.appid, fact.provider, fact.fact_kind, fact.ordinal)
         if key in keys:
             raise ValueError("deal facts must have unique provider ordinals")
@@ -600,11 +716,8 @@ def _states(
         key = (state.appid, state.provider)
         if key in result:
             raise ValueError("provider states must be unique per candidate")
-        if (
-            state.error_code is not None
-            and _ERROR_CODE.fullmatch(state.error_code) is None
-        ):
-            raise ValueError("provider error code is not sanitized")
+        if state.error_code is not None:
+            _validate_error_code(state.error_code)
         if state.state == "failed" and state.error_code is None:
             raise ValueError("failed provider state requires an error code")
         if state.state == "not_synced":
@@ -716,7 +829,53 @@ def _snapshots(
     )
 
 
-def _ranking_attempt(state: ProviderStateInput) -> ProviderAttempt:
+def _validate_provider_url(provider: str, value: str, appid: int) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("deal fact provider URL is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port not in {None, 443}
+    ):
+        raise ValueError("deal fact provider URL is invalid")
+    if provider == "gg-deals":
+        valid = (
+            parsed.hostname == "gg.deals"
+            and not parsed.query
+            and _GG_PATH.fullmatch(parsed.path) is not None
+        )
+    else:
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        valid = parsed.hostname == "www.cheapshark.com" and (
+            (
+                parsed.path == "/redirect"
+                and set(query) == {"dealID"}
+                and len(query["dealID"]) == 1
+                and bool(query["dealID"][0])
+            )
+            or (
+                parsed.path == "/search"
+                and set(query) == {"steamAppID"}
+                and query["steamAppID"] == [str(appid)]
+            )
+        )
+    if not valid:
+        raise ValueError("deal fact provider URL is invalid")
+
+
+def _ranking_attempt(state: ProviderStateInput, now: datetime) -> ProviderAttempt:
+    if _state_is_stale(state, now):
+        return ProviderAttempt(
+            state.provider,
+            _PROVIDER_RUNG[state.provider],
+            "unavailable",
+            "STALE_PRICE_EVIDENCE",
+        )
     if state.state == "ready":
         return ProviderAttempt(state.provider, _PROVIDER_RUNG[state.provider], "ready")
     if state.state == "not_found":

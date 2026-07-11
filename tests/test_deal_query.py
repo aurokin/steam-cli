@@ -16,6 +16,9 @@ from steam_agent.deal_query import (
     build_deal_query_from_snapshot,
 )
 from steam_agent.storage import (
+    PriceAttemptMetadata,
+    PriceDemandRow,
+    PriceRelevantAttempt,
     PriceSnapshot,
     StoredPriceFact,
     StoredPriceSubject,
@@ -40,7 +43,7 @@ def wishlist(
 ) -> WishlistStateInput:
     return WishlistStateInput(
         last_good_available=available,
-        last_good_fresh=fresh,
+        last_good_fresh=fresh and available,
         latest_attempt=attempt,  # type: ignore[arg-type]
         last_attempt_error_code=error,
         last_successful_sync_at=NOW_TEXT if available else None,
@@ -354,6 +357,18 @@ def test_failed_primary_uses_retained_fact_and_fallback_metadata() -> None:
     assert len(item["evidence"]["offers"]) == 2
 
 
+def test_persisted_provider_access_denial_remains_typed_partial_truth() -> None:
+    result = query(
+        states=(
+            state(10, "gg-deals", "not_found"),
+            state(10, "cheapshark", "failed", error="PROVIDER_ACCESS_DENIED"),
+        )
+    )
+
+    assert result["completeness"]["status"] == "partial"  # type: ignore[index]
+    assert "PROVIDER_ACCESS_DENIED" in warning_codes(result)
+
+
 def test_exact_freshness_boundary_and_stale_subject_are_distinct() -> None:
     boundary = query(
         facts=(fact(10, "gg-deals", "offer", 500),),
@@ -380,6 +395,8 @@ def test_exact_freshness_boundary_and_stale_subject_are_distinct() -> None:
     assert boundary["completeness"]["status"] == "complete"  # type: ignore[index]
     assert boundary["data"]["items"][0]["evidence"]["offers"][0]["fresh"] is True  # type: ignore[index]
     assert stale["completeness"]["status"] == "partial"  # type: ignore[index]
+    assert stale["data"]["items"][0]["deal"]["current_offer"] is None  # type: ignore[index]
+    assert len(stale["data"]["items"][0]["evidence"]["offers"]) == 1  # type: ignore[index]
     assert "STALE_PRICE_EVIDENCE" in warning_codes(stale)
     assert stale["completeness"]["missing_capabilities"] == []  # type: ignore[index]
     assert stale["completeness"]["stale_capabilities"] == ["prices.wishlist.read"]  # type: ignore[index]
@@ -387,6 +404,45 @@ def test_exact_freshness_boundary_and_stale_subject_are_distinct() -> None:
     assert (
         "prices.wishlist.read" in stale_not_found["completeness"]["stale_capabilities"]
     )  # type: ignore[index]
+
+
+def test_fresh_fallback_ranks_ahead_of_stale_primary_fact() -> None:
+    result = query(
+        store_class="unknown",
+        facts=(
+            fact(
+                10,
+                "gg-deals",
+                "offer",
+                100,
+                store_class="unknown",
+                comparability="normalized_game",
+                fresh_until=NOW_TEXT,
+            ),
+            fact(
+                10,
+                "cheapshark",
+                "offer",
+                500,
+                store_class="unknown",
+                comparability="normalized_game",
+                evidence_id=999,
+            ),
+        ),
+        states=(
+            state(10, "gg-deals", "ready", fresh_until=NOW_TEXT),
+            state(10, "cheapshark", "ready"),
+        ),
+        generated_at=NOW + timedelta(seconds=1),
+    )
+
+    item = result["data"]["items"][0]  # type: ignore[index]
+    assert item["deal"]["current_offer"]["evidence_id"] == 999
+    assert item["deal"]["fallback_rung"] == 1
+    assert {entry["evidence_id"] for entry in item["evidence"]["offers"]} == {
+        1000,
+        999,
+    }
 
 
 def test_order_and_json_are_deterministic() -> None:
@@ -497,6 +553,152 @@ def test_atomic_storage_snapshot_adapter_preserves_stable_identity_and_evidence(
     assert "steam_id" not in serialized
 
 
+def test_snapshot_adapter_reports_missing_gg_credential_before_first_attempt() -> None:
+    stable_id = steam_application_stable_id(10)
+    complete = SyncRun(
+        1,
+        "steam-store",
+        "wishlist.read",
+        None,
+        99,
+        NOW_TEXT,
+        NOW_TEXT,
+        "complete",
+        True,
+        1,
+        None,
+        None,
+    )
+    snapshot = WishlistDealSnapshot(
+        WishlistSnapshot(
+            (WishlistGame(99, 10, 0, 100, NOW_TEXT, 41, 1),),
+            complete,
+            complete,
+            None,
+            ((10, stable_id),),
+        ),
+        PriceSnapshot((), (), (), 0, 0, 0, False, False, (), (), ()),
+        ((10, stable_id),),
+    )
+
+    result = build_deal_query_from_snapshot(
+        snapshot,
+        account_alias="primary",
+        country="US",
+        store_class="official",
+        generated_at=NOW,
+        gg_credential_configured=False,
+    )
+
+    assert result["completeness"]["status"] == "partial"  # type: ignore[index]
+    assert {"AUTH_REQUIRED", "NOT_SYNCED"} <= warning_codes(result)
+
+
+def test_snapshot_adapter_preserves_untargeted_last_good_on_failed_attempt() -> None:
+    stable_ids = tuple(
+        (appid, steam_application_stable_id(appid)) for appid in (10, 20)
+    )
+    complete = SyncRun(
+        1,
+        "steam_web_api",
+        "wishlist.read",
+        None,
+        99,
+        NOW_TEXT,
+        NOW_TEXT,
+        "complete",
+        True,
+        2,
+        None,
+        None,
+    )
+    failed = SyncRun(
+        2,
+        "gg-deals",
+        "prices.wishlist.read",
+        None,
+        99,
+        NOW_TEXT,
+        NOW_TEXT,
+        "failed",
+        False,
+        0,
+        "PROVIDER_UNAVAILABLE",
+        None,
+    )
+    metadata = PriceAttemptMetadata(
+        failed,
+        99,
+        "US",
+        "gg-deals",
+        "wishlist",
+        1,
+        2,
+        0,
+        1,
+        None,
+        None,
+        None,
+        None,
+    )
+    targeted = PriceDemandRow(2, 99, "US", 10, 0, 0, 100, True, False, None)
+    untargeted = PriceDemandRow(2, 99, "US", 20, 1, 1, 200, False, False, None)
+    snapshot = WishlistDealSnapshot(
+        WishlistSnapshot(
+            (
+                WishlistGame(99, 10, 0, 100, NOW_TEXT, 41, 1),
+                WishlistGame(99, 20, 1, 200, NOW_TEXT, 42, 1),
+            ),
+            complete,
+            complete,
+            None,
+            stable_ids,
+        ),
+        PriceSnapshot(
+            (),
+            (
+                StoredPriceSubject(
+                    99,
+                    "US",
+                    "gg-deals",
+                    20,
+                    "ready",
+                    NOW_TEXT,
+                    "2026-07-11T18:00:00Z",
+                    "2026-07-18T12:00:00Z",
+                    1,
+                ),
+            ),
+            (failed,),
+            0,
+            0,
+            0,
+            False,
+            False,
+            (metadata,),
+            (targeted, untargeted),
+            (
+                PriceRelevantAttempt("gg-deals", 10, metadata, targeted, None),
+                PriceRelevantAttempt("gg-deals", 20, metadata, untargeted, None),
+            ),
+        ),
+        stable_ids,
+    )
+
+    result = build_deal_query_from_snapshot(
+        snapshot,
+        account_alias="primary",
+        country="US",
+        store_class="official",
+        generated_at=NOW,
+        gg_credential_configured=True,
+    )
+
+    by_appid = {item["appid"]: item for item in result["data"]["items"]}  # type: ignore[index]
+    assert by_appid[10]["deal"]["attempted_providers"][0]["status"] == "failed"
+    assert by_appid[20]["deal"]["attempted_providers"][0]["status"] == "ready"
+
+
 def test_query_context_derives_history_scope_from_store_class() -> None:
     assert query(store_class="official")["context"]["history_scope"] == (  # type: ignore[index]
         "all_time_official_stores"
@@ -545,6 +747,21 @@ def test_rejects_invalid_candidate_identity_metadata_and_timestamps(
             fact(10, "gg-deals", "offer", 500),
             automation_supported=True,
         ),
+        replace(fact(10, "gg-deals", "offer", 500), discount_percent=101),
+        replace(fact(10, "gg-deals", "offer", 500), store_class="invalid"),
+        replace(fact(10, "gg-deals", "offer", 500), comparability="invalid"),
+        replace(
+            fact(10, "gg-deals", "offer", 500),
+            provider_url="https://attacker.example/game/synthetic/",
+        ),
+        replace(
+            fact(10, "gg-deals", "offer", 500),
+            provider_url="https://user@gg.deals/game/synthetic/",
+        ),
+        replace(
+            fact(10, "cheapshark", "offer", 500),
+            provider_url="https://www.cheapshark.com/redirect?dealID=x&token=secret",
+        ),
     ],
 )
 def test_rejects_invalid_fact_provider_lineage_and_timestamps(
@@ -574,3 +791,23 @@ def test_rejects_invalid_fact_provider_lineage_and_timestamps(
 def test_rejects_invalid_provider_state_fields(invalid: ProviderStateInput) -> None:
     with pytest.raises(ValueError):
         query(states=(invalid,))
+
+
+def test_rejects_invalid_query_and_wishlist_runtime_state() -> None:
+    with pytest.raises(ValueError):
+        query(store_class="invalid")
+    with pytest.raises(ValueError):
+        query(wishlist_state=replace(wishlist(), latest_attempt="invalid"))
+    with pytest.raises(ValueError):
+        query(
+            wishlist_state=replace(
+                wishlist(attempt="failed", error="PROVIDER_UNAVAILABLE"),
+                last_attempt_error_code="SECRET_CANARY",
+            )
+        )
+    with pytest.raises(ValueError):
+        query(
+            wishlist_state=replace(
+                wishlist(), last_successful_sync_at="2026-07-11T12:00:00"
+            )
+        )

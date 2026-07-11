@@ -140,6 +140,12 @@ def smoke(wheel: Path) -> None:
         help_result = _run([str(executable), "sync", "wishlist", "--help"])
         if "--acknowledge-local-storage" not in help_result.stdout:
             raise RuntimeError("installed help does not expose the wishlist contract")
+        deals_help = _run([str(executable), "deals", "query", "--help"])
+        if not all(
+            option in deals_help.stdout
+            for option in ("--scope", "--account", "--country", "--store-class")
+        ):
+            raise RuntimeError("installed help does not expose the deal-query contract")
 
         data_dir = root / "data"
         query = [
