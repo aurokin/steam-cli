@@ -201,6 +201,52 @@ def test_invalid_or_unbounded_shapes_are_rejected(payload: object) -> None:
     assert caught.value.code in {"PROVIDER_RESPONSE_INVALID", "PRODUCT_NOT_FOUND"}
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gg.deals/game/synthetic/?key=secret-canary",
+        "https://gg.deals/game/synthetic/#fragment-canary",
+        "https://user@gg.deals/game/synthetic/",
+        "https://gg.deals:444/game/synthetic/",
+        "https://gg.deals/api/opaque-route/",
+        "https://gg.deals/game/not_safe/",
+    ],
+)
+def test_unsafe_provider_url_is_rejected_without_echo(url: str) -> None:
+    payload = {
+        "success": True,
+        "data": {"220": {"url": url, "prices": {}}},
+    }
+
+    with pytest.raises(GgDealsError) as caught:
+        GgDealsClient(
+            transport=RecordingTransport(_response(payload))
+        ).fetch_app_price_summary(appid=220, api_key=SecretValue("secret"))
+
+    assert caught.value.code == "PROVIDER_RESPONSE_INVALID"
+    assert "canary" not in str(caught.value)
+
+
+@pytest.mark.parametrize("category", ["game", "dlc", "pack"])
+def test_known_clean_page_categories_are_accepted(category: str) -> None:
+    url = f"https://gg.deals/{category}/synthetic-page/"
+    payload = {
+        "success": True,
+        "data": {
+            "220": {
+                "url": url,
+                "prices": {"currentRetail": "1.00"},
+            }
+        },
+    }
+
+    result = GgDealsClient(
+        transport=RecordingTransport(_response(payload))
+    ).fetch_app_price_summary(appid=220, api_key=SecretValue("secret"))
+
+    assert result.offers[0].provider_url.url == url
+
+
 def test_nested_additive_payload_is_depth_bounded() -> None:
     nested: object = "leaf"
     for _ in range(20):

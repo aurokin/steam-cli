@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import http.client
 import json
+import re
 from typing import Protocol
 from urllib.parse import urlencode, urlsplit
 
@@ -34,6 +35,8 @@ MAX_JSON_DEPTH = 12
 MAX_JSON_NODES = 1_000
 MAX_APPIDS_PER_REQUEST = 50
 DEFAULT_TIMEOUT_SECONDS = 10.0
+_SAFE_PAGE_CATEGORIES = frozenset({"game", "dlc", "pack"})
+_SAFE_PAGE_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,255}\Z")
 
 
 class GgDealsError(RuntimeError):
@@ -358,12 +361,23 @@ def _optional_usd(value: object) -> Money | None:
 def _safe_provider_url(value: object) -> bool:
     if not isinstance(value, str):
         return False
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    segments = parsed.path.strip("/").split("/")
     return (
         parsed.scheme == "https"
         and parsed.hostname == "gg.deals"
         and parsed.username is None
         and parsed.password is None
+        and port in {None, 443}
+        and not parsed.query
+        and not parsed.fragment
+        and len(segments) == 2
+        and segments[0] in _SAFE_PAGE_CATEGORIES
+        and _SAFE_PAGE_SLUG.fullmatch(segments[1]) is not None
     )
 
 
