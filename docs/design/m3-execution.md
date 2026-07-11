@@ -1,6 +1,7 @@
 # M3 wishlist and deal evidence execution plan
 
-Status: active 2026-07-11
+Status: active 2026-07-11; AUR-632 and AUR-636 implementation available for
+acceptance; milestone not yet accepted
 
 ## Outcome and sequence
 
@@ -53,6 +54,42 @@ that provider's facts and local key while preserving other providers and M1/M2.
 Money uses nonnegative integer minor units plus ISO currency and country. Offers
 are comparable only when product, country, currency, store/acquisition scope,
 and historical-low interpretation match. Missing price is unknown, not free.
+
+## Implemented AUR-636 query boundary
+
+```text
+steam-agent deals query --scope wishlist --account ALIAS --country US [--store-class official|keyshop|unknown] [--format json|table]
+```
+
+`official` is the default store class. The query is a deterministic local cache
+read over one atomic wishlist-and-price snapshot. It performs no provider
+request, secret resolution, refresh, browser navigation, or manual-reference
+fetch. Those boundaries keep a query safe for repeated agent calls and make
+staleness visible rather than silently refreshing data during evaluation.
+
+The result preserves every candidate and conflicting attributed fact, selected
+current and low summaries, evidence IDs, provider attempts, freshness, explicit
+comparison scope, limitations, and the GG.deals → CheapShark → manual-reference
+ladder. It omits SteamID64, internal account IDs, credentials, raw provider
+bodies, and local paths. JSON and table ordering are deterministic, and table
+output retains completeness and typed warning rows.
+
+Wishlist states remain distinct: never synchronized is unavailable and not a
+confirmed empty list; a valid empty projection is complete; stale, failed, and
+abandoned last-good projections are partial; a fresh last-good projection under
+an active refresh can remain complete with `SYNC_IN_PROGRESS`. Price states
+remain distinct per AppID and provider: `ready`, `not_found`, `unevaluated`,
+`failed`, `running`, `abandoned`, and `not_synced`. A primary `not_found` does
+not complete the ladder until the fallback is evaluated. A fresh fallback
+`not_found` completes with price unknown, not free. Stale evidence is reported
+as stale; absent or incomplete evaluation is reported as missing.
+
+Deletion is immediately visible because querying never rehydrates data.
+Account-scoped Steam deletion removes that account's wishlist and price
+lineage. Provider/account deletion removes only that account's demand and facts
+for the provider while preserving its shared credential; provider-wide
+deletion removes the provider cache and local credential while preserving other
+providers and Steam account data.
 
 ## Required acceptance harness
 

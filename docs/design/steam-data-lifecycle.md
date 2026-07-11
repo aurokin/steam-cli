@@ -1,11 +1,13 @@
 # Steam account data lifecycle
 
-Status: M2 policy boundary; persistent inventory candidate under acceptance review
+Status: accepted M2 policy boundary; active M3 wishlist and deal-evidence
+extension implemented for acceptance but not yet accepted
 
 This document governs Steam account data obtained through Valve's Web API. It
 does not change the accepted M1 local installed-library contract. It is the
 privacy and retention gate for AUR-620 and for the later persistent
-owned-library slice in AUR-627.
+owned-library slice in AUR-627. The M3 sections extend the same boundary to the
+provisional wishlist, bounded price-summary demand, and cache-only deal query.
 
 ## Terms basis
 
@@ -164,6 +166,39 @@ Installed-library observations from M1 are local machine evidence and are not
 proof of account ownership. They remain independently deletable from account
 data.
 
+### AUR-632 wishlist and price-summary synchronization
+
+M3 retains one account-scoped last-known-good normalized wishlist projection,
+its item evidence, and coarse attempt history after a separate versioned
+wishlist disclosure is acknowledged. The stored item fields are AppID,
+priority, date added, observation time, and evidence relationship. Raw Valve
+responses, titles, account names, and wishlist history are not retained. A
+failed, malformed, ambiguous-empty, mismatched count/list, rate-limited, or
+interrupted attempt never replaces the last-good projection; only a valid empty
+pair clears it.
+
+Price synchronization stores demand by immutable account row, AppID, explicit
+country, and provider. Retained facts are bounded current offers and
+historical-low summaries with exact provider product identity, money in integer
+minor units, store/comparison scope, freshness, attribution URL, observation
+time, and evidence relationship. It does not retain a raw response, full price
+event graph, inferred purchase history, or webpage contents. Current summaries
+are fresh for six hours, low summaries for 24 hours, and cached price facts,
+subjects, coarse attempts, and demand lineage hard-expire within seven days on
+the next price read or synchronization.
+
+### AUR-636 cache-only deal query
+
+`deals query --scope wishlist` reads the account's wishlist and price evidence
+as one local SQLite snapshot. It makes no network request, resolves no
+credential, and never opens its attributed or manual-only URLs. The normal
+result includes the user-chosen account alias but omits SteamID64, the immutable
+account row ID, secrets, raw provider bodies, and local paths. It preserves
+typed unsynchronized, valid-empty, stale, failed, running, abandoned,
+unevaluated, and provider `not_found` states. Deletion therefore cannot trigger
+implicit retrieval: the next query reports only retained evidence and typed
+missing or unsynchronized capability.
+
 ## Visibility and accuracy limits
 
 All Steam Web API results are presented as provided, as available, and without
@@ -209,7 +244,9 @@ owned by the CLI contract):
 
 The implemented surfaces are `auth remove`,
 `data delete --provider steam-web-api --account ALIAS --yes`, and
-`data delete --provider steam-web-api --all --yes`.
+`data delete --provider steam-web-api --all --yes`. M3 also implements
+`data delete --provider <gg-deals|cheapshark> --account ALIAS --yes` and
+`data delete --provider <gg-deals|cheapshark> --all --yes`.
 
 The accepted M2 implementation has separate account-scoped and all-provider
 deletion commands. Account deletion preserves the data-profile-wide key; the
@@ -227,6 +264,21 @@ installed evidence, still needs its AppID. Such a fact is detached to shared
 public provenance before account-scoped runs are removed; otherwise its
 projection, evidence, provenance, and orphan application identity are pruned in
 the same transaction.
+
+Steam Web API account deletion also removes the selected account's wishlist
+observations/current projection, wishlist and price attempts, per-AppID price
+demand, price subjects, price observations/current facts, evidence links, and
+newly orphaned application identities. Facts remain only where another current
+demand still requires them and must carry no deleted-account subject.
+
+Price-provider deletion has two narrower forms. Account/provider deletion
+removes that provider's price demand and evidence for the selected account while
+preserving the shared provider credential, other accounts, other price
+providers, M1 machine observations, and the Steam account. Provider-wide
+deletion removes all local facts, subjects, attempts, demand, evidence, and the
+locally managed credential/reference for that provider while preserving Steam
+account data and other providers. Neither form claims remote revocation or
+forensic erasure.
 
 Deletion must be transactional and idempotent, reject ambiguous profile
 targets, and report what categories were removed without echoing deleted data.

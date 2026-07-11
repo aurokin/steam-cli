@@ -1,7 +1,7 @@
 # CLI and JSON contract
 
-Status: M1 installed-library contract implemented; M2 persistent inventory
-candidate implemented and under acceptance review
+Status: M1 and M2 contracts implemented and accepted; M3 wishlist and deal
+evidence active, implemented for acceptance, and not yet accepted
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -193,6 +193,92 @@ needs the AppID; retained facts have shared provenance with no deleted-account
 subject. Unneeded catalog evidence and orphan application identities are
 removed transactionally.
 
+## Implemented M3 wishlist and deal-evidence commands
+
+The following commands are implemented while M3 remains active and not finally
+accepted:
+
+```text
+steam-agent sync wishlist --account ALIAS [--acknowledge-local-storage]
+steam-agent sync prices --scope wishlist --account ALIAS --country US [--provider auto|gg-deals|cheapshark] [--max-items N]
+steam-agent games query --scope wishlist --account ALIAS
+steam-agent deals query --scope wishlist --account ALIAS --country US [--store-class official|keyshop|unknown] [--format json|table]
+steam-agent data delete --provider <gg-deals|cheapshark> (--account ALIAS | --all) --yes
+```
+
+`deals query` requires an explicit account alias and country and defaults only
+`--store-class` to `official`. M3 currently accepts only explicit `US` country
+context and reports USD comparison context. It never infers country from IP
+address, locale, or the Steam account.
+
+The deal query is cache-only. It reads the wishlist projection, price facts,
+per-AppID subjects, and relevant provider attempts as one SQLite snapshot. It
+makes no network request, resolves no secret, and never opens a returned URL.
+Network access and credential use occur only in the separate explicit
+`sync wishlist` and `sync prices` commands.
+
+For each wishlist AppID, the JSON result preserves the stable local game ID,
+wishlist metadata and evidence IDs, every attributed current-offer and
+historical-low fact (including conflicting candidates), selected ranked facts,
+freshness, comparison grade, provider attempts, and manual references. Money is
+integer minor units with currency and country. The context records store class
+and its comparison scope: `official` maps to official-store lows, `keyshop` to
+keyshop lows, and `unknown` to any-store lows. A comparison that is not
+like-for-like remains degraded or noncomparable rather than being silently
+ranked as exact.
+
+The fallback ladder is deterministic:
+
+1. exact-AppID GG.deals API summaries;
+2. CheapShark's USD normalized-game fallback; and
+3. manual-only GG.deals and SteamDB AppID references.
+
+Manual references have `access_mode: manual_only` and
+`automation_supported: false`. They are output for a human or separately
+authorized browser workflow; Steam Agent does not fetch, scrape, or count them
+as completed API evidence.
+
+### M3 query completeness
+
+- No last-good wishlist is `unavailable`, has `empty: false`, and reports
+  `wishlist.read` missing. The warning distinguishes `NOT_SYNCED`,
+  `SYNC_IN_PROGRESS`, `SYNC_ABANDONED`, or a sanitized failed-attempt code.
+- A successfully synchronized empty wishlist is `complete`, has `empty: true`,
+  and requires no price evidence.
+- A stale last-good wishlist is `partial` and stale. A failed or abandoned
+  latest refresh keeps last-good candidates but is `partial`. A running refresh
+  is reported as `SYNC_IN_PROGRESS`; it is informational when the last-good
+  wishlist remains fresh and otherwise cannot make stale data fresh.
+- A fresh GG.deals `ready` subject completes the API ladder for an AppID. A
+  fresh primary `not_found` intentionally requires a completed CheapShark rung.
+  A fresh CheapShark `ready` or `not_found` completes the fallback rung; two
+  `not_found` results produce a complete deal bucket of `unknown`, never a free
+  price claim.
+- Unevaluated, failed, running, abandoned, or unsynchronized evidence remains a
+  typed provider attempt. If no completed rung covers that AppID, the query is
+  `partial` and reports `prices.wishlist.read` missing. Expired facts or
+  terminal subjects are `partial` with `prices.wishlist.read` stale, not
+  missing solely because they are stale.
+- A failed or unavailable GG.deals rung may still produce a complete result
+  through fresh CheapShark evidence. The result reports the sanitized primary
+  failure and `DEGRADED_FALLBACK` rather than hiding the fallback.
+
+Result and warning order are deterministic. JSON contains no SteamID64,
+internal account ID, credential, raw provider body, or local filesystem path.
+Table output is a safe abbreviated view over the same result and retains
+completeness and warning rows; it cannot turn unavailable or partial evidence
+into an apparently empty or complete list.
+
+Account-scoped Steam Web API deletion removes the account's wishlist and price
+demand, observations, subjects, attempts, evidence links, and orphaned
+identities along with its M2 data. Provider/account deletion removes only that
+provider's price data demanded by that account and preserves the shared
+provider credential. Provider-wide `--all` deletion removes that provider's
+cached facts and locally managed credential/reference while preserving Steam
+account data and other price providers. Every deletion is confirmed,
+transactional, idempotent, and reflected by later cache-only queries as typed
+remaining, missing, or unsynchronized evidence.
+
 ## Implemented process behavior
 
 - JSON data and typed JSON errors go to stdout. Diagnostics for unexpected
@@ -303,7 +389,6 @@ steam-agent games get <appid>
 steam-agent games query --scope <owned|wishlist|store|family|group>
 steam-agent games compare <appid...>
 steam-agent compatibility assess <appid...> --system <profile>
-steam-agent deals query --scope wishlist --country US
 steam-agent group query --members <profiles...> --ownership all
 steam-agent achievements query --state near-complete
 steam-agent profile show|set|infer

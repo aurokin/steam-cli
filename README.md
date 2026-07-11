@@ -18,8 +18,11 @@ queries. **The M2 truthful-account-inventory milestone is implemented and
 accepted:** local account selection, secure key storage, live provider
 classification, durable visible-owned synchronization, joined owned/installed
 and bounded catalog queries, truthful freshness, and transactional deletion are
-available. Wishlists, pricing, recommendations, compatibility, and Steam
-actions remain proposed design work behind later activation checkpoints.
+available. **M3 wishlist and deal evidence is active but not yet accepted:**
+provisional wishlist synchronization, bounded US price-summary synchronization,
+provider-scoped deletion, and the cache-only attributed deal query are
+implemented for acceptance work. Recommendations, compatibility, artwork, and
+Steam actions remain proposed design work behind later activation checkpoints.
 
 ## Install and develop
 
@@ -196,6 +199,50 @@ queries continue returning the last known-good result. See the
 [M1 execution plan](docs/design/m1-execution.md) and
 [CLI contract](docs/design/cli-contract.md) for exact status and exit behavior.
 
+## Active M3 wishlist and deal evidence
+
+M3 separates explicit network synchronization from local querying:
+
+```text
+uv run steam-agent sync wishlist --account primary --acknowledge-local-storage
+uv run steam-agent sync prices --scope wishlist --account primary --country US --provider auto
+uv run steam-agent deals query --scope wishlist --account primary --country US
+uv run steam-agent deals query --scope wishlist --account primary --country US --store-class official --format table
+```
+
+`deals query` defaults to the `official` store class. It reads one atomic
+wishlist-and-price snapshot from the local SQLite cache. It makes no network
+request, resolves no credential, and never follows the returned provider or
+manual-reference URLs. JSON is deterministic and preserves all attributed
+candidate evidence, freshness, provider attempts, comparison limits, and the
+GG.deals → CheapShark → manual-reference fallback ladder. Normal JSON and table
+output omit SteamID64, internal account IDs, secrets, and raw provider bodies.
+
+A valid empty wishlist is `complete` and empty. An unsynchronized or
+inaccessible wishlist is `unavailable`, not empty. Stale last-good data and
+failed, running, or abandoned refreshes remain distinguishable. A fresh
+provider `not_found` means price unknown, never free; primary GG.deals
+`not_found` requires the CheapShark rung to complete before the price capability
+is complete. Missing, unevaluated, stale, failed, running, and abandoned price
+evidence remain typed in completeness and warnings instead of being silently
+collapsed.
+
+Price-provider data can be removed for one account without deleting the shared
+credential, or for the whole local profile while preserving Steam account data
+and other providers:
+
+```text
+uv run steam-agent data delete --provider gg-deals --account primary --yes
+uv run steam-agent data delete --provider cheapshark --all --yes
+```
+
+Account-scoped Steam deletion also removes that account's wishlist, price
+demand, observations, subjects, evidence, and attempts. Deleted evidence is not
+reconstructed by `deals query`; a later query reports the remaining cache truth
+and typed missing/unsynchronized states. See the
+[M3 execution plan](docs/design/m3-execution.md) for the still-open milestone
+acceptance harness.
+
 The current working direction is:
 
 ```text
@@ -247,6 +294,7 @@ are added.
 - [Historical research-backed validation sequence](docs/design/roadmap.md)
 - [M1 execution plan and Linear work graph](docs/design/m1-execution.md)
 - [M2 truthful account inventory execution and evidence](docs/design/m2-execution.md)
+- [M3 wishlist and deal evidence execution](docs/design/m3-execution.md)
 - [Decision register](docs/adr/README.md)
 - [Original research handoff](steam-library-agent-research-handoff.md)
 
@@ -256,8 +304,10 @@ The design documents call out places where current research corrected it.
 ## Deliberately unresolved
 
 - Long-term storage schema and migration policy beyond the implemented M1 tables.
-- Whether wishlist access is reliable enough for the first supported release.
-- Which source may legally and reliably provide historical prices.
+- Whether the provisional wishlist contract and live M3 provider evidence pass
+  the final M3 acceptance gate.
+- Which approved provider may support a future full historical price-event
+  graph; M3 retains only attributed low summaries.
 - Which Steam actions may be executed rather than planned/opened for a human.
 - How much of the Steam catalog should be enriched locally.
 - Whether high-trust SteamKit/SteamCMD access is worth supporting.
