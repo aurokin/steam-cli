@@ -345,6 +345,7 @@ def _facts(snapshot: DealEvidenceSnapshot) -> list[PriceFactObservation]:
                 effective_at=None,
                 observed_at=offer.observed_at,
                 provider_url=offer.provider_url.url,
+                seller_id=offer.seller_id,
             )
         )
     for ordinal, low in enumerate(snapshot.history_lows):

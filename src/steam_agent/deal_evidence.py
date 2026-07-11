@@ -89,6 +89,7 @@ class OfferEvidence:
     observed_at: str
     provider_url: ManualReference
     comparability: Comparability
+    seller_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

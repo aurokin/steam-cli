@@ -287,6 +287,7 @@ class PriceFactObservation:
     effective_at: str | datetime | None
     observed_at: str | datetime
     provider_url: str
+    seller_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +316,7 @@ class StoredPriceFact:
     automation_supported: int
     evidence_id: int
     promoted_sync_run_id: int
+    seller_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -595,6 +597,12 @@ def _validate_price_fact(
         or not 0 <= fact.regular_amount_minor <= (1 << 63) - 1
     ):
         raise ValueError("price regular amount is invalid")
+    if fact.seller_id is not None and (
+        not isinstance(fact.seller_id, str)
+        or not 1 <= len(fact.seller_id) <= 512
+        or any(ord(character) < 32 for character in fact.seller_id)
+    ):
+        raise ValueError("price seller identity is invalid")
     if fact.discount_percent is not None and (
         not isinstance(fact.discount_percent, int)
         or isinstance(fact.discount_percent, bool)
@@ -1091,12 +1099,27 @@ class Storage:
         try:
             row = self._connection.execute(
                 """
-                SELECT next_allowed_at FROM provider_request_limits
+                SELECT next_allowed_at, cooldown_until FROM provider_request_limits
                 WHERE provider = ? AND budget_scope = ?
                 """,
                 (provider, budget_scope),
             ).fetchone()
             if row is not None:
+                cooldown_until = row["cooldown_until"]
+                if cooldown_until is not None:
+                    cooldown = datetime.fromisoformat(
+                        cooldown_until.replace("Z", "+00:00")
+                    )
+                    if requested < cooldown:
+                        self._connection.rollback()
+                        return False
+                    self._connection.execute(
+                        """
+                        UPDATE provider_request_limits SET cooldown_until = NULL
+                        WHERE provider = ? AND budget_scope = ?
+                        """,
+                        (provider, budget_scope),
+                    )
                 current_limit = datetime.fromisoformat(
                     row["next_allowed_at"].replace("Z", "+00:00")
                 )
@@ -1134,6 +1157,53 @@ class Storage:
         except BaseException:
             self._connection.rollback()
             raise
+
+    def defer_provider_requests(
+        self,
+        *,
+        provider: str,
+        budget_scope: str,
+        requested_at: str | datetime,
+        retry_after_seconds: int,
+    ) -> None:
+        """Persist a bounded provider cooldown across processes and CLI runs."""
+
+        if (
+            not provider
+            or not budget_scope
+            or not isinstance(retry_after_seconds, int)
+            or isinstance(retry_after_seconds, bool)
+            or not 0 <= retry_after_seconds <= 86_400
+        ):
+            raise ValueError("provider cooldown inputs are invalid")
+        requested = datetime.fromisoformat(
+            _timestamp(requested_at).replace("Z", "+00:00")
+        )
+        requested_timestamp = _timestamp(requested)
+        cooldown_until = _timestamp(
+            requested + timedelta(seconds=retry_after_seconds)
+        )
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO provider_request_limits(
+                    provider, budget_scope, next_allowed_at, cooldown_until
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, budget_scope) DO UPDATE SET
+                    cooldown_until = CASE
+                        WHEN cooldown_until IS NULL
+                          OR cooldown_until < excluded.cooldown_until
+                        THEN excluded.cooldown_until
+                        ELSE cooldown_until
+                    END
+                """,
+                (
+                    provider,
+                    budget_scope,
+                    requested_timestamp,
+                    cooldown_until,
+                ),
+            )
 
     def save_provider_probe(
         self,
@@ -2709,6 +2779,7 @@ class Storage:
                                 "currency": fact.currency,
                                 "store_class": fact.store_class,
                                 "provider_product_id": fact.provider_product_id,
+                                "seller_id": fact.seller_id,
                             },
                         )
                     )
@@ -2721,8 +2792,8 @@ class Storage:
                             regular_amount_minor, discount_percent, store_class,
                             comparability, low_scope, effective_at, observed_at,
                             fresh_until, hard_expires_at, provider_url,
-                            access_mode, automation_supported
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'exact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual_only', 0)
+                            access_mode, automation_supported, seller_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'exact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual_only', 0, ?)
                         """,
                         (
                             sync_run_id,
@@ -2746,6 +2817,7 @@ class Storage:
                             fresh_until,
                             hard_expires,
                             fact.provider_url,
+                            fact.seller_id,
                         ),
                     )
                     inserted.setdefault(appid, []).append(int(cursor.lastrowid))
@@ -2822,14 +2894,15 @@ class Storage:
                             discount_percent, store_class, comparability, low_scope,
                             effective_at, observed_at, fresh_until, hard_expires_at,
                             provider_url, access_mode, automation_supported,
-                            promoted_sync_run_id
+                            promoted_sync_run_id, seller_id
                         )
                         SELECT account_id, country, provider, appid, fact_kind, ordinal,
                                evidence_id, provider_product_id, product_mapping,
                                amount_minor, currency, regular_amount_minor,
                                discount_percent, store_class, comparability, low_scope,
                                effective_at, observed_at, fresh_until, hard_expires_at,
-                               provider_url, access_mode, automation_supported, ?
+                               provider_url, access_mode, automation_supported, ?,
+                               seller_id
                         FROM price_observations WHERE id IN ({placeholders})
                         """,
                         (sync_run_id, *fact_rows),

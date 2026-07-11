@@ -127,6 +127,7 @@ def test_lookup_is_fixed_host_bounded_on_demand_and_normalized() -> None:
     assert offer.regular_price.amount_minor == 999
     assert offer.discount_percent == 75
     assert offer.store_class == "unknown"
+    assert offer.seller_id == "1"
     assert offer.comparability == "normalized_game"
     assert offer.provider_url.access_mode == "manual_only"
     assert offer.provider_url.automation_supported is False
@@ -197,14 +198,32 @@ def test_rate_limit_preserves_only_bounded_retry_after() -> None:
     assert caught.value.retry_after_seconds == 37
 
 
+def test_rate_limit_notifies_persistent_request_budget_observer() -> None:
+    observed: list[int] = []
+    transport = SequenceTransport(
+        HttpResponse(429, b"discarded", {"Retry-After": "37"})
+    )
+
+    with pytest.raises(CheapSharkError):
+        CheapSharkClient(
+            transport=transport, retry_observer=observed.append
+        ).lookup_steam_app(220)
+
+    assert observed == [37]
+
+
 @pytest.mark.parametrize("retry_after", ["date", "-1", "86401"])
 def test_invalid_retry_after_is_discarded(retry_after: str) -> None:
     transport = SequenceTransport(
         HttpResponse(429, b"secret", {"Retry-After": retry_after})
     )
+    observed: list[int] = []
     with pytest.raises(CheapSharkError) as caught:
-        CheapSharkClient(transport=transport).lookup_steam_app(220)
+        CheapSharkClient(
+            transport=transport, retry_observer=observed.append
+        ).lookup_steam_app(220)
     assert caught.value.retry_after_seconds is None
+    assert observed == []
 
 
 @pytest.mark.parametrize("price", ["1.234", "-1.00", "NaN", 1.25])

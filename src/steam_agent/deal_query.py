@@ -137,6 +137,7 @@ class DealFactInput:
     access_mode: Literal["manual_only"]
     automation_supported: Literal[False]
     evidence_id: int
+    seller_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +429,7 @@ def _stored_fact(value: StoredPriceFact) -> DealFactInput:
         access_mode=value.access_mode,  # type: ignore[arg-type]
         automation_supported=False,
         evidence_id=value.evidence_id,
+        seller_id=value.seller_id,
     )
 
 
@@ -643,6 +645,12 @@ def _facts(
             or not 0 <= fact.regular_amount_minor <= (1 << 63) - 1
         ):
             raise ValueError("deal fact regular amount is invalid")
+        if fact.seller_id is not None and (
+            not isinstance(fact.seller_id, str)
+            or not 1 <= len(fact.seller_id) <= 512
+            or any(ord(character) < 32 for character in fact.seller_id)
+        ):
+            raise ValueError("deal fact seller identity is invalid")
         if (
             isinstance(fact.ordinal, bool)
             or not isinstance(fact.ordinal, int)
@@ -797,6 +805,7 @@ def _snapshots(
                     observed_at=fact.observed_at,
                     provider_url=reference,
                     comparability=fact.comparability,
+                    seller_id=fact.seller_id,
                 )
                 offers.append(evidence)
             else:
@@ -1101,6 +1110,7 @@ def _fact_json(fact: DealFactInput, now: datetime) -> dict[str, object]:
                 ),
                 "discount_percent": fact.discount_percent,
                 "store_class": fact.store_class,
+                "seller_id": fact.seller_id,
             }
         )
     else:

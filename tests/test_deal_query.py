@@ -74,6 +74,7 @@ def fact(
     scope: str | None = None,
     fresh_until: str = "2026-07-11T18:00:00Z",
     evidence_id: int | None = None,
+    seller_id: str | None = None,
 ) -> DealFactInput:
     if provider == "gg-deals":
         url = "https://gg.deals/game/synthetic/"
@@ -103,6 +104,7 @@ def fact(
         access_mode="manual_only",
         automation_supported=False,
         evidence_id=evidence_id or appid * 100 + ordinal,
+        seller_id=seller_id,
     )
 
 
@@ -341,6 +343,7 @@ def test_failed_primary_uses_retained_fact_and_fallback_metadata() -> None:
                 store_class="unknown",
                 comparability="normalized_game",
                 evidence_id=9,
+                seller_id="7",
             ),
         ),
         states=(
@@ -355,6 +358,12 @@ def test_failed_primary_uses_retained_fact_and_fallback_metadata() -> None:
     assert item["deal"]["fallback_rung"] == 1
     assert item["deal"]["used_providers"] == ["cheapshark"]
     assert len(item["evidence"]["offers"]) == 2
+    cheapshark = next(
+        offer
+        for offer in item["evidence"]["offers"]
+        if offer["provider"] == "cheapshark"
+    )
+    assert cheapshark["seller_id"] == "7"
 
 
 def test_persisted_provider_access_denial_remains_typed_partial_truth() -> None:

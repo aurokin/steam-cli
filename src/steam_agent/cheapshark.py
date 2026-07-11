@@ -111,6 +111,7 @@ class FixedHttpsTransport:
 
 Clock = Callable[[], datetime]
 RequestGate = Callable[[], None]
+RetryObserver = Callable[[int], None]
 
 
 def _utc_now() -> datetime:
@@ -126,6 +127,7 @@ class CheapSharkClient:
         max_deals: int = DEFAULT_MAX_DEALS,
         clock: Clock = _utc_now,
         request_gate: RequestGate = lambda: None,
+        retry_observer: RetryObserver = lambda _seconds: None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -140,6 +142,7 @@ class CheapSharkClient:
         self._max_deals = max_deals
         self._clock = clock
         self._request_gate = request_gate
+        self._retry_observer = retry_observer
 
     def lookup_steam_app(self, appid: int) -> DealEvidenceSnapshot:
         """Retrieve current offers and cheapest-ever summary for one AppID."""
@@ -169,7 +172,12 @@ class CheapSharkClient:
         )
         if len(response.body) > MAX_RESPONSE_BYTES:
             raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
-        _check_status(response)
+        try:
+            _check_status(response)
+        except CheapSharkError as exc:
+            if exc.retry_after_seconds is not None:
+                self._retry_observer(exc.retry_after_seconds)
+            raise
         try:
             payload = json.loads(response.body)
         except (UnicodeError, ValueError, RecursionError):
@@ -285,7 +293,7 @@ def _normalize_offer(
     if not isinstance(payload, dict):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     deal_id = _identifier(payload.get("dealID"))
-    _identifier(payload.get("storeID"))
+    store_id = _identifier(payload.get("storeID"))
     price = _money(payload.get("price"))
     regular = _money(payload.get("retailPrice"))
     discount = _discount_percent(payload.get("savings"))
@@ -303,6 +311,7 @@ def _normalize_offer(
         observed_at=observed_at,
         provider_url=reference,
         comparability="normalized_game",
+        seller_id=store_id,
     )
 
 

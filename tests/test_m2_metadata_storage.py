@@ -105,3 +105,28 @@ def test_provider_request_interval_recovers_from_clock_rollback(tmp_path: Path) 
             requested_at="2026-07-11T00:00:01Z",
             minimum_interval_seconds=1,
         )
+
+
+def test_provider_retry_after_cooldown_survives_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    with Storage(database) as storage:
+        storage.defer_provider_requests(
+            provider="cheapshark",
+            budget_scope="user-key",
+            requested_at=T0,
+            retry_after_seconds=37,
+        )
+    with Storage(database) as storage:
+        assert not storage.reserve_provider_request(
+            provider="cheapshark",
+            budget_scope="user-key",
+            requested_at="2026-07-11T00:00:36Z",
+            minimum_interval_seconds=1,
+        )
+    with Storage(database) as storage:
+        assert storage.reserve_provider_request(
+            provider="cheapshark",
+            budget_scope="user-key",
+            requested_at="2026-07-11T00:00:37Z",
+            minimum_interval_seconds=1,
+        )

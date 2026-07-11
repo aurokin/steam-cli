@@ -3332,7 +3332,9 @@ def _gg_deals_client(request_gate: Any) -> GgDealsClient:
 
 
 def _cheapshark_client(request_gate: Any) -> CheapSharkClient:
-    return CheapSharkClient(request_gate=request_gate)
+    return CheapSharkClient(
+        request_gate=request_gate, retry_observer=_defer_cheapshark_requests
+    )
 
 
 def _provider_budget_database_path() -> Path:
@@ -3352,6 +3354,16 @@ def _reserve_provider_request(
             budget_scope="user-key",
             requested_at=requested_at,
             minimum_interval_seconds=minimum_interval_seconds,
+        )
+
+
+def _defer_cheapshark_requests(retry_after_seconds: int) -> None:
+    with Storage(_provider_budget_database_path()) as storage:
+        storage.defer_provider_requests(
+            provider="cheapshark",
+            budget_scope="user-key",
+            requested_at=_utc_now(),
+            retry_after_seconds=retry_after_seconds,
         )
 
 

@@ -58,6 +58,7 @@ def offer(
     observed_at: datetime,
     amount: int = 500,
     provider: str = "gg-deals",
+    seller_id: str | None = None,
 ) -> PriceFactObservation:
     return PriceFactObservation(
         appid=appid,
@@ -78,7 +79,36 @@ def offer(
             if provider == "gg-deals"
             else "https://www.cheapshark.com/redirect?dealID=synthetic"
         ),
+        seller_id=seller_id,
     )
+
+
+def test_cheapshark_seller_identity_survives_cache_projection(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        run = storage.begin_price_sync(
+            provider="cheapshark",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            targeted_appids=(10,),
+            requested_limit=1,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            run.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, NOW, provider="cheapshark", seller_id="7"),),
+            completed_at=NOW,
+            status="complete",
+        )
+
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+
+        assert snapshot.facts[0].seller_id == "7"
 
 
 @pytest.mark.parametrize("category", ["dlc", "pack"])
@@ -684,6 +714,40 @@ def test_v14_backfills_only_evaluated_legacy_demand_as_targeted() -> None:
         assert connection.execute(
             "SELECT appid, targeted FROM price_sync_demand ORDER BY appid"
         ).fetchall() == [(10, 1), (20, 0)]
+
+
+def test_v15_adds_cooldown_and_nullable_seller_attribution() -> None:
+    migration = resources.files("steam_agent").joinpath(
+        "migrations", "015_cheapshark_policy.sql"
+    )
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript(
+            """
+            CREATE TABLE provider_request_limits(
+                provider TEXT, budget_scope TEXT, next_allowed_at TEXT,
+                PRIMARY KEY(provider, budget_scope)
+            );
+            CREATE TABLE price_observations(id INTEGER PRIMARY KEY);
+            CREATE TABLE price_current(id INTEGER PRIMARY KEY);
+            INSERT INTO price_observations(id) VALUES (1);
+            INSERT INTO price_current(id) VALUES (1);
+            """
+        )
+
+        connection.executescript(migration.read_text(encoding="utf-8"))
+
+        request_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(provider_request_limits)")
+        }
+        observation = connection.execute(
+            "SELECT seller_id FROM price_observations WHERE id=1"
+        ).fetchone()
+        current = connection.execute(
+            "SELECT seller_id FROM price_current WHERE id=1"
+        ).fetchone()
+        assert "cooldown_until" in request_columns
+        assert observation == (None,)
+        assert current == (None,)
 
 
 def test_provider_deletion_preserves_other_provider(tmp_path) -> None:
