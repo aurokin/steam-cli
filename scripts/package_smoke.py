@@ -46,6 +46,29 @@ def _versions(database: Path) -> tuple[int, ...]:
         )
 
 
+def _expected_versions() -> tuple[int, ...]:
+    migrations = (
+        Path(__file__).resolve().parents[1] / "src" / "steam_agent" / "migrations"
+    )
+    versions = tuple(
+        int(path.name.split("_", 1)[0])
+        for path in sorted(migrations.glob("[0-9][0-9][0-9]_*.sql"))
+    )
+    if not versions:
+        raise RuntimeError("source migration set is missing")
+    return versions
+
+
+def _tables(database: Path) -> set[str]:
+    with sqlite3.connect(database) as connection:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+
+
 def smoke(wheel: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="steam-agent-package-smoke-") as temporary:
         root = Path(temporary)
@@ -57,7 +80,44 @@ def smoke(wheel: Path) -> None:
         else:
             executable = environment / "bin" / "steam-agent"
             python = environment / "bin" / "python"
-        _run([str(python), "-m", "pip", "install", "--quiet", str(wheel)])
+        requirements = root / "runtime-requirements.txt"
+        _run(
+            [
+                "uv",
+                "export",
+                "--frozen",
+                "--no-dev",
+                "--no-emit-project",
+                "--format",
+                "requirements-txt",
+                "--output-file",
+                str(requirements),
+            ]
+        )
+        _run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--quiet",
+                "--python",
+                str(python),
+                "--requirement",
+                str(requirements),
+            ]
+        )
+        _run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--quiet",
+                "--python",
+                str(python),
+                "--no-deps",
+                str(wheel),
+            ]
+        )
 
         installed_version = _run(
             [
@@ -96,6 +156,11 @@ def smoke(wheel: Path) -> None:
 
         database = data_dir / "steam-agent.sqlite3"
         before = _versions(database)
+        expected = _expected_versions()
+        if before != expected or "wishlist_current" not in _tables(database):
+            raise RuntimeError(
+                "installed wheel did not apply the complete source schema"
+            )
         second = json.loads(_run(query).stdout)
         after = _versions(database)
         if (

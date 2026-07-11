@@ -16,9 +16,10 @@ uv run python scripts/package_smoke.py
 ```
 
 The package smoke creates an isolated virtual environment and temporary data
-directory. It installs the wheel, checks the entry point and wishlist help,
-validates a fresh-profile typed-unavailable query, reopens the migrated database,
-and verifies that secret-like command-line input is rejected without being
+directory. It installs the wheel against the locked runtime dependency export,
+checks the entry point and wishlist help, validates a fresh-profile
+typed-unavailable query, verifies the complete source migration set and database
+reopen, and checks that secret-like command-line input is rejected without being
 echoed.
 
 Live provider checks are intentionally not CI tests. Account contents, prices,
