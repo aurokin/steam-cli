@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+
+import pytest
+
+from steam_agent.storage import (
+    PriceDemandSubject,
+    PriceFactObservation,
+    Storage,
+    WishlistObservation,
+)
+
+
+NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
+
+
+def wishlist(storage: Storage) -> tuple[int, int, tuple[PriceDemandSubject, ...]]:
+    account = storage.configure_steam_account(
+        alias="primary", steam_id64="76561198000000000", configured_at=NOW
+    )
+    storage.record_wishlist_data_consent(
+        account_id=account.id,
+        disclosure_version="test",
+        accepted_at=NOW,
+        backups_acknowledged=True,
+    )
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="wishlist.read",
+        account_id=account.id,
+        started_at=NOW,
+    )
+    storage.complete_wishlist_snapshot(
+        run.id,
+        (
+            WishlistObservation(20, 1, 100, NOW),
+            WishlistObservation(10, 0, 200, NOW),
+        ),
+        item_list_retrieved_at=NOW,
+        item_count_retrieved_at=NOW,
+        item_list_reported_count=2,
+        item_count_reported_count=2,
+        completed_at=NOW,
+    )
+    demand = (
+        PriceDemandSubject(10, 0, 0, 200),
+        PriceDemandSubject(20, 1, 1, 100),
+    )
+    return account.id, run.id, demand
+
+
+def offer(
+    appid: int,
+    observed_at: datetime,
+    amount: int = 500,
+    provider: str = "gg-deals",
+) -> PriceFactObservation:
+    return PriceFactObservation(
+        appid=appid,
+        ordinal=0,
+        fact_kind="offer",
+        provider_product_id=f"steam/app/{appid}",
+        amount_minor=amount,
+        currency="USD",
+        regular_amount_minor=1000,
+        discount_percent=50,
+        store_class="official",
+        comparability="normalized_game",
+        low_scope=None,
+        effective_at=None,
+        observed_at=observed_at,
+        provider_url=(
+            "https://gg.deals/game/synthetic/"
+            if provider == "gg-deals"
+            else "https://www.cheapshark.com/redirect?dealID=synthetic"
+        ),
+    )
+
+
+def test_price_snapshot_is_atomic_last_good_fresh_and_hard_expiring(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="us",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=None,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            run.id,
+            outcomes={10: "observed", 20: "not_found"},
+            facts=(offer(10, NOW),),
+            completed_at=NOW,
+            status="complete",
+            rate_limit=100,
+            rate_remaining=99,
+            rate_reset_value=123,
+        )
+
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        assert len(snapshot.facts) == 1
+        assert snapshot.facts[0].amount_minor == 500
+        assert snapshot.facts[0].fresh_until == "2026-07-11T18:00:00Z"
+        assert snapshot.facts[0].hard_expires_at == "2026-07-18T12:00:00Z"
+        assert [(item.appid, item.outcome) for item in snapshot.subjects] == [
+            (10, "observed"),
+            (20, "not_found"),
+        ]
+        assert "synthetic" not in str(
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT payload_json FROM evidence WHERE capability='prices.wishlist.read'"
+            ).fetchone()[0]
+        )
+
+        failed = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=None,
+            started_at=NOW + timedelta(hours=1),
+        )
+        storage.finish_price_sync(
+            failed.id,
+            completed_at=NOW + timedelta(hours=1),
+            error_code="PROVIDER_UNAVAILABLE",
+        )
+        assert storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(hours=1)
+        ).facts[0].amount_minor == 500
+
+        stale = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(hours=7)
+        )
+        assert stale.stale_offer_count == 1
+        assert stale.stale_subject_count == 2
+
+        expired = storage.read_price_snapshot(
+            account_id=account_id,
+            country="US",
+            now=NOW + timedelta(days=7, seconds=1),
+        )
+        assert expired.facts == ()
+        assert expired.subjects == ()
+
+
+def test_running_and_abandoned_attempts_are_distinct(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        storage.begin_price_sync(
+            provider="gg-deals", account_id=account_id, country="US",
+            wishlist_sync_run_id=wishlist_run, demand=demand,
+            requested_limit=None, started_at=NOW,
+        )
+        running = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(minutes=5)
+        )
+        assert running.running is True
+        assert running.abandoned_running is False
+        abandoned = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(minutes=16)
+        )
+        assert abandoned.running is True
+        assert abandoned.abandoned_running is True
+
+
+def test_older_completion_cannot_replace_newer_per_app_projection(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        older = storage.begin_price_sync(
+            provider="gg-deals", account_id=account_id, country="US",
+            wishlist_sync_run_id=wishlist_run, demand=demand,
+            requested_limit=1, started_at=NOW,
+        )
+        newer = storage.begin_price_sync(
+            provider="gg-deals", account_id=account_id, country="US",
+            wishlist_sync_run_id=wishlist_run, demand=demand,
+            requested_limit=1, started_at=NOW + timedelta(minutes=1),
+        )
+        storage.complete_price_sync(
+            newer.id, outcomes={10: "observed"},
+            facts=(offer(10, NOW + timedelta(minutes=1), 400),),
+            completed_at=NOW + timedelta(minutes=1), status="partial",
+        )
+        storage.complete_price_sync(
+            older.id, outcomes={10: "observed"}, facts=(offer(10, NOW, 900),),
+            completed_at=NOW + timedelta(minutes=2), status="partial",
+        )
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(minutes=2)
+        )
+        assert snapshot.facts[0].amount_minor == 400
+        assert snapshot.facts[0].promoted_sync_run_id == newer.id
+
+
+def test_provider_deletion_preserves_other_provider(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        for provider in ("gg-deals", "cheapshark"):
+            run = storage.begin_price_sync(
+                provider=provider, account_id=account_id, country="US",
+                wishlist_sync_run_id=wishlist_run, demand=demand,
+                requested_limit=1, started_at=NOW,
+            )
+            storage.complete_price_sync(
+                run.id, outcomes={10: "observed"},
+                facts=(offer(10, NOW, provider=provider),),
+                completed_at=NOW, status="partial",
+            )
+
+        deletion = storage.delete_price_data(provider="gg-deals")
+        assert deletion.current_removed == 1
+        remaining = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        assert {fact.provider for fact in remaining.facts} == {"cheapshark"}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"amount_minor": True},
+        {"regular_amount_minor": -1},
+        {"discount_percent": 101},
+        {"provider_product_id": ""},
+        {"comparability": "maybe"},
+        {"store_class": "market"},
+        {"provider_url": "https://user:secret@gg.deals/game/x/"},
+        {"provider_url": "https://evil.example/game/x/"},
+        {"provider_url": "https://gg.deals/game/x/#fragment"},
+        {"provider_url": "https://gg.deals/game/x/?key=secret"},
+        {"observed_at": NOW + timedelta(seconds=1)},
+    ],
+)
+def test_storage_rejects_adversarial_fact_before_projection(
+    tmp_path, mutation: dict[str, object]
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        run = storage.begin_price_sync(
+            provider="gg-deals", account_id=account_id, country="US",
+            wishlist_sync_run_id=wishlist_run, demand=demand,
+            requested_limit=1, started_at=NOW,
+        )
+        with pytest.raises(ValueError):
+            storage.complete_price_sync(
+                run.id, outcomes={10: "observed"},
+                facts=(replace(offer(10, NOW), **mutation),),
+                completed_at=NOW, status="partial",
+            )
+        assert storage.get_sync_run(run.id).status == "running"
+        assert storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW
+        ).facts == ()

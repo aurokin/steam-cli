@@ -75,6 +75,9 @@ from steam_agent.steam_store_catalog import (
     SteamStoreCatalogClient,
 )
 from steam_agent.provider_auth import ProviderAuthClient, ProviderAuthError
+from steam_agent.gg_deals import GgDealsClient, GgDealsError
+from steam_agent.cheapshark import CheapSharkClient, CheapSharkError
+from steam_agent.price_library import PriceSyncError, sync_wishlist_prices
 
 
 EXIT_OK = 0
@@ -222,6 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Accept the versioned wishlist storage and backup disclosure.",
     )
+    prices_sync = sync_commands.add_parser(
+        "prices", help="Synchronize current and historical-low wishlist evidence."
+    )
+    _add_leaf_format(prices_sync)
+    prices_sync.add_argument("--scope", choices=("wishlist",), required=True)
+    prices_sync.add_argument("--account", default="primary")
+    prices_sync.add_argument("--country", required=True)
+    prices_sync.add_argument(
+        "--provider", choices=("auto", "gg-deals", "cheapshark"), default="auto"
+    )
+    prices_sync.add_argument("--max-items", type=int)
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -321,7 +335,9 @@ def build_parser() -> argparse.ArgumentParser:
         "delete", help="Delete retained Steam Web API account data."
     )
     _add_leaf_format(delete_data)
-    delete_data.add_argument("--provider", choices=("steam-web-api",), required=True)
+    delete_data.add_argument(
+        "--provider", choices=("steam-web-api", "gg-deals", "cheapshark"), required=True
+    )
     target = delete_data.add_mutually_exclusive_group(required=True)
     target.add_argument("--account")
     target.add_argument("--all", action="store_true")
@@ -473,6 +489,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_catalog(args, database_path)
     if args.command == "sync" and args.sync_command == "wishlist":
         return _dispatch_sync_wishlist(args, database_path)
+    if args.command == "sync" and args.sync_command == "prices":
+        return _dispatch_sync_prices(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -892,6 +910,186 @@ def _dispatch_sync_wishlist(args: argparse.Namespace, database_path: Path) -> in
                 "provider_contract_is_provisional",
                 "empty_auth_like_response_is_ambiguous",
                 "sequential_pair_may_detect_concurrent_wishlist_change",
+            ],
+        },
+    )
+
+
+def _dispatch_sync_prices(args: argparse.Namespace, database_path: Path) -> int:
+    country = args.country.upper()
+    if (
+        len(country) != 2
+        or not country.isascii()
+        or not country.isalpha()
+        or country != "US"
+    ):
+        return _emit_error(
+            args,
+            command="sync.prices",
+            code=(
+                "UNSUPPORTED_COUNTRY"
+                if len(country) == 2 and country.isascii() and country.isalpha()
+                else ErrorCode.INVALID_ARGUMENT
+            ),
+            message=(
+                "GG.deals and CheapShark are currently supported only for US/USD."
+                if len(country) == 2 and country.isascii() and country.isalpha()
+                else "Country must be a two-letter code."
+            ),
+            exit_code=2,
+        )
+    if args.max_items is not None and not 1 <= args.max_items <= 10_000:
+        return _emit_error(
+            args,
+            command="sync.prices",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="--max-items must be between 1 and 10000.",
+            exit_code=2,
+        )
+    with _credential_operation_lock(database_path):
+        spec = _CREDENTIAL_PROVIDERS["gg-deals"]
+        credential_ref = _provider_credential_ref(database_path, spec)
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="sync.prices",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            if account is None:
+                return _emit_error(
+                    args,
+                    command="sync.prices",
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            metadata = storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            resolved = (
+                {"state": "missing", "secret": None}
+                if metadata is None
+                else _resolve_credential(metadata, credential_ref)
+            )
+            if args.provider == "gg-deals" and resolved["state"] != "configured":
+                return _emit_error(
+                    args,
+                    command="sync.prices",
+                    code=(
+                        ErrorCode.AUTH_REQUIRED
+                        if resolved["state"] == "missing"
+                        else _credential_error_code(resolved["state"])
+                    ),
+                    message="The GG.deals API credential is unavailable.",
+                )
+
+            def gg_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "gg-deals", _utc_now(), _PROVIDER_MINIMUM_INTERVAL_SECONDS
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise GgDealsError("REQUEST_THROTTLED", retryable=True)
+
+            def cheap_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "cheapshark", _utc_now(), _PROVIDER_MINIMUM_INTERVAL_SECONDS
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise CheapSharkError("REQUEST_THROTTLED", retryable=True)
+
+            try:
+                result = sync_wishlist_prices(
+                    storage,
+                    account_id=account.id,
+                    country=country,
+                    provider=args.provider,
+                    gg_api_key=(
+                        resolved.get("secret")
+                        if resolved["state"] == "configured"
+                        else None
+                    ),
+                    max_items=args.max_items,
+                    gg_client=_gg_deals_client(gg_gate),
+                    cheapshark_client=_cheapshark_client(cheap_gate),
+                    clock=_utc_now,
+                )
+            except PriceSyncError as exc:
+                return _emit_error(
+                    args,
+                    command="sync.prices",
+                    code=exc.code,
+                    message="Wishlist price synchronization did not complete.",
+                    retryable=exc.retryable,
+                )
+    warnings = []
+    if args.provider == "auto" and resolved["state"] != "configured":
+        warnings.append(
+            WarningRecord(
+                code=_credential_error_code(resolved["state"]),
+                message=(
+                    "GG.deals was not attempted because its credential is unavailable; "
+                    "the bounded CheapShark fallback was used."
+                ),
+            )
+        )
+    if result.completeness == "partial":
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.PARTIAL_SCAN,
+                message="Only a bounded subset of wishlist price evidence was evaluated.",
+            )
+        )
+    return _emit_success(
+        args,
+        command="sync.prices",
+        context={
+            "account_alias": account.alias,
+            "country": country,
+            "currency": "USD",
+            "scope": "wishlist",
+            "identifiers_included": False,
+        },
+        completeness_value=completeness(
+            CompletenessStatus(result.completeness), warnings=warnings
+        ),
+        data={
+            "sync_runs": [
+                {
+                    "id": run.id,
+                    "provider": run.provider,
+                    "status": run.status,
+                    "error_code": run.error_code,
+                }
+                for run in result.runs
+            ],
+            "provider_selection": args.provider,
+            "providers_used": list(result.providers_used),
+            "providers_attempted": list(result.providers_attempted),
+            "evaluated_items": result.evaluated_items,
+            "total_items": result.total_items,
+            "observed_items": result.observed_items,
+            "fallback_evaluated": result.fallback_evaluated,
+            "fallback_total": result.fallback_total,
+            "current_freshness_seconds": 6 * 60 * 60,
+            "historical_low_freshness_seconds": 24 * 60 * 60,
+            "hard_expiry_seconds": 7 * 24 * 60 * 60,
+            "raw_payload_retained": False,
+            "limitations": [
+                "GG.deals exposes summary lows rather than a price-event graph",
+                "CheapShark is USD-only and groups offers at game level",
+                "provider links are manual-only and are never followed",
             ],
         },
     )
@@ -1792,6 +1990,8 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
             code=ErrorCode.CONFIRMATION_REQUIRED,
             message="Steam Web API data deletion requires --yes.",
         )
+    if args.provider in {"gg-deals", "cheapshark"}:
+        return _delete_price_provider_data(args, database_path)
     with _credential_operation_lock(database_path):
         if args.account is not None:
             with Storage(database_path) as storage:
@@ -1817,6 +2017,9 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                             "owned_current_removed": 0,
                             "wishlist_observations_removed": 0,
                             "wishlist_current_removed": 0,
+                            "price_observations_removed": 0,
+                            "price_current_removed": 0,
+                            "price_subjects_removed": 0,
                             "sync_runs_removed": 0,
                             "probes_removed": 0,
                             "consents_removed": 0,
@@ -1838,6 +2041,9 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                     "owned_current_removed": result.owned_current_removed,
                     "wishlist_observations_removed": result.wishlist_observations_removed,
                     "wishlist_current_removed": result.wishlist_current_removed,
+                    "price_observations_removed": result.price_observations_removed,
+                    "price_current_removed": result.price_current_removed,
+                    "price_subjects_removed": result.price_subjects_removed,
                     "sync_runs_removed": result.sync_runs_removed,
                     "probes_removed": result.probes_removed,
                     "consents_removed": result.consents_removed,
@@ -1848,6 +2054,109 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                 },
             )
         return _delete_all_steam_web_api_data(args, database_path)
+
+
+def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -> int:
+    with _credential_operation_lock(database_path):
+        if args.account is not None:
+            with Storage(database_path) as storage:
+                try:
+                    account = storage.get_account(args.account)
+                except ValueError:
+                    return _emit_error(
+                        args, command="data.delete", code=ErrorCode.INVALID_ARGUMENT,
+                        message="The account alias is invalid.", exit_code=2,
+                    )
+                if account is None:
+                    return _emit_success(
+                        args, command="data.delete",
+                        data={
+                            "scope": "account-provider", "provider": args.provider,
+                            "account_alias": args.account,
+                            "price_observations_removed": 0,
+                            "price_current_removed": 0,
+                            "price_subjects_removed": 0,
+                            "sync_runs_removed": 0,
+                            "evidence_removed": 0,
+                            "account_preserved": True,
+                            "credential_preserved": True,
+                            "backup_copies_require_separate_deletion": True,
+                        },
+                    )
+                deletion = storage.delete_price_data(
+                    provider=args.provider, account_id=account.id
+                )
+            return _emit_success(
+                args, command="data.delete",
+                data={
+                    "scope": "account-provider", "provider": args.provider,
+                    "account_alias": args.account,
+                    "price_observations_removed": deletion.observations_removed,
+                    "price_current_removed": deletion.current_removed,
+                    "price_subjects_removed": deletion.subjects_removed,
+                    "sync_runs_removed": deletion.sync_runs_removed,
+                    "evidence_removed": deletion.evidence_removed,
+                    "account_preserved": True,
+                    "credential_preserved": True,
+                    "backup_copies_require_separate_deletion": True,
+                },
+            )
+
+        metadata = None
+        credential_ref = None
+        store = None
+        previous_secret = None
+        if args.provider == "gg-deals":
+            credential_ref = _provider_credential_ref(
+                database_path, _CREDENTIAL_PROVIDERS["gg-deals"]
+            )
+            with Storage(database_path) as storage:
+                metadata = storage.get_credential_reference(
+                    provider=credential_ref.provider, kind=credential_ref.kind,
+                    profile_id=credential_ref.profile_id,
+                )
+            if metadata is not None:
+                store = _credential_store(metadata.backend, metadata.backend_locator)
+                previous_secret = store.resolve(credential_ref)
+        try:
+            if store is not None and previous_secret is not None:
+                if not store.delete(credential_ref):
+                    raise CredentialError(str(ErrorCode.CREDENTIAL_DELETE_FAILED))
+            with Storage(database_path) as storage:
+                deletion = storage.delete_price_data(
+                    provider=args.provider,
+                    credential_kind=(None if metadata is None else credential_ref.kind),
+                    credential_profile_id=(
+                        None if metadata is None else credential_ref.profile_id
+                    ),
+                )
+        except BaseException:
+            if store is not None and previous_secret is not None:
+                try:
+                    store.put(credential_ref, previous_secret)
+                except BaseException:
+                    return _emit_error(
+                        args, command="data.delete",
+                        code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
+                        message="Provider deletion failed and the key could not be restored.",
+                    )
+            raise
+        return _emit_success(
+            args, command="data.delete",
+            data={
+                "scope": "provider-all", "provider": args.provider,
+                "price_observations_removed": deletion.observations_removed,
+                "price_current_removed": deletion.current_removed,
+                "price_subjects_removed": deletion.subjects_removed,
+                "sync_runs_removed": deletion.sync_runs_removed,
+                "evidence_removed": deletion.evidence_removed,
+                "credential_refs_removed": deletion.credential_refs_removed,
+                "local_credential_removed": previous_secret is not None,
+                "steam_account_data_preserved": True,
+                "other_provider_data_preserved": True,
+                "backup_copies_require_separate_deletion": True,
+            },
+        )
 
 
 def _delete_all_steam_web_api_data(
@@ -1923,6 +2232,9 @@ def _delete_all_steam_web_api_data(
             "owned_current_removed": deletion.owned_current_removed,
             "wishlist_observations_removed": deletion.wishlist_observations_removed,
             "wishlist_current_removed": deletion.wishlist_current_removed,
+            "price_observations_removed": deletion.price_observations_removed,
+            "price_current_removed": deletion.price_current_removed,
+            "price_subjects_removed": deletion.price_subjects_removed,
             "sync_runs_removed": deletion.sync_runs_removed,
             "probes_removed": deletion.probes_removed,
             "consents_removed": deletion.consents_removed,
@@ -2147,6 +2459,15 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 ),
                 "wishlist_current_removed": (
                     0 if deletion is None else deletion.wishlist_current_removed
+                ),
+                "price_observations_removed": (
+                    0 if deletion is None else deletion.price_observations_removed
+                ),
+                "price_current_removed": (
+                    0 if deletion is None else deletion.price_current_removed
+                ),
+                "price_subjects_removed": (
+                    0 if deletion is None else deletion.price_subjects_removed
                 ),
                 "sync_runs_removed": 0
                 if deletion is None
@@ -2827,6 +3148,14 @@ def _steam_web_api_client() -> SteamWebApiClient:
 
 def _steam_wishlist_client() -> SteamWishlistClient:
     return SteamWishlistClient()
+
+
+def _gg_deals_client(request_gate: Any) -> GgDealsClient:
+    return GgDealsClient(request_gate=request_gate)
+
+
+def _cheapshark_client(request_gate: Any) -> CheapSharkClient:
+    return CheapSharkClient(request_gate=request_gate)
 
 
 def _provider_budget_database_path() -> Path:
