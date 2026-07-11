@@ -226,6 +226,31 @@ def test_invalid_retry_after_is_discarded(retry_after: str) -> None:
     assert observed == []
 
 
+def test_max_size_digit_strings_are_rejected_as_typed_provider_errors() -> None:
+    oversized_digits = "9" * 8_192
+    transport = SequenceTransport(
+        response([{"gameID": "42", "steamAppID": oversized_digits}])
+    )
+
+    with pytest.raises(CheapSharkError) as caught:
+        CheapSharkClient(transport=transport).lookup_steam_app(220)
+
+    assert caught.value.code == "PROVIDER_RESPONSE_INVALID"
+    assert caught.value.retryable is False
+
+
+def test_max_size_retry_after_digit_string_is_discarded_without_conversion() -> None:
+    transport = SequenceTransport(
+        HttpResponse(429, b"discarded", {"Retry-After": "9" * 8_192})
+    )
+
+    with pytest.raises(CheapSharkError) as caught:
+        CheapSharkClient(transport=transport).lookup_steam_app(220)
+
+    assert caught.value.code == "PROVIDER_RATE_LIMITED"
+    assert caught.value.retry_after_seconds is None
+
+
 @pytest.mark.parametrize("price", ["1.234", "-1.00", "NaN", 1.25])
 def test_invalid_price_shapes_are_rejected(price: object) -> None:
     payload = lookup_payload()

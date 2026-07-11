@@ -342,6 +342,10 @@ def _optional_usd(value: object) -> Money | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
         raise GgDealsError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    if isinstance(value, str) and (not value or len(value) > 64):
+        raise GgDealsError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    if isinstance(value, int) and not 0 <= value <= (1 << 63) - 1:
+        raise GgDealsError("PROVIDER_RESPONSE_INVALID", retryable=False)
     try:
         decimal = Decimal(str(value))
         minor = decimal * 100
@@ -353,7 +357,7 @@ def _optional_usd(value: object) -> Money | None:
         ):
             raise InvalidOperation
         amount_minor = int(minor)
-    except (InvalidOperation, ValueError):
+    except (InvalidOperation, ValueError, OverflowError):
         raise GgDealsError("PROVIDER_RESPONSE_INVALID", retryable=False) from None
     return Money(amount_minor=amount_minor, currency="USD", country="US")
 
@@ -383,10 +387,7 @@ def _safe_provider_url(value: object) -> bool:
 
 def _retry_after(headers: Mapping[str, str]) -> int | None:
     value = headers.get("retry-after") or headers.get("Retry-After")
-    if value is None or not value.isdecimal():
-        return None
-    seconds = int(value)
-    return seconds if seconds <= 86_400 else None
+    return _bounded_header_int(value, maximum=86_400)
 
 
 def _rate_limit_metadata(headers: Mapping[str, str]) -> RateLimitMetadata:
@@ -401,11 +402,18 @@ def _rate_limit_metadata(headers: Mapping[str, str]) -> RateLimitMetadata:
     )
 
 
-def _bounded_header_int(value: str | None) -> int | None:
+def _bounded_header_int(
+    value: str | None, *, maximum: int = (1 << 63) - 1
+) -> int | None:
     if value is None or not value.isascii() or not value.isdecimal():
         return None
-    parsed = int(value)
-    return parsed if parsed <= (1 << 63) - 1 else None
+    normalized = value.lstrip("0") or "0"
+    upper = str(maximum)
+    if len(normalized) > len(upper) or (
+        len(normalized) == len(upper) and normalized > upper
+    ):
+        return None
+    return int(normalized)
 
 
 def _timestamp(value: datetime) -> str:

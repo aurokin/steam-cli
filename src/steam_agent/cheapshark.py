@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import http.client
 import json
+import re
 from typing import Protocol
 from urllib.parse import urlencode
 
@@ -37,6 +38,7 @@ MAX_JSON_ITEMS = 2_000
 MAX_STRING_LENGTH = 8_192
 DEFAULT_MAX_DEALS = 100
 MAX_UNSIGNED_32 = (1 << 32) - 1
+_DECIMAL_TEXT = re.compile(r"[0-9]+(?:\.[0-9]+)?\Z")
 
 
 class CheapSharkError(RuntimeError):
@@ -212,11 +214,9 @@ def _retry_after(headers: Mapping[str, str]) -> int | None:
     )
     if raw is None:
         return None
-    try:
-        seconds = int(raw)
-    except (TypeError, ValueError):
+    if not isinstance(raw, str):
         return None
-    return seconds if 0 <= seconds <= 86_400 else None
+    return _bounded_digit_string(raw, maximum=86_400)
 
 
 def _select_game_id(payload: object, *, appid: int) -> str:
@@ -344,32 +344,43 @@ def _normalize_history_low(
 
 
 def _money(value: object) -> Money:
-    if not isinstance(value, str) or not value or len(value) > 32:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 32
+        or _DECIMAL_TEXT.fullmatch(value) is None
+    ):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     try:
         amount = Decimal(value)
-    except InvalidOperation:
-        raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False) from None
-    if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
+        if not amount.is_finite() or amount.as_tuple().exponent < -2:
+            raise InvalidOperation
+        minor = amount * 100
+        if minor != minor.to_integral_value() or minor > 1_000_000_000:
+            raise InvalidOperation
+        amount_minor = int(minor)
+    except (InvalidOperation, ValueError, OverflowError):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
-    minor = amount * 100
-    if minor != minor.to_integral_value() or minor > 1_000_000_000:
-        raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
-    return Money(amount_minor=int(minor), currency="USD", country="US")
+    return Money(amount_minor=amount_minor, currency="USD", country="US")
 
 
 def _discount_percent(value: object) -> int | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value or len(value) > 32:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 32
+        or _DECIMAL_TEXT.fullmatch(value) is None
+    ):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     try:
         percent = Decimal(value)
-    except InvalidOperation:
+        if not percent.is_finite() or not 0 <= percent <= 100:
+            raise InvalidOperation
+        return int(percent.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, OverflowError):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False) from None
-    if not percent.is_finite() or not 0 <= percent <= 100:
-        raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
-    return int(percent.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _unix_timestamp(value: object) -> str | None:
@@ -391,14 +402,31 @@ def _identifier(value: object) -> str:
 def _positive_int_string(value: object, *, allow_zero: bool = False) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         result = value
-    elif isinstance(value, str) and value.isascii() and value.isdigit():
-        result = int(value)
+    elif isinstance(value, str):
+        parsed = _bounded_digit_string(value, maximum=(1 << 63) - 1)
+        if parsed is None:
+            raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
+        result = parsed
     else:
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     minimum = 0 if allow_zero else 1
     if not minimum <= result <= (1 << 63) - 1:
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     return result
+
+
+def _bounded_digit_string(value: str, *, maximum: int) -> int | None:
+    """Parse ASCII digits only after their magnitude is proven bounded."""
+
+    if not value or not value.isascii() or not value.isdigit():
+        return None
+    normalized = value.lstrip("0") or "0"
+    upper = str(maximum)
+    if len(normalized) > len(upper) or (
+        len(normalized) == len(upper) and normalized > upper
+    ):
+        return None
+    return int(normalized)
 
 
 def _validate_appid(appid: int) -> None:

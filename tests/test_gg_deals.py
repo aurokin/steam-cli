@@ -14,6 +14,7 @@ from steam_agent.gg_deals import (
     GgDealsClient,
     GgDealsError,
     HttpResponse,
+    RateLimitMetadata,
 )
 
 
@@ -416,6 +417,59 @@ def test_batch_is_sorted_deduplicated_and_returns_exact_subset_with_rate_metadat
     assert result.rate_limit.remaining == 97
     assert result.rate_limit.reset_value == 1783780000
     assert "ignored and not retained" not in str(result)
+
+
+def test_oversized_numeric_strings_are_rejected_or_discarded_before_conversion() -> None:
+    payload = {
+        "success": True,
+        "data": {
+            "220": {
+                "url": "https://gg.deals/game/synthetic-220/",
+                "prices": {"currentRetail": "9" * 8_192},
+            }
+        },
+    }
+    transport = RecordingTransport(
+        HttpResponse(
+            200,
+            json.dumps(payload).encode(),
+            {"X-RateLimit-Limit": "9" * 8_192},
+        )
+    )
+
+    with pytest.raises(GgDealsError, match="PROVIDER_RESPONSE_INVALID"):
+        GgDealsClient(transport=transport).fetch_app_price_summaries(
+            appids=(220,), api_key=SecretValue("secret")
+        )
+
+
+def test_oversized_rate_headers_are_discarded_without_integer_conversion() -> None:
+    payload = {
+        "success": True,
+        "data": {
+            "220": {
+                "url": "https://gg.deals/game/synthetic-220/",
+                "prices": {"currentRetail": "1.00"},
+            }
+        },
+    }
+    transport = RecordingTransport(
+        HttpResponse(
+            200,
+            json.dumps(payload).encode(),
+            {
+                "X-RateLimit-Limit": "9" * 8_192,
+                "X-RateLimit-Remaining": "9" * 8_192,
+                "X-RateLimit-Reset": "9" * 8_192,
+            },
+        )
+    )
+
+    result = GgDealsClient(transport=transport).fetch_app_price_summaries(
+        appids=(220,), api_key=SecretValue("secret")
+    )
+
+    assert result.rate_limit == RateLimitMetadata(None, None, None)
 
 
 def test_batch_rejects_too_many_unique_appids_before_transport() -> None:
