@@ -1180,9 +1180,7 @@ class Storage:
             _timestamp(requested_at).replace("Z", "+00:00")
         )
         requested_timestamp = _timestamp(requested)
-        cooldown_until = _timestamp(
-            requested + timedelta(seconds=retry_after_seconds)
-        )
+        cooldown_until = _timestamp(requested + timedelta(seconds=retry_after_seconds))
         with self._connection:
             self._connection.execute(
                 """
@@ -3371,6 +3369,26 @@ class Storage:
                 """,
                 (account_id,),
             )
+        # Demand rows describe a particular wishlist membership epoch.  Once an
+        # AppID leaves the promoted wishlist, retaining that row would make a
+        # later re-add look like stale/expired price evidence from the earlier
+        # membership.  Keep the coarse run metadata for bounded audit retention,
+        # but retire subject lineage that is no longer current membership.
+        self._connection.execute(
+            """
+            DELETE FROM price_sync_demand AS demand
+            WHERE demand.account_id = ?
+              AND demand.sync_run_id IN (
+                  SELECT id FROM sync_runs WHERE status <> 'running'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM wishlist_current AS wishlist
+                  WHERE wishlist.account_id = demand.account_id
+                    AND wishlist.appid = demand.appid
+              )
+            """,
+            (account_id,),
+        )
         self._delete_orphan_owned_evidence(evidence_ids)
 
     def read_wishlist_snapshot(self, account_id: int) -> WishlistSnapshot:

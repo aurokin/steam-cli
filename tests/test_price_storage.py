@@ -118,9 +118,12 @@ def test_identical_frozen_clock_price_facts_remain_account_scoped(tmp_path) -> N
         )
 
         storage.delete_price_data(provider="gg-deals", account_id=first_id)
-        assert storage.read_price_snapshot(
-            account_id=first_id, country="US", now=NOW
-        ).facts == ()
+        assert (
+            storage.read_price_snapshot(
+                account_id=first_id, country="US", now=NOW
+            ).facts
+            == ()
+        )
         remaining = storage.read_price_snapshot(
             account_id=second_id, country="US", now=NOW
         )
@@ -699,6 +702,75 @@ def test_promoted_wishlist_removal_prunes_price_cache(tmp_path) -> None:
             ).fetchone()[0]
             == 0
         )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_sync_demand WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        # Coarse attempt metadata remains under the ordinary seven-day policy;
+        # only obsolete membership-specific demand lineage is retired.
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_sync_metadata WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        deletion = storage.delete_price_data(provider="gg-deals", account_id=account_id)
+        assert deletion.sync_runs_removed == 1
+        assert (
+            storage.read_price_snapshot(
+                account_id=account_id, country="US", now=NOW + timedelta(hours=1)
+            ).attempt_metadata
+            == ()
+        )
+
+
+def test_wishlist_removal_retires_only_removed_price_demand(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        price_run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            targeted_appids=(10,),
+            requested_limit=1,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            price_run.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, NOW),),
+            completed_at=NOW,
+            status="complete",
+        )
+        retained = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(hours=1),
+        )
+        storage.complete_wishlist_snapshot(
+            retained.id,
+            (WishlistObservation(20, 1, 100, NOW + timedelta(hours=1)),),
+            item_list_retrieved_at=NOW + timedelta(hours=1),
+            item_count_retrieved_at=NOW + timedelta(hours=1),
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=NOW + timedelta(hours=1),
+        )
+
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW + timedelta(hours=1)
+        )
+        assert [(row.appid, row.targeted) for row in snapshot.demand_rows] == [
+            (20, False)
+        ]
+        assert snapshot.attempt_metadata[0].demand_count == 2
 
 
 def test_price_lineage_expires_with_the_seven_day_cache_boundary(tmp_path) -> None:
@@ -813,7 +885,8 @@ def test_v15_adds_cooldown_and_nullable_seller_attribution() -> None:
         connection.executescript(migration.read_text(encoding="utf-8"))
 
         request_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(provider_request_limits)")
+            row[1]
+            for row in connection.execute("PRAGMA table_info(provider_request_limits)")
         }
         observation = connection.execute(
             "SELECT seller_id FROM price_observations WHERE id=1"

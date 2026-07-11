@@ -462,6 +462,98 @@ def test_deals_query_marks_retained_attempt_expired_after_subject_hard_expiry(
     )
 
 
+def test_removed_then_readded_wishlist_item_requires_new_price_sync(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    database = data_dir / "steam-agent.sqlite3"
+    with Storage(database) as storage:
+        account_id, wishlist_run, demand = wishlist(
+            storage, observations=(WishlistObservation(10, 0, 100, NOW),)
+        )
+        configure_gg_metadata(storage, database)
+        price_run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=None,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            price_run.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, provider="gg-deals", amount_minor=500),),
+            completed_at=NOW,
+            status="complete",
+        )
+
+        removed = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(hours=1),
+        )
+        storage.complete_wishlist_snapshot(
+            removed.id,
+            (),
+            item_list_retrieved_at=NOW + timedelta(hours=1),
+            item_count_retrieved_at=NOW + timedelta(hours=1),
+            item_list_reported_count=0,
+            item_count_reported_count=0,
+            completed_at=NOW + timedelta(hours=1),
+        )
+
+        readded_at = NOW + timedelta(hours=2)
+        readded = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=readded_at,
+        )
+        storage.complete_wishlist_snapshot(
+            readded.id,
+            (WishlistObservation(10, 0, 100, readded_at),),
+            item_list_retrieved_at=readded_at,
+            item_count_retrieved_at=readded_at,
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=readded_at,
+        )
+
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW + timedelta(hours=2))
+    code, result, stderr = invoke(
+        data_dir,
+        [
+            "deals",
+            "query",
+            "--scope",
+            "wishlist",
+            "--account",
+            "primary",
+            "--country",
+            "US",
+        ],
+        capsys,
+    )
+
+    assert code == 0 and stderr == ""
+    assert result["completeness"]["status"] == "partial"  # type: ignore[index]
+    assert result["completeness"]["missing_capabilities"] == [  # type: ignore[index]
+        "prices.wishlist.read"
+    ]
+    assert result["completeness"]["stale_capabilities"] == []  # type: ignore[index]
+    item = result["data"]["items"][0]  # type: ignore[index]
+    assert item["evidence"]["offers"] == []
+    assert [
+        (attempt["provider"], attempt["error_code"])
+        for attempt in item["deal"]["attempted_providers"]
+    ] == [("gg-deals", "NOT_SYNCED"), ("cheapshark", "NOT_SYNCED")]
+
+
 def test_deals_query_reflects_provider_and_account_deletion(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
