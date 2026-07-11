@@ -2768,6 +2768,12 @@ class Storage:
                             support_level="contractual_third_party",
                             account_id=run.account_id,
                             context={
+                                # Price acquisition is wishlist/account scoped even
+                                # when two accounts yield byte-identical provider
+                                # facts at the same instant.  Keep the subject in the
+                                # evidence identity so SQLite's legacy evidence
+                                # uniqueness key cannot collapse those observations.
+                                "account_id": run.account_id,
                                 "country": metadata["country"],
                                 "currency": fact.currency,
                                 "comparability": fact.comparability,

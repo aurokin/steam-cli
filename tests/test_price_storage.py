@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from importlib import resources
+import json
 import sqlite3
 
 import pytest
@@ -18,9 +19,14 @@ from steam_agent.storage import (
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
 
 
-def wishlist(storage: Storage) -> tuple[int, int, tuple[PriceDemandSubject, ...]]:
+def wishlist(
+    storage: Storage,
+    *,
+    alias: str = "primary",
+    steam_id64: str = "76561198000000000",
+) -> tuple[int, int, tuple[PriceDemandSubject, ...]]:
     account = storage.configure_steam_account(
-        alias="primary", steam_id64="76561198000000000", configured_at=NOW
+        alias=alias, steam_id64=steam_id64, configured_at=NOW
     )
     storage.record_wishlist_data_consent(
         account_id=account.id,
@@ -51,6 +57,76 @@ def wishlist(storage: Storage) -> tuple[int, int, tuple[PriceDemandSubject, ...]
         PriceDemandSubject(20, 1, 1, 100),
     )
     return account.id, run.id, demand
+
+
+def test_identical_frozen_clock_price_facts_remain_account_scoped(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        first_id, first_wishlist, first_demand = wishlist(storage)
+        second_id, second_wishlist, second_demand = wishlist(
+            storage,
+            alias="secondary",
+            steam_id64="76561198000000001",
+        )
+
+        for account_id, wishlist_run, demand in (
+            (first_id, first_wishlist, first_demand),
+            (second_id, second_wishlist, second_demand),
+        ):
+            run = storage.begin_price_sync(
+                provider="gg-deals",
+                account_id=account_id,
+                country="US",
+                wishlist_sync_run_id=wishlist_run,
+                demand=demand,
+                targeted_appids=(10,),
+                requested_limit=1,
+                started_at=NOW,
+            )
+            storage.complete_price_sync(
+                run.id,
+                outcomes={10: "observed"},
+                facts=(offer(10, NOW),),
+                completed_at=NOW,
+                status="complete",
+            )
+
+        evidence = storage._connection.execute(  # noqa: SLF001
+            """
+            SELECT account_id, context_json, payload_json
+            FROM evidence
+            WHERE capability = 'prices.wishlist.read'
+            ORDER BY account_id
+            """
+        ).fetchall()
+        assert [row["account_id"] for row in evidence] == [first_id, second_id]
+        assert all(
+            f'"account_id":{row["account_id"]}' in row["context_json"]
+            for row in evidence
+        )
+        assert all(
+            set(json.loads(row["payload_json"]))
+            == {
+                "amount_minor",
+                "appid",
+                "currency",
+                "fact_kind",
+                "provider_product_id",
+                "seller_id",
+                "store_class",
+            }
+            for row in evidence
+        )
+
+        storage.delete_price_data(provider="gg-deals", account_id=first_id)
+        assert storage.read_price_snapshot(
+            account_id=first_id, country="US", now=NOW
+        ).facts == ()
+        remaining = storage.read_price_snapshot(
+            account_id=second_id, country="US", now=NOW
+        )
+        assert [(fact.appid, fact.amount_minor) for fact in remaining.facts] == [
+            (10, 500)
+        ]
 
 
 def offer(
