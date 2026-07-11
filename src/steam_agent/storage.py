@@ -589,7 +589,9 @@ def _validate_price_fact(
         valid_url = (
             parsed.hostname == "gg.deals"
             and not parsed.query
-            and parsed.path.startswith(("/game/", "/steam/app/"))
+            and parsed.path.startswith(
+                ("/game/", "/dlc/", "/pack/", "/steam/app/")
+            )
         )
     elif provider == "cheapshark":
         query = parse_qs(parsed.query, keep_blank_values=True)

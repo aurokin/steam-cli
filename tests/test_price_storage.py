@@ -79,6 +79,31 @@ def offer(
     )
 
 
+@pytest.mark.parametrize("category", ["dlc", "pack"])
+def test_gg_product_attribution_urls_are_allowed(tmp_path, category: str) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        run = storage.begin_price_sync(
+            provider="gg-deals", account_id=account_id, country="US",
+            wishlist_sync_run_id=wishlist_run, demand=demand,
+            requested_limit=1, started_at=NOW,
+        )
+        dlc_fact = replace(
+            offer(10, NOW),
+            provider_url=f"https://gg.deals/{category}/synthetic-product/",
+        )
+        storage.complete_price_sync(
+            run.id, outcomes={10: "observed"}, facts=(dlc_fact,),
+            completed_at=NOW, status="partial",
+        )
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        assert snapshot.facts[0].provider_url == (
+            f"https://gg.deals/{category}/synthetic-product/"
+        )
+
+
 def test_price_snapshot_is_atomic_last_good_fresh_and_hard_expiring(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id, wishlist_run, demand = wishlist(storage)
