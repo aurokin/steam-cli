@@ -45,8 +45,10 @@ at most one normalized current/low summary per provider, exact product, and
 country. Current evidence is fresh for six hours, low summaries for 24 hours,
 and every cached third-party row expires within seven days. Account demand and
 provider provenance are deletion-indexed; facts with no remaining demand are
-pruned. Provider-wide deletion removes that provider's facts and local key while
-preserving other providers and M1/M2.
+pruned. Coarse price-attempt and per-AppID demand lineage uses the same seven-day
+retention boundary. Expiry is enforced atomically on the next price read or
+sync; M3 does not introduce a background job. Provider-wide deletion removes
+that provider's facts and local key while preserving other providers and M1/M2.
 
 Money uses nonnegative integer minor units plus ISO currency and country. Offers
 are comparable only when product, country, currency, store/acquisition scope,

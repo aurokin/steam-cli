@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
 
 from steam_agent.cheapshark import CheapSharkClient, CheapSharkError
@@ -69,6 +69,22 @@ def sync_wishlist_prices(
     wishlist = storage.read_wishlist_snapshot(account_id)
     if wishlist.latest_complete is None:
         raise PriceSyncError("NOT_SYNCED", retryable=False)
+    if wishlist.latest is None:
+        raise PriceSyncError("NOT_SYNCED", retryable=False)
+    if wishlist.latest.status == "running":
+        raise PriceSyncError("SYNC_IN_PROGRESS", retryable=True)
+    if wishlist.latest.id != wishlist.latest_complete.id:
+        raise PriceSyncError(
+            wishlist.latest.error_code or "WISHLIST_REFRESH_FAILED",
+            retryable=True,
+        )
+    completed_at = wishlist.latest_complete.completed_at
+    if completed_at is None:
+        raise PriceSyncError("NOT_SYNCED", retryable=False)
+    evaluated_at = clock()
+    completed_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+    if evaluated_at > completed_dt + timedelta(hours=24):
+        raise PriceSyncError("STALE_LAST_GOOD", retryable=True)
     ordered_games = sorted(
         wishlist.games, key=lambda item: (item.priority, item.date_added, item.appid)
     )

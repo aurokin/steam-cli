@@ -469,6 +469,165 @@ def test_older_completion_cannot_replace_newer_per_app_projection(tmp_path) -> N
             item.attempt.run.id == newer.id
             for item in snapshot.latest_relevant_attempts
         )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_observations WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_superseded_price_payload_and_evidence_are_pruned(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        first = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=1,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            first.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, NOW, 900),),
+            completed_at=NOW,
+            status="partial",
+        )
+        old_evidence_id = (
+            storage.read_price_snapshot(account_id=account_id, country="US", now=NOW)
+            .facts[0]
+            .evidence_id
+        )
+        second = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=1,
+            started_at=NOW + timedelta(minutes=1),
+        )
+        storage.complete_price_sync(
+            second.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, NOW + timedelta(minutes=1), 400),),
+            completed_at=NOW + timedelta(minutes=1),
+            status="partial",
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_observations WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT 1 FROM evidence WHERE id = ?", (old_evidence_id,)
+            ).fetchone()
+            is None
+        )
+
+
+def test_promoted_wishlist_removal_prunes_price_cache(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        price_run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=1,
+            started_at=NOW,
+        )
+        storage.complete_price_sync(
+            price_run.id,
+            outcomes={10: "observed"},
+            facts=(offer(10, NOW),),
+            completed_at=NOW,
+            status="partial",
+        )
+        empty = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(hours=1),
+        )
+        storage.complete_wishlist_snapshot(
+            empty.id,
+            (),
+            item_list_retrieved_at=NOW + timedelta(hours=1),
+            item_count_retrieved_at=NOW + timedelta(hours=1),
+            item_list_reported_count=0,
+            item_count_reported_count=0,
+            completed_at=NOW + timedelta(hours=1),
+        )
+        snapshot = storage.read_wishlist_deal_snapshot(
+            account_id=account_id,
+            country="US",
+            now=NOW + timedelta(hours=1),
+        )
+        assert snapshot.wishlist.games == ()
+        assert snapshot.prices.facts == ()
+        assert snapshot.prices.subjects == ()
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_observations WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_price_lineage_expires_with_the_seven_day_cache_boundary(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        run = storage.begin_price_sync(
+            provider="gg-deals",
+            account_id=account_id,
+            country="US",
+            wishlist_sync_run_id=wishlist_run,
+            demand=demand,
+            requested_limit=1,
+            started_at=NOW,
+        )
+        storage.finish_price_sync(
+            run.id,
+            completed_at=NOW,
+            error_code="PROVIDER_UNAVAILABLE",
+            retry_after_seconds=30,
+        )
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id,
+            country="US",
+            now=NOW + timedelta(days=7, seconds=1),
+        )
+        assert snapshot.attempts == ()
+        assert snapshot.attempt_metadata == ()
+        assert snapshot.demand_rows == ()
+
+
+def test_price_demand_must_exactly_match_referenced_wishlist(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        mismatched = (replace(demand[0], wishlist_priority=99), demand[1])
+        with pytest.raises(
+            ValueError, match="price demand does not match the wishlist snapshot"
+        ):
+            storage.begin_price_sync(
+                provider="gg-deals",
+                account_id=account_id,
+                country="US",
+                wishlist_sync_run_id=wishlist_run,
+                demand=mismatched,
+                requested_limit=1,
+                started_at=NOW,
+            )
 
 
 def test_provider_deletion_preserves_other_provider(tmp_path) -> None:

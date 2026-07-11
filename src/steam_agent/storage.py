@@ -1520,6 +1520,7 @@ class Storage:
                     (sync_run_id,),
                 )
                 promoted = 1
+                self._prune_price_cache_to_wishlist(run.account_id)
             self._connection.execute(
                 """
                 UPDATE sync_runs SET status = 'complete', completed_at = ?,
@@ -2445,6 +2446,48 @@ class Storage:
                 or not wishlist.promoted
             ):
                 raise ValueError("price demand requires a promoted wishlist snapshot")
+            latest_complete = self.latest_account_sync(
+                capability="wishlist.read", account_id=account_id, status="complete"
+            )
+            if latest_complete is None or latest_complete.id != wishlist_sync_run_id:
+                raise ValueError("price demand requires the current wishlist snapshot")
+            latest_wishlist = self.latest_account_sync(
+                capability="wishlist.read", account_id=account_id
+            )
+            if latest_wishlist is None or latest_wishlist.id != wishlist_sync_run_id:
+                raise ValueError(
+                    "latest wishlist attempt is not ready for price demand"
+                )
+            expected_demand = tuple(
+                (
+                    int(row["appid"]),
+                    index,
+                    int(row["priority"]),
+                    int(row["date_added"]),
+                )
+                for index, row in enumerate(
+                    self._connection.execute(
+                        """
+                        SELECT appid, priority, date_added
+                        FROM wishlist_observations
+                        WHERE sync_run_id = ?
+                        ORDER BY priority, date_added, appid
+                        """,
+                        (wishlist_sync_run_id,),
+                    )
+                )
+            )
+            supplied_demand = tuple(
+                (
+                    item.appid,
+                    item.demand_order,
+                    item.wishlist_priority,
+                    item.wishlist_date_added,
+                )
+                for item in ordered
+            )
+            if supplied_demand != expected_demand:
+                raise ValueError("price demand does not match the wishlist snapshot")
             cursor = self._connection.execute(
                 """
                 INSERT INTO sync_runs(
@@ -2794,6 +2837,11 @@ class Storage:
                 ),
             )
             self._expire_price_data(completed)
+            self._prune_superseded_price_observations(
+                account_id=run.account_id,
+                country=str(metadata["country"]),
+                provider=run.provider,
+            )
             self._connection.commit()
             return self.get_sync_run(sync_run_id)
         except BaseException:
@@ -3119,6 +3167,98 @@ class Storage:
         self._connection.execute(
             "DELETE FROM price_observations WHERE hard_expires_at <= ?", (now,)
         )
+        lineage_cutoff = _timestamp(
+            datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)
+        )
+        expired_lineage_evidence = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT observations.evidence_id
+                FROM price_observations AS observations
+                JOIN sync_runs AS runs ON runs.id = observations.sync_run_id
+                WHERE runs.capability = 'prices.wishlist.read'
+                  AND COALESCE(runs.completed_at, runs.started_at) <= ?
+                """,
+                (lineage_cutoff,),
+            )
+        )
+        self._connection.execute(
+            """
+            DELETE FROM sync_runs
+            WHERE capability = 'prices.wishlist.read'
+              AND COALESCE(completed_at, started_at) <= ?
+            """,
+            (lineage_cutoff,),
+        )
+        evidence_ids += expired_lineage_evidence
+        self._delete_orphan_owned_evidence(evidence_ids)
+
+    def _prune_superseded_price_observations(
+        self, *, account_id: int, country: str, provider: str
+    ) -> None:
+        evidence_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT observations.evidence_id
+                FROM price_observations AS observations
+                WHERE observations.account_id = ?
+                  AND observations.country = ?
+                  AND observations.provider = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM price_current AS current
+                      WHERE current.evidence_id = observations.evidence_id
+                  )
+                """,
+                (account_id, country, provider),
+            )
+        )
+        self._connection.execute(
+            """
+            DELETE FROM price_observations AS observations
+            WHERE observations.account_id = ?
+              AND observations.country = ?
+              AND observations.provider = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM price_current AS current
+                  WHERE current.evidence_id = observations.evidence_id
+              )
+            """,
+            (account_id, country, provider),
+        )
+        self._delete_orphan_owned_evidence(evidence_ids)
+
+    def _prune_price_cache_to_wishlist(self, account_id: int) -> None:
+        evidence_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT observations.evidence_id
+                FROM price_observations AS observations
+                WHERE observations.account_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wishlist_current AS wishlist
+                      WHERE wishlist.account_id = observations.account_id
+                        AND wishlist.appid = observations.appid
+                  )
+                """,
+                (account_id,),
+            )
+        )
+        for table in ("price_current", "price_subject_current", "price_observations"):
+            self._connection.execute(
+                f"""
+                DELETE FROM {table} AS price
+                WHERE price.account_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wishlist_current AS wishlist
+                      WHERE wishlist.account_id = price.account_id
+                        AND wishlist.appid = price.appid
+                  )
+                """,
+                (account_id,),
+            )
         self._delete_orphan_owned_evidence(evidence_ids)
 
     def read_wishlist_snapshot(self, account_id: int) -> WishlistSnapshot:
