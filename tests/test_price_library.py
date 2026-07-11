@@ -64,7 +64,12 @@ def empty_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
     )
 
 
-def observed_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
+def observed_snapshot(
+    provider: str, appid: int, *, observed_at: datetime = NOW
+) -> DealEvidenceSnapshot:
+    observed_text = (
+        observed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
     product = ProductIdentity(f"product-{appid}", appid)
     if provider == "gg-deals":
         url = f"https://gg.deals/game/synthetic-{appid}/"
@@ -79,7 +84,7 @@ def observed_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
         None,
         None,
         store_class,
-        "2026-07-11T12:00:00Z",
+        observed_text,
         ManualReference(url, "manual"),
         "exact_product",
     )
@@ -88,7 +93,7 @@ def observed_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
         product,
         (offer,),
         (),
-        "2026-07-11T12:00:00Z",
+        observed_text,
         (),
     )
 
@@ -217,13 +222,25 @@ class ShuffledSparseGg:
         )
 
 
+class AllEmptyGg:
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        values = tuple(appids)
+        return GgDealsBatch(
+            values,
+            tuple(empty_snapshot("gg-deals", appid) for appid in reversed(values)),
+            (),
+            RateLimitMetadata(100, 99, 123),
+        )
+
+
 class RecordingCheap:
-    def __init__(self) -> None:
+    def __init__(self, *, observed_at: datetime = NOW) -> None:
         self.calls: list[int] = []
+        self.observed_at = observed_at
 
     def lookup_steam_app(self, appid: int) -> DealEvidenceSnapshot:
         self.calls.append(appid)
-        return observed_snapshot("cheapshark", appid)
+        return observed_snapshot("cheapshark", appid, observed_at=self.observed_at)
 
 
 def test_forced_primary_not_found_completes_run_but_not_evidence_ladder(
@@ -431,6 +448,124 @@ def test_fallback_client_setup_failure_does_not_create_running_attempt(
         assert snapshot.attempts == ()
 
 
+def test_default_fallback_bound_advances_and_converges_across_runs(tmp_path) -> None:
+    cheap = RecordingCheap()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 25)
+        first = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=AllEmptyGg(),
+            cheapshark_client=cheap,
+            clock=lambda: NOW,
+        )
+        second = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=AllEmptyGg(),
+            cheapshark_client=cheap,
+            clock=lambda: NOW,
+        )
+
+        assert first.completeness == "partial"
+        assert first.fallback_total == 25
+        assert first.fallback_evaluated == 20
+        assert second.completeness == "complete"
+        assert second.fallback_total == 25
+        assert second.fallback_evaluated == 5
+        assert cheap.calls == list(range(1, 26))
+        snapshot = storage.read_wishlist_deal_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        query = build_deal_query_from_snapshot(
+            snapshot,
+            account_alias="primary",
+            country="US",
+            store_class="unknown",
+            generated_at=NOW,
+            gg_credential_configured=True,
+        )
+        assert query["completeness"]["status"] == "complete"
+        assert len(query["data"]["items"]) == 25
+
+
+def test_explicit_max_refreshes_same_deterministic_prefix(tmp_path) -> None:
+    cheap = RecordingCheap()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 25)
+        for _ in range(2):
+            result = sync_wishlist_prices(
+                storage,
+                account_id=account_id,
+                country="US",
+                provider="auto",
+                gg_api_key=SecretValue("secret"),
+                max_items=3,
+                gg_client=AllEmptyGg(),
+                cheapshark_client=cheap,
+                clock=lambda: NOW,
+            )
+            assert result.completeness == "partial"
+            assert result.fallback_total == 3
+            assert result.fallback_evaluated == 3
+
+        assert cheap.calls == [1, 2, 3, 1, 2, 3]
+        fallback = storage.read_price_snapshot(
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            now=NOW,
+        )
+        latest_run = fallback.attempts[-1].id
+        assert [
+            row.appid
+            for row in fallback.demand_rows
+            if row.sync_run_id == latest_run and row.targeted
+        ] == [1, 2, 3]
+
+
+def test_default_fallback_retries_expired_terminal_subject(tmp_path) -> None:
+    cheap = RecordingCheap()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 1)
+        first = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            gg_api_key=None,
+            max_items=None,
+            cheapshark_client=cheap,
+            clock=lambda: NOW,
+        )
+        assert first.completeness == "complete"
+
+        refreshed_at = NOW + timedelta(hours=6)
+        cheap.observed_at = refreshed_at
+        second = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            gg_api_key=None,
+            max_items=None,
+            cheapshark_client=cheap,
+            clock=lambda: refreshed_at,
+        )
+
+        assert second.completeness == "complete"
+        assert second.fallback_evaluated == 1
+        assert cheap.calls == [1, 1]
+
+
 class CheapOk:
     def lookup_steam_app(self, appid: int) -> DealEvidenceSnapshot:
         return observed_snapshot("cheapshark", appid)
@@ -477,6 +612,7 @@ class MidCheap:
 def test_mid_fallback_failure_is_partial_and_preserves_reason(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup(storage, 2)
+        cheap = MidCheap()
         result = sync_wishlist_prices(
             storage,
             account_id=account_id,
@@ -484,13 +620,26 @@ def test_mid_fallback_failure_is_partial_and_preserves_reason(tmp_path) -> None:
             provider="cheapshark",
             gg_api_key=None,
             max_items=None,
-            cheapshark_client=MidCheap(),
+            cheapshark_client=cheap,
             clock=lambda: NOW,
         )
         assert result.completeness == "partial"
         assert result.evaluated_items == 1
         assert result.runs[0].status == "partial"
         assert result.runs[0].error_code == "PROVIDER_UNAVAILABLE"
+        retry = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            gg_api_key=None,
+            max_items=None,
+            cheapshark_client=cheap,
+            clock=lambda: NOW,
+        )
+        assert retry.completeness == "complete"
+        assert retry.fallback_evaluated == 1
+        assert cheap.calls == 3
 
 
 class MismatchedCheap:

@@ -116,6 +116,29 @@ def sync_wishlist_prices(
     observed: set[int] = set()
     fallback_candidates: list[int] = []
     fallback_evaluated = 0
+    fallback_evaluated_appids: set[int] = set()
+
+    fresh_fallback_appids: set[int] = set()
+    if max_items is None:
+        fallback_cache = storage.read_price_snapshot(
+            account_id=account_id,
+            country=country,
+            provider="cheapshark",
+            now=evaluated_at,
+        )
+        unresolved_latest = {
+            item.appid
+            for item in fallback_cache.latest_relevant_attempts
+            if item.demand.targeted
+            and not item.demand.evaluated
+            and item.attempt.run.status in {"failed", "partial"}
+        }
+        fresh_fallback_appids = {
+            subject.appid
+            for subject in fallback_cache.subjects
+            if _timestamp_is_after(subject.fresh_until, evaluated_at)
+            and subject.appid not in unresolved_latest
+        }
 
     selected = demand if max_items is None else demand[:max_items]
     use_gg = provider in {"auto", "gg-deals"} and gg_api_key is not None
@@ -234,12 +257,20 @@ def sync_wishlist_prices(
         # Provider response ordering is not part of the normalized contract.
         # Canonicalize the sparse fallback set back into wishlist demand order
         # before persisting the exact targeted subset.
-        targets = tuple(item.appid for item in demand if item.appid in fallback_set)[
-            :fallback_limit
-        ]
+        targets = tuple(
+            item.appid
+            for item in demand
+            if item.appid in fallback_set
+            and (max_items is not None or item.appid not in fresh_fallback_appids)
+        )[:fallback_limit]
         # Construct the client before beginning durable run lineage.  A local
         # configuration/setup error must not strand a running provider attempt.
-        api = cheapshark_client or CheapSharkClient()
+        api = cheapshark_client or CheapSharkClient() if targets else None
+    else:
+        targets = ()
+        api = None
+    if targets:
+        assert api is not None
         run = storage.begin_price_sync(
             provider="cheapshark",
             account_id=account_id,
@@ -274,6 +305,7 @@ def sync_wishlist_prices(
             else:
                 outcomes[appid] = "not_found"
         fallback_evaluated = len(outcomes)
+        fallback_evaluated_appids.update(outcomes)
         evaluated.update(outcomes)
         if outcomes:
             used_providers.append("cheapshark")
@@ -320,9 +352,12 @@ def sync_wishlist_prices(
     # still requires the fallback rung before the price can truthfully be called
     # unknown. The individual SyncRun records provider-run completeness; this
     # result records completeness of the full evidence ladder.
-    fallback_complete = fallback_evaluated >= fallback_total
+    fallback_satisfied = (fresh_fallback_appids & fallback_set) | (
+        fallback_evaluated_appids & fallback_set
+    )
+    fallback_complete = fallback_set <= fallback_satisfied
     overall_complete = (
-        len(evaluated) == total
+        len(evaluated | (fresh_fallback_appids & fallback_set)) == total
         and fallback_complete
         and all(run.status != "failed" for run in runs)
     )
@@ -401,6 +436,13 @@ def _facts(snapshot: DealEvidenceSnapshot) -> list[PriceFactObservation]:
 def _validate_context(country: str, currency: str) -> None:
     if country != "US" or currency != "USD":
         raise PriceSyncError("PROVIDER_CONTEXT_MISMATCH", retryable=False)
+
+
+def _timestamp_is_after(value: str, threshold: datetime) -> bool:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if threshold.tzinfo is None or threshold.utcoffset() is None:
+        raise ValueError("clock must return a timezone-aware datetime")
+    return parsed > threshold.astimezone(timezone.utc)
 
 
 __all__ = [
