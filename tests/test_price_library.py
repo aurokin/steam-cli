@@ -56,6 +56,35 @@ def empty_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
     )
 
 
+def observed_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
+    product = ProductIdentity(f"product-{appid}", appid)
+    if provider == "gg-deals":
+        url = f"https://gg.deals/game/synthetic-{appid}/"
+        store_class = "official"
+    else:
+        url = "https://www.cheapshark.com/redirect?dealID=synthetic"
+        store_class = "unknown"
+    offer = OfferEvidence(
+        provider,
+        product,
+        Money(100, "USD", "US"),
+        None,
+        None,
+        store_class,
+        "2026-07-11T12:00:00Z",
+        ManualReference(url, "manual"),
+        "exact_product",
+    )
+    return DealEvidenceSnapshot(
+        provider,
+        product,
+        (offer,),
+        (),
+        "2026-07-11T12:00:00Z",
+        (),
+    )
+
+
 class MidBatchGg:
     calls = 0
 
@@ -68,7 +97,7 @@ class MidBatchGg:
             )
         return GgDealsBatch(
             values,
-            tuple(empty_snapshot("gg-deals", appid) for appid in values),
+            tuple(observed_snapshot("gg-deals", appid) for appid in values),
             (),
             RateLimitMetadata(100, 50, 123),
         )
@@ -112,7 +141,24 @@ class SparseGgFallback:
         values = tuple(appids)
         return GgDealsBatch(
             values,
-            tuple(empty_snapshot("gg-deals", appid) for appid in values if appid != 2),
+            tuple(
+                observed_snapshot("gg-deals", appid)
+                for appid in values
+                if appid != 2
+            ),
+            (2,) if 2 in values else (),
+            RateLimitMetadata(100, 99, 123),
+        )
+
+
+class EmptyAndNullGg:
+    """Model both an item with empty prices and an API null/missing item."""
+
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        assert tuple(appids) == (1, 2)
+        return GgDealsBatch(
+            (1, 2),
+            (empty_snapshot("gg-deals", 1),),
             (2,),
             RateLimitMetadata(100, 99, 123),
         )
@@ -141,10 +187,29 @@ def test_forced_primary_not_found_completes_run_but_not_evidence_ladder(
         assert result.completeness == "partial"
 
 
+def test_bounded_primary_run_completes_exact_target_subset(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 3)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="gg-deals",
+            gg_api_key=SecretValue("secret"),
+            max_items=1,
+            gg_client=SparseGgFallback(),
+            clock=lambda: NOW,
+        )
+
+        assert result.runs[0].status == "complete"
+        assert result.evaluated_items == 1
+        assert result.completeness == "partial"
+
+
 def test_sparse_cheapshark_fallback_persists_exact_targets(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup(storage, 3)
-        sync_wishlist_prices(
+        result = sync_wishlist_prices(
             storage,
             account_id=account_id,
             country="US",
@@ -155,6 +220,8 @@ def test_sparse_cheapshark_fallback_persists_exact_targets(tmp_path) -> None:
             cheapshark_client=CheapOk(),
             clock=lambda: NOW,
         )
+        assert [run.status for run in result.runs] == ["complete", "complete"]
+        assert result.completeness == "complete"
         snapshot = storage.read_price_snapshot(
             account_id=account_id, country="US", provider="cheapshark", now=NOW
         )
@@ -163,9 +230,40 @@ def test_sparse_cheapshark_fallback_persists_exact_targets(tmp_path) -> None:
         ] == [(1, False, False), (2, True, True), (3, False, False)]
 
 
+def test_empty_and_null_primary_prices_enter_successful_fallback(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 2)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=EmptyAndNullGg(),
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+
+        assert [run.status for run in result.runs] == ["complete", "complete"]
+        assert result.fallback_total == 2
+        assert result.fallback_evaluated == 2
+        assert result.observed_items == 2
+        assert result.completeness == "complete"
+
+        primary = storage.read_price_snapshot(
+            account_id=account_id, country="US", provider="gg-deals", now=NOW
+        )
+        assert [(row.appid, row.outcome) for row in primary.demand_rows] == [
+            (1, "not_found"),
+            (2, "not_found"),
+        ]
+        assert primary.facts == ()
+
+
 class CheapOk:
     def lookup_steam_app(self, appid: int) -> DealEvidenceSnapshot:
-        return empty_snapshot("cheapshark", appid)
+        return observed_snapshot("cheapshark", appid)
 
 
 def test_mid_gg_batch_failure_is_recorded_and_fallback_completes(tmp_path) -> None:
@@ -203,7 +301,7 @@ class MidCheap:
             raise CheapSharkError(
                 "PROVIDER_UNAVAILABLE", retryable=True, retry_after_seconds=9
             )
-        return empty_snapshot("cheapshark", appid)
+        return observed_snapshot("cheapshark", appid)
 
 
 def test_mid_fallback_failure_is_partial_and_preserves_reason(tmp_path) -> None:

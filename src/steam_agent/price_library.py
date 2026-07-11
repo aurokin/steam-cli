@@ -155,9 +155,17 @@ def sync_wishlist_prices(
                 except PriceSyncError as exc:
                     failure = exc
                     break
-                outcomes[snapshot.product.steam_appid] = "observed"
-                observed.add(snapshot.product.steam_appid)
-                facts.extend(normalized_facts)
+                appid = snapshot.product.steam_appid
+                if normalized_facts:
+                    outcomes[appid] = "observed"
+                    observed.add(appid)
+                    facts.extend(normalized_facts)
+                else:
+                    # A product-shaped response with no normalized price facts
+                    # does not prove that a usable price was observed.  It is a
+                    # truthful miss on this provider rung and must fall through.
+                    outcomes[appid] = "not_found"
+                    fallback_candidates.append(appid)
             if isinstance(failure, PriceSyncError):
                 break
             for appid in batch.not_found_appids:
@@ -173,7 +181,8 @@ def sync_wishlist_prices(
                 completed_at=clock(),
                 status=(
                     "complete"
-                    if failure is None and len(outcomes) == total
+                    if failure is None
+                    and set(outcomes) == {item.appid for item in selected}
                     else "partial"
                 ),
                 rate_limit=rate.limit,
@@ -245,9 +254,12 @@ def sync_wishlist_prices(
             except PriceSyncError as exc:
                 failure = exc
                 break
-            outcomes[appid] = "observed"
-            observed.add(appid)
-            facts.extend(normalized_facts)
+            if normalized_facts:
+                outcomes[appid] = "observed"
+                observed.add(appid)
+                facts.extend(normalized_facts)
+            else:
+                outcomes[appid] = "not_found"
         fallback_evaluated = len(outcomes)
         evaluated.update(outcomes)
         if outcomes:
@@ -260,7 +272,7 @@ def sync_wishlist_prices(
                     completed_at=clock(),
                     status=(
                         "complete"
-                        if failure is None and len(outcomes) == total
+                        if failure is None and set(outcomes) == set(targets)
                         else "partial"
                     ),
                     error_code=None if failure is None else failure.code,
