@@ -3,7 +3,10 @@
 ## Current Phase
 
 - M1 installed-library is accepted; preserve its schema `0.1` behavior and last-good rule.
-- M2 truthful account inventory is the active acceptance candidate: account capability, visible-owned persistence, owned/installed joining, and deletion are in scope.
+- M2 truthful account inventory is accepted; preserve its account capability,
+  visible-owned, joined-library, freshness, deletion, and schema `0.1` behavior.
+- M3 is proposed but not activated. Do not implement wishlist or deal evidence
+  until its Linear milestone is explicitly activated.
 - Keep wishlist, pricing, recommendation, compatibility, artwork, and action capabilities in design until their Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.

@@ -96,7 +96,7 @@ inaccessible or ambiguous; it is not serialized as `private`.
 
 ## Implemented M2 persistent-inventory commands
 
-The following surface is implemented as the M2 acceptance candidate:
+The following surface is the accepted M2 contract:
 
 ```text
 steam-agent sync owned --account ALIAS [--acknowledge-local-storage]

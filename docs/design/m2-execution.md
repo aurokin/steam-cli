@@ -1,6 +1,6 @@
 # M2 truthful account inventory execution plan
 
-Status: acceptance-candidate execution and evidence record
+Status: accepted 2026-07-11
 
 This document turns the M2 outcome in Linear into bounded implementation and
 review gates. Product semantics and lifecycle rules remain canonical in the
@@ -19,9 +19,10 @@ The execution order is:
 2. AUR-627 adds deletion-gated, last-known-good visible-owned persistence.
 3. AUR-629 joins the selected account, machine, and bounded catalog evidence.
 
-AUR-620 is accepted; AUR-627 and AUR-629 are implemented as this acceptance
-candidate. This work does not activate wishlist, pricing, recommendations,
-artwork, compatibility, or Steam actions.
+AUR-620, AUR-627, and AUR-629 are accepted. The final gate passed 403 tests,
+package construction, live primary-account tracers, and a two-reviewer
+Diffwarden pass with zero findings. This acceptance does not activate wishlist,
+pricing, recommendations, artwork, compatibility, or Steam actions.
 
 ## Capability evidence collected 2026-07-11
 

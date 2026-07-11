@@ -14,11 +14,12 @@ return stable machine-readable results that an agent can reason over.
 **The M1 installed-library tracer bullet is implemented and accepted.** It
 scans local Steam metadata without credentials, stores
 complete observations in SQLite, and exposes deterministic installed-game
-queries. **The M2 truthful-account-inventory candidate is implemented and under
-acceptance review:** local account selection, secure key storage, live provider
+queries. **The M2 truthful-account-inventory milestone is implemented and
+accepted:** local account selection, secure key storage, live provider
 classification, durable visible-owned synchronization, joined owned/installed
-queries, and deletion are available. Wishlists, pricing, recommendations,
-compatibility, and Steam actions remain design work.
+and bounded catalog queries, truthful freshness, and transactional deletion are
+available. Wishlists, pricing, recommendations, compatibility, and Steam
+actions remain proposed design work behind later activation checkpoints.
 
 ## Install and develop
 

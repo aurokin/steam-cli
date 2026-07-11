@@ -211,7 +211,7 @@ The implemented surfaces are `auth remove`,
 `data delete --provider steam-web-api --account ALIAS --yes`, and
 `data delete --provider steam-web-api --all --yes`.
 
-The M2 acceptance candidate has separate account-scoped and all-provider
+The accepted M2 implementation has separate account-scoped and all-provider
 deletion commands. Account deletion preserves the data-profile-wide key; the
 all-provider path removes the key and reference without claiming Valve
 revocation or forensic erasure.
