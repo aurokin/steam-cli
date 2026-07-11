@@ -314,7 +314,11 @@ def _normalize_visible_owned_game(value: object) -> VisibleOwnedGame:
     if not _positive_unsigned_32(appid):
         raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
     name = value.get("name")
-    if name is not None and not isinstance(name, str):
+    if name is not None and (
+        not isinstance(name, str)
+        or len(name) > 512
+        or any(ord(character) < 32 for character in name)
+    ):
         raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
     return VisibleOwnedGame(
         appid=appid,

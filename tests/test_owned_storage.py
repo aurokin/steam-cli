@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import resources
 import json
 from pathlib import Path
 import sqlite3
@@ -71,9 +72,12 @@ def _complete_owned(
     storage.record_owned_snapshot(
         run.id,
         games,
-        retrieved_at=start,
-        include_appinfo=True,
-        include_played_free_games=True,
+        base_retrieved_at=start,
+        expanded_retrieved_at=start,
+        base_reported_count=sum(
+            game.inclusion_basis == "visible_owned" for game in games
+        ),
+        expanded_reported_count=len(games),
     )
     storage.finish_owned_sync(run.id, status="complete", completed_at=end)
     return run.id
@@ -103,6 +107,60 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
         ).fetchone() == (6,)
 
 
+def test_populated_v5_upgrade_backfills_steam_application_identities(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "upgrade.sqlite3"
+    migrations = resources.files("steam_agent").joinpath("migrations")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_migrations "
+            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        for version in range(1, 6):
+            migration = next(
+                item
+                for item in migrations.iterdir()
+                if item.name.startswith(f"{version:03d}_")
+            )
+            connection.executescript(migration.read_text(encoding="utf-8"))
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (version, T0),
+            )
+        connection.executemany(
+            "INSERT INTO steam_apps(appid, name, app_type, updated_at) "
+            "VALUES (?, ?, 'unknown', ?)",
+            ((10, "Legacy Ten", T0), (20, None, T1)),
+        )
+        connection.execute(
+            "INSERT INTO accounts(alias, provider, provider_account_id, source_kind, "
+            "created_at, updated_at) VALUES "
+            "('primary', 'steam', '76561198000000000', 'upgrade-test', ?, ?)",
+            (T0, T0),
+        )
+        connection.commit()
+
+    with Storage(path) as storage:
+        assert storage.get_app(10).name == "Legacy Ten"  # type: ignore[union-attr]
+        mappings = storage._connection.execute(
+            """
+            SELECT external_id, game_entity_id, entity_kind
+            FROM external_game_identities
+            JOIN game_entities ON game_entities.id = game_entity_id
+            ORDER BY CAST(external_id AS INTEGER)
+            """
+        ).fetchall()
+        assert [tuple(row) for row in mappings] == [
+            ("10", 10, "application"),
+            ("20", 20, "application"),
+        ]
+        assert storage.get_account("primary") is not None
+        assert storage._connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 6
+
+
 def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
     with Storage(tmp_path / "db.sqlite3") as storage:
         account_id = _account(storage)
@@ -116,9 +174,10 @@ def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
             storage.record_owned_snapshot(
                 run.id,
                 [_owned(10, T0)],
-                retrieved_at=T0,
-                include_appinfo=False,
-                include_played_free_games=True,
+                base_retrieved_at=T0,
+                expanded_retrieved_at=T0,
+                base_reported_count=1,
+                expanded_reported_count=1,
             )
         assert storage.get_sync_run(run.id).records_seen == 0
         assert (
@@ -150,6 +209,25 @@ def test_complete_owned_snapshot_preserves_basis_provenance_and_account_name(
         assert all(game.promoted_sync_run_id == run_id for game in snapshot.games)
         assert snapshot.latest_complete is not None
         assert snapshot.latest_complete.id == run_id
+        assert snapshot.latest_complete_provenance is not None
+        assert snapshot.latest_complete_provenance.sync_run_id == run_id
+        assert snapshot.latest_complete_provenance.provider == "steam_web_api"
+        assert snapshot.latest_complete_provenance.support_level == "official_documented"
+        assert snapshot.latest_complete_provenance.include_appinfo is True
+        assert (
+            snapshot.latest_complete_provenance.base_include_played_free_games
+            is False
+        )
+        assert snapshot.latest_complete_provenance.base_reported_count == 1
+        assert (
+            snapshot.latest_complete_provenance.expanded_include_played_free_games
+            is True
+        )
+        assert snapshot.latest_complete_provenance.expanded_reported_count == 2
+        assert (
+            snapshot.latest_complete_provenance.classification_method
+            == "sequential_set_difference"
+        )
 
 
 def test_complete_owned_sync_requires_an_explicit_recorded_snapshot(
@@ -206,9 +284,10 @@ def test_older_complete_owned_sync_cannot_replace_newer_completion(
             storage.record_owned_snapshot(
                 run.id,
                 [_owned(appid, at)],
-                retrieved_at=at,
-                include_appinfo=True,
-                include_played_free_games=True,
+                base_retrieved_at=at,
+                expanded_retrieved_at=at,
+                base_reported_count=1,
+                expanded_reported_count=1,
             )
         storage.finish_owned_sync(newer.id, status="complete", completed_at=T2)
         finished_older = storage.finish_owned_sync(
@@ -221,8 +300,21 @@ def test_older_complete_owned_sync_cannot_replace_newer_completion(
         ).fetchone()
         assert json.loads(evidence["context_json"]) == {
             "account_id": account_id,
-            "include_appinfo": True,
-            "include_played_free_games": True,
+            "classification_method": "sequential_set_difference",
+            "request_pair": {
+                "base": {
+                    "include_appinfo": True,
+                    "include_played_free_games": False,
+                    "reported_count": 1,
+                    "retrieved_at": T1,
+                },
+                "expanded": {
+                    "include_appinfo": True,
+                    "include_played_free_games": True,
+                    "reported_count": 1,
+                    "retrieved_at": T1,
+                },
+            },
         }
         assert set(json.loads(evidence["payload_json"])) == {
             "appid",
@@ -230,7 +322,19 @@ def test_older_complete_owned_sync_cannot_replace_newer_completion(
             "name",
             "playtime_forever_minutes",
         }
-        assert storage.get_app(10).name is None  # type: ignore[union-attr]
+        assert storage.get_app(10) is None
+        assert storage._connection.execute(
+            "SELECT 1 FROM external_game_identities WHERE external_id = '10'"
+        ).fetchone() is None
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_observations"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_sync_metadata"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM evidence"
+        ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("status", ["partial", "failed"])
@@ -248,9 +352,10 @@ def test_incomplete_owned_sync_preserves_last_good(tmp_path: Path, status: str) 
         storage.record_owned_snapshot(
             run.id,
             [_owned(20, T2)],
-            retrieved_at=T2,
-            include_appinfo=False,
-            include_played_free_games=True,
+            base_retrieved_at=T2,
+            expanded_retrieved_at=T2,
+            base_reported_count=1,
+            expanded_reported_count=1,
         )
         storage.finish_owned_sync(
             run.id,
@@ -261,6 +366,15 @@ def test_incomplete_owned_sync_preserves_last_good(tmp_path: Path, status: str) 
         games = storage.list_owned(account_id)
         assert [game.appid for game in games] == [10]
         assert games[0].promoted_sync_run_id == original
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_observations"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM owned_sync_metadata"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM evidence"
+        ).fetchone()[0] == 1
 
 
 def test_explicit_complete_empty_owned_snapshot_clears_projection(
@@ -291,9 +405,10 @@ def test_owned_bulk_validation_is_atomic(tmp_path: Path) -> None:
             storage.record_owned_snapshot(
                 run.id,
                 [_owned(10, T0), _owned(10, T0)],
-                retrieved_at=T0,
-                include_appinfo=False,
-                include_played_free_games=True,
+                base_retrieved_at=T0,
+                expanded_retrieved_at=T0,
+                base_reported_count=2,
+                expanded_reported_count=2,
             )
         assert (
             storage._connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
@@ -328,9 +443,10 @@ def test_owned_bulk_write_rolls_back_after_late_failure(tmp_path: Path) -> None:
             storage.record_owned_snapshot(
                 run.id,
                 [_owned(10, T0), _owned(20, T0)],
-                retrieved_at=T0,
-                include_appinfo=True,
-                include_played_free_games=True,
+                base_retrieved_at=T0,
+                expanded_retrieved_at=T0,
+                base_reported_count=2,
+                expanded_reported_count=2,
             )
         assert (
             storage._connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
@@ -385,6 +501,9 @@ def test_joined_library_snapshot_reads_both_projections(tmp_path: Path) -> None:
         assert [game.appid for game in joined.installed.games] == [10]
         assert joined.owned.latest_complete is not None
         assert joined.installed.latest_complete is not None
+        assert len(joined.entity_ids_by_appid) == 1
+        assert joined.entity_ids_by_appid[0][0] == 10
+        assert joined.entity_ids_by_appid[0][1] > 0
 
 
 def test_account_deletion_removes_account_data_but_preserves_m1_and_shared_key(

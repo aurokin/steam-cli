@@ -315,6 +315,18 @@ def test_invalid_provider_shapes_are_typed(payload: object) -> None:
         {
             "response": {
                 "game_count": 1,
+                "games": [{"appid": 10, "name": "x" * 513}],
+            }
+        },
+        {
+            "response": {
+                "game_count": 1,
+                "games": [{"appid": 10, "name": "line\nbreak"}],
+            }
+        },
+        {
+            "response": {
+                "game_count": 1,
                 "games": [{"appid": 10, "playtime_forever": -1}],
             }
         },
