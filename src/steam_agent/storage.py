@@ -92,6 +92,7 @@ class SyncRun:
     provider: str
     capability: str
     machine_id: str | None
+    account_id: int | None
     started_at: str
     completed_at: str | None
     status: SyncStatus
@@ -156,6 +157,81 @@ class InstalledSnapshot:
     latest_complete: SyncRun | None
 
 
+OwnedInclusionBasis = Literal["visible_owned", "played_free"]
+
+
+@dataclass(frozen=True)
+class OwnedObservation:
+    appid: int
+    playtime_forever_minutes: int | None
+    inclusion_basis: OwnedInclusionBasis
+    observed_at: str | datetime
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class OwnedGame:
+    account_id: int
+    appid: int
+    name: str | None
+    playtime_forever_minutes: int | None
+    inclusion_basis: OwnedInclusionBasis
+    observed_at: str
+    evidence_id: int
+    promoted_sync_run_id: int
+
+
+@dataclass(frozen=True)
+class OwnedSnapshot:
+    games: tuple[OwnedGame, ...]
+    latest: SyncRun | None
+    latest_complete: SyncRun | None
+
+
+@dataclass(frozen=True)
+class AccountDataConsent:
+    account_id: int
+    consent_kind: str
+    disclosure_version: str
+    backups_acknowledged: bool
+    accepted_at: str
+
+
+@dataclass(frozen=True)
+class AccountDataDeletion:
+    account_removed: bool
+    owned_observations_removed: int
+    owned_current_removed: int
+    sync_runs_removed: int
+    probes_removed: int
+    consents_removed: int
+    evidence_removed: int
+    orphan_apps_removed: int
+    shared_credential_preserved: bool = True
+
+
+@dataclass(frozen=True)
+class AllSteamAccountDataDeletion:
+    accounts_removed: int
+    owned_observations_removed: int
+    owned_current_removed: int
+    sync_runs_removed: int
+    probes_removed: int
+    consents_removed: int
+    evidence_removed: int
+    orphan_apps_removed: int
+    credential_refs_removed: int
+    shared_credential_preserved: bool = True
+
+
+@dataclass(frozen=True)
+class LibrarySnapshot:
+    """Account and machine projections captured in one SQLite read transaction."""
+
+    owned: OwnedSnapshot
+    installed: InstalledSnapshot
+
+
 def _timestamp(value: str | datetime) -> str:
     if isinstance(value, str):
         candidate = value
@@ -174,7 +250,9 @@ def _optional_timestamp(value: str | datetime | None) -> str | None:
 
 
 def _canonical_json(value: Mapping[str, Any] | None) -> str:
-    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        value or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 
 class Storage:
@@ -203,6 +281,7 @@ class Storage:
         connection = sqlite3.connect(str(self.path))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA secure_delete = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
@@ -255,7 +334,9 @@ class Storage:
             )
             applied = {
                 row["version"]
-                for row in self._connection.execute("SELECT version FROM schema_migrations")
+                for row in self._connection.execute(
+                    "SELECT version FROM schema_migrations"
+                )
             }
             for migration in sorted(migrations_dir.glob("[0-9][0-9][0-9]_*.sql")):
                 version = int(migration.name.split("_", 1)[0])
@@ -264,8 +345,8 @@ class Storage:
                 sql = migration.read_text(encoding="utf-8")
                 for statement in _sql_statements(sql):
                     self._connection.execute(statement)
-                applied_at = datetime.now(timezone.utc).isoformat().replace(
-                    "+00:00", "Z"
+                applied_at = (
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 )
                 self._connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -294,7 +375,14 @@ class Storage:
                     architecture = excluded.architecture,
                     updated_at = excluded.updated_at
                 """,
-                (machine.id, machine.name, machine.platform, machine.architecture, timestamp, timestamp),
+                (
+                    machine.id,
+                    machine.name,
+                    machine.platform,
+                    machine.architecture,
+                    timestamp,
+                    timestamp,
+                ),
             )
         return machine
 
@@ -703,17 +791,275 @@ class Storage:
         capability: str,
         started_at: str | datetime,
         machine_id: str | None = None,
+        account_id: int | None = None,
     ) -> SyncRun:
         timestamp = _timestamp(started_at)
+        if machine_id is not None and account_id is not None:
+            raise ValueError("a sync cannot target both a machine and an account")
         with self._connection:
             cursor = self._connection.execute(
                 """
-                INSERT INTO sync_runs(provider, capability, machine_id, started_at, status)
-                VALUES (?, ?, ?, ?, 'running')
+                INSERT INTO sync_runs(
+                    provider, capability, machine_id, account_id, started_at, status
+                ) VALUES (?, ?, ?, ?, ?, 'running')
                 """,
-                (provider, capability, machine_id, timestamp),
+                (provider, capability, machine_id, account_id, timestamp),
             )
         return self.get_sync_run(int(cursor.lastrowid))
+
+    def record_owned_data_consent(
+        self,
+        *,
+        account_id: int,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> AccountDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO account_data_consents(
+                    account_id, consent_kind, disclosure_version,
+                    backups_acknowledged, accepted_at
+                ) VALUES (?, 'owned_persistence', ?, 1, ?)
+                ON CONFLICT(account_id, consent_kind) DO UPDATE SET
+                    disclosure_version = excluded.disclosure_version,
+                    backups_acknowledged = excluded.backups_acknowledged,
+                    accepted_at = excluded.accepted_at
+                """,
+                (account_id, disclosure_version, timestamp),
+            )
+        consent = self.get_owned_data_consent(account_id)
+        assert consent is not None
+        return consent
+
+    def get_owned_data_consent(self, account_id: int) -> AccountDataConsent | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM account_data_consents
+            WHERE account_id = ? AND consent_kind = 'owned_persistence'
+            """,
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return AccountDataConsent(**values)
+
+    def record_owned_snapshot(
+        self,
+        sync_run_id: int,
+        observations: list[OwnedObservation] | tuple[OwnedObservation, ...],
+        *,
+        retrieved_at: str | datetime,
+        include_appinfo: bool,
+        include_played_free_games: bool,
+        support_level: str = "official_documented",
+    ) -> tuple[int, ...]:
+        """Atomically record one normalized GetOwnedGames response.
+
+        Evidence payloads are constructed here from the allowlisted normalized
+        fields. Callers cannot pass a raw provider object through this method.
+        """
+
+        retrieved = _timestamp(retrieved_at)
+        normalized: list[tuple[OwnedObservation, str]] = []
+        appids: set[int] = set()
+        if not support_level or len(support_level) > 128:
+            raise ValueError("support_level must be between 1 and 128 characters")
+        for observation in observations:
+            if observation.appid <= 0 or observation.appid in appids:
+                raise ValueError("owned AppIDs must be positive and unique")
+            if (
+                observation.playtime_forever_minutes is not None
+                and observation.playtime_forever_minutes < 0
+            ):
+                raise ValueError("owned playtime cannot be negative")
+            if observation.inclusion_basis not in ("visible_owned", "played_free"):
+                raise ValueError("unsupported owned inclusion basis")
+            if observation.name is not None and (
+                not isinstance(observation.name, str)
+                or len(observation.name) > 512
+                or any(ord(character) < 32 for character in observation.name)
+            ):
+                raise ValueError("owned name is invalid")
+            observed = _timestamp(observation.observed_at)
+            normalized.append((observation, observed))
+            appids.add(observation.appid)
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._require_running_owned_sync(sync_run_id)
+            already_recorded = self._connection.execute(
+                "SELECT 1 FROM owned_sync_metadata WHERE sync_run_id = ?",
+                (sync_run_id,),
+            ).fetchone()
+            if already_recorded is not None:
+                raise InvalidSyncTransition("owned snapshot is already recorded")
+            consent = self._connection.execute(
+                """
+                SELECT 1 FROM account_data_consents
+                WHERE account_id = ? AND consent_kind = 'owned_persistence'
+                """,
+                (run.account_id,),
+            ).fetchone()
+            if consent is None:
+                raise InvalidSyncTransition("owned persistence consent is required")
+
+            self._connection.execute(
+                """
+                INSERT INTO owned_sync_metadata(
+                    sync_run_id, account_id, retrieved_at, include_appinfo,
+                    include_played_free_games, support_level
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sync_run_id,
+                    run.account_id,
+                    retrieved,
+                    int(bool(include_appinfo)),
+                    int(bool(include_played_free_games)),
+                    support_level,
+                ),
+            )
+
+            evidence_ids: list[int] = []
+            for observation, observed in normalized:
+                payload = {
+                    "appid": observation.appid,
+                    "inclusion_basis": observation.inclusion_basis,
+                    "name": observation.name,
+                    "playtime_forever_minutes": observation.playtime_forever_minutes,
+                }
+                evidence_id = self._insert_evidence(
+                    EvidenceInput(
+                        provider=run.provider,
+                        capability=run.capability,
+                        source_kind="steam_web_api",
+                        source_locator=f"GetOwnedGames:app:{observation.appid}",
+                        retrieved_at=retrieved,
+                        support_level=support_level,
+                        context={
+                            "account_id": run.account_id,
+                            "include_appinfo": bool(include_appinfo),
+                            "include_played_free_games": bool(
+                                include_played_free_games
+                            ),
+                        },
+                        payload=payload,
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO steam_apps(appid, name, app_type, updated_at)
+                    VALUES (?, NULL, 'unknown', ?)
+                    ON CONFLICT(appid) DO NOTHING
+                    """,
+                    (observation.appid, observed),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO owned_observations(
+                        sync_run_id, evidence_id, account_id, appid, name,
+                        playtime_forever_minutes, inclusion_basis, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sync_run_id,
+                        evidence_id,
+                        run.account_id,
+                        observation.appid,
+                        observation.name,
+                        observation.playtime_forever_minutes,
+                        observation.inclusion_basis,
+                        observed,
+                    ),
+                )
+                evidence_ids.append(evidence_id)
+            self._connection.execute(
+                "UPDATE sync_runs SET records_seen = ? WHERE id = ?",
+                (len(normalized), sync_run_id),
+            )
+            self._connection.commit()
+            return tuple(evidence_ids)
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
+    def finish_owned_sync(
+        self,
+        sync_run_id: int,
+        *,
+        status: TerminalSyncStatus,
+        completed_at: str | datetime,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+    ) -> SyncRun:
+        if status not in ("complete", "partial", "failed"):
+            raise ValueError("status must be complete, partial, or failed")
+        timestamp = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._require_owned_sync(sync_run_id)
+            if existing.status != "running":
+                if (
+                    existing.status == status
+                    and existing.completed_at == timestamp
+                    and existing.error_code == error_code
+                    and existing.error_detail == error_detail
+                ):
+                    self._connection.commit()
+                    return existing
+                raise InvalidSyncTransition(
+                    f"sync run {sync_run_id} is already {existing.status}"
+                )
+            promoted = 0
+            if status == "complete":
+                recorded = self._connection.execute(
+                    "SELECT 1 FROM owned_sync_metadata WHERE sync_run_id = ?",
+                    (sync_run_id,),
+                ).fetchone()
+                if recorded is None:
+                    raise InvalidSyncTransition(
+                        "a complete owned sync requires a recorded snapshot"
+                    )
+                newer_complete = self._connection.execute(
+                    """
+                    SELECT 1 FROM sync_runs
+                    WHERE capability = 'owned.visible.read' AND account_id = ?
+                      AND id > ? AND status = 'complete'
+                    LIMIT 1
+                    """,
+                    (existing.account_id, sync_run_id),
+                ).fetchone()
+                if newer_complete is None:
+                    self._promote_owned(existing.account_id, sync_run_id)
+                    promoted = 1
+            self._connection.execute(
+                """
+                UPDATE sync_runs SET status = ?, completed_at = ?, promoted = ?,
+                    error_code = ?, error_detail = ?
+                WHERE id = ?
+                """,
+                (status, timestamp, promoted, error_code, error_detail, sync_run_id),
+            )
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
 
     def record_installed_observation(
         self,
@@ -892,6 +1238,340 @@ class Storage:
         ).fetchone()
         return None if row is None else _sync_run(row)
 
+    def latest_account_sync(
+        self,
+        *,
+        capability: str,
+        account_id: int,
+        status: SyncStatus | None = None,
+    ) -> SyncRun | None:
+        clauses = ["capability = ?", "account_id = ?"]
+        parameters: list[object] = [capability, account_id]
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status)
+        row = self._connection.execute(
+            f"SELECT * FROM sync_runs WHERE {' AND '.join(clauses)} "
+            "ORDER BY id DESC LIMIT 1",
+            parameters,
+        ).fetchone()
+        return None if row is None else _sync_run(row)
+
+    def list_owned(self, account_id: int) -> list[OwnedGame]:
+        rows = self._connection.execute(
+            """
+            SELECT
+                account_id, appid, name, playtime_forever_minutes,
+                inclusion_basis, observed_at, evidence_id, promoted_sync_run_id
+            FROM owned_current
+            WHERE account_id = ?
+            ORDER BY appid
+            """,
+            (account_id,),
+        )
+        return [OwnedGame(**dict(row)) for row in rows]
+
+    def read_owned_snapshot(self, account_id: int) -> OwnedSnapshot:
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            snapshot = self._read_owned_snapshot(account_id)
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
+    def read_library_snapshot(
+        self, account_id: int, machine_id: str
+    ) -> LibrarySnapshot:
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            owned = self._read_owned_snapshot(account_id)
+            installed_games = tuple(self.list_installed(machine_id))
+            installed = InstalledSnapshot(
+                games=installed_games,
+                latest=self.latest_sync(capability="installed", machine_id=machine_id),
+                latest_complete=self.latest_sync(
+                    capability="installed",
+                    machine_id=machine_id,
+                    status="complete",
+                ),
+            )
+            self._connection.commit()
+            return LibrarySnapshot(owned=owned, installed=installed)
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
+    def delete_steam_account_data(self, account_id: int) -> AccountDataDeletion:
+        """Delete one target account while preserving data-profile credentials."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            account = self._connection.execute(
+                "SELECT alias FROM accounts WHERE id = ? AND provider = 'steam'",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                self._connection.commit()
+                return AccountDataDeletion(False, 0, 0, 0, 0, 0, 0, 0)
+            alias = account["alias"]
+            counts = {
+                "owned_observations": self._count_where(
+                    "owned_observations", "account_id", account_id
+                ),
+                "owned_current": self._count_where(
+                    "owned_current", "account_id", account_id
+                ),
+                "sync_runs": self._count_where("sync_runs", "account_id", account_id),
+                "consents": self._count_where(
+                    "account_data_consents", "account_id", account_id
+                ),
+            }
+            counts["probes"] = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM provider_probes "
+                    "WHERE account_alias = ? COLLATE NOCASE",
+                    (alias,),
+                ).fetchone()[0]
+            )
+            evidence_ids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT DISTINCT evidence_id FROM owned_observations "
+                    "WHERE account_id = ?",
+                    (account_id,),
+                )
+            )
+            appids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT DISTINCT appid FROM owned_observations "
+                    "WHERE account_id = ?",
+                    (account_id,),
+                )
+            )
+            cursor = self._connection.execute(
+                "DELETE FROM accounts WHERE id = ? AND provider = 'steam'",
+                (account_id,),
+            )
+            evidence_removed = 0
+            if evidence_ids:
+                placeholders = ",".join("?" for _ in evidence_ids)
+                evidence_cursor = self._connection.execute(
+                    f"""
+                    DELETE FROM evidence
+                    WHERE id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM installed_observations
+                          WHERE installed_observations.evidence_id = evidence.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM installed_current
+                          WHERE installed_current.evidence_id = evidence.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM owned_observations
+                          WHERE owned_observations.evidence_id = evidence.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM owned_current
+                          WHERE owned_current.evidence_id = evidence.id
+                      )
+                    """,
+                    evidence_ids,
+                )
+                evidence_removed = evidence_cursor.rowcount
+            orphan_apps_removed = 0
+            if appids:
+                placeholders = ",".join("?" for _ in appids)
+                app_cursor = self._connection.execute(
+                    f"""
+                    DELETE FROM steam_apps
+                    WHERE appid IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM installed_observations
+                          WHERE installed_observations.appid = steam_apps.appid
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM installed_current
+                          WHERE installed_current.appid = steam_apps.appid
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM owned_observations
+                          WHERE owned_observations.appid = steam_apps.appid
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM owned_current
+                          WHERE owned_current.appid = steam_apps.appid
+                      )
+                    """,
+                    appids,
+                )
+                orphan_apps_removed = app_cursor.rowcount
+            self._connection.commit()
+            return AccountDataDeletion(
+                account_removed=cursor.rowcount > 0,
+                owned_observations_removed=counts["owned_observations"],
+                owned_current_removed=counts["owned_current"],
+                sync_runs_removed=counts["sync_runs"],
+                probes_removed=counts["probes"],
+                consents_removed=counts["consents"],
+                evidence_removed=evidence_removed,
+                orphan_apps_removed=orphan_apps_removed,
+            )
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
+    def delete_all_steam_account_data(
+        self,
+        *,
+        credential_provider: str | None = None,
+        credential_kind: str | None = None,
+        credential_profile_id: str | None = None,
+    ) -> AllSteamAccountDataDeletion:
+        """Delete every Steam account subject in one database transaction.
+
+        When a complete credential identity is supplied, its metadata is
+        removed in the same transaction. The caller deletes the external
+        secret first and restores it if this database transaction fails.
+        """
+
+        credential_parts = (
+            credential_provider,
+            credential_kind,
+            credential_profile_id,
+        )
+        if any(part is not None for part in credential_parts) and not all(
+            isinstance(part, str) and part for part in credential_parts
+        ):
+            raise ValueError("credential identity must be complete or omitted")
+        credential_identity_supplied = credential_provider is not None
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            accounts = tuple(
+                (int(row["id"]), str(row["alias"]))
+                for row in self._connection.execute(
+                    "SELECT id, alias FROM accounts WHERE provider = 'steam'"
+                )
+            )
+            if not accounts:
+                credential_refs_removed = self._remove_credential_identity(
+                    credential_provider, credential_kind, credential_profile_id
+                )
+                self._connection.commit()
+                return AllSteamAccountDataDeletion(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    credential_refs_removed,
+                    not credential_identity_supplied,
+                )
+            account_ids = tuple(account_id for account_id, _ in accounts)
+            aliases = tuple(alias for _, alias in accounts)
+            id_placeholders = ",".join("?" for _ in account_ids)
+            alias_placeholders = ",".join("?" for _ in aliases)
+            counts = {
+                "owned_observations": int(
+                    self._connection.execute(
+                        f"SELECT COUNT(*) FROM owned_observations "
+                        f"WHERE account_id IN ({id_placeholders})",
+                        account_ids,
+                    ).fetchone()[0]
+                ),
+                "owned_current": int(
+                    self._connection.execute(
+                        f"SELECT COUNT(*) FROM owned_current "
+                        f"WHERE account_id IN ({id_placeholders})",
+                        account_ids,
+                    ).fetchone()[0]
+                ),
+                "sync_runs": int(
+                    self._connection.execute(
+                        f"SELECT COUNT(*) FROM sync_runs "
+                        f"WHERE account_id IN ({id_placeholders})",
+                        account_ids,
+                    ).fetchone()[0]
+                ),
+                "consents": int(
+                    self._connection.execute(
+                        f"SELECT COUNT(*) FROM account_data_consents "
+                        f"WHERE account_id IN ({id_placeholders})",
+                        account_ids,
+                    ).fetchone()[0]
+                ),
+                "probes": int(
+                    self._connection.execute(
+                        f"SELECT COUNT(*) FROM provider_probes "
+                        f"WHERE account_alias COLLATE NOCASE IN ({alias_placeholders})",
+                        aliases,
+                    ).fetchone()[0]
+                ),
+            }
+            evidence_ids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    f"SELECT DISTINCT evidence_id FROM owned_observations "
+                    f"WHERE account_id IN ({id_placeholders})",
+                    account_ids,
+                )
+            )
+            appids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    f"SELECT DISTINCT appid FROM owned_observations "
+                    f"WHERE account_id IN ({id_placeholders})",
+                    account_ids,
+                )
+            )
+            account_cursor = self._connection.execute(
+                "DELETE FROM accounts WHERE provider = 'steam'"
+            )
+            evidence_removed = self._delete_orphan_owned_evidence(evidence_ids)
+            orphan_apps_removed = self._delete_orphan_apps(appids)
+            credential_refs_removed = self._remove_credential_identity(
+                credential_provider, credential_kind, credential_profile_id
+            )
+            self._connection.commit()
+            return AllSteamAccountDataDeletion(
+                accounts_removed=account_cursor.rowcount,
+                owned_observations_removed=counts["owned_observations"],
+                owned_current_removed=counts["owned_current"],
+                sync_runs_removed=counts["sync_runs"],
+                probes_removed=counts["probes"],
+                consents_removed=counts["consents"],
+                evidence_removed=evidence_removed,
+                orphan_apps_removed=orphan_apps_removed,
+                credential_refs_removed=credential_refs_removed,
+                shared_credential_preserved=not credential_identity_supplied,
+            )
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
     def list_installed(self, machine_id: str) -> list[InstalledGame]:
         rows = self._connection.execute(
             """
@@ -930,9 +1610,7 @@ class Storage:
         self._connection.execute("BEGIN")
         try:
             games = tuple(self.list_installed(machine_id))
-            latest = self.latest_sync(
-                capability="installed", machine_id=machine_id
-            )
+            latest = self.latest_sync(capability="installed", machine_id=machine_id)
             latest_complete = self.latest_sync(
                 capability="installed", machine_id=machine_id, status="complete"
             )
@@ -956,12 +1634,133 @@ class Storage:
         ).fetchone()
         return None if row is None else SteamApp(**dict(row))
 
+    def _read_owned_snapshot(self, account_id: int) -> OwnedSnapshot:
+        return OwnedSnapshot(
+            games=tuple(self.list_owned(account_id)),
+            latest=self.latest_account_sync(
+                capability="owned.visible.read", account_id=account_id
+            ),
+            latest_complete=self.latest_account_sync(
+                capability="owned.visible.read",
+                account_id=account_id,
+                status="complete",
+            ),
+        )
+
+    def _count_where(self, table: str, column: str, value: object) -> int:
+        allowed = {
+            ("owned_observations", "account_id"),
+            ("owned_current", "account_id"),
+            ("sync_runs", "account_id"),
+            ("account_data_consents", "account_id"),
+        }
+        if (table, column) not in allowed:
+            raise ValueError("unsupported count target")
+        return int(
+            self._connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (value,)
+            ).fetchone()[0]
+        )
+
+    def _delete_orphan_owned_evidence(self, evidence_ids: tuple[int, ...]) -> int:
+        if not evidence_ids:
+            return 0
+        placeholders = ",".join("?" for _ in evidence_ids)
+        cursor = self._connection.execute(
+            f"""
+            DELETE FROM evidence
+            WHERE id IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM installed_observations
+                  WHERE installed_observations.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM installed_current
+                  WHERE installed_current.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM owned_observations
+                  WHERE owned_observations.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM owned_current
+                  WHERE owned_current.evidence_id = evidence.id
+              )
+            """,
+            evidence_ids,
+        )
+        return cursor.rowcount
+
+    def _remove_credential_identity(
+        self,
+        provider: str | None,
+        kind: str | None,
+        profile_id: str | None,
+    ) -> int:
+        if provider is None or kind is None or profile_id is None:
+            return 0
+        cursor = self._connection.execute(
+            """
+            DELETE FROM credential_refs
+            WHERE provider = ? AND kind = ? AND profile_id = ?
+            """,
+            (provider, kind, profile_id),
+        )
+        return cursor.rowcount
+
+    def _delete_orphan_apps(self, appids: tuple[int, ...]) -> int:
+        if not appids:
+            return 0
+        placeholders = ",".join("?" for _ in appids)
+        cursor = self._connection.execute(
+            f"""
+            DELETE FROM steam_apps
+            WHERE appid IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM installed_observations
+                  WHERE installed_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM installed_current
+                  WHERE installed_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM owned_observations
+                  WHERE owned_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM owned_current
+                  WHERE owned_current.appid = steam_apps.appid
+              )
+            """,
+            appids,
+        )
+        return cursor.rowcount
+
+    def _require_owned_sync(self, sync_run_id: int) -> SyncRun:
+        run = self.get_sync_run(sync_run_id)
+        if run.capability != "owned.visible.read":
+            raise InvalidSyncTransition("sync run is not an owned-library sync")
+        if run.account_id is None or run.machine_id is not None:
+            raise InvalidSyncTransition("owned sync requires only an account_id")
+        return run
+
+    def _require_running_owned_sync(self, sync_run_id: int) -> SyncRun:
+        run = self._require_owned_sync(sync_run_id)
+        if run.status != "running":
+            raise InvalidSyncTransition(
+                f"sync run {sync_run_id} is already {run.status}"
+            )
+        return run
+
     def _require_running_installed_sync(self, sync_run_id: int) -> SyncRun:
         run = self.get_sync_run(sync_run_id)
         if run.capability != "installed":
             raise InvalidSyncTransition("sync run is not an installed scan")
         if run.status != "running":
-            raise InvalidSyncTransition(f"sync run {sync_run_id} is already {run.status}")
+            raise InvalidSyncTransition(
+                f"sync run {sync_run_id} is already {run.status}"
+            )
         return run
 
     def _insert_evidence(self, evidence: EvidenceInput) -> int:
@@ -1074,17 +1873,60 @@ class Storage:
             (machine_id, sync_run_id),
         )
 
+    def _promote_owned(self, account_id: int | None, sync_run_id: int) -> None:
+        if account_id is None:
+            raise InvalidSyncTransition("owned sync requires an account_id")
+        observed_at = self._connection.execute(
+            "SELECT started_at FROM sync_runs WHERE id = ?", (sync_run_id,)
+        ).fetchone()["started_at"]
+        # Account-sourced names remain observation-local. The shared steam_apps
+        # catalog must not inherit a private account's display metadata.
+        self._connection.execute(
+            """
+            INSERT INTO steam_apps(appid, name, app_type, updated_at)
+            SELECT DISTINCT appid, NULL, 'unknown', ?
+            FROM owned_observations WHERE sync_run_id = ?
+            ON CONFLICT(appid) DO NOTHING
+            """,
+            (observed_at, sync_run_id),
+        )
+        self._connection.execute(
+            "DELETE FROM owned_current WHERE account_id = ?", (account_id,)
+        )
+        self._connection.execute(
+            """
+            INSERT INTO owned_current(
+                account_id, appid, evidence_id, promoted_sync_run_id, name,
+                playtime_forever_minutes, inclusion_basis, observed_at
+            )
+            SELECT
+                account_id, appid, evidence_id, sync_run_id, name,
+                playtime_forever_minutes, inclusion_basis, observed_at
+            FROM owned_observations
+            WHERE sync_run_id = ? AND account_id = ?
+            """,
+            (sync_run_id, account_id),
+        )
+
 
 __all__ = [
     "Account",
     "AccountConflict",
+    "AccountDataConsent",
+    "AccountDataDeletion",
+    "AllSteamAccountDataDeletion",
     "CredentialReferenceRecord",
     "EvidenceInput",
     "InstalledGame",
     "InstalledObservation",
     "InstalledSnapshot",
     "InvalidSyncTransition",
+    "LibrarySnapshot",
     "Machine",
+    "OwnedGame",
+    "OwnedInclusionBasis",
+    "OwnedObservation",
+    "OwnedSnapshot",
     "ProviderProbeRecord",
     "SteamApp",
     "Storage",
@@ -1123,11 +1965,10 @@ def _account_alias(value: str) -> str:
     if not value[0].isascii() or not value[0].isalpha():
         raise ValueError("account alias must begin with an ASCII letter")
     if any(
-        not (
-            character.isascii()
-            and (character.isalnum() or character in "_-")
-        )
+        not (character.isascii() and (character.isalnum() or character in "_-"))
         for character in value
     ):
-        raise ValueError("account alias may contain only ASCII letters, digits, _ and -")
+        raise ValueError(
+            "account alias may contain only ASCII letters, digits, _ and -"
+        )
     return value
