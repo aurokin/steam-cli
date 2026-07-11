@@ -1,0 +1,19 @@
+"libraryfolders"
+{
+    "0"
+    {
+        "path" "."
+        "apps"
+        {
+            "10" "1"
+        }
+    }
+    "1"
+    {
+        "path" "../secondary"
+        "apps"
+        {
+            "20" "1"
+        }
+    }
+}

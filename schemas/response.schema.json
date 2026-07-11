@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steam-agent.local/schema/response-0.1.json",
+  "title": "Steam Agent CLI response 0.1",
+  "type": "object",
+  "required": ["schema_version", "command", "generated_at", "context"],
+  "properties": {
+    "schema_version": { "const": "0.1" },
+    "command": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "context": { "type": "object" },
+    "completeness": {
+      "type": "object",
+      "required": [
+        "status",
+        "missing_capabilities",
+        "stale_capabilities",
+        "warnings"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["complete", "partial", "unavailable"]
+        },
+        "missing_capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "stale_capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "source": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "data": { "type": "object" },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "remediation": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "required": ["data", "completeness"],
+      "not": { "required": ["error"] }
+    },
+    {
+      "required": ["error"],
+      "not": {
+        "anyOf": [
+          { "required": ["data"] },
+          { "required": ["completeness"] }
+        ]
+      }
+    }
+  ],
+  "additionalProperties": false
+}

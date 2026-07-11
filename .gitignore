@@ -1,0 +1,16 @@
+.venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime data and credentials
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
