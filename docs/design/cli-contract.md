@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: M1 installed-library contract implemented; later commands exploratory
+Status: M1 installed-library contract implemented; M2 capability gate in progress
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -28,6 +28,50 @@ from `--steam-root`, then `STEAM_AGENT_STEAM_ROOT`, then platform defaults.
 All M1 capabilities are local and credential-free. Secret-like arguments such
 as `--api-key`, `--token`, `--password`, `--cookie`, and `--client-secret` are
 rejected without echoing their value.
+
+## Implemented M2 capability-gate commands
+
+These commands are implemented while M2 live validation remains open:
+
+```text
+steam-agent accounts discover [--steam-root PATH] [--include-identifiers]
+steam-agent accounts configure (--from-local-most-recent | --steam-id64 ID) [--alias ALIAS] [--steam-root PATH]
+steam-agent accounts status [--alias ALIAS] [--include-identifiers]
+steam-agent accounts remove [--alias ALIAS] --yes
+steam-agent auth set steam-web-api [--backend os|file] [--yes-file-risk]
+steam-agent auth status steam-web-api
+steam-agent auth remove steam-web-api --yes
+steam-agent owned capability [--account ALIAS]
+steam-agent owned probe [--account ALIAS]
+```
+
+`accounts discover` returns a candidate count and whether primary selection is
+available, ambiguous, or absent. It does not return Steam identifiers, account
+names, or persona names unless `--include-identifiers` is explicit. An
+ambiguous discovery can then be configured by passing one listed identity to
+`--steam-id64`; unlisted identities are rejected. `accounts configure` persists only the chosen alias,
+SteamID64, source kind, and timestamps. `accounts status` requires the explicit
+`--include-identifiers` opt-in to return SteamID64.
+
+`auth set` reads and confirms the key with hidden terminal input. The default
+`os` backend must resolve to an approved native credential store. The `file`
+backend is a POSIX-only, permission-protected but unencrypted fallback and
+requires `--yes-file-risk`; it is never selected automatically. `auth remove`
+removes the local credential but does not claim to revoke the key at Valve.
+
+`owned capability` is read-only and makes no provider request. It reports
+support, identity, credential, and last-probe state as separate axes.
+`owned probe` is the explicit network boundary: the key is sent in the
+`x-webapi-key` header to the fixed Valve HTTPS API host. The response is
+processed in memory and discarded; only coarse result and retry metadata are
+persisted. This gate does not store an owned library or prove complete license
+ownership. A persisted one-second cross-process interval limits locally managed
+user-key requests; a refusal returns `REQUEST_THROTTLED` as retryable.
+
+The accepted M1 `capabilities` payload remains unchanged for schema `0.1`.
+During the M2 gate, `owned capability` is the canonical detailed account
+capability surface. Merging it into the top-level index requires an explicit
+schema-contract change rather than silently altering the accepted M1 payload.
 
 ## Implemented process behavior
 

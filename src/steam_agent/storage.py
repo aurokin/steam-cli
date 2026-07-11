@@ -7,14 +7,16 @@ runs remain available for diagnostics but never replace last-known-good state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Literal, Mapping
+
+from steam_agent.local_accounts import validate_steam_id64
 
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
@@ -33,12 +35,47 @@ class InvalidSyncTransition(StorageError):
     """A sync run was used for the wrong capability or after completion."""
 
 
+class AccountConflict(StorageError):
+    """An alias or provider identity is already configured differently."""
+
+
 @dataclass(frozen=True)
 class Machine:
     id: str
     name: str
     platform: str
     architecture: str | None = None
+
+
+@dataclass(frozen=True)
+class Account:
+    id: int
+    alias: str
+    provider: str
+    provider_account_id: str = field(repr=False)
+    source_kind: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class CredentialReferenceRecord:
+    provider: str
+    kind: str
+    profile_id: str
+    backend: str
+    configured_at: str
+    updated_at: str
+    backend_locator: str | None
+
+
+@dataclass(frozen=True)
+class ProviderProbeRecord:
+    capability: str
+    account_alias: str
+    probe_state: str
+    checked_at: str
+    retryable: bool
 
 
 @dataclass(frozen=True)
@@ -260,6 +297,400 @@ class Storage:
                 (machine.id, machine.name, machine.platform, machine.architecture, timestamp, timestamp),
             )
         return machine
+
+    def configure_steam_account(
+        self,
+        *,
+        alias: str,
+        steam_id64: str,
+        configured_at: str | datetime,
+        source_kind: str = "local_steam_login_registry",
+    ) -> Account:
+        """Persist an explicitly selected Steam account without profile names."""
+
+        normalized_alias = _account_alias(alias)
+        normalized_steam_id = validate_steam_id64(steam_id64)
+        timestamp = _timestamp(configured_at)
+        if not source_kind or len(source_kind) > 128:
+            raise ValueError("source_kind must be between 1 and 128 characters")
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            alias_row = self._connection.execute(
+                "SELECT * FROM accounts WHERE alias = ? COLLATE NOCASE",
+                (normalized_alias,),
+            ).fetchone()
+            identity_row = self._connection.execute(
+                """
+                SELECT * FROM accounts
+                WHERE provider = 'steam' AND provider_account_id = ?
+                """,
+                (normalized_steam_id,),
+            ).fetchone()
+            if (
+                alias_row is not None
+                and alias_row["provider_account_id"] != normalized_steam_id
+            ):
+                raise AccountConflict("account alias is already configured")
+            if (
+                identity_row is not None
+                and identity_row["alias"].casefold() != normalized_alias.casefold()
+            ):
+                raise AccountConflict(
+                    "Steam account is already configured under another alias"
+                )
+
+            if alias_row is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO accounts(
+                        alias, provider, provider_account_id, source_kind,
+                        created_at, updated_at
+                    ) VALUES (?, 'steam', ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_alias,
+                        normalized_steam_id,
+                        source_kind,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                account_id = int(cursor.lastrowid)
+            else:
+                account_id = int(alias_row["id"])
+                self._connection.execute(
+                    """
+                    UPDATE accounts
+                    SET source_kind = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (source_kind, timestamp, account_id),
+                )
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        account = self.get_account(normalized_alias)
+        assert account is not None
+        return account
+
+    def get_account(self, alias: str) -> Account | None:
+        normalized_alias = _account_alias(alias)
+        row = self._connection.execute(
+            "SELECT * FROM accounts WHERE alias = ? COLLATE NOCASE",
+            (normalized_alias,),
+        ).fetchone()
+        return None if row is None else Account(**dict(row))
+
+    def list_accounts(self) -> list[Account]:
+        rows = self._connection.execute(
+            "SELECT * FROM accounts ORDER BY alias COLLATE NOCASE, id"
+        )
+        return [Account(**dict(row)) for row in rows]
+
+    def remove_account(self, alias: str) -> bool:
+        normalized_alias = _account_alias(alias)
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM accounts WHERE alias = ? COLLATE NOCASE",
+                (normalized_alias,),
+            )
+        return cursor.rowcount > 0
+
+    def upsert_credential_reference(
+        self,
+        *,
+        provider: str,
+        kind: str,
+        profile_id: str,
+        backend: str,
+        configured_at: str | datetime,
+        backend_locator: str | None = None,
+    ) -> CredentialReferenceRecord:
+        if backend not in ("os", "file"):
+            raise ValueError("backend must be os or file")
+        for value in (provider, kind, profile_id):
+            if not value or len(value) > 128:
+                raise ValueError(
+                    "credential reference parts must be between 1 and 128 characters"
+                )
+        timestamp = _timestamp(configured_at)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO credential_refs(
+                    provider, kind, profile_id, backend, configured_at, updated_at,
+                    backend_locator
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, kind, profile_id) DO UPDATE SET
+                    backend = excluded.backend,
+                    updated_at = excluded.updated_at,
+                    backend_locator = excluded.backend_locator
+                """,
+                (
+                    provider,
+                    kind,
+                    profile_id,
+                    backend,
+                    timestamp,
+                    timestamp,
+                    backend_locator,
+                ),
+            )
+        record = self.get_credential_reference(
+            provider=provider, kind=kind, profile_id=profile_id
+        )
+        assert record is not None
+        return record
+
+    def upsert_credential_and_clear_probes(
+        self,
+        *,
+        provider: str,
+        kind: str,
+        profile_id: str,
+        backend: str,
+        backend_locator: str | None,
+        configured_at: str | datetime,
+        capability: str,
+    ) -> None:
+        """Commit credential metadata and dependent-probe invalidation together."""
+
+        if backend not in ("os", "file"):
+            raise ValueError("backend must be os or file")
+        for value in (provider, kind, profile_id, capability):
+            if not value or len(value) > 128:
+                raise ValueError("credential metadata inputs are invalid")
+        timestamp = _timestamp(configured_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO credential_refs(
+                    provider, kind, profile_id, backend, configured_at, updated_at,
+                    backend_locator
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, kind, profile_id) DO UPDATE SET
+                    backend = excluded.backend,
+                    updated_at = excluded.updated_at,
+                    backend_locator = excluded.backend_locator
+                """,
+                (
+                    provider,
+                    kind,
+                    profile_id,
+                    backend,
+                    timestamp,
+                    timestamp,
+                    backend_locator,
+                ),
+            )
+            self._connection.execute(
+                "DELETE FROM provider_probes WHERE capability = ?", (capability,)
+            )
+            self._connection.commit()
+        except BaseException:
+            self._connection.rollback()
+            raise
+
+    def remove_credential_and_clear_probes(
+        self,
+        *,
+        provider: str,
+        kind: str,
+        profile_id: str,
+        capability: str,
+    ) -> bool:
+        """Remove credential metadata and dependent probes atomically."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "DELETE FROM provider_probes WHERE capability = ?", (capability,)
+            )
+            cursor = self._connection.execute(
+                """
+                DELETE FROM credential_refs
+                WHERE provider = ? AND kind = ? AND profile_id = ?
+                """,
+                (provider, kind, profile_id),
+            )
+            self._connection.commit()
+            return cursor.rowcount > 0
+        except BaseException:
+            self._connection.rollback()
+            raise
+
+    def get_credential_reference(
+        self, *, provider: str, kind: str, profile_id: str
+    ) -> CredentialReferenceRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM credential_refs
+            WHERE provider = ? AND kind = ? AND profile_id = ?
+            """,
+            (provider, kind, profile_id),
+        ).fetchone()
+        return None if row is None else CredentialReferenceRecord(**dict(row))
+
+    def remove_credential_reference(
+        self, *, provider: str, kind: str, profile_id: str
+    ) -> bool:
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM credential_refs
+                WHERE provider = ? AND kind = ? AND profile_id = ?
+                """,
+                (provider, kind, profile_id),
+            )
+        return cursor.rowcount > 0
+
+    def clear_provider_probes(self, *, capability: str | None = None) -> int:
+        """Invalidate coarse capability evidence after an auth-policy change."""
+
+        with self._connection:
+            if capability is None:
+                cursor = self._connection.execute("DELETE FROM provider_probes")
+            else:
+                cursor = self._connection.execute(
+                    "DELETE FROM provider_probes WHERE capability = ?", (capability,)
+                )
+        return cursor.rowcount
+
+    def reserve_provider_request(
+        self,
+        *,
+        provider: str,
+        budget_scope: str,
+        requested_at: str | datetime,
+        minimum_interval_seconds: float,
+    ) -> bool:
+        """Atomically reserve a cross-process provider request interval."""
+
+        if not provider or not budget_scope or minimum_interval_seconds <= 0:
+            raise ValueError("provider request budget inputs are invalid")
+        timestamp = _timestamp(requested_at)
+        requested = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        next_allowed = _timestamp(
+            requested + timedelta(seconds=minimum_interval_seconds)
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT next_allowed_at FROM provider_request_limits
+                WHERE provider = ? AND budget_scope = ?
+                """,
+                (provider, budget_scope),
+            ).fetchone()
+            if row is not None:
+                current_limit = datetime.fromisoformat(
+                    row["next_allowed_at"].replace("Z", "+00:00")
+                )
+                remaining_seconds = (current_limit - requested).total_seconds()
+                # A valid reservation is only one configured interval ahead.
+                # Treat a much larger future deadline as stale clock-jump
+                # residue so wall-clock correction cannot wedge all restarts.
+                recovery_window = max(5.0, minimum_interval_seconds * 2)
+                if 0 < remaining_seconds <= recovery_window:
+                    self._connection.rollback()
+                    return False
+                if remaining_seconds > recovery_window:
+                    self._connection.execute(
+                        """
+                        UPDATE provider_request_limits
+                        SET next_allowed_at = ?
+                        WHERE provider = ? AND budget_scope = ?
+                        """,
+                        (next_allowed, provider, budget_scope),
+                    )
+                    self._connection.commit()
+                    return False
+            self._connection.execute(
+                """
+                INSERT INTO provider_request_limits(
+                    provider, budget_scope, next_allowed_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(provider, budget_scope) DO UPDATE SET
+                    next_allowed_at = excluded.next_allowed_at
+                """,
+                (provider, budget_scope, next_allowed),
+            )
+            self._connection.commit()
+            return True
+        except BaseException:
+            self._connection.rollback()
+            raise
+
+    def save_provider_probe(
+        self,
+        *,
+        capability: str,
+        account_alias: str,
+        probe_state: str,
+        checked_at: str | datetime,
+        retryable: bool,
+    ) -> ProviderProbeRecord:
+        allowed_states = {
+            "ready",
+            "authentication_failed",
+            "data_inaccessible",
+            "provider_unavailable",
+            "rate_limited",
+            "contract_changed",
+            "invalid_request",
+        }
+        if probe_state not in allowed_states:
+            raise ValueError("unsupported provider probe state")
+        normalized_alias = _account_alias(account_alias)
+        timestamp = _timestamp(checked_at)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO provider_probes(
+                    capability, account_alias, probe_state, checked_at,
+                    retryable
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(capability, account_alias) DO UPDATE SET
+                    probe_state = excluded.probe_state,
+                    checked_at = excluded.checked_at,
+                    retryable = excluded.retryable
+                """,
+                (
+                    capability,
+                    normalized_alias,
+                    probe_state,
+                    timestamp,
+                    int(retryable),
+                ),
+            )
+        record = self.get_provider_probe(
+            capability=capability, account_alias=normalized_alias
+        )
+        assert record is not None
+        return record
+
+    def get_provider_probe(
+        self, *, capability: str, account_alias: str
+    ) -> ProviderProbeRecord | None:
+        normalized_alias = _account_alias(account_alias)
+        row = self._connection.execute(
+            """
+            SELECT * FROM provider_probes
+            WHERE capability = ? AND account_alias = ? COLLATE NOCASE
+            """,
+            (capability, normalized_alias),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["retryable"] = bool(values["retryable"])
+        return ProviderProbeRecord(**values)
 
     def begin_sync(
         self,
@@ -641,12 +1072,16 @@ class Storage:
 
 
 __all__ = [
+    "Account",
+    "AccountConflict",
+    "CredentialReferenceRecord",
     "EvidenceInput",
     "InstalledGame",
     "InstalledObservation",
     "InstalledSnapshot",
     "InvalidSyncTransition",
     "Machine",
+    "ProviderProbeRecord",
     "SteamApp",
     "Storage",
     "StorageError",
@@ -674,3 +1109,21 @@ def _sync_run(row: sqlite3.Row) -> SyncRun:
     values = dict(row)
     values["promoted"] = bool(values["promoted"])
     return SyncRun(**values)
+
+
+def _account_alias(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("account alias must be text")
+    if not 1 <= len(value) <= 64:
+        raise ValueError("account alias must be between 1 and 64 characters")
+    if not value[0].isascii() or not value[0].isalpha():
+        raise ValueError("account alias must begin with an ASCII letter")
+    if any(
+        not (
+            character.isascii()
+            and (character.isalnum() or character in "_-")
+        )
+        for character in value
+    ):
+        raise ValueError("account alias may contain only ASCII letters, digits, _ and -")
+    return value

@@ -14,8 +14,10 @@ return stable machine-readable results that an agent can reason over.
 **The M1 installed-library tracer bullet is implemented and accepted.** It
 scans local Steam metadata without credentials, stores
 complete observations in SQLite, and exposes deterministic installed-game
-queries. Owned games, wishlists, pricing, recommendations, compatibility, and
-Steam actions remain design work.
+queries. **M2 account and credential capability work is in progress:** local
+account selection and secure key storage are implemented, while live provider
+validation and owned-library persistence are not yet accepted. Wishlists,
+pricing, recommendations, compatibility, and Steam actions remain design work.
 
 ## Install and develop
 
@@ -88,6 +90,41 @@ The database filename is `steam-agent.sqlite3`. Override the directory with
 `--data-dir PATH` or `STEAM_AGENT_DATA_DIR`; keep it private and out of the
 repository.
 
+## M2 capability checkpoint
+
+M2 can discover a local Steam account without returning account names or
+identifiers, configure the uniquely most-recent account under a local alias,
+and report the account/credential/probe axes independently:
+
+```text
+uv run steam-agent accounts discover
+uv run steam-agent accounts configure --from-local-most-recent --alias primary
+uv run steam-agent accounts status --alias primary
+uv run steam-agent auth status steam-web-api
+uv run steam-agent owned capability --account primary
+```
+
+If discovery is ambiguous, rerun it with `--include-identifiers`, then configure
+one of the listed local identities with `--steam-id64 ID`. Identifiers appear
+only after that explicit opt-in.
+
+Identifiers remain redacted unless `accounts status --include-identifiers` is
+explicitly requested. Store a user Web API key through the hidden interactive
+prompt; it is never accepted on the command line:
+
+```text
+uv run steam-agent auth set steam-web-api
+uv run steam-agent owned probe --account primary
+```
+
+The default backend is the native OS credential store. POSIX users can select
+the unencrypted permission-protected fallback only with both `--backend file`
+and `--yes-file-risk`. There is no automatic downgrade. An owned capability
+probe is an explicit network operation; it discards the response body and
+persists only coarse probe state. It does not synchronize or persist games.
+See the [credential ADR](docs/adr/0003-credential-storage.md) and
+[Steam data lifecycle policy](docs/design/steam-data-lifecycle.md).
+
 A partial scan records its diagnostics but does not replace the last complete
 installed-game projection for that machine. This is intentional: subsequent
 queries continue returning the last known-good result. See the
@@ -135,6 +172,7 @@ are added.
 - [Project governance and the repo/Linear boundary](docs/project-governance.md)
 - [Product questions](docs/design/product-questions.md)
 - [Evidence and provider matrix](docs/design/evidence-matrix.md)
+- [Steam account data lifecycle and deletion gates](docs/design/steam-data-lifecycle.md)
 - [Provisional architecture](docs/design/architecture.md)
 - [CLI and JSON contract](docs/design/cli-contract.md)
 - [Historical pricing strategy](docs/design/pricing-strategy.md)

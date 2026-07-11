@@ -16,6 +16,7 @@
 | Project status and document index | `README.md` |
 | Supported user questions and evidence distinctions | `docs/design/product-questions.md` |
 | Provider support levels, terms, and limitations | `docs/design/evidence-matrix.md` |
+| Steam account retention, privacy, and deletion gates | `docs/design/steam-data-lifecycle.md` |
 | Proposed layers and language criteria | `docs/design/architecture.md` |
 | Agent-facing command and JSON behavior | `docs/design/cli-contract.md` |
 | Historical pricing providers and fallback semantics | `docs/design/pricing-strategy.md` |

@@ -1,6 +1,7 @@
 # Evidence and provider matrix
 
-Status: working design, verified 2026-07-10
+Status: working design; Steam/Valve account references reverified 2026-07-11,
+third-party verification dates remain provider-specific research notes
 
 Support levels used below:
 
@@ -12,7 +13,7 @@ Support levels used below:
 
 | Capability | Preferred source | Level | Important limitations |
 | --- | --- | --- | --- |
-| Owned games/playtime | Steam `IPlayerService/GetOwnedGames` | Documented | Requires key and visible game details; free played games need an option; private games can be omitted |
+| Owned games/playtime | Steam `IPlayerService/GetOwnedGames` | Documented | Requires a user key and visible game details; `include_played_free_games` covers played free games, not all free licenses; individually private games can be omitted |
 | Recent play | Steam `GetRecentlyPlayedGames` | Documented | Visibility applies; a short window is not a preference verdict |
 | Friends/profile | Steam `ISteamUser` | Documented | Private friend lists fail; no consent should be inferred from public visibility |
 | Achievements/stats | Steam `ISteamUserStats` | Documented | Per-game support varies; hidden achievements need care |
@@ -53,14 +54,22 @@ Support levels used below:
 ## Provider policy
 
 - Every observation stores provider, retrieval time, effective time when known,
-  region/language context, support level, and the raw-cache reference.
+  relevant request context, and support level. A raw-cache reference exists only
+  when the capability's retention policy permits a raw body; Steam account
+  probes and owned-library synchronization retain no raw response body by
+  default.
 - Normalized facts never erase conflicting observations.
 - Adapters expose capabilities at runtime; missing auth, privacy, rate limits,
   and unsupported fields are typed states.
 - Provisional adapters are contract-tested and can be disabled independently.
 - Provider failures do not corrupt the last known-good normalized snapshot.
-- API keys are bring-your-own, read from environment/keychain/private config,
-  and never accepted on the command line.
+- Steam account retrieval is explicit and request-only. Public visibility is not
+  consent to retrieve unrelated profiles or capabilities.
+- API keys are bring-your-own, stored through an approved credential backend,
+  and never accepted on the command line or written to SQLite, evidence, logs,
+  fixtures, or diagnostics.
+- Steam account retention, disclosure, and deletion follow the
+  [Steam account data lifecycle](steam-data-lifecycle.md).
 - Reference URLs carry an access mode; manual viewing never implies permission
   for agent/browser extraction.
 

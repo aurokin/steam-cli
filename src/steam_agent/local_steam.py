@@ -688,7 +688,7 @@ def _read_keyvalues(
             )
         )
         return None
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError):
         warnings.append(
             LocalSteamWarning(
                 WarningKind.INACCESSIBLE,

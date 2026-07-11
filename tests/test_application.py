@@ -87,6 +87,30 @@ def test_nonempty_platform_data_home_is_honored(
     assert application.default_data_dir() == configured / "steam-agent"
 
 
+def test_credential_fallback_ignores_workspace_xdg_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(application.sys, "platform", "linux")
+    monkeypatch.setattr(application, "_fixed_user_home", lambda: home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(workspace))
+
+    result = application.default_credential_dir()
+
+    assert result == home / ".config" / "steam-agent" / "credentials"
+    assert workspace not in result.parents
+
+
+@pytest.mark.skipif(application.os.name != "posix", reason="POSIX account database test")
+def test_fixed_user_home_ignores_home_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "spoofed-home"))
+
+    assert application._fixed_user_home() != tmp_path / "spoofed-home"
+
+
 @pytest.mark.parametrize("invalid_value", ["", "relative/program-files"])
 def test_invalid_windows_program_files_values_use_platform_defaults(
     monkeypatch: pytest.MonkeyPatch, invalid_value: str

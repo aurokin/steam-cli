@@ -65,6 +65,51 @@ def default_database_path() -> Path:
     return default_data_dir() / "steam-agent.sqlite3"
 
 
+def default_credential_dir() -> Path:
+    """Return a non-overridable default for explicit file-secret fallback.
+
+    Runtime ``--data-dir`` and ``STEAM_AGENT_DATA_DIR`` overrides deliberately
+    do not redirect credentials into a repository or shared workspace.
+    """
+
+    home = _fixed_user_home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "steam-agent" / "credentials"
+    if sys.platform == "win32":
+        return home / "AppData" / "Roaming" / "steam-agent" / "credentials"
+    # Secret fallback placement is deliberately not environment-overridable;
+    # data-directory and XDG overrides may point at a repository or shared mount.
+    return home / ".config" / "steam-agent" / "credentials"
+
+
+def _fixed_user_home() -> Path:
+    """Resolve the OS account home without process environment overrides."""
+
+    if os.name == "posix":
+        import pwd
+
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        if home.is_absolute():
+            return home
+        raise RuntimeError("OS account home is not absolute")
+    if sys.platform == "win32":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        # CSIDL_PROFILE resolves through the shell API rather than HOME-like env.
+        result = ctypes.windll.shell32.SHGetFolderPathW(  # type: ignore[attr-defined]
+            None, 40, None, 0, buffer
+        )
+        home = Path(buffer.value)
+        if result == 0 and home.is_absolute():
+            return home
+        raise RuntimeError("Windows profile directory is unavailable")
+    home = Path.home()
+    if home.is_absolute():
+        return home
+    raise RuntimeError("OS account home is unavailable")
+
+
 def discover_steam_root() -> Path | None:
     override = os.environ.get("STEAM_AGENT_STEAM_ROOT")
     if override:
@@ -239,6 +284,7 @@ __all__ = [
     "InstalledSyncResult",
     "default_data_dir",
     "default_database_path",
+    "default_credential_dir",
     "discover_steam_root",
     "installed_item",
     "machine_for",
