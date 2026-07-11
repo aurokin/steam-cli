@@ -5,8 +5,9 @@
 - M1 installed-library is accepted; preserve its schema `0.1` behavior and last-good rule.
 - M2 truthful account inventory is accepted; preserve its account capability,
   visible-owned, joined-library, freshness, deletion, and schema `0.1` behavior.
-- M3 is proposed but not activated. Do not implement wishlist or deal evidence
-  until its Linear milestone is explicitly activated.
+- M3 wishlist and deal evidence is active. Keep it read-only and bounded to
+  provisional wishlist reads, exact AppID offers, attributed low summaries,
+  explicit fallbacks, and the retention rules in `docs/design/m3-execution.md`.
 - Keep wishlist, pricing, recommendation, compatibility, artwork, and action capabilities in design until their Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
@@ -28,6 +29,7 @@
 | Validation sequence | `docs/design/roadmap.md` |
 | M1 implementation scope and Linear work graph | `docs/design/m1-execution.md` |
 | M2 implementation scope and acceptance evidence | `docs/design/m2-execution.md` |
+| M3 implementation scope and acceptance evidence | `docs/design/m3-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions

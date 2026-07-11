@@ -9,19 +9,19 @@ them.
 | D001 | Product boundary: evidence/ranking engine vs natural-language agent | Proposed direction | Costly to blur later | Exercise agent workflows against the CLI sketch |
 | D002 | Canonical store: SQLite with JSON interface | Implemented for M1; long-term scope open | Moderate | M1 proves migrations, idempotency, and per-machine last-good promotion; broader profile/group volumes and backup/concurrency remain |
 | D003 | Implementation language and packaging | [Accepted: Python 3.12+ and uv](0001-python-uv-packaging.md) | Costly after release | Package build and entry-point smoke tests |
-| D004 | Provider support-level model | Proposed direction | Costly if omitted | Contract-failure fixtures for documented/provisional providers |
-| D005 | Wishlist adapter in supported core | Open | Easy if isolated | Live privacy/share-token probes and failure behavior |
-| D006 | Historical-price provider portfolio | Blocked on outreach | Easy if adapter-based | ITAD approval; GG.deals terms; VGI quote; degraded fallback tests |
+| D004 | Provider support-level model | M3 bounded contract accepted | Costly if omitted | Contract-failure fixtures and runtime support/fallback output |
+| D005 | Wishlist adapter in supported core | [Accepted provisionally for M3](0004-provisional-wishlist.md) | Easy if isolated | Live count/list, missing-key, malformed, and last-good evidence |
+| D006 | Historical-price provider portfolio | [Accepted degraded M3 ladder](0005-m3-deal-providers.md) | Easy if adapter-based | GG/CheapShark live smokes; ITAD remains conditional |
 | D007 | Full catalog vs demand-driven enrichment | Demand-bounded observed-AppID slice implemented for M2; broader discovery catalog remains open | Moderate | Live six-page scan persisted only 782 demanded identities; broader discovery quality and storage measurements remain |
 | D008 | SteamGridDB integration | Optional | Easy | Art use cases and terms/attribution review |
 | D009 | High-trust SteamKit/SteamCMD mode | Deferred | Moderate | Private-data value vs account/session risk |
 | D010 | MCP surface | Deferred until CLI stabilizes | Easy | Multiple consumers needing typed live tools |
-| D011 | Raw-response retention and deletion | Implemented M2 candidate: no raw body, one last-good normalized projection, account-subject deletion, and shared-key removal only on all-Steam-data termination | Costly for privacy | [Steam account lifecycle policy](../design/steam-data-lifecycle.md), [M2 execution plan](../design/m2-execution.md), adversarial redaction/retention tests, per-account/all-account deletion and live resync evidence |
-| D012 | Ranking recipe semantics | Open | Costly once agents depend on it | Golden scenarios, user overrides, versioning plan |
+| D011 | Raw-response retention and deletion | M2 accepted; M3 extension active | Costly for privacy | M3 stores no raw bodies and bounds third-party normalized cache retention |
+| D012 | Ranking recipe semantics | Narrow `deal-evidence/0.1` recipe active for M3 only | Costly once agents depend on it | Golden comparison, mismatch, fallback, and deterministic-order scenarios |
 | D013 | Public binary/package name | [Accepted: `steam-agent`](0002-steam-agent-command-name.md) | Costly after release | Avoids the known `steam` client collision |
 | D014 | Read/plan/open/execute action boundary | Proposed direction | Costly and safety-critical | Steam policy review and action-specific capability probes |
-| D015 | Provider-neutral game/offer/license identity graph | M2 application identity foundation implemented with stable entity IDs and typed Steam AppID mapping; offer/license/package/bundle/edition joins remain open | Costly | Cross-edition/package and cross-launcher fixtures |
-| D016 | Browser reference access modes | Proposed direction | Moderate | Provider permissions for manual link, human-open, agent-read, and ingestion |
+| D015 | Provider-neutral game/offer/license identity graph | [M3 exact-AppID offer slice accepted](0006-m3-offer-identity.md); broader joins open | Costly | App/package/bundle/edition mismatch and ambiguity fixtures |
+| D016 | Browser reference access modes | M3 manual-only/API distinction accepted | Moderate | URL allowlist and no-follow tests; broader agent-read/open behavior remains open |
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
 | D018 | M2 credential storage boundary | [Accepted: native `keyring` with explicit protected-file fallback](0003-credential-storage.md) | Moderate | Native backend probes, file-safety tests, redaction tests, and M2 capability review |
 | D019 | Preconfigure optional provider API keys before adapter milestones | Implemented credential checkpoint only; provider adapters remain gated | Easy | Hidden-input tests, provider-isolated references, non-retaining fixed-host probes, and provider terms review |
