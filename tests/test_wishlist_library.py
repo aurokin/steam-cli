@@ -5,7 +5,7 @@ import pytest
 
 from steam_agent.credentials import SecretValue
 from steam_agent.steam_wishlist import WishlistCount, WishlistItem, WishlistItems
-from steam_agent.storage import Storage
+from steam_agent.storage import Storage, WishlistObservation
 from steam_agent.wishlist_library import WishlistSyncError, sync_wishlist
 
 
@@ -175,3 +175,47 @@ def test_explicit_matching_zero_clears_projection_and_delete_reports_it(
         result = storage.delete_steam_account_data(account_id)
         assert result.account_removed is True
         assert result.wishlist_current_removed == 0
+
+
+def test_older_completion_cannot_replace_or_prune_newer_snapshot(
+    tmp_path: Path,
+) -> None:
+    storage, account_id = configured(tmp_path / "db.sqlite3")
+    with storage:
+        older = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=T0,
+        )
+        newer = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=T0 + timedelta(seconds=1),
+        )
+        storage.complete_wishlist_snapshot(
+            newer.id,
+            [WishlistObservation(20, 0, 200, T0)],
+            item_list_retrieved_at=T0,
+            item_count_retrieved_at=T0,
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=T0 + timedelta(seconds=2),
+        )
+        storage.complete_wishlist_snapshot(
+            older.id,
+            [WishlistObservation(10, 0, 100, T0)],
+            item_list_retrieved_at=T0,
+            item_count_retrieved_at=T0,
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=T0 + timedelta(seconds=3),
+        )
+
+        snapshot = storage.read_wishlist_snapshot(account_id)
+        assert [game.appid for game in snapshot.games] == [20]
+        assert snapshot.latest_complete is not None
+        assert snapshot.latest_complete.id == newer.id
+        assert snapshot.latest_complete_provenance is not None
+        assert snapshot.latest_complete_provenance.sync_run_id == newer.id

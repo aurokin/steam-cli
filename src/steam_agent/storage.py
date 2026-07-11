@@ -1139,6 +1139,8 @@ class Storage:
         list_at = _timestamp(item_list_retrieved_at)
         count_at = _timestamp(item_count_retrieved_at)
         completed = _timestamp(completed_at)
+        if not support_level or len(support_level) > 128:
+            raise ValueError("support_level must be between 1 and 128 characters")
         if (
             not isinstance(item_list_reported_count, int)
             or isinstance(item_list_reported_count, bool)
@@ -1154,10 +1156,16 @@ class Storage:
         seen: set[int] = set()
         for observation in observations:
             if (
-                observation.appid <= 0
+                not isinstance(observation.appid, int)
+                or isinstance(observation.appid, bool)
+                or not 1 <= observation.appid <= (1 << 32) - 1
                 or observation.appid in seen
-                or observation.priority < 0
-                or observation.date_added < 0
+                or not isinstance(observation.priority, int)
+                or isinstance(observation.priority, bool)
+                or not 0 <= observation.priority <= (1 << 32) - 1
+                or not isinstance(observation.date_added, int)
+                or isinstance(observation.date_added, bool)
+                or not 0 <= observation.date_added <= (1 << 32) - 1
             ):
                 raise ValueError("wishlist observations are invalid")
             seen.add(observation.appid)
@@ -1275,7 +1283,9 @@ class Storage:
                 """,
                 (completed, promoted, len(normalized), sync_run_id),
             )
-            self._prune_wishlist_payloads(run.account_id, sync_run_id)
+            self._prune_wishlist_payloads(
+                run.account_id, sync_run_id, keep_selected=bool(promoted)
+            )
             self._connection.commit()
         except BaseException:
             try:
@@ -1305,7 +1315,9 @@ class Storage:
                 """,
                 (completed, error_code, sync_run_id),
             )
-            self._prune_wishlist_payloads(run.account_id, sync_run_id)
+            self._prune_wishlist_payloads(
+                run.account_id, sync_run_id, keep_selected=False
+            )
             self._connection.commit()
         except BaseException:
             try:
@@ -3389,12 +3401,15 @@ class Storage:
         self._delete_orphan_apps(appids)
 
     def _prune_wishlist_payloads(
-        self, account_id: int | None, selected_sync_run_id: int
+        self,
+        account_id: int | None,
+        selected_sync_run_id: int,
+        *,
+        keep_selected: bool,
     ) -> None:
         if account_id is None:
             raise ValueError("wishlist payload pruning requires an account")
-        status = self.get_sync_run(selected_sync_run_id).status
-        operator = "<>" if status == "complete" else "="
+        operator = "<>" if keep_selected else "="
         evidence_ids = tuple(
             int(row[0])
             for row in self._connection.execute(
