@@ -229,7 +229,7 @@ def _select_game_id(payload: object, *, appid: int) -> str:
         candidate_appid = _positive_int_string(item.get("steamAppID"))
         if candidate_appid != appid:
             continue
-        game_id = _identifier(item.get("gameID"))
+        game_id = _numeric_identifier(item.get("gameID"))
         matches.add(game_id)
     if not matches:
         raise CheapSharkError("GAME_NOT_FOUND", retryable=False)
@@ -293,7 +293,7 @@ def _normalize_offer(
     if not isinstance(payload, dict):
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     deal_id = _identifier(payload.get("dealID"))
-    store_id = _identifier(payload.get("storeID"))
+    store_id = _numeric_identifier(payload.get("storeID"))
     price = _money(payload.get("price"))
     regular = _money(payload.get("retailPrice"))
     discount = _discount_percent(payload.get("savings"))
@@ -394,7 +394,22 @@ def _unix_timestamp(value: object) -> str | None:
 
 
 def _identifier(value: object) -> str:
-    if not isinstance(value, str) or not value or len(value) > 512:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or not value.isprintable()
+    ):
+        raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    return value
+
+
+def _numeric_identifier(value: object) -> str:
+    """Validate CheapShark's decimal game/store identifiers without coercion."""
+
+    if not isinstance(value, str) or _bounded_digit_string(
+        value, maximum=(1 << 63) - 1
+    ) in {None, 0}:
         raise CheapSharkError("PROVIDER_RESPONSE_INVALID", retryable=False)
     return value
 

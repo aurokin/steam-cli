@@ -136,9 +136,7 @@ def test_lookup_is_fixed_host_bounded_on_demand_and_normalized() -> None:
     )
     assert len(result.history_lows) == 1
     low = result.history_lows[0]
-    assert low.provider_url.url == (
-        "https://www.cheapshark.com/search?steamAppID=220"
-    )
+    assert low.provider_url.url == ("https://www.cheapshark.com/search?steamAppID=220")
     assert low.provider_url.url != offer.provider_url.url
     assert low.provider_url.access_mode == "manual_only"
     assert low.provider_url.automation_supported is False
@@ -230,6 +228,40 @@ def test_max_size_digit_strings_are_rejected_as_typed_provider_errors() -> None:
     oversized_digits = "9" * 8_192
     transport = SequenceTransport(
         response([{"gameID": "42", "steamAppID": oversized_digits}])
+    )
+
+    with pytest.raises(CheapSharkError) as caught:
+        CheapSharkClient(transport=transport).lookup_steam_app(220)
+
+    assert caught.value.code == "PROVIDER_RESPONSE_INVALID"
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("game_id", ["42\n", "not-a-number", "0"])
+def test_invalid_game_identifier_is_rejected_before_detail_lookup(
+    game_id: str,
+) -> None:
+    transport = SequenceTransport(response([{"gameID": game_id, "steamAppID": "220"}]))
+
+    with pytest.raises(CheapSharkError) as caught:
+        CheapSharkClient(transport=transport).lookup_steam_app(220)
+
+    assert caught.value.code == "PROVIDER_RESPONSE_INVALID"
+    assert caught.value.retryable is False
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("store_id", ["1\n", "not-a-number", "0"])
+def test_invalid_store_identifier_is_rejected_during_normalization(
+    store_id: str,
+) -> None:
+    payload = lookup_payload()
+    deals = payload["deals"]
+    assert isinstance(deals, list)
+    assert isinstance(deals[0], dict)
+    deals[0]["storeID"] = store_id
+    transport = SequenceTransport(
+        response([{"gameID": "42", "steamAppID": "220"}]), response(payload)
     )
 
     with pytest.raises(CheapSharkError) as caught:
