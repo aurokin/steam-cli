@@ -171,6 +171,144 @@ def test_full_provider_failure_preserves_retry_delay(tmp_path) -> None:
         assert [row.targeted for row in snapshot.demand_rows] == [True, False]
 
 
+def test_total_primary_outage_is_complete_when_fallback_covers_every_item(
+    tmp_path,
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 2)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=FullyUnavailableGg(),
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+
+        assert result.completeness == "complete"
+        assert [run.status for run in result.runs] == ["failed", "complete"]
+        assert result.providers_attempted == ("gg-deals", "cheapshark")
+        query = build_deal_query_from_snapshot(
+            storage.read_wishlist_deal_snapshot(
+                account_id=account_id, country="US", now=NOW
+            ),
+            account_alias="primary",
+            country="US",
+            store_class="unknown",
+            generated_at=NOW,
+            gg_credential_configured=True,
+        )
+        assert query["completeness"]["status"] == "complete"
+        assert "DEGRADED_FALLBACK" in {
+            warning["code"] for warning in query["completeness"]["warnings"]
+        }
+        assert all(
+            item["deal"]["attempted_providers"][0]["status"] == "failed"
+            for item in query["data"]["items"]
+        )
+
+
+def test_cached_fallback_coverage_completes_later_total_primary_outage(
+    tmp_path,
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 2)
+        seeded = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            gg_api_key=None,
+            max_items=None,
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+        assert seeded.completeness == "complete"
+
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=FullyUnavailableGg(),
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+
+        assert result.completeness == "complete"
+        assert result.fallback_total == 2
+        assert result.fallback_evaluated == 0
+        assert len(result.runs) == 1
+        assert result.runs[0].provider == "gg-deals"
+        assert result.runs[0].status == "failed"
+
+
+def test_sync_entry_expires_old_prices_before_bounded_provider_failure(
+    tmp_path,
+) -> None:
+    later = NOW + timedelta(days=8)
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 1)
+        seeded = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            gg_api_key=None,
+            max_items=None,
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+        assert seeded.completeness == "complete"
+        refreshed = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=later,
+        )
+        storage.complete_wishlist_snapshot(
+            refreshed.id,
+            (WishlistObservation(1, 1, 1, later),),
+            item_list_retrieved_at=later,
+            item_count_retrieved_at=later,
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=later,
+        )
+
+        with pytest.raises(PriceSyncError, match="PROVIDER_UNAVAILABLE"):
+            sync_wishlist_prices(
+                storage,
+                account_id=account_id,
+                country="US",
+                provider="gg-deals",
+                gg_api_key=SecretValue("secret"),
+                max_items=1,
+                gg_client=FullyUnavailableGg(),
+                clock=lambda: later,
+            )
+
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_observations WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM price_subject_current WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 class SparseGgFallback:
     def fetch_app_price_summaries(self, *, appids, api_key):
         values = tuple(appids)

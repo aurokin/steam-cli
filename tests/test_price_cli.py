@@ -20,7 +20,7 @@ from steam_agent.deal_evidence import (
     OfferEvidence,
     ProductIdentity,
 )
-from steam_agent.gg_deals import GgDealsBatch, RateLimitMetadata
+from steam_agent.gg_deals import GgDealsBatch, GgDealsError, RateLimitMetadata
 from steam_agent.steam_wishlist import WishlistCount, WishlistItem, WishlistItems
 from steam_agent.storage import Storage
 
@@ -82,6 +82,11 @@ class GgClient:
             (20,),
             RateLimitMetadata(100, 99, 123),
         )
+
+
+class GgUnavailableClient:
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        raise GgDealsError("PROVIDER_UNAVAILABLE", retryable=True)
 
 
 class CheapClient:
@@ -188,6 +193,31 @@ def test_cli_traces_wishlist_through_fallback_and_queryable_snapshot(
         assert all(
             fact.currency == "USD" and fact.country == "US" for fact in snapshot.facts
         )
+
+    monkeypatch.setattr(cli, "_gg_deals_client", lambda gate: GgUnavailableClient())
+    monkeypatch.setattr(cli, "_cheapshark_client", lambda gate: CheapAnyClient())
+    code, degraded, stderr = invoke(
+        common
+        + [
+            "sync",
+            "prices",
+            "--scope",
+            "wishlist",
+            "--account",
+            "primary",
+            "--country",
+            "US",
+            "--provider",
+            "auto",
+        ],
+        capsys,
+    )
+    assert code == 0 and stderr == ""
+    assert degraded["completeness"]["status"] == "complete"  # type: ignore[index]
+    assert "DEGRADED_FALLBACK" in {
+        warning["code"]
+        for warning in degraded["completeness"]["warnings"]  # type: ignore[index]
+    }
 
     code, deleted, _ = invoke(
         common

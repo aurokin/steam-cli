@@ -1196,6 +1196,24 @@ def _dispatch_sync_prices(args: argparse.Namespace, database_path: Path) -> int:
                 ),
             )
         )
+    if (
+        args.provider == "auto"
+        and result.completeness == "complete"
+        and any(
+            run.provider == "gg-deals" and run.error_code is not None
+            for run in result.runs
+        )
+    ):
+        warnings.append(
+            WarningRecord(
+                code="DEGRADED_FALLBACK",
+                message=(
+                    "GG.deals did not complete; fresh CheapShark fallback evidence "
+                    "completed the requested deal-evidence ladder."
+                ),
+                source="gg-deals",
+            )
+        )
     return _emit_success(
         args,
         command="sync.prices",

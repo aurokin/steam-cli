@@ -66,6 +66,16 @@ def sync_wishlist_prices(
         raise ValueError("unsupported price provider selection")
     if max_items is not None and not 1 <= max_items <= 10_000:
         raise ValueError("max_items must be between 1 and 10000")
+    evaluated_at = clock()
+    # Enforce the hard retention boundary at every sync entry, including
+    # bounded runs and provider failures that produce no outcomes.  The read is
+    # local/cache-only and also supplies default fallback scheduling state.
+    fallback_cache = storage.read_price_snapshot(
+        account_id=account_id,
+        country=country,
+        provider="cheapshark",
+        now=evaluated_at,
+    )
     wishlist = storage.read_wishlist_snapshot(account_id)
     if wishlist.latest_complete is None:
         raise PriceSyncError("NOT_SYNCED", retryable=False)
@@ -81,7 +91,6 @@ def sync_wishlist_prices(
     completed_at = wishlist.latest_complete.completed_at
     if completed_at is None:
         raise PriceSyncError("NOT_SYNCED", retryable=False)
-    evaluated_at = clock()
     completed_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
     if evaluated_at > completed_dt + timedelta(hours=24):
         raise PriceSyncError("STALE_LAST_GOOD", retryable=True)
@@ -120,12 +129,6 @@ def sync_wishlist_prices(
 
     fresh_fallback_appids: set[int] = set()
     if max_items is None:
-        fallback_cache = storage.read_price_snapshot(
-            account_id=account_id,
-            country=country,
-            provider="cheapshark",
-            now=evaluated_at,
-        )
         unresolved_latest = {
             item.appid
             for item in fallback_cache.latest_relevant_attempts
@@ -359,7 +362,6 @@ def sync_wishlist_prices(
     overall_complete = (
         len(evaluated | (fresh_fallback_appids & fallback_set)) == total
         and fallback_complete
-        and all(run.status != "failed" for run in runs)
     )
     return PriceSyncResult(
         runs=tuple(runs),
