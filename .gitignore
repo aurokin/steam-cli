@@ -7,6 +7,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+.ws/
 
 # Local runtime data and credentials
 *.sqlite

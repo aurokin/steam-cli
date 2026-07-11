@@ -132,6 +132,7 @@ are added.
 
 ## Design documents
 
+- [Project governance and the repo/Linear boundary](docs/project-governance.md)
 - [Product questions](docs/design/product-questions.md)
 - [Evidence and provider matrix](docs/design/evidence-matrix.md)
 - [Provisional architecture](docs/design/architecture.md)
@@ -139,7 +140,7 @@ are added.
 - [Historical pricing strategy](docs/design/pricing-strategy.md)
 - [Actions and automation boundaries](docs/design/actions.md)
 - [Existing tool evaluation](docs/design/existing-tools.md)
-- [Research-backed roadmap](docs/design/roadmap.md)
+- [Historical research-backed validation sequence](docs/design/roadmap.md)
 - [M1 execution plan and Linear work graph](docs/design/m1-execution.md)
 - [Decision register](docs/adr/README.md)
 - [Original research handoff](steam-library-agent-research-handoff.md)

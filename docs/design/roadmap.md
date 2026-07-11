@@ -1,6 +1,14 @@
-# Research-backed roadmap
+# Research-backed validation sequence
 
-Status: proposed validation sequence, not a release commitment
+Status: non-canonical research snapshot, not a release commitment
+
+This document preserves the research rationale and validation order that shaped
+the product. Current milestone sequence, dependencies, and execution status are
+canonical in the
+[Steam CLI Product Roadmap](https://linear.app/aurokin/project/steam-cli-product-roadmap-dc80b02971d6)
+under the rules in [`docs/project-governance.md`](../project-governance.md).
+The phase numbers below are historical design groupings and must not be used as
+current Linear milestone identifiers.
 
 The roadmap uses tracer-bullet slices. Each phase should answer a design question
 and leave a usable agent contract, not merely add provider integrations.
