@@ -114,7 +114,7 @@ def test_populated_v8_upgrades_to_catalog_schema_without_rewriting_identity(
             storage._connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-            == 13
+            == 14
         )
         assert (
             storage._connection.execute(

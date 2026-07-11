@@ -69,6 +69,13 @@ def _tables(database: Path) -> set[str]:
         }
 
 
+def _columns(database: Path, table: str) -> set[str]:
+    with sqlite3.connect(database) as connection:
+        return {
+            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+
+
 def smoke(wheel: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="steam-agent-package-smoke-") as temporary:
         root = Path(temporary)
@@ -157,7 +164,11 @@ def smoke(wheel: Path) -> None:
         database = data_dir / "steam-agent.sqlite3"
         before = _versions(database)
         expected = _expected_versions()
-        if before != expected or "wishlist_current" not in _tables(database):
+        if (
+            before != expected
+            or "wishlist_current" not in _tables(database)
+            or "targeted" not in _columns(database, "price_sync_demand")
+        ):
             raise RuntimeError(
                 "installed wheel did not apply the complete source schema"
             )

@@ -128,6 +128,7 @@ def sync_wishlist_prices(
             country=country,
             wishlist_sync_run_id=wishlist.latest_complete.id,
             demand=demand,
+            targeted_appids=tuple(item.appid for item in selected),
             requested_limit=max_items,
             started_at=clock(),
         )
@@ -222,6 +223,7 @@ def sync_wishlist_prices(
             country=country,
             wishlist_sync_run_id=wishlist.latest_complete.id,
             demand=demand,
+            targeted_appids=targets,
             requested_limit=fallback_limit,
             started_at=clock(),
         )

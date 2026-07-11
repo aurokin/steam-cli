@@ -83,7 +83,7 @@ class FullyUnavailableGg:
 
 def test_full_provider_failure_preserves_retry_delay(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
-        account_id = setup(storage, 1)
+        account_id = setup(storage, 2)
         try:
             sync_wishlist_prices(
                 storage,
@@ -91,7 +91,7 @@ def test_full_provider_failure_preserves_retry_delay(tmp_path) -> None:
                 country="US",
                 provider="gg-deals",
                 gg_api_key=SecretValue("secret"),
-                max_items=None,
+                max_items=1,
                 gg_client=FullyUnavailableGg(),
                 clock=lambda: NOW,
             )
@@ -104,6 +104,40 @@ def test_full_provider_failure_preserves_retry_delay(tmp_path) -> None:
         )
         assert snapshot.attempts[-1].status == "failed"
         assert snapshot.attempt_metadata[-1].retry_after_seconds == 17
+        assert [row.targeted for row in snapshot.demand_rows] == [True, False]
+
+
+class SparseGgFallback:
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        values = tuple(appids)
+        return GgDealsBatch(
+            values,
+            tuple(empty_snapshot("gg-deals", appid) for appid in values if appid != 2),
+            (2,),
+            RateLimitMetadata(100, 99, 123),
+        )
+
+
+def test_sparse_cheapshark_fallback_persists_exact_targets(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 3)
+        sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=SparseGgFallback(),
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id, country="US", provider="cheapshark", now=NOW
+        )
+        assert [
+            (row.appid, row.targeted, row.evaluated) for row in snapshot.demand_rows
+        ] == [(1, False, False), (2, True, True), (3, False, False)]
 
 
 class CheapOk:

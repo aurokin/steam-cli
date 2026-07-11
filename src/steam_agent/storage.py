@@ -371,6 +371,7 @@ class PriceDemandRow:
     demand_order: int
     wishlist_priority: int
     wishlist_date_added: int
+    targeted: bool
     evaluated: bool
     outcome: str | None
 
@@ -2401,6 +2402,7 @@ class Storage:
         country: str,
         wishlist_sync_run_id: int,
         demand: tuple[PriceDemandSubject, ...],
+        targeted_appids: tuple[int, ...] | None = None,
         requested_limit: int | None,
         started_at: str | datetime,
     ) -> SyncRun:
@@ -2416,6 +2418,13 @@ class Storage:
         ):
             raise ValueError("requested_limit must be positive")
         ordered = sorted(demand, key=lambda item: item.demand_order)
+        if targeted_appids is None:
+            targeted_appids = tuple(
+                item.appid
+                for item in (
+                    ordered if requested_limit is None else ordered[:requested_limit]
+                )
+            )
         if any(
             not isinstance(item.appid, int)
             or isinstance(item.appid, bool)
@@ -2435,6 +2444,25 @@ class Storage:
             raise ValueError("price demand order must be contiguous")
         if len({item.appid for item in ordered}) != len(ordered):
             raise ValueError("price demand AppIDs must be unique")
+        if any(
+            not isinstance(appid, int)
+            or isinstance(appid, bool)
+            or not 1 <= appid <= (1 << 32) - 1
+            for appid in targeted_appids
+        ):
+            raise ValueError("targeted price AppIDs are invalid")
+        targeted_set = set(targeted_appids)
+        if len(targeted_set) != len(targeted_appids):
+            raise ValueError("targeted price AppIDs must be unique")
+        ordered_targeted = tuple(
+            item.appid for item in ordered if item.appid in targeted_set
+        )
+        if targeted_appids != ordered_targeted:
+            raise ValueError(
+                "targeted price AppIDs must be an ordered subset of demand"
+            )
+        if requested_limit is not None and len(targeted_appids) > requested_limit:
+            raise ValueError("targeted price AppIDs exceed requested_limit")
         timestamp = _timestamp(started_at)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -2522,8 +2550,8 @@ class Storage:
                     """
                     INSERT INTO price_sync_demand(
                         sync_run_id, account_id, country, appid, demand_order,
-                        wishlist_priority, wishlist_date_added
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        wishlist_priority, wishlist_date_added, targeted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -2533,6 +2561,7 @@ class Storage:
                         subject.demand_order,
                         subject.wishlist_priority,
                         subject.wishlist_date_added,
+                        int(subject.appid in targeted_set),
                     ),
                 )
             self._connection.commit()
@@ -2614,12 +2643,15 @@ class Storage:
             demanded = {
                 int(row[0])
                 for row in self._connection.execute(
-                    "SELECT appid FROM price_sync_demand WHERE sync_run_id = ?",
+                    """
+                    SELECT appid FROM price_sync_demand
+                    WHERE sync_run_id = ? AND targeted = 1
+                    """,
                     (sync_run_id,),
                 )
             }
             if set(outcomes) - demanded:
-                raise ValueError("evaluated price subject was not demanded")
+                raise ValueError("evaluated price subject was not targeted")
             if status == "complete" and (
                 set(outcomes) != demanded or error_code is not None
             ):
@@ -3001,6 +3033,7 @@ class Storage:
                 demand_order=int(row["demand_order"]),
                 wishlist_priority=int(row["wishlist_priority"]),
                 wishlist_date_added=int(row["wishlist_date_added"]),
+                targeted=bool(row["targeted"]),
                 evaluated=bool(row["evaluated"]),
                 outcome=None if row["outcome"] is None else str(row["outcome"]),
             )

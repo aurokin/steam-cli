@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+from importlib import resources
+import sqlite3
 
 import pytest
 
@@ -260,9 +262,12 @@ def test_combined_snapshot_explains_never_synced_and_bounded_demand(tmp_path) ->
             metadata.rate_reset_value,
         ) == (run.id, 2, 1, 1, 100, 99, 123)
         assert [
-            (row.appid, row.demand_order, row.evaluated, row.outcome)
+            (row.appid, row.demand_order, row.targeted, row.evaluated, row.outcome)
             for row in snapshot.prices.demand_rows
-        ] == [(10, 0, True, "observed"), (20, 1, False, None)]
+        ] == [
+            (10, 0, True, True, "observed"),
+            (20, 1, False, False, None),
+        ]
         assert [
             (item.appid, item.attempt.run.id, item.demand.evaluated)
             for item in snapshot.prices.latest_relevant_attempts
@@ -373,6 +378,12 @@ def test_running_lineage_survives_hard_expiry(tmp_path) -> None:
             item.attempt.run.id == running.id
             for item in alongside_last_good.prices.latest_relevant_attempts
         )
+        assert [
+            row.targeted for row in alongside_last_good.prices.demand_rows[-2:]
+        ] == [
+            True,
+            False,
+        ]
         snapshot = storage.read_wishlist_deal_snapshot(
             account_id=account_id,
             country="US",
@@ -628,6 +639,51 @@ def test_price_demand_must_exactly_match_referenced_wishlist(tmp_path) -> None:
                 requested_limit=1,
                 started_at=NOW,
             )
+
+
+@pytest.mark.parametrize(
+    "targeted_appids",
+    [(20, 10), (10, 10), (999,), (10, 20)],
+)
+def test_price_targets_must_be_an_ordered_bounded_demand_subset(
+    tmp_path, targeted_appids: tuple[int, ...]
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id, wishlist_run, demand = wishlist(storage)
+        with pytest.raises(ValueError, match="targeted price AppIDs"):
+            storage.begin_price_sync(
+                provider="gg-deals",
+                account_id=account_id,
+                country="US",
+                wishlist_sync_run_id=wishlist_run,
+                demand=demand,
+                targeted_appids=targeted_appids,
+                requested_limit=1,
+                started_at=NOW,
+            )
+
+
+def test_v14_backfills_only_evaluated_legacy_demand_as_targeted() -> None:
+    migration = resources.files("steam_agent").joinpath(
+        "migrations", "014_price_sync_targets.sql"
+    )
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute(
+            """
+            CREATE TABLE price_sync_demand(
+                appid INTEGER PRIMARY KEY,
+                evaluated INTEGER NOT NULL CHECK (evaluated IN (0, 1))
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO price_sync_demand(appid, evaluated) VALUES (?, ?)",
+            ((10, 1), (20, 0)),
+        )
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        assert connection.execute(
+            "SELECT appid, targeted FROM price_sync_demand ORDER BY appid"
+        ).fetchall() == [(10, 1), (20, 0)]
 
 
 def test_provider_deletion_preserves_other_provider(tmp_path) -> None:
