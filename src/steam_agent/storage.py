@@ -22,9 +22,7 @@ from steam_agent.local_accounts import validate_steam_id64
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
 TerminalSyncStatus = Literal["complete", "partial", "failed"]
-STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID(
-    "d95b6568-2886-5d15-aa84-1986e4ac511e"
-)
+STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID("d95b6568-2886-5d15-aa84-1986e4ac511e")
 
 
 def steam_application_stable_id(appid: int | str) -> str:
@@ -286,10 +284,19 @@ class CatalogSourceProvenance:
 
 
 @dataclass(frozen=True)
+class CatalogRelevantAttempt:
+    run: SyncRun
+    appids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class CatalogSnapshot:
     facts: tuple[CatalogFact, ...]
     sources: tuple[CatalogSourceProvenance, ...]
+    # Compatibility shortcut only when one unique relevant attempt represents
+    # the scoped demand. `attempts` is authoritative for aggregate truth.
     latest: SyncRun | None
+    attempts: tuple[CatalogRelevantAttempt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -325,6 +332,13 @@ class AllSteamAccountDataDeletion:
     evidence_removed: int
     orphan_apps_removed: int
     credential_refs_removed: int
+    catalog_observations_removed: int = 0
+    catalog_current_removed: int = 0
+    catalog_sync_runs_removed: int = 0
+    catalog_metadata_removed: int = 0
+    catalog_streams_removed: int = 0
+    catalog_pages_removed: int = 0
+    catalog_evidence_removed: int = 0
     shared_credential_preserved: bool = True
 
 
@@ -919,6 +933,63 @@ class Storage:
             )
         return self.get_sync_run(int(cursor.lastrowid))
 
+    def begin_catalog_sync(
+        self,
+        *,
+        provider: str,
+        account_id: int,
+        machine_id: str,
+        demanded_appids: list[int] | tuple[int, ...],
+        started_at: str | datetime,
+    ) -> SyncRun:
+        """Atomically record a catalog attempt and its complete demand subject."""
+
+        timestamp = _timestamp(started_at)
+        demanded = _catalog_appids(demanded_appids)
+        if (
+            not isinstance(machine_id, str)
+            or not 1 <= len(machine_id) <= 256
+            or any(ord(character) < 32 for character in machine_id)
+        ):
+            raise ValueError("catalog machine ID is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            account = self._connection.execute(
+                "SELECT 1 FROM accounts WHERE id = ? AND provider = 'steam'",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                raise ValueError("catalog account is not configured")
+            cursor = self._connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    provider, capability, started_at, status
+                ) VALUES (?, 'catalog.application.read', ?, 'running')
+                """,
+                (provider, timestamp),
+            )
+            sync_run_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO catalog_sync_subjects(
+                    sync_run_id, account_id, machine_id
+                ) VALUES (?, ?, ?)
+                """,
+                (sync_run_id, account_id, machine_id),
+            )
+            self._connection.executemany(
+                "INSERT INTO catalog_sync_demand(sync_run_id, appid) VALUES (?, ?)",
+                ((sync_run_id, appid) for appid in demanded),
+            )
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
+
     def record_owned_data_consent(
         self,
         *,
@@ -1309,7 +1380,9 @@ class Storage:
         streams = _catalog_streams(games, non_games)
         for stream, _ in streams:
             if demanded and stream.termination == "no_demand":
-                raise ValueError("nonempty catalog demand cannot use no-demand provenance")
+                raise ValueError(
+                    "nonempty catalog demand cannot use no-demand provenance"
+                )
             if (
                 demanded
                 and stream.termination == "demand_boundary"
@@ -1322,6 +1395,17 @@ class Storage:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             run = self._require_running_catalog_sync(sync_run_id)
+            if self._catalog_demand_for_run(sync_run_id) != demanded:
+                raise InvalidSyncTransition(
+                    "catalog completion demand differs from the recorded attempt"
+                )
+            subject = self._connection.execute(
+                "SELECT account_id, machine_id FROM catalog_sync_subjects "
+                "WHERE sync_run_id = ?",
+                (sync_run_id,),
+            ).fetchone()
+            if subject is None:
+                raise InvalidSyncTransition("catalog sync subject is not recorded")
             self._connection.execute(
                 """
                 INSERT INTO catalog_sync_metadata(
@@ -1442,6 +1526,57 @@ class Storage:
                     """,
                     (sync_run_id, *promotable),
                 )
+            subject_promotable = tuple(
+                observation.appid
+                for observation in normalized
+                if not self._connection.execute(
+                    """
+                    SELECT 1 FROM catalog_subject_current
+                    WHERE account_id = ? AND machine_id = ? AND appid = ?
+                      AND promoted_sync_run_id > ?
+                    """,
+                    (
+                        subject["account_id"],
+                        subject["machine_id"],
+                        observation.appid,
+                        sync_run_id,
+                    ),
+                ).fetchone()
+            )
+            if subject_promotable:
+                placeholders = ",".join("?" for _ in subject_promotable)
+                self._connection.execute(
+                    f"""
+                    DELETE FROM catalog_subject_current
+                    WHERE account_id = ? AND machine_id = ?
+                      AND appid IN ({placeholders})
+                    """,
+                    (
+                        subject["account_id"],
+                        subject["machine_id"],
+                        *subject_promotable,
+                    ),
+                )
+                self._connection.execute(
+                    f"""
+                    INSERT INTO catalog_subject_current(
+                        account_id, machine_id, appid, evidence_id,
+                        promoted_sync_run_id, classification, last_modified,
+                        price_change_number, observed_at
+                    )
+                    SELECT ?, ?, appid, evidence_id, sync_run_id,
+                           classification, last_modified, price_change_number,
+                           observed_at
+                    FROM catalog_observations
+                    WHERE sync_run_id = ? AND appid IN ({placeholders})
+                    """,
+                    (
+                        subject["account_id"],
+                        subject["machine_id"],
+                        sync_run_id,
+                        *subject_promotable,
+                    ),
+                )
             self._connection.execute(
                 """
                 UPDATE sync_runs
@@ -1449,7 +1584,12 @@ class Storage:
                     records_seen = ?, error_code = NULL, error_detail = NULL
                 WHERE id = ?
                 """,
-                (completed, int(bool(promotable)), len(normalized), sync_run_id),
+                (
+                    completed,
+                    int(bool(promotable) or bool(subject_promotable)),
+                    len(normalized),
+                    sync_run_id,
+                ),
             )
             self._prune_catalog_payloads()
             self._connection.commit()
@@ -1475,6 +1615,8 @@ class Storage:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_running_catalog_sync(sync_run_id)
+            if self._catalog_demand_for_run(sync_run_id) is None:
+                raise InvalidSyncTransition("catalog sync demand is not recorded")
             self._connection.execute(
                 """
                 UPDATE sync_runs
@@ -1714,16 +1856,56 @@ class Storage:
             raise
 
     def read_catalog_snapshot(
-        self, appids: list[int] | tuple[int, ...]
+        self,
+        appids: list[int] | tuple[int, ...],
+        *,
+        account_id: int | None = None,
+        machine_id: str | None = None,
     ) -> CatalogSnapshot:
         demanded = set(_catalog_appids(appids))
         if self._connection.in_transaction:
             raise StorageError("cannot start a read snapshot inside a transaction")
         self._connection.execute("BEGIN")
         try:
-            snapshot = self._read_catalog_snapshot(demanded)
+            snapshot = self._read_catalog_snapshot(
+                demanded, account_id=account_id, machine_id=machine_id
+            )
             self._connection.commit()
             return snapshot
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
+    def read_catalog_demand(self, account_id: int, machine_id: str) -> tuple[int, ...]:
+        """Read only owned/installed demand, without interpreting catalog state."""
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM accounts WHERE id = ? AND provider = 'steam'",
+                    (account_id,),
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("catalog account is not configured")
+            rows = self._connection.execute(
+                """
+                SELECT appid FROM owned_current WHERE account_id = ?
+                UNION
+                SELECT appid FROM installed_current WHERE machine_id = ?
+                ORDER BY appid
+                """,
+                (account_id, machine_id),
+            )
+            demanded = tuple(int(row[0]) for row in rows)
+            self._connection.commit()
+            return demanded
         except BaseException:
             try:
                 self._rollback_or_reopen()
@@ -1756,7 +1938,9 @@ class Storage:
                 }
             )
             catalog = self._read_catalog_snapshot(
-                {appid for appid, _ in stable_game_ids_by_appid}
+                {appid for appid, _ in stable_game_ids_by_appid},
+                account_id=account_id,
+                machine_id=machine_id,
             )
             self._connection.commit()
             return LibrarySnapshot(
@@ -1820,6 +2004,11 @@ class Storage:
                     (account_id,),
                 )
             )
+            (
+                catalog_runs_removed,
+                catalog_evidence_removed,
+                catalog_appids,
+            ) = self._delete_account_catalog_scope(account_id)
             cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE id = ? AND provider = 'steam'",
                 (account_id,),
@@ -1851,13 +2040,16 @@ class Storage:
                     evidence_ids,
                 )
                 evidence_removed = max(evidence_removed, evidence_cursor.rowcount)
-            orphan_apps_removed = self._delete_orphan_apps(appids)
+            evidence_removed += catalog_evidence_removed
+            orphan_apps_removed = self._delete_orphan_apps(
+                tuple(sorted({*appids, *catalog_appids}))
+            )
             self._connection.commit()
             return AccountDataDeletion(
                 account_removed=cursor.rowcount > 0,
                 owned_observations_removed=counts["owned_observations"],
                 owned_current_removed=counts["owned_current"],
-                sync_runs_removed=counts["sync_runs"],
+                sync_runs_removed=counts["sync_runs"] + catalog_runs_removed,
                 probes_removed=counts["probes"],
                 consents_removed=counts["consents"],
                 evidence_removed=evidence_removed,
@@ -1903,87 +2095,143 @@ class Storage:
                     "SELECT id, alias FROM accounts WHERE provider = 'steam'"
                 )
             )
-            if not accounts:
-                credential_refs_removed = self._remove_credential_identity(
-                    credential_provider, credential_kind, credential_profile_id
-                )
-                self._connection.commit()
-                return AllSteamAccountDataDeletion(
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    credential_refs_removed,
-                    not credential_identity_supplied,
-                )
             account_ids = tuple(account_id for account_id, _ in accounts)
             aliases = tuple(alias for _, alias in accounts)
-            id_placeholders = ",".join("?" for _ in account_ids)
-            alias_placeholders = ",".join("?" for _ in aliases)
             counts = {
-                "owned_observations": int(
-                    self._connection.execute(
-                        f"SELECT COUNT(*) FROM owned_observations "
+                "owned_observations": 0,
+                "owned_current": 0,
+                "sync_runs": 0,
+                "consents": 0,
+                "probes": 0,
+            }
+            evidence_ids: tuple[int, ...] = ()
+            account_appids: tuple[int, ...] = ()
+            if account_ids:
+                id_placeholders = ",".join("?" for _ in account_ids)
+                alias_placeholders = ",".join("?" for _ in aliases)
+                counts = {
+                    "owned_observations": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM owned_observations "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "owned_current": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM owned_current "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "sync_runs": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM sync_runs "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "consents": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM account_data_consents "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "probes": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM provider_probes "
+                            f"WHERE account_alias COLLATE NOCASE IN "
+                            f"({alias_placeholders})",
+                            aliases,
+                        ).fetchone()[0]
+                    ),
+                }
+                evidence_ids = tuple(
+                    int(row[0])
+                    for row in self._connection.execute(
+                        f"SELECT DISTINCT evidence_id FROM owned_observations "
                         f"WHERE account_id IN ({id_placeholders})",
                         account_ids,
+                    )
+                )
+                account_appids = tuple(
+                    int(row[0])
+                    for row in self._connection.execute(
+                        f"SELECT DISTINCT appid FROM owned_observations "
+                        f"WHERE account_id IN ({id_placeholders})",
+                        account_ids,
+                    )
+                )
+
+            catalog_counts = {
+                "observations": int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM catalog_observations"
                     ).fetchone()[0]
                 ),
-                "owned_current": int(
+                "current": int(
                     self._connection.execute(
-                        f"SELECT COUNT(*) FROM owned_current "
-                        f"WHERE account_id IN ({id_placeholders})",
-                        account_ids,
+                        "SELECT COUNT(*) FROM catalog_current"
                     ).fetchone()[0]
                 ),
                 "sync_runs": int(
                     self._connection.execute(
-                        f"SELECT COUNT(*) FROM sync_runs "
-                        f"WHERE account_id IN ({id_placeholders})",
-                        account_ids,
+                        "SELECT COUNT(*) FROM sync_runs "
+                        "WHERE capability = 'catalog.application.read'"
                     ).fetchone()[0]
                 ),
-                "consents": int(
+                "metadata": int(
                     self._connection.execute(
-                        f"SELECT COUNT(*) FROM account_data_consents "
-                        f"WHERE account_id IN ({id_placeholders})",
-                        account_ids,
+                        "SELECT COUNT(*) FROM catalog_sync_metadata"
                     ).fetchone()[0]
                 ),
-                "probes": int(
+                "streams": int(
                     self._connection.execute(
-                        f"SELECT COUNT(*) FROM provider_probes "
-                        f"WHERE account_alias COLLATE NOCASE IN ({alias_placeholders})",
-                        aliases,
+                        "SELECT COUNT(*) FROM catalog_stream_provenance"
+                    ).fetchone()[0]
+                ),
+                "pages": int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM catalog_page_provenance"
                     ).fetchone()[0]
                 ),
             }
-            evidence_ids = tuple(
+            catalog_evidence_ids = tuple(
                 int(row[0])
                 for row in self._connection.execute(
-                    f"SELECT DISTINCT evidence_id FROM owned_observations "
-                    f"WHERE account_id IN ({id_placeholders})",
-                    account_ids,
+                    """
+                    SELECT evidence_id FROM catalog_observations
+                    UNION
+                    SELECT evidence_id FROM catalog_current
+                    """
                 )
             )
-            appids = tuple(
+            catalog_appids = tuple(
                 int(row[0])
                 for row in self._connection.execute(
-                    f"SELECT DISTINCT appid FROM owned_observations "
-                    f"WHERE account_id IN ({id_placeholders})",
-                    account_ids,
+                    """
+                    SELECT appid FROM catalog_observations
+                    UNION
+                    SELECT appid FROM catalog_current
+                    """
                 )
             )
             account_cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE provider = 'steam'"
             )
-            evidence_removed = max(
+            catalog_runs_cursor = self._connection.execute(
+                "DELETE FROM sync_runs WHERE capability = 'catalog.application.read'"
+            )
+            catalog_evidence_removed = self._delete_orphan_owned_evidence(
+                catalog_evidence_ids
+            )
+            account_evidence_removed = max(
                 len(evidence_ids), self._delete_orphan_owned_evidence(evidence_ids)
             )
-            orphan_apps_removed = self._delete_orphan_apps(appids)
+            orphan_apps_removed = self._delete_orphan_apps(
+                tuple(sorted({*account_appids, *catalog_appids}))
+            )
             credential_refs_removed = self._remove_credential_identity(
                 credential_provider, credential_kind, credential_profile_id
             )
@@ -1992,12 +2240,19 @@ class Storage:
                 accounts_removed=account_cursor.rowcount,
                 owned_observations_removed=counts["owned_observations"],
                 owned_current_removed=counts["owned_current"],
-                sync_runs_removed=counts["sync_runs"],
+                sync_runs_removed=(counts["sync_runs"] + catalog_runs_cursor.rowcount),
                 probes_removed=counts["probes"],
                 consents_removed=counts["consents"],
-                evidence_removed=evidence_removed,
+                evidence_removed=(account_evidence_removed + catalog_evidence_removed),
                 orphan_apps_removed=orphan_apps_removed,
                 credential_refs_removed=credential_refs_removed,
+                catalog_observations_removed=catalog_counts["observations"],
+                catalog_current_removed=catalog_counts["current"],
+                catalog_sync_runs_removed=catalog_runs_cursor.rowcount,
+                catalog_metadata_removed=catalog_counts["metadata"],
+                catalog_streams_removed=catalog_counts["streams"],
+                catalog_pages_removed=catalog_counts["pages"],
+                catalog_evidence_removed=catalog_evidence_removed,
                 shared_credential_preserved=not credential_identity_supplied,
             )
         except BaseException:
@@ -2186,20 +2441,57 @@ class Storage:
             raise StorageError("Steam application identity mapping is incomplete")
         return result
 
-    def _read_catalog_snapshot(self, appids: set[int]) -> CatalogSnapshot:
-        latest_row = self._connection.execute(
-            """
-            SELECT * FROM sync_runs
-            WHERE capability = 'catalog.application.read'
-              AND machine_id IS NULL AND account_id IS NULL
-            ORDER BY id DESC LIMIT 1
-            """
-        ).fetchone()
-        latest = None if latest_row is None else _sync_run(latest_row)
+    def _read_catalog_snapshot(
+        self,
+        appids: set[int],
+        *,
+        account_id: int | None = None,
+        machine_id: str | None = None,
+    ) -> CatalogSnapshot:
+        if (account_id is None) != (machine_id is None):
+            raise ValueError("catalog attempt scope must be complete or omitted")
+        if account_id is None:
+            latest_row = self._connection.execute(
+                """
+                SELECT * FROM sync_runs
+                WHERE capability = 'catalog.application.read'
+                  AND machine_id IS NULL AND account_id IS NULL
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            latest = None if latest_row is None else _sync_run(latest_row)
+            attempts = (
+                ()
+                if latest is None or not appids
+                else (CatalogRelevantAttempt(latest, tuple(sorted(appids))),)
+            )
+        else:
+            assert machine_id is not None
+            attempts = self._latest_catalog_attempts(
+                account_id=account_id,
+                machine_id=machine_id,
+                demanded=appids,
+            )
+            latest = (
+                attempts[0].run
+                if len(attempts) == 1 and set(attempts[0].appids) == appids
+                else None
+            )
         if not appids:
-            return CatalogSnapshot(facts=(), sources=(), latest=latest)
+            return CatalogSnapshot(
+                facts=(), sources=(), latest=None, attempts=()
+            )
         parameters = tuple(sorted(appids))
         placeholders = ",".join("?" for _ in parameters)
+        if account_id is None:
+            current_table = "catalog_current"
+            subject_clause = ""
+            fact_parameters: tuple[object, ...] = parameters
+        else:
+            assert machine_id is not None
+            current_table = "catalog_subject_current"
+            subject_clause = "AND current.account_id = ? AND current.machine_id = ?"
+            fact_parameters = (*parameters, account_id, machine_id)
         fact_rows = tuple(
             self._connection.execute(
                 f"""
@@ -2208,7 +2500,7 @@ class Storage:
                     current.classification, current.last_modified,
                     current.price_change_number, current.observed_at,
                     current.evidence_id, current.promoted_sync_run_id
-                FROM catalog_current AS current
+                FROM {current_table} AS current
                 JOIN external_game_identities AS identities
                   ON identities.provider = 'steam'
                  AND identities.identity_kind = 'application_appid'
@@ -2216,9 +2508,10 @@ class Storage:
                 JOIN game_entities AS entities
                   ON entities.id = identities.game_entity_id
                 WHERE current.appid IN ({placeholders})
+                  {subject_clause}
                 ORDER BY current.appid
                 """,
-                parameters,
+                fact_parameters,
             )
         )
         facts = tuple(CatalogFact(**dict(row)) for row in fact_rows)
@@ -2270,9 +2563,7 @@ class Storage:
                     CatalogStreamProvenance(
                         stream=stream_row["stream"],
                         termination=stream_row["termination"],
-                        scanned_through_appid=int(
-                            stream_row["scanned_through_appid"]
-                        ),
+                        scanned_through_appid=int(stream_row["scanned_through_appid"]),
                         filter_context=json.loads(stream_row["filter_context_json"]),
                         pages=page_values,
                     )
@@ -2291,6 +2582,57 @@ class Storage:
             facts=facts,
             sources=tuple(sources),
             latest=latest,
+            attempts=attempts,
+        )
+
+    def _latest_catalog_attempts(
+        self, *, account_id: int, machine_id: str, demanded: set[int]
+    ) -> tuple[CatalogRelevantAttempt, ...]:
+        if not demanded:
+            return ()
+        by_run: dict[int, tuple[SyncRun, list[int]]] = {}
+        for appid in sorted(demanded):
+            row = self._connection.execute(
+                """
+                SELECT runs.*
+                FROM sync_runs AS runs
+                JOIN catalog_sync_subjects AS subjects
+                  ON subjects.sync_run_id = runs.id
+                JOIN catalog_sync_demand AS demand
+                  ON demand.sync_run_id = runs.id
+                WHERE subjects.account_id = ? AND subjects.machine_id = ?
+                  AND demand.appid = ?
+                  AND runs.capability = 'catalog.application.read'
+                ORDER BY runs.id DESC LIMIT 1
+                """,
+                (account_id, machine_id, appid),
+            ).fetchone()
+            if row is None:
+                continue
+            run = _sync_run(row)
+            entry = by_run.setdefault(run.id, (run, []))
+            entry[1].append(appid)
+        return tuple(
+            CatalogRelevantAttempt(run=run, appids=tuple(appids))
+            for run, appids in (by_run[run_id] for run_id in sorted(by_run))
+        )
+
+    def _catalog_demand_for_run(self, sync_run_id: int) -> tuple[int, ...] | None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM catalog_sync_subjects WHERE sync_run_id = ?",
+                (sync_run_id,),
+            ).fetchone()
+            is None
+        ):
+            return None
+        return tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                "SELECT appid FROM catalog_sync_demand "
+                "WHERE sync_run_id = ? ORDER BY appid",
+                (sync_run_id,),
+            )
         )
 
     def _count_where(self, table: str, column: str, value: object) -> int:
@@ -2340,6 +2682,10 @@ class Storage:
                   SELECT 1 FROM catalog_current
                   WHERE catalog_current.evidence_id = evidence.id
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_subject_current
+                  WHERE catalog_subject_current.evidence_id = evidence.id
+              )
             """,
             evidence_ids,
         )
@@ -2358,6 +2704,13 @@ class Storage:
                       AND current.promoted_sync_run_id = observations.sync_run_id
                       AND current.evidence_id = observations.evidence_id
                 )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM catalog_subject_current AS subject_current
+                    WHERE subject_current.appid = observations.appid
+                      AND subject_current.promoted_sync_run_id =
+                          observations.sync_run_id
+                      AND subject_current.evidence_id = observations.evidence_id
+                  )
                 """
             )
         )
@@ -2370,6 +2723,14 @@ class Storage:
                   AND current.promoted_sync_run_id = catalog_observations.sync_run_id
                   AND current.evidence_id = catalog_observations.evidence_id
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM catalog_subject_current AS subject_current
+                WHERE subject_current.appid = catalog_observations.appid
+                  AND subject_current.promoted_sync_run_id =
+                      catalog_observations.sync_run_id
+                  AND subject_current.evidence_id =
+                      catalog_observations.evidence_id
+              )
             """
         )
         self._connection.execute(
@@ -2380,9 +2741,204 @@ class Storage:
                 WHERE catalog_current.promoted_sync_run_id =
                       catalog_sync_metadata.sync_run_id
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM catalog_subject_current
+                WHERE catalog_subject_current.promoted_sync_run_id =
+                      catalog_sync_metadata.sync_run_id
+              )
             """
         )
         self._delete_orphan_owned_evidence(evidence_ids)
+
+    def _delete_account_catalog_scope(
+        self, account_id: int
+    ) -> tuple[int, int, tuple[int, ...]]:
+        """Remove one account's demand lineage while retaining shared facts.
+
+        Catalog facts are public and shared, but the demand set that selected
+        them is account data. A current fact whose provenance belongs to the
+        deleted account is detached to an unscoped copy only when another
+        account or installed projection still needs that AppID.
+        """
+
+        run_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                "SELECT sync_run_id FROM catalog_sync_subjects "
+                "WHERE account_id = ? ORDER BY sync_run_id",
+                (account_id,),
+            )
+        )
+        catalog_appids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                "SELECT appid FROM catalog_current ORDER BY appid"
+            )
+        )
+        evidence_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT evidence_id FROM catalog_observations
+                UNION
+                SELECT evidence_id FROM catalog_current
+                """
+            )
+        )
+        needed = {
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT demand.appid
+                FROM catalog_sync_demand AS demand
+                JOIN catalog_sync_subjects AS subjects
+                  ON subjects.sync_run_id = demand.sync_run_id
+                WHERE subjects.account_id <> ?
+                UNION
+                SELECT appid FROM owned_current WHERE account_id <> ?
+                UNION
+                SELECT appid FROM installed_current
+                """,
+                (account_id, account_id),
+            )
+        }
+
+        for source_run_id in run_ids:
+            retained_appids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT appid FROM catalog_current "
+                    "WHERE promoted_sync_run_id = ? ORDER BY appid",
+                    (source_run_id,),
+                )
+                if int(row[0]) in needed
+            )
+            if not retained_appids:
+                continue
+            source = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id = ? AND status = 'complete'",
+                (source_run_id,),
+            ).fetchone()
+            metadata = self._connection.execute(
+                "SELECT provider, support_level FROM catalog_sync_metadata "
+                "WHERE sync_run_id = ?",
+                (source_run_id,),
+            ).fetchone()
+            if source is None or metadata is None:
+                raise StorageError("shared catalog provenance is incomplete")
+            cursor = self._connection.execute(
+                """
+                INSERT INTO sync_runs(
+                    provider, capability, started_at, completed_at, status,
+                    promoted, records_seen, error_code, error_detail
+                ) VALUES (?, 'catalog.application.read', ?, ?, 'complete',
+                          1, ?, NULL, NULL)
+                """,
+                (
+                    source["provider"],
+                    source["started_at"],
+                    source["completed_at"],
+                    len(retained_appids),
+                ),
+            )
+            detached_run_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO catalog_sync_metadata(
+                    sync_run_id, provider, support_level, demanded_count
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    detached_run_id,
+                    metadata["provider"],
+                    metadata["support_level"],
+                    len(retained_appids),
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO catalog_stream_provenance(
+                    sync_run_id, stream, termination, scanned_through_appid,
+                    filter_context_json
+                )
+                SELECT ?, stream, termination, scanned_through_appid,
+                       filter_context_json
+                FROM catalog_stream_provenance WHERE sync_run_id = ?
+                """,
+                (detached_run_id, source_run_id),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO catalog_page_provenance(
+                    sync_run_id, stream, page_number, requested_last_appid,
+                    first_appid, last_appid, item_count, have_more_results,
+                    retrieved_at
+                )
+                SELECT ?, stream, page_number, requested_last_appid,
+                       first_appid, last_appid, item_count, have_more_results,
+                       retrieved_at
+                FROM catalog_page_provenance WHERE sync_run_id = ?
+                """,
+                (detached_run_id, source_run_id),
+            )
+            placeholders = ",".join("?" for _ in retained_appids)
+            self._connection.execute(
+                f"""
+                INSERT INTO catalog_observations(
+                    sync_run_id, evidence_id, appid, classification,
+                    last_modified, price_change_number, observed_at
+                )
+                SELECT ?, evidence_id, appid, classification,
+                       last_modified, price_change_number, observed_at
+                FROM catalog_current WHERE appid IN ({placeholders})
+                """,
+                (detached_run_id, *retained_appids),
+            )
+            self._connection.execute(
+                f"""
+                UPDATE catalog_current SET promoted_sync_run_id = ?
+                WHERE appid IN ({placeholders})
+                """,
+                (detached_run_id, *retained_appids),
+            )
+
+        if needed:
+            placeholders = ",".join("?" for _ in needed)
+            self._connection.execute(
+                f"DELETE FROM catalog_current WHERE appid NOT IN ({placeholders})",
+                tuple(sorted(needed)),
+            )
+        else:
+            self._connection.execute("DELETE FROM catalog_current")
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            self._connection.execute(
+                f"DELETE FROM sync_runs WHERE id IN ({placeholders})", run_ids
+            )
+        self._prune_catalog_payloads()
+        orphan_runs = self._connection.execute(
+            """
+            DELETE FROM sync_runs
+            WHERE capability = 'catalog.application.read'
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_sync_subjects
+                  WHERE catalog_sync_subjects.sync_run_id = sync_runs.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_sync_metadata
+                  WHERE catalog_sync_metadata.sync_run_id = sync_runs.id
+              )
+            """
+        ).rowcount
+        self._delete_orphan_owned_evidence(evidence_ids)
+        evidence_removed = sum(
+            self._connection.execute(
+                "SELECT 1 FROM evidence WHERE id = ?", (evidence_id,)
+            ).fetchone()
+            is None
+            for evidence_id in evidence_ids
+        )
+        return len(run_ids) + orphan_runs, evidence_removed, catalog_appids
 
     def _prune_owned_payloads(
         self,
@@ -2499,6 +3055,10 @@ class Storage:
                   SELECT 1 FROM catalog_current
                   WHERE catalog_current.appid = steam_apps.appid
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_subject_current
+                  WHERE catalog_subject_current.appid = steam_apps.appid
+              )
             """,
             appids,
         )
@@ -2568,7 +3128,9 @@ class Storage:
         if run.capability != "catalog.application.read":
             raise InvalidSyncTransition("sync run is not an application-catalog sync")
         if run.account_id is not None or run.machine_id is not None:
-            raise InvalidSyncTransition("catalog sync cannot target an account or machine")
+            raise InvalidSyncTransition(
+                "catalog sync cannot target an account or machine"
+            )
         if run.status != "running":
             raise InvalidSyncTransition(
                 f"sync run {sync_run_id} is already {run.status}"
@@ -2910,7 +3472,9 @@ def _validate_catalog_filter_context(
         "include_videos",
         "include_hardware",
     }
-    if not boolean_keys <= set(context) or set(context) - boolean_keys - {"max_results"}:
+    if not boolean_keys <= set(context) or set(context) - boolean_keys - {
+        "max_results"
+    }:
         raise ValueError("catalog filter context contains unsupported fields")
     if any(not isinstance(context[key], bool) for key in boolean_keys):
         raise ValueError("catalog include filters must be boolean")

@@ -1,7 +1,6 @@
 # Steam account data lifecycle
 
-Status: M2 policy boundary; capability evidence collected, persistence
-implementation in progress
+Status: M2 policy boundary; persistent inventory candidate under acceptance review
 
 This document governs Steam account data obtained through Valve's Web API. It
 does not change the accepted M1 local installed-library contract. It is the
@@ -122,23 +121,26 @@ AUR-627 may persist only the following normalized fields for the current
 last-known-good visible-owned projection:
 
 - the local immutable account row ID and Steam AppID;
+- the optional display name deliberately requested for a usable owned-library
+  query;
 - total reported playtime in minutes, preserving missing separately from zero;
-- an inclusion basis of `default_owned_set` or `played_free_only`;
+- an inclusion basis of `visible_owned` or `played_free`;
 - the sync/evidence relationship, provider, documented support level, retrieval
   time, and the two requested `include_played_free_games` flag values; and
 - coarse sync status, counts, timestamps, and typed failure metadata that
   contains no provider response text.
 
-The owned request does not retain names, icons, last-played time, platform-
-specific playtime, or other additive fields. Names and application types come
-from independently sourced catalog or accepted local evidence. Adding another
-owned field requires an active use case and a lifecycle review rather than
-silently retaining every field Valve adds.
+The owned request does not retain icons, last-played time, rolling or platform-
+specific playtime, or other additive fields. The optional response name remains
+inside the account-owned projection and is deleted with it; it must not update
+shared catalog or installed evidence. Adding another owned field requires an
+active use case and a lifecycle review rather than silently retaining every
+field Valve adds.
 
 The sync obtains a default set with `include_played_free_games=false` and an
 expanded set with it set to `true`. An AppID present only in the valid expanded
-set is classified `played_free_only`; an AppID in the default set is classified
-`default_owned_set`. The default set must be a subset of the expanded set before
+set is classified `played_free`; an AppID in the default set is classified
+`visible_owned`. The default set must be a subset of the expanded set before
 promotion. Neither value proves purchase method, current price, license kind,
 or `free=false`, and the expanded set still omits unplayed free entitlements.
 If either request fails or the pair is inconsistent, the run does not promote.
@@ -149,6 +151,9 @@ observations and their account-scoped evidence. Failed, inaccessible, partial,
 or malformed attempts retain the previous projection but do not retain game
 payloads. Longitudinal playtime history is outside M2 and requires a separate
 purpose and retention decision.
+
+The agent contract treats a visible-owned snapshot older than 24 hours as
+stale. A refresh in progress does not make its prior projection fresh.
 
 Raw Steam account response bodies are not retained by default. Adding raw-body
 retention, hosted storage, analytics, or another account-data purpose requires
@@ -202,18 +207,26 @@ owned by the CLI contract):
    data directory for users who also want to remove M1 machine data and every
    other local record.
 
-A candidate surface is `auth remove`, `profiles delete --delete-steam-data`,
-and `data delete --provider steam-web-api --all`. These spellings are proposed,
-not an implemented contract; the behavior above is the gate.
+The implemented surfaces are `auth remove`,
+`data delete --provider steam-web-api --account ALIAS --yes`, and
+`data delete --provider steam-web-api --all --yes`.
 
-The current AUR-620 checkpoint has separate commands for logical removal of one
-account alias (with its probe rows) and for removal of the locally managed
-credential. Neither is the all-provider termination path above, and neither
-makes a physical-erasure claim for SQLite pages.
-Therefore AUR-620 remains in progress and AUR-627 may not persist owned-game
-observations. Physical-erasure/rebuild behavior and all-account deletion are
-acceptance gates for that persistent slice, not properties of the current
-checkpoint.
+The M2 acceptance candidate has separate account-scoped and all-provider
+deletion commands. Account deletion preserves the data-profile-wide key; the
+all-provider path removes the key and reference without claiming Valve
+revocation or forensic erasure.
+
+Catalog attempt subjects and demanded AppIDs are account data even though the
+resulting store classifications are public. Per-account deletion removes every
+catalog attempt, demand row, and subject-specific last-good fact reference for
+that account. Subject references keep freshness, classification, and evidence
+from being borrowed across accounts while normalized public facts remain shared.
+A catalog fact is retained
+only when another account's current or recorded demand, or retained M1
+installed evidence, still needs its AppID. Such a fact is detached to shared
+public provenance before account-scoped runs are removed; otherwise its
+projection, evidence, provenance, and orphan application identity are pruned in
+the same transaction.
 
 Deletion must be transactional and idempotent, reject ambiguous profile
 targets, and report what categories were removed without echoing deleted data.
@@ -232,21 +245,19 @@ account. The all-Steam-data path removes every Steam account subject before it
 removes that shared credential reference and locally managed key.
 
 SQLite deletion provides bounded best effort, not a promise of forensic
-erasure. Sensitive account tables use `secure_delete`, and a successful delete
-compacts or rebuilds the database while preserving out-of-scope M1 and other
-provider data. The command reports logical deletion and compaction/rebuild
-outcomes separately. Flash translation layers, filesystem journals, snapshots,
-cloud backups, and prior copies remain outside the application's control. A
-locked credential store, interrupted rebuild, or failed key deletion produces
-an incomplete typed result and must never be reported as successful
-termination.
+erasure. Sensitive account tables use `secure_delete`. The command reports
+logical row and credential deletion separately. Flash translation layers,
+filesystem journals, snapshots, cloud backups, and prior copies remain outside
+the application's control. A locked credential store, interrupted transaction,
+or failed key deletion produces an incomplete typed result and must never be
+reported as successful termination.
 
 Data export, if added, is a separate explicit action. Deletion must not create
 an export or diagnostic copy as a side effect.
 
 ## First persistent sync disclosure
 
-Before the first owned sync for a local data profile, the CLI must stop with a
+Before the first owned sync for an account, the CLI must stop with a
 typed disclosure-required result until the user explicitly acknowledges the
 versioned policy. The disclosure states:
 
@@ -262,7 +273,8 @@ versioned policy. The disclosure states:
 - that physical deletion cannot cover user-controlled backups, snapshots, or
   storage-media remapping.
 
-Acknowledgment stores only the policy version and timestamp. It is not consent
+Acknowledgment stores the policy version, timestamp, and confirmation that the
+backup implications were acknowledged. It is not consent
 for background synchronization, another account, another Steam capability, or
 hosted processing. A material field, purpose, retention, or storage-location
 change requires a new policy version and acknowledgment.

@@ -111,6 +111,7 @@ class CatalogPageProvenance:
 @dataclass(frozen=True, slots=True)
 class CatalogScan:
     stream: CatalogStream
+    max_results: int
     state: Literal["complete", "partial"]
     termination: Literal[
         "no_demand", "demand_boundary", "end_of_stream", "provider_error"
@@ -133,6 +134,7 @@ class _Page:
 
 
 Clock = Callable[[], datetime]
+RequestGate = Callable[[], None]
 
 
 def _utc_now() -> datetime:
@@ -147,6 +149,7 @@ class SteamStoreCatalogClient:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_results: int = DEFAULT_MAX_RESULTS,
         clock: Clock = _utc_now,
+        request_gate: RequestGate = lambda: None,
     ) -> None:
         if not isinstance(max_results, int) or isinstance(max_results, bool):
             raise ValueError("max_results must be an integer")
@@ -158,11 +161,12 @@ class SteamStoreCatalogClient:
         self._timeout = timeout
         self._max_results = max_results
         self._clock = clock
+        self._request_gate = request_gate
 
     def scan_demanded_apps(
         self,
         *,
-        api_key: SecretValue,
+        api_key: SecretValue | None,
         demanded_appids: Iterable[int],
         stream: CatalogStream | str,
     ) -> CatalogScan:
@@ -174,6 +178,7 @@ class SteamStoreCatalogClient:
         if not demanded:
             return CatalogScan(
                 stream=selected_stream,
+                max_results=self._max_results,
                 state="complete",
                 termination="no_demand",
                 demanded_appids=(),
@@ -183,6 +188,8 @@ class SteamStoreCatalogClient:
                 pages=(),
                 scanned_through_appid=0,
             )
+        if api_key is None:
+            raise CatalogApiError("AUTHENTICATION_FAILED", retryable=False)
 
         demanded_set = set(demanded)
         maximum_demanded = demanded[-1]
@@ -192,6 +199,7 @@ class SteamStoreCatalogClient:
         page_number = 1
         while True:
             try:
+                self._request_gate()
                 response = self._transport.request(
                     host=STEAM_STORE_API_HOST,
                     path=self._request_path(stream=selected_stream, last_appid=cursor),
@@ -209,6 +217,7 @@ class SteamStoreCatalogClient:
                     raise
                 return _scan_result(
                     stream=selected_stream,
+                    max_results=self._max_results,
                     state="partial",
                     termination="provider_error",
                     demanded=demanded,
@@ -242,6 +251,7 @@ class SteamStoreCatalogClient:
             if not page.have_more_results:
                 return _scan_result(
                     stream=selected_stream,
+                    max_results=self._max_results,
                     state="complete",
                     termination="end_of_stream",
                     demanded=demanded,
@@ -252,6 +262,7 @@ class SteamStoreCatalogClient:
             if cursor >= maximum_demanded:
                 return _scan_result(
                     stream=selected_stream,
+                    max_results=self._max_results,
                     state="complete",
                     termination="demand_boundary",
                     demanded=demanded,
@@ -279,6 +290,7 @@ class SteamStoreCatalogClient:
 def _scan_result(
     *,
     stream: CatalogStream,
+    max_results: int,
     state: Literal["complete", "partial"],
     termination: Literal["demand_boundary", "end_of_stream", "provider_error"],
     demanded: tuple[int, ...],
@@ -301,6 +313,7 @@ def _scan_result(
         unresolved = tuple(appid for appid in demanded if appid > cursor)
     return CatalogScan(
         stream=stream,
+        max_results=max_results,
         state=state,
         termination=termination,
         demanded_appids=demanded,
@@ -317,14 +330,10 @@ def _scan_result(
 def _interpret_page(response: HttpResponse, *, requested_last_appid: int) -> _Page:
     _raise_for_status(response.status)
     decoded, payload = _decode_json(response.body)
-    if not decoded or not isinstance(payload, dict) or set(payload) != {"response"}:
+    if not decoded or not isinstance(payload, dict) or "response" not in payload:
         raise CatalogApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
     body = payload["response"]
-    if not isinstance(body, dict) or not set(body) <= {
-        "apps",
-        "have_more_results",
-        "last_appid",
-    }:
+    if not isinstance(body, dict):
         raise CatalogApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
     apps_value = body.get("apps", [])
     have_more = body.get("have_more_results", False)
@@ -334,11 +343,7 @@ def _interpret_page(response: HttpResponse, *, requested_last_appid: int) -> _Pa
     apps: list[tuple[int, int | None, int | None]] = []
     previous = requested_last_appid
     for value in apps_value:
-        if not isinstance(value, dict) or not set(value) <= {
-            "appid",
-            "last_modified",
-            "price_change_number",
-        }:
+        if not isinstance(value, dict):
             raise CatalogApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
         appid = value.get("appid")
         if not _positive_unsigned_32(appid) or appid <= previous:

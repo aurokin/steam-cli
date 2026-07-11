@@ -1,7 +1,7 @@
 # CLI and JSON contract
 
-Status: M1 installed-library contract implemented; M2 capability gate
-implemented and persistent inventory contract planned
+Status: M1 installed-library contract implemented; M2 persistent inventory
+candidate implemented and under acceptance review
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -94,33 +94,77 @@ invalid key returned `authentication_failed`, and a syntactically valid
 nonexistent SteamID64 returned `data_inaccessible`. The last state means
 inaccessible or ambiguous; it is not serialized as `private`.
 
-## Planned M2 persistent-inventory commands
+## Implemented M2 persistent-inventory commands
 
-The following surface is an implementation plan, not yet an implemented or
-accepted CLI contract:
+The following surface is implemented as the M2 acceptance candidate:
 
 ```text
-steam-agent data policy show steam-web-api
-steam-agent data policy accept steam-web-api --yes
-steam-agent sync owned --account ALIAS
+steam-agent sync owned --account ALIAS [--acknowledge-local-storage]
+steam-agent sync catalog --account ALIAS --machine ID
 steam-agent games query --scope owned --account ALIAS
-steam-agent games query --scope account --account ALIAS --machine ID
+steam-agent games query --scope library --account ALIAS --machine ID
 steam-agent data delete --provider steam-web-api --account ALIAS --yes
 steam-agent data delete --provider steam-web-api --all --yes
 ```
 
 The first `sync owned` returns a typed `DATA_POLICY_ACKNOWLEDGMENT_REQUIRED`
-result until the current disclosure is acknowledged. Policy display and
-acknowledgment make no provider request. The acknowledgment is local-profile
-scoped and records only policy version and time.
+result until the current disclosure is acknowledged by rerunning with
+`--acknowledge-local-storage`. The blocked attempt makes no provider request.
+The acknowledgment is account-scoped and records policy version, acceptance
+time, and acknowledgment of user-controlled backup implications.
 
 `sync owned` performs the documented false/true
 `include_played_free_games` request pair. It promotes only when both responses
 are structurally valid and the default set is a subset of the expanded set.
-The query reports `default_owned_set` and `played_free_only`; neither is a
+The query reports `visible_owned` and `played_free`; neither is a
 purchase or license-kind claim. Authentication, visibility ambiguity, provider
 failure, malformed data, inconsistent pairs, and interrupted runs preserve the
 last-known-good projection. Only an explicit valid empty pair clears it.
+Visible-owned snapshots older than 24 hours are returned as partial/stale even
+when the last attempt succeeded; a running refresh does not make an old
+projection fresh.
+
+`sync catalog` derives a demand set from the selected owned and installed
+projections, scans the documented ordered `IStoreService/GetAppList` games and
+aggregate non-game streams, and persists only demanded AppIDs. The upstream API
+has no documented arbitrary-AppID filter, so the initial scan may read multiple
+pages through the highest demanded AppID. Classification is `game`,
+`non_game`, or `not_observed`; the aggregate stream does not establish an exact
+non-game subtype. Application, package, bundle, and edition identities remain
+separate, and the latter three are `unknown` because this endpoint exposes no
+supported mapping.
+
+Every catalog attempt records its account alias subject, machine ID, and full
+AppID demand before the first provider request, including attempts that later
+fail. For every demanded AppID, joined completeness selects the newest attempt
+for that same account and machine whose demand included that AppID, then
+aggregates the unique relevant attempts. An unrelated account, machine, or
+disjoint AppID refresh cannot make retained facts fresh or stale. If any AppID
+lacks an applicable attempt, the catalog slice is unavailable; any relevant
+failed or partial attempt makes it partial. Relevant attempts are listed with
+their exact AppIDs so output never implies one run represented the whole query.
+When an AppID has a relevant attempt but no last-good fact yet, the slice is
+partial with `NOT_SYNCED` plus the attempt state: `SYNC_IN_PROGRESS`,
+`SYNC_ABANDONED`, or its sanitized failure code. An AppID with neither a fact
+nor an applicable attempt remains unavailable.
+Each account/machine also retains its own last-good fact references; the shared
+normalized catalog may advance independently, but a different subject's newer
+classification, evidence, or observation time cannot replace query truth for
+this subject. Subject promotion merges by AppID: a narrower completed demand
+updates only its AppIDs, and an older completion may fill disjoint AppIDs but
+cannot replace a newer overlapping fact.
+Each catalog fact has a 24-hour freshness window; if any demanded fact is older,
+the catalog slice is partial and reports the number and age range of stale
+facts. One or more non-abandoned relevant refreshes in progress report
+`SYNC_IN_PROGRESS` but do
+not degrade a fresh complete last-good projection. It also does not make stale
+facts fresh. Empty demand is vacuously complete and has no applicable historical
+catalog attempt, warning, or stale capability.
+
+Catalog page provenance is promoted only after both catalog streams complete.
+A partial or failed attempt retains coarse run status and a sanitized error
+code, but discards its page details and never replaces the last-good catalog
+facts or provenance.
 
 Normal owned and joined query output omits SteamID64 and local filesystem paths.
 It keeps the following independent:
@@ -129,6 +173,7 @@ It keeps the following independent:
 - included only by the played-free flag;
 - installed on the selected machine;
 - application type from catalog/local evidence; and
+- a stable local entity ID plus typed Steam application AppID identity;
 - family availability, playable-now, purchasability, and license kind, which
   remain `unknown` without separate evidence.
 
@@ -136,9 +181,17 @@ Per-account deletion removes that target's normalized projection, account-
 scoped evidence, sync/probe history, and account metadata. It does not remove
 the data-profile-wide Steam Web API key. `--all` is the local Web API
 termination path and also removes the shared key and reference; it does not
-claim Valve revoked the key. Deletion results distinguish logical deletion,
-SQLite compaction/rebuild, key-store deletion, and user-controlled backup
-remediation rather than returning one misleading boolean.
+claim Valve revoked the key. Deletion results distinguish logical row deletion,
+key-store deletion, and user-controlled backup remediation rather than returning
+one misleading boolean. SQLite uses `secure_delete`; this is not a promise about
+external backups, filesystem snapshots, flash remapping, or other copies.
+
+Per-account deletion also removes that account's catalog attempt subjects,
+demand membership, and catalog run rows. Public catalog facts survive only when
+another account's demand/current projection or M1 installed evidence still
+needs the AppID; retained facts have shared provenance with no deleted-account
+subject. Unneeded catalog evidence and orphan application identities are
+removed transactionally.
 
 ## Implemented process behavior
 

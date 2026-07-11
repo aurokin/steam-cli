@@ -14,10 +14,11 @@ return stable machine-readable results that an agent can reason over.
 **The M1 installed-library tracer bullet is implemented and accepted.** It
 scans local Steam metadata without credentials, stores
 complete observations in SQLite, and exposes deterministic installed-game
-queries. **M2 account and credential capability work is in progress:** local
-account selection and secure key storage are implemented, while live provider
-validation and owned-library persistence are not yet accepted. Wishlists,
-pricing, recommendations, compatibility, and Steam actions remain design work.
+queries. **The M2 truthful-account-inventory candidate is implemented and under
+acceptance review:** local account selection, secure key storage, live provider
+classification, durable visible-owned synchronization, joined owned/installed
+queries, and deletion are available. Wishlists, pricing, recommendations,
+compatibility, and Steam actions remain design work.
 
 ## Install and develop
 
@@ -90,11 +91,12 @@ The database filename is `steam-agent.sqlite3`. Override the directory with
 `--data-dir PATH` or `STEAM_AGENT_DATA_DIR`; keep it private and out of the
 repository.
 
-## M2 capability checkpoint
+## M2 truthful account inventory
 
 M2 can discover a local Steam account without returning account names or
 identifiers, configure the uniquely most-recent account under a local alias,
-and report the account/credential/probe axes independently:
+report the account/credential/probe axes independently, and synchronize the
+visible owned library:
 
 ```text
 uv run steam-agent accounts discover
@@ -102,6 +104,10 @@ uv run steam-agent accounts configure --from-local-most-recent --alias primary
 uv run steam-agent accounts status --alias primary
 uv run steam-agent auth status steam-web-api
 uv run steam-agent owned capability --account primary
+uv run steam-agent sync owned --account primary --acknowledge-local-storage
+uv run steam-agent sync catalog --account primary --machine local
+uv run steam-agent games query --scope owned --account primary
+uv run steam-agent games query --scope library --account primary --machine local
 ```
 
 If discovery is ambiguous, rerun it with `--include-identifiers`, then configure
@@ -142,6 +148,45 @@ probe is an explicit network operation; it discards the response body and
 persists only coarse probe state. It does not synchronize or persist games.
 See the [credential ADR](docs/adr/0003-credential-storage.md) and
 [Steam data lifecycle policy](docs/design/steam-data-lifecycle.md).
+
+`sync owned` is a separate explicit network operation. Its first persistent
+run requires the versioned local-storage acknowledgment shown above. It compares
+the documented default and played-free-expanded results, stores only normalized
+AppID, optional name, lifetime playtime, inclusion basis, and provenance, and
+promotes only a complete valid pair. Failed or inaccessible attempts preserve
+the last-good snapshot. Per-account deletion preserves the shared key; the
+all-provider termination path also removes the locally managed key/reference:
+
+```text
+uv run steam-agent data delete --provider steam-web-api --account primary --yes
+uv run steam-agent data delete --provider steam-web-api --all --yes
+```
+
+Deleting one account also removes its catalog attempt and demand history.
+Public catalog facts are retained only when another account or installed-machine
+projection still needs the AppID; retained facts no longer reference the
+deleted account. The shared Web API key remains configured.
+
+`sync catalog` uses Valve's documented ordered store catalog, but stores facts
+only for AppIDs already observed in the selected owned/installed projections.
+Because Valve provides no supported arbitrary-AppID filter, retrieval may scan
+several pages even though persistence stays demand-bounded. The joined query
+keeps application identity separate from package, bundle, and edition identity;
+unsupported mappings remain explicitly unknown.
+
+Catalog attempt status is scoped to the selected account, machine, and demanded
+AppIDs. The query selects the newest relevant attempt independently per AppID
+and reports the aggregate, so one successful AppID cannot hide another AppID's
+failure. Retained catalog facts older than 24 hours are reported as stale; a
+sync for unrelated demand does not change that status.
+The same boundary applies to classification and provenance: another account's
+newer shared catalog observation does not replace this subject's last-good fact.
+A running refresh reports `SYNC_IN_PROGRESS` without degrading fresh last-good
+facts. When there are no demanded AppIDs, catalog completeness is complete and
+does not inherit an earlier attempt's status.
+If a new AppID has no last-good fact yet, its running, abandoned, or failed
+attempt is reported alongside `NOT_SYNCED` instead of being hidden behind a
+generic unavailable result.
 
 A partial scan records its diagnostics but does not replace the last complete
 installed-game projection for that machine. This is intentional: subsequent
@@ -198,6 +243,7 @@ are added.
 - [Existing tool evaluation](docs/design/existing-tools.md)
 - [Historical research-backed validation sequence](docs/design/roadmap.md)
 - [M1 execution plan and Linear work graph](docs/design/m1-execution.md)
+- [M2 truthful account inventory execution and evidence](docs/design/m2-execution.md)
 - [Decision register](docs/adr/README.md)
 - [Original research handoff](steam-library-agent-research-handoff.md)
 

@@ -92,7 +92,12 @@ def test_games_scan_uses_fixed_host_header_key_and_explicit_filter() -> None:
     transport = SequenceTransport(
         response(
             [
-                {"appid": 10, "last_modified": 100, "price_change_number": 7},
+                {
+                    "appid": 10,
+                    "name": "Provider name is deliberately discarded",
+                    "last_modified": 100,
+                    "price_change_number": 7,
+                },
                 {"appid": 20},
             ],
             more=True,
@@ -108,6 +113,7 @@ def test_games_scan_uses_fixed_host_header_key_and_explicit_filter() -> None:
     )
 
     assert result.state == "complete"
+    assert result.max_results == 50000
     assert result.termination == "demand_boundary"
     assert result.hits[0].appid == 10
     assert result.hits[0].last_modified == 100
@@ -144,6 +150,7 @@ def test_non_games_scan_sets_aggregate_filter_and_scans_until_max_demand() -> No
     )
 
     assert result.state == "complete"
+    assert result.max_results == 2
     assert result.termination == "demand_boundary"
     assert [hit.appid for hit in result.hits] == [5, 20]
     assert result.confirmed_absent_appids == (15,)
@@ -169,6 +176,32 @@ def test_non_games_scan_sets_aggregate_filter_and_scans_until_max_demand() -> No
     }
 
 
+def test_request_gate_runs_before_every_catalog_page() -> None:
+    transport = SequenceTransport(
+        response([{"appid": 10}], more=True, last_appid=10),
+        response([{"appid": 20}], more=False, last_appid=20),
+    )
+    gate_calls = 0
+
+    def gate() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+
+    result = SteamStoreCatalogClient(
+        transport=transport,
+        clock=Clock(),
+        max_results=1,
+        request_gate=gate,
+    ).scan_demanded_apps(
+        api_key=SecretValue("secret"),
+        demanded_appids=[20],
+        stream="games",
+    )
+
+    assert result.state == "complete"
+    assert gate_calls == 2
+
+
 def test_end_of_stream_confirms_missing_demands() -> None:
     transport = SequenceTransport(response([{"appid": 10}], more=False, last_appid=10))
     result = SteamStoreCatalogClient(
@@ -189,11 +222,22 @@ def test_end_of_stream_confirms_missing_demands() -> None:
 def test_empty_demand_makes_no_request() -> None:
     transport = SequenceTransport()
     result = SteamStoreCatalogClient(transport=transport).scan_demanded_apps(
-        api_key=SecretValue("secret"), demanded_appids=[], stream="games"
+        api_key=None, demanded_appids=[], stream="games"
     )
     assert result.termination == "no_demand"
     assert result.state == "complete"
     assert result.pages == ()
+    assert transport.calls == []
+
+
+def test_nonempty_demand_requires_a_credential_before_request() -> None:
+    transport = SequenceTransport()
+
+    with pytest.raises(CatalogApiError, match="AUTHENTICATION_FAILED"):
+        SteamStoreCatalogClient(transport=transport).scan_demanded_apps(
+            api_key=None, demanded_appids=[10], stream="games"
+        )
+
     assert transport.calls == []
 
 
@@ -270,11 +314,9 @@ def test_status_mapping(status: int, code: str, retryable: bool) -> None:
         response([{"appid": True}]),
         response([{"appid": 10, "last_modified": -1}]),
         response([{"appid": 10, "price_change_number": True}]),
-        response([{"appid": 10, "unknown": 1}]),
         response([{"appid": 10}], last_appid=11),
         response([], more=True, last_appid=0),
         response([], more=False, last_appid=1),
-        response([{"appid": 10}], extra_body={"unknown": 1}),
     ],
 )
 def test_invalid_page_shapes_are_typed(bad_response: HttpResponse) -> None:
@@ -285,6 +327,25 @@ def test_invalid_page_shapes_are_typed(bad_response: HttpResponse) -> None:
         client.scan_demanded_apps(
             api_key=SecretValue("secret"), demanded_appids=[20], stream="games"
         )
+
+
+def test_additive_provider_fields_are_ignored() -> None:
+    payload = {
+        "response": {
+            "apps": [{"appid": 10, "future_app_field": {"nested": True}}],
+            "have_more_results": False,
+            "last_appid": 10,
+            "future_response_field": "ignored",
+        },
+        "future_top_level_field": [1, 2, 3],
+    }
+    result = SteamStoreCatalogClient(
+        transport=SequenceTransport(HttpResponse(200, json.dumps(payload).encode()))
+    ).scan_demanded_apps(
+        api_key=SecretValue("secret"), demanded_appids=[10], stream="games"
+    )
+
+    assert [hit.appid for hit in result.hits] == [10]
 
 
 def test_cross_page_progress_must_be_strict() -> None:

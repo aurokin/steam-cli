@@ -29,6 +29,13 @@ from steam_agent.application import (
     sync_installed,
     usable_steam_root,
 )
+from steam_agent.owned_library import (
+    OWNED_DISCLOSURE_VERSION,
+    OwnedSyncError,
+    owned_item,
+    sync_owned,
+)
+from steam_agent.catalog_inventory import CatalogSyncError, sync_catalog
 from steam_agent.credentials import (
     CredentialError,
     CredentialRef,
@@ -57,6 +64,10 @@ from steam_agent.local_accounts import (
     select_primary_local_account,
 )
 from steam_agent.steam_web_api import SteamApiError, SteamWebApiClient
+from steam_agent.steam_store_catalog import (
+    CatalogApiError,
+    SteamStoreCatalogClient,
+)
 from steam_agent.provider_auth import ProviderAuthClient, ProviderAuthError
 
 
@@ -69,6 +80,9 @@ SECRET_FLAGS = frozenset(
 _SAFE_WARNING_SOURCE = re.compile(r"(?:libraryfolders\.vdf|appmanifest_\d+\.acf)\Z")
 _OWNED_CAPABILITY = "owned.visible.read"
 _OWNED_PROBE_FRESHNESS_SECONDS = 24 * 60 * 60
+_OWNED_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
+_CATALOG_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
+_SYNC_ABANDONED_SECONDS = 15 * 60
 _PROVIDER_MINIMUM_INTERVAL_SECONDS = 1.0
 
 
@@ -87,22 +101,37 @@ _CREDENTIAL_PROVIDERS = {
     spec.cli_name: spec
     for spec in (
         _CredentialProviderSpec(
-            "steam-web-api", "steam", "web-api-key", "Steam Web API key",
-            "Steam Web API user key", "credential:steam_web_api_user_key",
+            "steam-web-api",
+            "steam",
+            "web-api-key",
+            "Steam Web API key",
+            "Steam Web API user key",
+            "credential:steam_web_api_user_key",
             _OWNED_CAPABILITY,
         ),
         _CredentialProviderSpec(
-            "isthereanydeal", "isthereanydeal", "api-key",
-            "IsThereAnyDeal API key", "IsThereAnyDeal API key",
+            "isthereanydeal",
+            "isthereanydeal",
+            "api-key",
+            "IsThereAnyDeal API key",
+            "IsThereAnyDeal API key",
             "credential:isthereanydeal_api_key",
         ),
         _CredentialProviderSpec(
-            "steamgriddb", "steamgriddb", "api-key", "SteamGridDB API key",
-            "SteamGridDB API key", "credential:steamgriddb_api_key",
+            "steamgriddb",
+            "steamgriddb",
+            "api-key",
+            "SteamGridDB API key",
+            "SteamGridDB API key",
+            "credential:steamgriddb_api_key",
         ),
         _CredentialProviderSpec(
-            "gg-deals", "gg-deals", "api-key", "GG.deals API key",
-            "GG.deals API key", "credential:gg_deals_api_key",
+            "gg-deals",
+            "gg-deals",
+            "api-key",
+            "GG.deals API key",
+            "GG.deals API key",
+            "credential:gg_deals_api_key",
         ),
     )
 }
@@ -129,12 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="steam-agent",
         description="Local-first Steam evidence and operations for agents.",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--data-dir", type=Path, help="Override the local data directory.")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
+        "--data-dir", type=Path, help="Override the local data directory."
+    )
     parser.add_argument("--format", choices=("json", "table"), default="json")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    status_parser = commands.add_parser("status", help="Show local data and M1 readiness.")
+    status_parser = commands.add_parser(
+        "status", help="Show local data and M1 readiness."
+    )
     _add_leaf_format(status_parser)
     capabilities_parser = commands.add_parser(
         "capabilities", help="Show available M1 capabilities."
@@ -142,27 +177,53 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(capabilities_parser)
     doctor = commands.add_parser("doctor", help="Check local M1 prerequisites.")
     _add_leaf_format(doctor)
-    doctor.add_argument("--offline", action="store_true", help="Do not use the network.")
+    doctor.add_argument(
+        "--offline", action="store_true", help="Do not use the network."
+    )
 
     sync = commands.add_parser("sync", help="Synchronize a capability.")
     sync_commands = sync.add_subparsers(dest="sync_command", required=True)
-    installed = sync_commands.add_parser("installed", help="Scan installed Steam games.")
+    installed = sync_commands.add_parser(
+        "installed", help="Scan installed Steam games."
+    )
     _add_leaf_format(installed)
     installed.add_argument("--machine", default="local")
     installed.add_argument("--steam-root", type=Path)
+    owned_sync = sync_commands.add_parser(
+        "owned", help="Synchronize the visible owned library."
+    )
+    _add_leaf_format(owned_sync)
+    owned_sync.add_argument("--account", default="primary")
+    owned_sync.add_argument(
+        "--acknowledge-local-storage",
+        action="store_true",
+        help="Accept the versioned local storage and backup disclosure.",
+    )
+    catalog_sync = sync_commands.add_parser(
+        "catalog", help="Synchronize bounded catalog evidence for observed AppIDs."
+    )
+    _add_leaf_format(catalog_sync)
+    catalog_sync.add_argument("--account", default="primary")
+    catalog_sync.add_argument("--machine", default="local")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
     query = game_commands.add_parser("query", help="Query games in a scope.")
     _add_leaf_format(query)
-    query.add_argument("--scope", choices=("installed",), required=True)
+    query.add_argument(
+        "--scope", choices=("installed", "owned", "library"), required=True
+    )
     query.add_argument("--machine", default="local")
+    query.add_argument("--account", default="primary")
     query.add_argument("--include-paths", action="store_true")
 
-    accounts = commands.add_parser("accounts", help="Configure Steam account identities.")
+    accounts = commands.add_parser(
+        "accounts", help="Configure Steam account identities."
+    )
     account_commands = accounts.add_subparsers(dest="accounts_command", required=True)
     discover_accounts = account_commands.add_parser(
-        "discover", help="Inspect local Steam account candidates without exposing identifiers."
+        "discover",
+        help="Inspect local Steam account candidates without exposing identifiers.",
     )
     _add_leaf_format(discover_accounts)
     discover_accounts.add_argument("--steam-root", type=Path)
@@ -183,28 +244,41 @@ def build_parser() -> argparse.ArgumentParser:
     account_status.add_argument("--alias", default="primary")
     account_status.add_argument("--include-identifiers", action="store_true")
     remove_account = account_commands.add_parser(
-        "remove", help="Remove a local account alias and its probe metadata."
+        "remove",
+        help=(
+            "Remove an account alias and all account-scoped owned data while "
+            "preserving the shared API key."
+        ),
     )
     _add_leaf_format(remove_account)
     remove_account.add_argument("--alias", default="primary")
     remove_account.add_argument("--yes", action="store_true")
 
-    auth = commands.add_parser("auth", help="Manage provider credentials without argv secrets.")
+    auth = commands.add_parser(
+        "auth", help="Manage provider credentials without argv secrets."
+    )
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)
-    auth_set = auth_commands.add_parser("set", help="Store a credential from hidden input.")
+    auth_set = auth_commands.add_parser(
+        "set", help="Store a credential from hidden input."
+    )
     _add_leaf_format(auth_set)
     auth_set.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
     auth_set.add_argument("--backend", choices=("os", "file"), default="os")
     auth_set.add_argument("--yes-file-risk", action="store_true")
-    auth_status = auth_commands.add_parser("status", help="Show redacted credential status.")
+    auth_status = auth_commands.add_parser(
+        "status", help="Show redacted credential status."
+    )
     _add_leaf_format(auth_status)
     auth_status.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
     auth_probe = auth_commands.add_parser(
-        "probe", help="Explicitly validate a third-party credential without retaining a body."
+        "probe",
+        help="Explicitly validate a third-party credential without retaining a body.",
     )
     _add_leaf_format(auth_probe)
     auth_probe.add_argument("provider", choices=_AUTH_PROBE_PROVIDER_NAMES)
-    auth_remove = auth_commands.add_parser("remove", help="Remove a locally stored credential.")
+    auth_remove = auth_commands.add_parser(
+        "remove", help="Remove a locally stored credential."
+    )
     _add_leaf_format(auth_remove)
     auth_remove.add_argument("provider", choices=_AUTH_PROVIDER_NAMES)
     auth_remove.add_argument("--yes", action="store_true")
@@ -212,15 +286,29 @@ def build_parser() -> argparse.ArgumentParser:
     owned = commands.add_parser("owned", help="Inspect visible-owned capability state.")
     owned_commands = owned.add_subparsers(dest="owned_command", required=True)
     owned_capability = owned_commands.add_parser(
-        "capability", help="Show account, credential, and probe state without network access."
+        "capability",
+        help="Show account, credential, and probe state without network access.",
     )
     _add_leaf_format(owned_capability)
     owned_capability.add_argument("--account", default="primary")
     owned_probe = owned_commands.add_parser(
-        "probe", help="Explicitly probe visible-owned access without retaining the payload."
+        "probe",
+        help="Explicitly probe visible-owned access without retaining the payload.",
     )
     _add_leaf_format(owned_probe)
     owned_probe.add_argument("--account", default="primary")
+
+    data = commands.add_parser("data", help="Delete locally retained provider data.")
+    data_commands = data.add_subparsers(dest="data_command", required=True)
+    delete_data = data_commands.add_parser(
+        "delete", help="Delete retained Steam Web API account data."
+    )
+    _add_leaf_format(delete_data)
+    delete_data.add_argument("--provider", choices=("steam-web-api",), required=True)
+    target = delete_data.add_mutually_exclusive_group(required=True)
+    target.add_argument("--account")
+    target.add_argument("--all", action="store_true")
+    delete_data.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -235,9 +323,7 @@ def _add_leaf_format(parser: argparse.ArgumentParser) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
-    if any(
-        argument.split("=", 1)[0] in SECRET_FLAGS for argument in effective_argv
-    ):
+    if any(argument.split("=", 1)[0] in SECRET_FLAGS for argument in effective_argv):
         namespace = argparse.Namespace(format=_parse_error_format(effective_argv))
         return _emit_error(
             namespace,
@@ -358,9 +444,16 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _emit_success(
             args,
             command="doctor",
-            data={"offline": bool(args.offline), "installed_read": "ready" if root else "unavailable"},
+            data={
+                "offline": bool(args.offline),
+                "installed_read": "ready" if root else "unavailable",
+            },
             completeness_value=_installed_read_completeness(root),
         )
+    if args.command == "sync" and args.sync_command == "owned":
+        return _dispatch_sync_owned(args, database_path)
+    if args.command == "sync" and args.sync_command == "catalog":
+        return _dispatch_sync_catalog(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -422,6 +515,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.command == "games" and args.games_command == "query":
+        if args.scope in ("owned", "library"):
+            return _dispatch_account_games_query(args, database_path)
         with Storage(database_path) as storage:
             installed_snapshot = storage.read_installed_snapshot(args.machine)
         games = installed_snapshot.games
@@ -519,7 +614,1086 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_auth(args, database_path)
     if args.command == "owned":
         return _dispatch_owned(args, database_path)
+    if args.command == "data":
+        return _dispatch_data(args, database_path)
     raise AssertionError("argparse accepted an unhandled command")
+
+
+def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
+    with _credential_operation_lock(database_path):
+        credential_ref = _steam_credential_ref(database_path)
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="sync.owned",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            if account is None:
+                return _emit_error(
+                    args,
+                    command="sync.owned",
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            consent = storage.get_owned_data_consent(account.id)
+            if (
+                consent is None
+                or consent.disclosure_version != OWNED_DISCLOSURE_VERSION
+            ):
+                if not args.acknowledge_local_storage:
+                    return _emit_error(
+                        args,
+                        command="sync.owned",
+                        code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                        message=(
+                            "Valve data is stored as-is in the selected local data "
+                            "directory: AppID, optional name, lifetime playtime, "
+                            "inclusion basis, provenance, and coarse sync metadata. "
+                            "Visible-owned is not complete license truth; individually "
+                            "private games and unplayed free entitlements may be omitted, "
+                            "and sequential request differences may reflect a concurrent "
+                            "library change. Storage countries follow the device, selected "
+                            "filesystem, replicas, and user-controlled backups. Account "
+                            "deletion preserves the shared key; all-provider deletion "
+                            "removes its local key/reference but does not revoke it at "
+                            "Valve. SQLite secure deletion cannot erase external backups, "
+                            "snapshots, journals, or storage-media remapping."
+                        ),
+                        remediation=(
+                            "Rerun with --acknowledge-local-storage to accept this "
+                            "versioned local-storage policy."
+                        ),
+                    )
+                storage.record_owned_data_consent(
+                    account_id=account.id,
+                    disclosure_version=OWNED_DISCLOSURE_VERSION,
+                    accepted_at=_utc_now(),
+                    backups_acknowledged=True,
+                )
+            metadata = storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            if metadata is None:
+                return _emit_error(
+                    args,
+                    command="sync.owned",
+                    code=ErrorCode.AUTH_REQUIRED,
+                    message="A Steam Web API user key has not been configured.",
+                )
+            resolved = _resolve_credential(metadata, credential_ref)
+            if resolved["state"] != "configured":
+                return _emit_error(
+                    args,
+                    command="sync.owned",
+                    code=_credential_error_code(resolved["state"]),
+                    message="The Steam Web API credential is unavailable.",
+                )
+
+            def request_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "steam-web-api",
+                        _utc_now(),
+                        _PROVIDER_MINIMUM_INTERVAL_SECONDS,
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise OwnedSyncError("REQUEST_THROTTLED", retryable=True)
+
+            try:
+                result = sync_owned(
+                    storage,
+                    account_id=account.id,
+                    steamid=account.provider_account_id,
+                    api_key=resolved["secret"],
+                    client=_steam_web_api_client(),
+                    request_gate=request_gate,
+                    clock=_utc_now,
+                )
+            except OwnedSyncError as exc:
+                return _emit_error(
+                    args,
+                    command="sync.owned",
+                    code=exc.code,
+                    message="The visible-owned synchronization did not complete.",
+                    retryable=exc.retryable,
+                )
+        return _emit_success(
+            args,
+            command="sync.owned",
+            context={"account_alias": account.alias, "identifiers_included": False},
+            data={
+                "sync_run_id": result.run.id,
+                "sync_status": result.run.status,
+                "records_seen": result.run.records_seen,
+                "visible_owned_count": result.visible_owned_count,
+                "played_free_count": result.played_free_count,
+                "disclosure_version": OWNED_DISCLOSURE_VERSION,
+                "limitations": [
+                    "individually_private_games_may_be_omitted",
+                    "unplayed_free_entitlements_are_not_complete",
+                    "sequential_request_difference_may_reflect_concurrent_library_change",
+                ],
+            },
+        )
+
+
+def _credential_error_code(state: str) -> str:
+    return {
+        "missing": str(ErrorCode.CREDENTIAL_NOT_FOUND),
+        "store_locked": str(ErrorCode.CREDENTIAL_STORE_LOCKED),
+        "store_unavailable": str(ErrorCode.CREDENTIAL_STORE_UNAVAILABLE),
+    }.get(state, str(ErrorCode.CREDENTIAL_READ_FAILED))
+
+
+def _dispatch_sync_catalog(args: argparse.Namespace, database_path: Path) -> int:
+    with _credential_operation_lock(database_path):
+        credential_ref = _steam_credential_ref(database_path)
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="sync.catalog",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            if account is None:
+                return _emit_error(
+                    args,
+                    command="sync.catalog",
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            # Demand derivation deliberately avoids catalog reads. A malformed
+            # retained catalog projection must not prevent an explicit repair.
+            demanded = storage.read_catalog_demand(account.id, args.machine)
+            secret: SecretValue | None = None
+            if demanded:
+                metadata = storage.get_credential_reference(
+                    provider=credential_ref.provider,
+                    kind=credential_ref.kind,
+                    profile_id=credential_ref.profile_id,
+                )
+                if metadata is None:
+                    return _emit_error(
+                        args,
+                        command="sync.catalog",
+                        code=ErrorCode.AUTH_REQUIRED,
+                        message="A Steam Web API user key has not been configured.",
+                    )
+                resolved = _resolve_credential(metadata, credential_ref)
+                if resolved["state"] != "configured":
+                    return _emit_error(
+                        args,
+                        command="sync.catalog",
+                        code=_credential_error_code(resolved["state"]),
+                        message="The Steam Web API credential is unavailable.",
+                    )
+                secret = resolved["secret"]
+
+            def request_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "steam-web-api",
+                        _utc_now(),
+                        _PROVIDER_MINIMUM_INTERVAL_SECONDS,
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise CatalogApiError("REQUEST_THROTTLED", retryable=True)
+
+            try:
+                result = sync_catalog(
+                    storage,
+                    account_id=account.id,
+                    machine_id=args.machine,
+                    demanded_appids=demanded,
+                    api_key=secret,
+                    client=SteamStoreCatalogClient(request_gate=request_gate),
+                    clock=_utc_now,
+                )
+            except CatalogSyncError as exc:
+                return _emit_error(
+                    args,
+                    command="sync.catalog",
+                    code=exc.code,
+                    message="The bounded Steam catalog synchronization did not complete.",
+                    retryable=exc.retryable,
+                )
+    return _emit_success(
+        args,
+        command="sync.catalog",
+        context={
+            "account_alias": account.alias,
+            "machine_id": args.machine,
+            "identifiers_included": False,
+        },
+        data={
+            "sync_run_id": result.run.id,
+            "sync_status": result.run.status,
+            "demanded_count": result.demanded_count,
+            "game_count": result.game_count,
+            "non_game_count": result.non_game_count,
+            "not_observed_count": result.not_observed_count,
+            "page_count": result.page_count,
+            "persistence_scope": "demanded_appids_only",
+            "upstream_scan_scope": "ordered_catalog_through_highest_demanded_appid",
+            "identity_limitations": [
+                "packages_not_collected",
+                "bundles_not_collected",
+                "editions_not_collected",
+                "non_game_subtype_not_distinguished",
+            ],
+        },
+    )
+
+
+def _account_snapshot_completeness(
+    snapshot: Any, *, capability: str, subject: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    latest = snapshot.latest
+    latest_complete = snapshot.latest_complete
+    last_good_stale = False
+    if capability == "owned.visible.read" and latest_complete is not None:
+        last_good_at = datetime.fromisoformat(
+            latest_complete.completed_at.replace("Z", "+00:00")
+        )
+        last_good_stale = (
+            _utc_now() - last_good_at
+        ).total_seconds() > _OWNED_SYNC_FRESHNESS_SECONDS
+    if latest is None:
+        return completeness(
+            CompletenessStatus.UNAVAILABLE,
+            missing_capabilities=[capability],
+            warnings=[
+                WarningRecord(
+                    code=ErrorCode.NOT_SYNCED,
+                    message=f"{subject} have not been synchronized.",
+                )
+            ],
+        ), {"last_attempt_status": None, "last_successful_sync_at": None}
+    if latest.status == "complete":
+        if last_good_stale:
+            return completeness(
+                CompletenessStatus.PARTIAL,
+                stale_capabilities=[capability],
+                warnings=[
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message="The visible-owned snapshot is older than the freshness policy.",
+                    )
+                ],
+            ), {
+                "last_attempt_status": "complete",
+                "last_successful_sync_at": latest.completed_at,
+            }
+        return completeness(CompletenessStatus.COMPLETE), {
+            "last_attempt_status": "complete",
+            "last_successful_sync_at": latest.completed_at,
+        }
+    if latest.status == "running":
+        started_at = datetime.fromisoformat(latest.started_at.replace("Z", "+00:00"))
+        abandoned = (
+            _utc_now() - started_at
+        ).total_seconds() > _SYNC_ABANDONED_SECONDS
+        warning = WarningRecord(
+            code=(
+                ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS
+            ),
+            message=(
+                f"The last {subject.lower()} synchronization appears abandoned."
+                if abandoned
+                else f"A {subject.lower()} synchronization is in progress."
+            ),
+        )
+        if latest_complete is None:
+            value = completeness(
+                CompletenessStatus.UNAVAILABLE,
+                missing_capabilities=[capability],
+                warnings=[warning],
+            )
+        elif last_good_stale:
+            value = completeness(
+                CompletenessStatus.PARTIAL,
+                stale_capabilities=[capability],
+                warnings=[
+                    warning,
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message=(
+                            "The visible-owned snapshot is older than the "
+                            "freshness policy."
+                        ),
+                    ),
+                ],
+            )
+        else:
+            value = completeness(
+                CompletenessStatus.PARTIAL
+                if abandoned
+                else CompletenessStatus.COMPLETE,
+                stale_capabilities=[capability] if abandoned else [],
+                warnings=[warning],
+            )
+        return value, {
+            "last_attempt_status": "running",
+            "last_successful_sync_at": (
+                None if latest_complete is None else latest_complete.completed_at
+            ),
+        }
+    has_last_good = latest_complete is not None
+    attempt_was_partial = latest.status == "partial"
+    warning_code = (
+        str(ErrorCode.STALE_LAST_GOOD)
+        if has_last_good
+        else (latest.error_code or str(ErrorCode.STALE_LAST_GOOD))
+    )
+    warning = WarningRecord(
+        code=warning_code,
+        message=(
+            (
+                f"The latest {subject.lower()} synchronization "
+                f"{'was incomplete' if attempt_was_partial else 'failed'}; "
+                "the last-good snapshot is preserved."
+            )
+            if has_last_good
+            else (
+                f"The latest {subject.lower()} synchronization "
+                f"{'was incomplete' if attempt_was_partial else 'failed'} and no "
+                "complete snapshot exists."
+            )
+        ),
+    )
+    if latest_complete is None:
+        value = completeness(
+            CompletenessStatus.UNAVAILABLE,
+            missing_capabilities=[capability],
+            warnings=[warning],
+        )
+    else:
+        value = completeness(
+            CompletenessStatus.PARTIAL,
+            stale_capabilities=[capability],
+            warnings=[warning],
+        )
+    return value, {
+        "last_attempt_status": latest.status,
+        "last_error_code": latest.error_code,
+        "last_successful_sync_at": (
+            None if latest_complete is None else latest_complete.completed_at
+        ),
+    }
+
+
+def _owned_provenance(snapshot: Any) -> dict[str, Any] | None:
+    provenance = snapshot.latest_complete_provenance
+    if provenance is None:
+        return None
+    return {
+        "sync_run_id": provenance.sync_run_id,
+        "provider": provenance.provider,
+        "support_level": provenance.support_level,
+        "include_appinfo": provenance.include_appinfo,
+        "base": {
+            "include_played_free_games": (provenance.base_include_played_free_games),
+            "retrieved_at": provenance.base_retrieved_at,
+            "reported_count": provenance.base_reported_count,
+        },
+        "expanded": {
+            "include_played_free_games": (
+                provenance.expanded_include_played_free_games
+            ),
+            "retrieved_at": provenance.expanded_retrieved_at,
+            "reported_count": provenance.expanded_reported_count,
+        },
+        "classification_method": provenance.classification_method,
+    }
+
+
+def _catalog_sources(snapshot: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "sync_run_id": source.sync_run_id,
+            "provider": source.provider,
+            "support_level": source.support_level,
+            "streams": [
+                {
+                    "stream": stream.stream,
+                    "termination": stream.termination,
+                    "scanned_through_appid": stream.scanned_through_appid,
+                    "filter_context": dict(stream.filter_context),
+                    "pages": [
+                        {
+                            "page_number": page.page_number,
+                            "requested_last_appid": page.requested_last_appid,
+                            "first_appid": page.first_appid,
+                            "last_appid": page.last_appid,
+                            "item_count": page.item_count,
+                            "have_more_results": page.have_more_results,
+                            "retrieved_at": page.retrieved_at,
+                        }
+                        for page in stream.pages
+                    ],
+                }
+                for stream in source.streams
+            ],
+        }
+        for source in snapshot.sources
+    ]
+
+
+def _catalog_completeness(
+    snapshot: Any, *, demanded_appids: set[int]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not demanded_appids:
+        return completeness(CompletenessStatus.COMPLETE), {
+            "last_attempt_status": None,
+            "last_error_code": None,
+            "last_attempt_sync_run_id": None,
+            "relevant_attempts": [],
+            "freshness_window_seconds": _CATALOG_SYNC_FRESHNESS_SECONDS,
+            "sources": [],
+            "oldest_fact_observed_at": None,
+            "newest_fact_observed_at": None,
+            "stale_fact_count": 0,
+        }
+    observed = {fact.appid for fact in snapshot.facts}
+    missing = demanded_appids - observed
+    relevant_attempts = tuple(snapshot.attempts)
+    if not relevant_attempts and snapshot.latest is not None:
+        # Compatibility for callers constructing the pre-aggregate snapshot
+        # shape directly; storage-backed scoped reads always provide attempts.
+        attempt_values = ((snapshot.latest, tuple(sorted(demanded_appids))),)
+    else:
+        attempt_values = tuple(
+            (attempt.run, attempt.appids) for attempt in relevant_attempts
+        )
+    attempted_appids = {
+        appid for _, appids in attempt_values for appid in appids
+    }
+    missing_attempts = demanded_appids - attempted_appids
+    sole_attempt = attempt_values[0][0] if len(attempt_values) == 1 else None
+    metadata = {
+        "last_attempt_status": None if sole_attempt is None else sole_attempt.status,
+        "last_error_code": None if sole_attempt is None else sole_attempt.error_code,
+        "last_attempt_sync_run_id": None if sole_attempt is None else sole_attempt.id,
+        "relevant_attempts": [
+            {
+                "sync_run_id": run.id,
+                "status": run.status,
+                "error_code": run.error_code,
+                "started_at": run.started_at,
+                "completed_at": run.completed_at,
+                "appids": list(appids),
+            }
+            for run, appids in attempt_values
+        ],
+        "freshness_window_seconds": _CATALOG_SYNC_FRESHNESS_SECONDS,
+        "sources": _catalog_sources(snapshot),
+    }
+    observed_times = [
+        datetime.fromisoformat(fact.observed_at.replace("Z", "+00:00"))
+        for fact in snapshot.facts
+    ]
+    stale_fact_count = sum(
+        (_utc_now() - observed_at).total_seconds() > _CATALOG_SYNC_FRESHNESS_SECONDS
+        for observed_at in observed_times
+    )
+    metadata.update(
+        {
+            "oldest_fact_observed_at": (
+                None
+                if not observed_times
+                else min(observed_times).isoformat().replace("+00:00", "Z")
+            ),
+            "newest_fact_observed_at": (
+                None
+                if not observed_times
+                else max(observed_times).isoformat().replace("+00:00", "Z")
+            ),
+            "stale_fact_count": stale_fact_count,
+        }
+    )
+    failed_attempts = tuple(
+        run for run, _ in attempt_values if run.status in ("failed", "partial")
+    )
+    running_attempts = tuple(
+        run for run, _ in attempt_values if run.status == "running"
+    )
+    abandoned_running = bool(running_attempts) and any(
+        (
+            _utc_now()
+            - datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))
+        ).total_seconds()
+        > _SYNC_ABANDONED_SECONDS
+        for run in running_attempts
+    )
+    refresh_warning = (
+        None
+        if not running_attempts
+        else WarningRecord(
+            code=(
+                ErrorCode.SYNC_ABANDONED
+                if abandoned_running
+                else ErrorCode.SYNC_IN_PROGRESS
+            ),
+            message=(
+                "The catalog synchronization appears abandoned."
+                if abandoned_running
+                else "A catalog synchronization is in progress."
+            ),
+        )
+    )
+    if missing or missing_attempts:
+        warnings = [
+            WarningRecord(
+                code=ErrorCode.NOT_SYNCED,
+                message=(
+                    "Catalog facts or scoped synchronization attempts are "
+                    "missing for observed application identities."
+                ),
+            )
+        ]
+        if refresh_warning is not None:
+            warnings.append(refresh_warning)
+        if failed_attempts:
+            failed_code = next(
+                (
+                    run.error_code
+                    for run in reversed(failed_attempts)
+                    if run.error_code is not None
+                ),
+                str(ErrorCode.STALE_LAST_GOOD),
+            )
+            warnings.append(
+                WarningRecord(
+                    code=failed_code,
+                    message=(
+                        "A relevant catalog synchronization failed or was "
+                        "incomplete before it produced a last-good fact."
+                    ),
+                )
+            )
+        active_or_failed = bool(running_attempts or failed_attempts)
+        return completeness(
+            (
+                CompletenessStatus.PARTIAL
+                if active_or_failed and not missing_attempts
+                else CompletenessStatus.UNAVAILABLE
+            ),
+            missing_capabilities=["catalog.application.read"],
+            warnings=warnings,
+        ), metadata
+    if failed_attempts:
+        warnings = [
+            WarningRecord(
+                code=ErrorCode.STALE_LAST_GOOD,
+                message=(
+                    "At least one demanded AppID has a newer failed or incomplete "
+                    "catalog attempt; retained subject facts remain last-good."
+                ),
+            )
+        ]
+        if refresh_warning is not None:
+            warnings.append(refresh_warning)
+        return completeness(
+            CompletenessStatus.PARTIAL,
+            stale_capabilities=["catalog.application.read"],
+            warnings=warnings,
+        ), metadata
+    if running_attempts:
+        assert refresh_warning is not None
+        if stale_fact_count:
+            return completeness(
+                CompletenessStatus.PARTIAL,
+                stale_capabilities=["catalog.application.read"],
+                warnings=[
+                    refresh_warning,
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message=(
+                            "One or more retained catalog facts are older than "
+                            "the 24-hour freshness window."
+                        ),
+                    ),
+                ],
+            ), metadata
+        return completeness(
+            (
+                CompletenessStatus.PARTIAL
+                if abandoned_running
+                else CompletenessStatus.COMPLETE
+            ),
+            stale_capabilities=(
+                ["catalog.application.read"] if abandoned_running else []
+            ),
+            warnings=[refresh_warning],
+        ), metadata
+    if stale_fact_count:
+        return completeness(
+            CompletenessStatus.PARTIAL,
+            stale_capabilities=["catalog.application.read"],
+            warnings=[
+                WarningRecord(
+                    code=ErrorCode.STALE_LAST_GOOD,
+                    message=(
+                        "One or more retained catalog facts are older than the "
+                        "24-hour freshness window."
+                    ),
+                )
+            ],
+        ), metadata
+    return completeness(CompletenessStatus.COMPLETE), metadata
+
+
+def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path) -> int:
+    if args.include_paths:
+        return _emit_error(
+            args,
+            command="games.query",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="--include-paths is available only for installed-scope queries.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            return _emit_error(
+                args,
+                command="games.query",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
+        if account is None:
+            unavailable_snapshot = {
+                "last_attempt_status": None,
+                "last_successful_sync_at": None,
+            }
+            if args.scope == "owned":
+                empty_data: dict[str, Any] = {
+                    "items": [],
+                    "empty": False,
+                    "limitations": [
+                        "individually_private_games_may_be_omitted",
+                        "unplayed_free_entitlements_are_not_complete",
+                        "sequential_request_difference_may_reflect_concurrent_library_change",
+                    ],
+                    "next_cursor": None,
+                    "source": None,
+                    "snapshot": unavailable_snapshot,
+                }
+            else:
+                empty_data = {
+                    "items": [],
+                    "limitations": [
+                        "individually_private_games_may_be_omitted",
+                        "unplayed_free_entitlements_are_not_complete",
+                        "sequential_request_difference_may_reflect_concurrent_library_change",
+                    ],
+                    "next_cursor": None,
+                    "snapshots": {
+                        "owned": {**unavailable_snapshot, "source": None},
+                        "installed": unavailable_snapshot,
+                        "catalog": {
+                            "last_attempt_status": None,
+                            "last_error_code": None,
+                            "sources": [],
+                        },
+                    },
+                }
+            return _emit_success(
+                args,
+                command="games.query",
+                context={
+                    "account_alias": args.account,
+                    "scopes": (
+                        ["owned", "installed", "catalog"]
+                        if args.scope == "library"
+                        else ["owned"]
+                    ),
+                    "identifiers_included": False,
+                    **({"machine_id": args.machine} if args.scope == "library" else {}),
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["account.identity"],
+                    warnings=[
+                        WarningRecord(
+                            code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                            message="The requested account alias is not configured.",
+                        )
+                    ],
+                ),
+                data=empty_data,
+            )
+        if args.scope == "owned":
+            owned_snapshot = storage.read_owned_snapshot(account.id)
+            owned_game_ids = dict(owned_snapshot.stable_game_ids_by_appid)
+            owned_completeness, metadata = _account_snapshot_completeness(
+                owned_snapshot,
+                capability="owned.visible.read",
+                subject="Owned games",
+            )
+            return _emit_success(
+                args,
+                command="games.query",
+                context={
+                    "account_alias": account.alias,
+                    "scopes": ["owned"],
+                    "identifiers_included": False,
+                },
+                completeness_value=owned_completeness,
+                data={
+                    "items": [
+                        {
+                            **owned_item(game),
+                            "game_id": f"game:{owned_game_ids[game.appid]}",
+                        }
+                        for game in owned_snapshot.games
+                    ],
+                    "empty": bool(
+                        owned_snapshot.latest_complete is not None
+                        and not owned_snapshot.games
+                    ),
+                    "limitations": [
+                        "individually_private_games_may_be_omitted",
+                        "unplayed_free_entitlements_are_not_complete",
+                        "sequential_request_difference_may_reflect_concurrent_library_change",
+                    ],
+                    "next_cursor": None,
+                    "source": _owned_provenance(owned_snapshot),
+                    "snapshot": metadata,
+                },
+            )
+        library = storage.read_library_snapshot(account.id, args.machine)
+
+    owned_completeness, owned_metadata = _account_snapshot_completeness(
+        library.owned,
+        capability="owned.visible.read",
+        subject="Owned games",
+    )
+    installed_completeness, installed_metadata = _account_snapshot_completeness(
+        library.installed,
+        capability="installed.read",
+        subject="Installed games",
+    )
+    catalog_completeness, catalog_metadata = _catalog_completeness(
+        library.catalog,
+        demanded_appids={
+            *(game.appid for game in library.owned.games),
+            *(game.appid for game in library.installed.games),
+        },
+    )
+    owned_usable = library.owned.latest_complete is not None
+    installed_usable = library.installed.latest_complete is not None
+    installed_types_by_appid = {
+        game.appid: game.app_type for game in library.installed.games
+    }
+    entity_ids = dict(library.stable_game_ids_by_appid)
+    by_appid: dict[int, dict[str, Any]] = {}
+    for game in library.owned.games:
+        by_appid[game.appid] = {
+            **owned_item(game),
+            "game_id": f"game:{entity_ids[game.appid]}",
+            "installed": False if installed_usable else None,
+            "app_type": "unknown",
+            "names": {"owned": game.name, "installed": None},
+        }
+    for game in library.installed.games:
+        item = by_appid.setdefault(
+            game.appid,
+            {
+                "appid": game.appid,
+                "game_id": f"game:{entity_ids[game.appid]}",
+                "name": game.name,
+                "visible_in_owned_games": False if owned_usable else None,
+                "inclusion_basis": None,
+                "playtime_forever_minutes": None,
+                "observed_at": game.observed_at,
+                "evidence_ids": [],
+                "family_available": None,
+                "purchasable": None,
+                "playable_now": None,
+                "names": {"owned": None, "installed": game.name},
+            },
+        )
+        item["installed"] = True
+        item["app_type"] = game.app_type
+        item["names"]["installed"] = game.name
+        if item["name"] is None and game.name is not None:
+            item["name"] = game.name
+        item["evidence_ids"] = sorted({*item["evidence_ids"], game.evidence_id})
+    catalog_by_appid = {fact.appid: fact for fact in library.catalog.facts}
+    for appid, item in by_appid.items():
+        fact = catalog_by_appid.get(appid)
+        item["catalog_classification"] = None if fact is None else fact.classification
+        item["catalog_observed_at"] = None if fact is None else fact.observed_at
+        item["catalog_evidence_ids"] = [] if fact is None else [fact.evidence_id]
+        item["app_types"] = {
+            "installed": installed_types_by_appid.get(appid),
+            "catalog": None if fact is None else fact.classification,
+        }
+        if fact is not None and fact.classification in ("game", "non_game"):
+            item["app_type"] = fact.classification
+        if fact is not None:
+            item["evidence_ids"] = sorted({*item["evidence_ids"], fact.evidence_id})
+        item["identity"] = {
+            "entity_kind": "application",
+            "external_identities": [
+                {
+                    "provider": "steam",
+                    "identity_kind": "application_appid",
+                    "value": str(appid),
+                }
+            ],
+            "package": None,
+            "bundle": None,
+            "edition": None,
+        }
+    warnings = [
+        *owned_completeness["warnings"],
+        *installed_completeness["warnings"],
+        *catalog_completeness["warnings"],
+    ]
+    missing = sorted(
+        {
+            *owned_completeness["missing_capabilities"],
+            *installed_completeness["missing_capabilities"],
+            *catalog_completeness["missing_capabilities"],
+        }
+    )
+    stale = sorted(
+        {
+            *owned_completeness["stale_capabilities"],
+            *installed_completeness["stale_capabilities"],
+            *catalog_completeness["stale_capabilities"],
+        }
+    )
+    if missing and not (owned_usable or installed_usable):
+        status = CompletenessStatus.UNAVAILABLE
+    elif missing:
+        status = CompletenessStatus.PARTIAL
+    elif stale or any(
+        value["status"] == "partial"
+        for value in (
+            owned_completeness,
+            installed_completeness,
+            catalog_completeness,
+        )
+    ):
+        status = CompletenessStatus.PARTIAL
+    else:
+        status = CompletenessStatus.COMPLETE
+    return _emit_success(
+        args,
+        command="games.query",
+        context={
+            "account_alias": account.alias,
+            "machine_id": args.machine,
+            "scopes": ["owned", "installed", "catalog"],
+            "identifiers_included": False,
+        },
+        completeness_value=completeness(
+            status,
+            warnings=warnings,
+            missing_capabilities=missing,
+            stale_capabilities=stale,
+        ),
+        data={
+            "items": [by_appid[appid] for appid in sorted(by_appid)],
+            "limitations": [
+                "individually_private_games_may_be_omitted",
+                "unplayed_free_entitlements_are_not_complete",
+                "sequential_request_difference_may_reflect_concurrent_library_change",
+            ],
+            "next_cursor": None,
+            "snapshots": {
+                "owned": {
+                    **owned_metadata,
+                    "source": _owned_provenance(library.owned),
+                },
+                "installed": installed_metadata,
+                "catalog": catalog_metadata,
+            },
+        },
+    )
+
+
+def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
+    if args.data_command != "delete":
+        raise AssertionError("unhandled data command")
+    if not args.yes:
+        return _emit_error(
+            args,
+            command="data.delete",
+            code=ErrorCode.CONFIRMATION_REQUIRED,
+            message="Steam Web API data deletion requires --yes.",
+        )
+    with _credential_operation_lock(database_path):
+        if args.account is not None:
+            with Storage(database_path) as storage:
+                try:
+                    account = storage.get_account(args.account)
+                except ValueError:
+                    return _emit_error(
+                        args,
+                        command="data.delete",
+                        code=ErrorCode.INVALID_ARGUMENT,
+                        message="The account alias is invalid.",
+                        exit_code=2,
+                    )
+                if account is None:
+                    return _emit_success(
+                        args,
+                        command="data.delete",
+                        data={
+                            "scope": "account",
+                            "account_alias": args.account,
+                            "removed": False,
+                            "owned_observations_removed": 0,
+                            "owned_current_removed": 0,
+                            "sync_runs_removed": 0,
+                            "probes_removed": 0,
+                            "consents_removed": 0,
+                            "evidence_removed": 0,
+                            "orphan_apps_removed": 0,
+                            "shared_credential_preserved": True,
+                            "backup_copies_require_separate_deletion": True,
+                        },
+                    )
+                result = storage.delete_steam_account_data(account.id)
+            return _emit_success(
+                args,
+                command="data.delete",
+                data={
+                    "scope": "account",
+                    "account_alias": args.account,
+                    "removed": result.account_removed,
+                    "owned_observations_removed": result.owned_observations_removed,
+                    "owned_current_removed": result.owned_current_removed,
+                    "sync_runs_removed": result.sync_runs_removed,
+                    "probes_removed": result.probes_removed,
+                    "consents_removed": result.consents_removed,
+                    "evidence_removed": result.evidence_removed,
+                    "orphan_apps_removed": result.orphan_apps_removed,
+                    "shared_credential_preserved": True,
+                    "backup_copies_require_separate_deletion": True,
+                },
+            )
+        return _delete_all_steam_web_api_data(args, database_path)
+
+
+def _delete_all_steam_web_api_data(
+    args: argparse.Namespace, database_path: Path
+) -> int:
+    credential_ref = _steam_credential_ref(database_path)
+    with Storage(database_path) as storage:
+        metadata = storage.get_credential_reference(
+            provider=credential_ref.provider,
+            kind=credential_ref.kind,
+            profile_id=credential_ref.profile_id,
+        )
+    store = None
+    previous_secret = None
+    credential_unreadable = False
+    credential_deleted = False
+    if metadata is not None:
+        store = _credential_store(metadata.backend, metadata.backend_locator)
+        try:
+            previous_secret = store.resolve(credential_ref)
+        except CredentialError as exc:
+            if exc.code != "CREDENTIAL_READ_FAILED":
+                raise
+            credential_unreadable = True
+    try:
+        if store is not None and (previous_secret is not None or credential_unreadable):
+            if not store.delete(credential_ref):
+                raise CredentialError(str(ErrorCode.CREDENTIAL_DELETE_FAILED))
+            credential_deleted = True
+        with Storage(database_path) as storage:
+            deletion = storage.delete_all_steam_account_data(
+                credential_provider=(
+                    None if metadata is None else credential_ref.provider
+                ),
+                credential_kind=None if metadata is None else credential_ref.kind,
+                credential_profile_id=(
+                    None if metadata is None else credential_ref.profile_id
+                ),
+            )
+    except BaseException:
+        if store is not None and previous_secret is not None:
+            try:
+                store.put(credential_ref, previous_secret)
+            except BaseException:
+                return _emit_error(
+                    args,
+                    command="data.delete",
+                    code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
+                    message=(
+                        "Account-data deletion failed and the locally managed key "
+                        "could not be restored."
+                    ),
+                )
+        elif credential_deleted and credential_unreadable:
+            return _emit_error(
+                args,
+                command="data.delete",
+                code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
+                message=(
+                    "Account-data deletion failed after an unreadable locally "
+                    "managed key was removed. The database was retained, but "
+                    "the key could not be restored."
+                ),
+            )
+        raise
+    return _emit_success(
+        args,
+        command="data.delete",
+        data={
+            "scope": "all-steam-web-api",
+            "accounts_removed": deletion.accounts_removed,
+            "owned_observations_removed": deletion.owned_observations_removed,
+            "owned_current_removed": deletion.owned_current_removed,
+            "sync_runs_removed": deletion.sync_runs_removed,
+            "probes_removed": deletion.probes_removed,
+            "consents_removed": deletion.consents_removed,
+            "evidence_removed": deletion.evidence_removed,
+            "orphan_apps_removed": deletion.orphan_apps_removed,
+            "credential_refs_removed": deletion.credential_refs_removed,
+            "catalog_observations_removed": (deletion.catalog_observations_removed),
+            "catalog_current_removed": deletion.catalog_current_removed,
+            "catalog_sync_runs_removed": deletion.catalog_sync_runs_removed,
+            "catalog_metadata_removed": deletion.catalog_metadata_removed,
+            "catalog_streams_removed": deletion.catalog_streams_removed,
+            "catalog_pages_removed": deletion.catalog_pages_removed,
+            "catalog_evidence_removed": deletion.catalog_evidence_removed,
+            "shared_credential_preserved": deletion.shared_credential_preserved,
+            "local_credential_removed": (
+                previous_secret is not None or credential_unreadable
+            ),
+            "credential_already_absent": (
+                metadata is not None
+                and previous_secret is None
+                and not credential_unreadable
+            ),
+            "valve_key_revoked": False,
+            "backup_copies_require_separate_deletion": True,
+        },
+    )
 
 
 def _dispatch_accounts(args: argparse.Namespace, database_path: Path) -> int:
@@ -566,7 +1740,9 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 status,
                 warnings=warnings,
                 missing_capabilities=(
-                    ["account.identity"] if status == CompletenessStatus.UNAVAILABLE else []
+                    ["account.identity"]
+                    if status == CompletenessStatus.UNAVAILABLE
+                    else []
                 ),
             ),
             data={
@@ -685,7 +1861,12 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
             )
         try:
             with Storage(database_path) as storage:
-                removed = storage.remove_account(args.alias)
+                account = storage.get_account(args.alias)
+                deletion = (
+                    None
+                    if account is None
+                    else storage.delete_steam_account_data(account.id)
+                )
         except ValueError:
             return _emit_error(
                 args,
@@ -697,7 +1878,31 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
         return _emit_success(
             args,
             command="accounts.remove",
-            data={"alias": args.alias, "removed": removed},
+            data={
+                "alias": args.alias,
+                "removed": deletion is not None and deletion.account_removed,
+                "owned_observations_removed": (
+                    0 if deletion is None else deletion.owned_observations_removed
+                ),
+                "owned_current_removed": (
+                    0 if deletion is None else deletion.owned_current_removed
+                ),
+                "sync_runs_removed": 0
+                if deletion is None
+                else deletion.sync_runs_removed,
+                "probes_removed": 0 if deletion is None else deletion.probes_removed,
+                "consents_removed": 0
+                if deletion is None
+                else deletion.consents_removed,
+                "evidence_removed": 0
+                if deletion is None
+                else deletion.evidence_removed,
+                "orphan_apps_removed": (
+                    0 if deletion is None else deletion.orphan_apps_removed
+                ),
+                "shared_credential_preserved": True,
+                "backup_copies_require_separate_deletion": True,
+            },
         )
     raise AssertionError("unhandled accounts command")
 
@@ -768,9 +1973,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                     exit_code=2,
                 )
             if existing is not None:
-                store = _credential_store(
-                    existing.backend, existing.backend_locator
-                )
+                store = _credential_store(existing.backend, existing.backend_locator)
                 store_probe = store.probe()
             previous_secret = store.resolve(credential_ref)
             put_completed = False
@@ -791,9 +1994,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                     if previous_secret is None:
                         deleted = store.delete(credential_ref)
                         if put_completed and not deleted:
-                            raise CredentialError(
-                                "CREDENTIAL_ROLLBACK_FAILED"
-                            )
+                            raise CredentialError("CREDENTIAL_ROLLBACK_FAILED")
                     else:
                         store.put(credential_ref, previous_secret)
                 except CredentialError:
@@ -964,9 +2165,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                                 "CREDENTIAL_ROLLBACK_FAILED"
                             ) from None
                     else:
-                        raise CredentialError(
-                            "CREDENTIAL_ROLLBACK_FAILED"
-                        ) from None
+                        raise CredentialError("CREDENTIAL_ROLLBACK_FAILED") from None
                     raise
                 removed = True
         data = {
@@ -1007,7 +2206,11 @@ def _dispatch_owned_locked(args: argparse.Namespace, database_path: Path) -> int
             kind=credential_ref.kind,
             profile_id=credential_ref.profile_id,
         )
-        if args.owned_command == "probe" and account is not None and metadata is not None:
+        if (
+            args.owned_command == "probe"
+            and account is not None
+            and metadata is not None
+        ):
             credential = _resolve_credential(metadata, credential_ref)
             if credential["state"] == "configured":
                 now = _utc_now()
@@ -1141,9 +2344,7 @@ def _credential_operation_lock(database_path: Path) -> Iterator[None]:
                         errno.EACCES,
                         errno.EAGAIN,
                     ):
-                        raise CredentialError(
-                            "CREDENTIAL_STORE_UNAVAILABLE"
-                        ) from None
+                        raise CredentialError("CREDENTIAL_STORE_UNAVAILABLE") from None
                     if time.monotonic() >= lock_deadline:
                         raise CredentialError("CREDENTIAL_STORE_LOCKED") from None
                     time.sleep(0.05)
@@ -1181,13 +2382,11 @@ def _credential_snapshot(
     }
 
 
-def _resolve_credential(
-    metadata: Any, credential_ref: CredentialRef
-) -> dict[str, Any]:
+def _resolve_credential(metadata: Any, credential_ref: CredentialRef) -> dict[str, Any]:
     try:
-        secret = _credential_store(
-            metadata.backend, metadata.backend_locator
-        ).resolve(credential_ref)
+        secret = _credential_store(metadata.backend, metadata.backend_locator).resolve(
+            credential_ref
+        )
     except CredentialError as exc:
         state = (
             "store_locked"
@@ -1456,6 +2655,7 @@ def _command_name(args: argparse.Namespace) -> str:
         "accounts_command",
         "auth_command",
         "owned_command",
+        "data_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -1512,6 +2712,8 @@ def _table_field(value: object) -> str:
 
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
     escaped: list[str] = []
     for character in str(value):
         if character == "\\":
@@ -1546,11 +2748,38 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
             if warning.get("source"):
                 fields.append(warning["source"])
             _print_table_fields(*fields)
-        _print_table_fields("APPID", "NAME", "STATE", "SIZE")
-        for item in envelope["data"]["items"]:
+        scopes = envelope.get("context", {}).get("scopes", [])
+        if scopes == ["installed"] or (
+            not scopes and all("state" in item for item in envelope["data"]["items"])
+        ):
+            _print_table_fields("APPID", "NAME", "STATE", "SIZE")
+            for item in envelope["data"]["items"]:
+                _print_table_fields(
+                    item["appid"], item["name"], item["state"], item["size_bytes"]
+                )
+        elif scopes == ["owned"]:
+            _print_table_fields("APPID", "NAME", "VISIBLE", "BASIS", "PLAYTIME")
+            for item in envelope["data"]["items"]:
+                _print_table_fields(
+                    item["appid"],
+                    item["name"],
+                    item["visible_in_owned_games"],
+                    item["inclusion_basis"],
+                    item["playtime_forever_minutes"],
+                )
+        else:
             _print_table_fields(
-                item["appid"], item["name"], item["state"], item["size_bytes"]
+                "APPID", "NAME", "VISIBLE", "INSTALLED", "TYPE", "PLAYTIME"
             )
+            for item in envelope["data"]["items"]:
+                _print_table_fields(
+                    item["appid"],
+                    item["name"],
+                    item["visible_in_owned_games"],
+                    item["installed"],
+                    item["app_type"],
+                    item["playtime_forever_minutes"],
+                )
         return
     for key, value in envelope["data"].items():
         _print_table_fields(key, value)

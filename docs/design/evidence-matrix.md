@@ -17,7 +17,7 @@ Support levels used below:
 | Recent play | Steam `GetRecentlyPlayedGames` | Documented | Visibility applies; a short window is not a preference verdict |
 | Friends/profile | Steam `ISteamUser` | Documented | Private friend lists fail; no consent should be inferred from public visibility |
 | Achievements/stats | Steam `ISteamUserStats` | Documented | Per-game support varies; hidden achievements need care |
-| Store catalog identity | Steam `IStoreService/GetAppList` | Documented | Returns catalog/type/change signals, not rich metadata or price history |
+| Store catalog identity | Steam `IStoreService/GetAppList` | Documented | Ordered paginated full-catalog stream with no documented arbitrary-AppID filter; persistence can be demand-bounded, but initial retrieval scans through the highest demanded AppID; returns change signals, not rich metadata or price history |
 | Wishlist | Valve `IWishlistService` | Provisional | Missing from Valve's supported reference; share-token/auth behavior varies |
 | Rich store metadata/current price | Storefront `api/appdetails` | Provisional | Undocumented shape/rate limits; country and language affect results |
 | Store reviews | Steam store review API | Documented | Review windows and filters must be recorded |

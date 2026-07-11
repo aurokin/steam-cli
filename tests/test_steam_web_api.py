@@ -39,7 +39,9 @@ class RecordingTransport:
         return self.response
 
 
-def client_for(status: int, payload: object) -> tuple[SteamWebApiClient, RecordingTransport]:
+def client_for(
+    status: int, payload: object
+) -> tuple[SteamWebApiClient, RecordingTransport]:
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
     transport = RecordingTransport(HttpResponse(status, body))
     return SteamWebApiClient(transport=transport), transport
@@ -103,6 +105,7 @@ def test_fetch_normalizes_complete_response_and_uses_requested_flags() -> None:
     result = client.fetch_visible_owned_games(
         steamid="76561197960265728",
         api_key=SecretValue(sentinel),
+        include_appinfo=True,
         include_played_free_games=False,
     )
 
@@ -154,6 +157,7 @@ def test_fetch_tolerates_additive_response_and_game_fields() -> None:
     result = client.fetch_visible_owned_games(
         steamid="76561197960265728",
         api_key=SecretValue("canary"),
+        include_appinfo=True,
         include_played_free_games=True,
     )
 
@@ -167,6 +171,7 @@ def test_fetch_explicit_zero_is_confirmed_empty() -> None:
     result = client.fetch_visible_owned_games(
         steamid="76561197960265728",
         api_key=SecretValue("canary"),
+        include_appinfo=True,
         include_played_free_games=True,
     )
 
@@ -181,6 +186,7 @@ def test_fetch_empty_response_is_inaccessible_not_empty() -> None:
     result = client.fetch_visible_owned_games(
         steamid="76561197960265728",
         api_key=SecretValue("canary"),
+        include_appinfo=True,
         include_played_free_games=False,
     )
 
@@ -351,6 +357,7 @@ def test_fetch_rejects_invalid_provider_shapes(payload: object) -> None:
         client.fetch_visible_owned_games(
             steamid="76561197960265728",
             api_key=SecretValue("canary"),
+            include_appinfo=True,
             include_played_free_games=True,
         )
 
@@ -375,6 +382,7 @@ def test_fetch_maps_http_status_without_retaining_provider_body(
         client.fetch_visible_owned_games(
             steamid="76561197960265728",
             api_key=SecretValue("canary"),
+            include_appinfo=True,
             include_played_free_games=False,
         )
 
@@ -390,6 +398,7 @@ def test_fetch_rejects_non_boolean_flag_without_request() -> None:
         client.fetch_visible_owned_games(
             steamid="76561197960265728",
             api_key=SecretValue("canary"),
+            include_appinfo=True,
             include_played_free_games=1,  # type: ignore[arg-type]
         )
 
@@ -399,7 +408,9 @@ def test_fetch_rejects_non_boolean_flag_without_request() -> None:
 def test_invalid_steamid_makes_no_request() -> None:
     client, transport = client_for(200, {"response": {"game_count": 0}})
     with pytest.raises(ValueError, match="unsigned 64-bit"):
-        client.probe_visible_owned_games(steamid="not-an-id", api_key=SecretValue("canary"))
+        client.probe_visible_owned_games(
+            steamid="not-an-id", api_key=SecretValue("canary")
+        )
     assert transport.call is None
 
 

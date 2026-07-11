@@ -640,3 +640,65 @@ def test_owned_capability_expires_old_probe_and_exposes_retryability(
     assert capability["probe"] == "stale"
     assert capability["probe_retryable"] is True
     assert value["completeness"]["status"] == "unavailable"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("probe_state", "warning_code"),
+    [
+        ("authentication_failed", "AUTHENTICATION_FAILED"),
+        (
+            "data_inaccessible",
+            "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+        ),
+        ("contract_changed", "PROVIDER_RESPONSE_INVALID"),
+    ],
+)
+def test_owned_capability_preserves_non_ready_probe_states(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_state: str,
+    warning_code: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    database = data_dir / "steam-agent.sqlite3"
+    credential_ref = cli._steam_credential_ref(database)
+    checked = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    with Storage(database) as storage:
+        storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=checked,
+        )
+        storage.upsert_credential_reference(
+            provider="steam",
+            kind="web-api-key",
+            profile_id=credential_ref.profile_id,
+            backend="os",
+            configured_at=checked,
+        )
+        storage.save_provider_probe(
+            capability="owned.visible.read",
+            account_alias="primary",
+            probe_state=probe_state,
+            checked_at=checked,
+            retryable=False,
+        )
+    credential_store = InMemoryCredentialStore()
+    credential_store.put(credential_ref, SecretValue("credential-long-enough"))
+    monkeypatch.setattr(
+        cli, "_credential_store", lambda backend, backend_locator=None: credential_store
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: checked)
+
+    code, value, stderr = _invoke(
+        ["--data-dir", str(data_dir), "owned", "capability"], capsys
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert value["data"]["capability"]["probe"] == probe_state  # type: ignore[index]
+    assert value["completeness"]["status"] == "unavailable"  # type: ignore[index]
+    assert [
+        warning["code"] for warning in value["completeness"]["warnings"]  # type: ignore[index]
+    ] == [warning_code]

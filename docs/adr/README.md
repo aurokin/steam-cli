@@ -12,15 +12,15 @@ them.
 | D004 | Provider support-level model | Proposed direction | Costly if omitted | Contract-failure fixtures for documented/provisional providers |
 | D005 | Wishlist adapter in supported core | Open | Easy if isolated | Live privacy/share-token probes and failure behavior |
 | D006 | Historical-price provider portfolio | Blocked on outreach | Easy if adapter-based | ITAD approval; GG.deals terms; VGI quote; degraded fallback tests |
-| D007 | Full catalog vs demand-driven enrichment | Open | Moderate | Storage/sync measurements and discovery quality tests |
+| D007 | Full catalog vs demand-driven enrichment | Demand-bounded observed-AppID slice implemented for M2; broader discovery catalog remains open | Moderate | Live six-page scan persisted only 782 demanded identities; broader discovery quality and storage measurements remain |
 | D008 | SteamGridDB integration | Optional | Easy | Art use cases and terms/attribution review |
 | D009 | High-trust SteamKit/SteamCMD mode | Deferred | Moderate | Private-data value vs account/session risk |
 | D010 | MCP surface | Deferred until CLI stabilizes | Easy | Multiple consumers needing typed live tools |
-| D011 | Raw-response retention and deletion | Bounded for the M2 probe; AUR-627 implementation plan reviewed but not yet accepted: no raw body, one last-good normalized projection, account-subject deletion, and shared-key removal only on all-Steam-data termination | Costly for privacy | [Steam account lifecycle policy](../design/steam-data-lifecycle.md), [M2 execution plan](../design/m2-execution.md), adversarial redaction/retention tests, implemented per-profile/all-account deletion before AUR-627 persists live data |
+| D011 | Raw-response retention and deletion | Implemented M2 candidate: no raw body, one last-good normalized projection, account-subject deletion, and shared-key removal only on all-Steam-data termination | Costly for privacy | [Steam account lifecycle policy](../design/steam-data-lifecycle.md), [M2 execution plan](../design/m2-execution.md), adversarial redaction/retention tests, per-account/all-account deletion and live resync evidence |
 | D012 | Ranking recipe semantics | Open | Costly once agents depend on it | Golden scenarios, user overrides, versioning plan |
 | D013 | Public binary/package name | [Accepted: `steam-agent`](0002-steam-agent-command-name.md) | Costly after release | Avoids the known `steam` client collision |
 | D014 | Read/plan/open/execute action boundary | Proposed direction | Costly and safety-critical | Steam policy review and action-specific capability probes |
-| D015 | Provider-neutral game/offer/license identity graph | Proposed direction | Costly | Cross-edition/package and cross-launcher fixtures |
+| D015 | Provider-neutral game/offer/license identity graph | M2 application identity foundation implemented with stable entity IDs and typed Steam AppID mapping; offer/license/package/bundle/edition joins remain open | Costly | Cross-edition/package and cross-launcher fixtures |
 | D016 | Browser reference access modes | Proposed direction | Moderate | Provider permissions for manual link, human-open, agent-read, and ingestion |
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
 | D018 | M2 credential storage boundary | [Accepted: native `keyring` with explicit protected-file fallback](0003-credential-storage.md) | Moderate | Native backend probes, file-safety tests, redaction tests, and M2 capability review |

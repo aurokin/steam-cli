@@ -2,8 +2,9 @@
 
 ## Current Phase
 
-- M1 installed-library is accepted; keep new work outside its boundary in design until the next milestone is explicitly selected.
-- Treat capabilities beyond the credential-free installed-library slice as research and design until explicitly assigned.
+- M1 installed-library is accepted; preserve its schema `0.1` behavior and last-good rule.
+- M2 truthful account inventory is the active acceptance candidate: account capability, visible-owned persistence, owned/installed joining, and deletion are in scope.
+- Keep wishlist, pricing, recommendation, compatibility, artwork, and action capabilities in design until their Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
 - Preserve the M1 last-good rule: partial or failed scans must not replace a complete installed projection.
@@ -23,6 +24,7 @@
 | Steam actions, policy, and confirmation classes | `docs/design/actions.md` |
 | Validation sequence | `docs/design/roadmap.md` |
 | M1 implementation scope and Linear work graph | `docs/design/m1-execution.md` |
+| M2 implementation scope and acceptance evidence | `docs/design/m2-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions

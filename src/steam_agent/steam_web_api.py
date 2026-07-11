@@ -149,20 +149,24 @@ class SteamWebApiClient:
         *,
         steamid: str,
         api_key: SecretValue,
+        include_appinfo: bool,
         include_played_free_games: bool,
     ) -> VisibleOwnedSnapshot:
         """Fetch and normalize a complete visible-owned response in memory."""
 
+        if not isinstance(include_appinfo, bool):
+            raise ValueError("include_appinfo must be a boolean")
         if not isinstance(include_played_free_games, bool):
             raise ValueError("include_played_free_games must be a boolean")
         response = self._request_visible_owned_games(
             steamid=steamid,
             api_key=api_key,
-            include_appinfo=True,
+            include_appinfo=include_appinfo,
             include_played_free_games=include_played_free_games,
         )
         return _interpret_visible_owned_snapshot(
             response,
+            include_appinfo=include_appinfo,
             include_played_free_games=include_played_free_games,
         )
 
@@ -235,10 +239,7 @@ def _interpret_owned_response(response: HttpResponse) -> OwnedGamesProbe:
         or (games_present and not isinstance(games, list))
         or (count > 0 and not games_present)
         or (isinstance(games, list) and len(games) != count)
-        or (
-            isinstance(games, list)
-            and not _valid_game_entries(games)
-        )
+        or (isinstance(games, list) and not _valid_game_entries(games))
     ):
         raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
     return OwnedGamesProbe(
@@ -249,7 +250,10 @@ def _interpret_owned_response(response: HttpResponse) -> OwnedGamesProbe:
 
 
 def _interpret_visible_owned_snapshot(
-    response: HttpResponse, *, include_played_free_games: bool
+    response: HttpResponse,
+    *,
+    include_appinfo: bool,
+    include_played_free_games: bool,
 ) -> VisibleOwnedSnapshot:
     _raise_for_response_status(response.status)
     decoded, payload = _decode_json(response.body)
@@ -263,7 +267,7 @@ def _interpret_visible_owned_snapshot(
             snapshot_state="data_inaccessible",
             games=(),
             reported_game_count=None,
-            include_appinfo=True,
+            include_appinfo=include_appinfo,
             include_played_free_games=include_played_free_games,
         )
 
@@ -289,7 +293,7 @@ def _interpret_visible_owned_snapshot(
         snapshot_state="ready",
         games=tuple(normalized),
         reported_game_count=count,
-        include_appinfo=True,
+        include_appinfo=include_appinfo,
         include_played_free_games=include_played_free_games,
     )
 
@@ -323,9 +327,7 @@ def _normalize_visible_owned_game(value: object) -> VisibleOwnedGame:
     return VisibleOwnedGame(
         appid=appid,
         name=name,
-        playtime_forever_minutes=_optional_unsigned_32(
-            value, "playtime_forever"
-        ),
+        playtime_forever_minutes=_optional_unsigned_32(value, "playtime_forever"),
         playtime_windows_forever_minutes=_optional_unsigned_32(
             value, "playtime_windows_forever"
         ),
