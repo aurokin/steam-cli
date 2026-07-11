@@ -2255,6 +2255,8 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
         credential_ref = None
         store = None
         previous_secret = None
+        credential_unreadable = False
+        credential_deleted = False
         if args.provider == "gg-deals":
             credential_ref = _provider_credential_ref(
                 database_path, _CREDENTIAL_PROVIDERS["gg-deals"]
@@ -2267,11 +2269,19 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                 )
             if metadata is not None:
                 store = _credential_store(metadata.backend, metadata.backend_locator)
-                previous_secret = store.resolve(credential_ref)
+                try:
+                    previous_secret = store.resolve(credential_ref)
+                except CredentialError as exc:
+                    if exc.code != "CREDENTIAL_READ_FAILED":
+                        raise
+                    credential_unreadable = True
         try:
-            if store is not None and previous_secret is not None:
+            if store is not None and (
+                previous_secret is not None or credential_unreadable
+            ):
                 if not store.delete(credential_ref):
                     raise CredentialError(str(ErrorCode.CREDENTIAL_DELETE_FAILED))
+                credential_deleted = True
             with Storage(database_path) as storage:
                 deletion = storage.delete_price_data(
                     provider=args.provider,
@@ -2291,6 +2301,17 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                         code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
                         message="Provider deletion failed and the key could not be restored.",
                     )
+            elif credential_deleted and credential_unreadable:
+                return _emit_error(
+                    args,
+                    command="data.delete",
+                    code=ErrorCode.CREDENTIAL_ROLLBACK_FAILED,
+                    message=(
+                        "Provider deletion failed after an unreadable locally managed "
+                        "key was removed. The database was retained, but the key could "
+                        "not be restored."
+                    ),
+                )
             raise
         return _emit_success(
             args,
@@ -2304,7 +2325,7 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                 "sync_runs_removed": deletion.sync_runs_removed,
                 "evidence_removed": deletion.evidence_removed,
                 "credential_refs_removed": deletion.credential_refs_removed,
-                "local_credential_removed": previous_secret is not None,
+                "local_credential_removed": credential_deleted,
                 "steam_account_data_preserved": True,
                 "other_provider_data_preserved": True,
                 "backup_copies_require_separate_deletion": True,
