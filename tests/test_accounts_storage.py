@@ -28,7 +28,9 @@ def test_account_migration_is_packaged_and_applied(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+        ]
 
 
 def test_configure_get_list_and_remove_multiple_accounts(tmp_path: Path) -> None:

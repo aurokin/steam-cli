@@ -243,7 +243,7 @@ def test_migration_resource_is_packaged_and_applied_once(tmp_path: Path) -> None
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+    assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
     assert {"machines", "steam_apps", "sync_runs", "evidence"} <= tables
     assert {"installed_observations", "installed_current", "accounts"} <= tables
 
@@ -497,8 +497,10 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(initialize, range(workers)))
 
-    assert results == [(1, 2, 3, 4, 5, 6, 7, 8)] * workers
+    assert results == [(1, 2, 3, 4, 5, 6, 7, 8, 9)] * workers
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+        ]

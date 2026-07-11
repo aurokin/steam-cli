@@ -224,6 +224,74 @@ class OwnedSnapshotProvenance:
     classification_method: str
 
 
+CatalogClassification = Literal["game", "non_game", "not_observed"]
+CatalogStreamName = Literal["games", "non_games"]
+
+
+@dataclass(frozen=True)
+class CatalogObservation:
+    appid: int
+    classification: CatalogClassification
+    last_modified: int | None = None
+    price_change_number: int | None = None
+
+
+@dataclass(frozen=True)
+class CatalogPageInput:
+    page_number: int
+    requested_last_appid: int
+    first_appid: int | None
+    last_appid: int
+    item_count: int
+    have_more_results: bool
+    retrieved_at: str | datetime
+
+
+@dataclass(frozen=True)
+class CatalogStreamInput:
+    stream: CatalogStreamName
+    termination: str
+    scanned_through_appid: int
+    filter_context: Mapping[str, Any]
+    pages: tuple[CatalogPageInput, ...]
+
+
+@dataclass(frozen=True)
+class CatalogFact:
+    appid: int
+    stable_game_id: str
+    classification: CatalogClassification
+    last_modified: int | None
+    price_change_number: int | None
+    observed_at: str
+    evidence_id: int
+    promoted_sync_run_id: int
+
+
+@dataclass(frozen=True)
+class CatalogStreamProvenance:
+    stream: CatalogStreamName
+    termination: str
+    scanned_through_appid: int
+    filter_context: Mapping[str, Any]
+    pages: tuple[CatalogPageInput, ...]
+
+
+@dataclass(frozen=True)
+class CatalogSourceProvenance:
+    sync_run_id: int
+    provider: str
+    support_level: str
+    streams: tuple[CatalogStreamProvenance, ...]
+
+
+@dataclass(frozen=True)
+class CatalogSnapshot:
+    facts: tuple[CatalogFact, ...]
+    sources: tuple[CatalogSourceProvenance, ...]
+    latest: SyncRun | None
+
+
 @dataclass(frozen=True)
 class AccountDataConsent:
     account_id: int
@@ -267,6 +335,7 @@ class LibrarySnapshot:
     owned: OwnedSnapshot
     installed: InstalledSnapshot
     stable_game_ids_by_appid: tuple[tuple[int, str], ...]
+    catalog: CatalogSnapshot
 
 
 def _timestamp(value: str | datetime) -> str:
@@ -1221,6 +1290,209 @@ class Storage:
             raise
         return self.get_sync_run(sync_run_id)
 
+    def complete_catalog_snapshot(
+        self,
+        sync_run_id: int,
+        demanded_appids: list[int] | tuple[int, ...],
+        observations: list[CatalogObservation] | tuple[CatalogObservation, ...],
+        *,
+        games: CatalogStreamInput,
+        non_games: CatalogStreamInput,
+        completed_at: str | datetime,
+        support_level: str = "official_documented",
+    ) -> SyncRun:
+        """Atomically promote demanded application facts from two complete scans."""
+
+        completed = _timestamp(completed_at)
+        demanded = _catalog_appids(demanded_appids)
+        normalized = _catalog_observations(observations, demanded=demanded)
+        streams = _catalog_streams(games, non_games)
+        for stream, _ in streams:
+            if demanded and stream.termination == "no_demand":
+                raise ValueError("nonempty catalog demand cannot use no-demand provenance")
+            if (
+                demanded
+                and stream.termination == "demand_boundary"
+                and stream.scanned_through_appid < demanded[-1]
+            ):
+                raise ValueError("catalog demand boundary does not cover demand")
+        if not support_level or len(support_level) > 128:
+            raise ValueError("support_level must be between 1 and 128 characters")
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._require_running_catalog_sync(sync_run_id)
+            self._connection.execute(
+                """
+                INSERT INTO catalog_sync_metadata(
+                    sync_run_id, provider, support_level, demanded_count
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (sync_run_id, run.provider, support_level, len(demanded)),
+            )
+            for stream, pages in streams:
+                self._connection.execute(
+                    """
+                    INSERT INTO catalog_stream_provenance(
+                        sync_run_id, stream, termination, scanned_through_appid,
+                        filter_context_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sync_run_id,
+                        stream.stream,
+                        stream.termination,
+                        stream.scanned_through_appid,
+                        _canonical_json(stream.filter_context),
+                    ),
+                )
+                for page, retrieved_at in pages:
+                    self._connection.execute(
+                        """
+                        INSERT INTO catalog_page_provenance(
+                            sync_run_id, stream, page_number,
+                            requested_last_appid, first_appid, last_appid,
+                            item_count, have_more_results, retrieved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sync_run_id,
+                            stream.stream,
+                            page.page_number,
+                            page.requested_last_appid,
+                            page.first_appid,
+                            page.last_appid,
+                            page.item_count,
+                            int(page.have_more_results),
+                            retrieved_at,
+                        ),
+                    )
+
+            for observation in normalized:
+                self._ensure_steam_application_identity(
+                    observation.appid, observed_at=completed
+                )
+                evidence_id = self._insert_evidence(
+                    EvidenceInput(
+                        provider=run.provider,
+                        capability=run.capability,
+                        source_kind="steam_web_api",
+                        source_locator=f"GetAppList:app:{observation.appid}",
+                        retrieved_at=completed,
+                        support_level=support_level,
+                        context={
+                            "demanded": True,
+                            "games_filter": games.filter_context,
+                            "non_games_filter": non_games.filter_context,
+                        },
+                        payload={
+                            "appid": observation.appid,
+                            "classification": observation.classification,
+                            "last_modified": observation.last_modified,
+                            "price_change_number": observation.price_change_number,
+                        },
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO catalog_observations(
+                        sync_run_id, evidence_id, appid, classification,
+                        last_modified, price_change_number, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sync_run_id,
+                        evidence_id,
+                        observation.appid,
+                        observation.classification,
+                        observation.last_modified,
+                        observation.price_change_number,
+                        completed,
+                    ),
+                )
+
+            promotable = tuple(
+                observation.appid
+                for observation in normalized
+                if not self._connection.execute(
+                    """
+                    SELECT 1 FROM catalog_current
+                    WHERE appid = ? AND promoted_sync_run_id > ?
+                    """,
+                    (observation.appid, sync_run_id),
+                ).fetchone()
+            )
+            if promotable:
+                placeholders = ",".join("?" for _ in promotable)
+                self._connection.execute(
+                    f"DELETE FROM catalog_current WHERE appid IN ({placeholders})",
+                    promotable,
+                )
+                self._connection.execute(
+                    f"""
+                    INSERT INTO catalog_current(
+                        appid, evidence_id, promoted_sync_run_id, classification,
+                        last_modified, price_change_number, observed_at
+                    )
+                    SELECT
+                        appid, evidence_id, sync_run_id, classification,
+                        last_modified, price_change_number, observed_at
+                    FROM catalog_observations
+                    WHERE sync_run_id = ? AND appid IN ({placeholders})
+                    """,
+                    (sync_run_id, *promotable),
+                )
+            self._connection.execute(
+                """
+                UPDATE sync_runs
+                SET status = 'complete', completed_at = ?, promoted = ?,
+                    records_seen = ?, error_code = NULL, error_detail = NULL
+                WHERE id = ?
+                """,
+                (completed, int(bool(promotable)), len(normalized), sync_run_id),
+            )
+            self._prune_catalog_payloads()
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def finish_catalog_sync(
+        self,
+        sync_run_id: int,
+        *,
+        status: Literal["partial", "failed"],
+        completed_at: str | datetime,
+        error_code: str,
+    ) -> SyncRun:
+        if status not in ("partial", "failed") or not error_code:
+            raise ValueError("catalog failure requires partial/failed status and code")
+        completed = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_running_catalog_sync(sync_run_id)
+            self._connection.execute(
+                """
+                UPDATE sync_runs
+                SET status = ?, completed_at = ?, promoted = 0,
+                    error_code = ?, error_detail = NULL
+                WHERE id = ?
+                """,
+                (status, completed, error_code, sync_run_id),
+            )
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
+
     def record_installed_observation(
         self,
         sync_run_id: int,
@@ -1441,6 +1713,24 @@ class Storage:
                 pass
             raise
 
+    def read_catalog_snapshot(
+        self, appids: list[int] | tuple[int, ...]
+    ) -> CatalogSnapshot:
+        demanded = set(_catalog_appids(appids))
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            snapshot = self._read_catalog_snapshot(demanded)
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
     def read_library_snapshot(
         self, account_id: int, machine_id: str
     ) -> LibrarySnapshot:
@@ -1465,11 +1755,15 @@ class Storage:
                     *(game.appid for game in installed.games),
                 }
             )
+            catalog = self._read_catalog_snapshot(
+                {appid for appid, _ in stable_game_ids_by_appid}
+            )
             self._connection.commit()
             return LibrarySnapshot(
                 owned=owned,
                 installed=installed,
                 stable_game_ids_by_appid=stable_game_ids_by_appid,
+                catalog=catalog,
             )
         except BaseException:
             try:
@@ -1557,33 +1851,7 @@ class Storage:
                     evidence_ids,
                 )
                 evidence_removed = max(evidence_removed, evidence_cursor.rowcount)
-            orphan_apps_removed = 0
-            if appids:
-                placeholders = ",".join("?" for _ in appids)
-                app_cursor = self._connection.execute(
-                    f"""
-                    DELETE FROM steam_apps
-                    WHERE appid IN ({placeholders})
-                      AND NOT EXISTS (
-                          SELECT 1 FROM installed_observations
-                          WHERE installed_observations.appid = steam_apps.appid
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM installed_current
-                          WHERE installed_current.appid = steam_apps.appid
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM owned_observations
-                          WHERE owned_observations.appid = steam_apps.appid
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM owned_current
-                          WHERE owned_current.appid = steam_apps.appid
-                      )
-                    """,
-                    appids,
-                )
-                orphan_apps_removed = app_cursor.rowcount
+            orphan_apps_removed = self._delete_orphan_apps(appids)
             self._connection.commit()
             return AccountDataDeletion(
                 account_removed=cursor.rowcount > 0,
@@ -1918,6 +2186,113 @@ class Storage:
             raise StorageError("Steam application identity mapping is incomplete")
         return result
 
+    def _read_catalog_snapshot(self, appids: set[int]) -> CatalogSnapshot:
+        latest_row = self._connection.execute(
+            """
+            SELECT * FROM sync_runs
+            WHERE capability = 'catalog.application.read'
+              AND machine_id IS NULL AND account_id IS NULL
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        latest = None if latest_row is None else _sync_run(latest_row)
+        if not appids:
+            return CatalogSnapshot(facts=(), sources=(), latest=latest)
+        parameters = tuple(sorted(appids))
+        placeholders = ",".join("?" for _ in parameters)
+        fact_rows = tuple(
+            self._connection.execute(
+                f"""
+                SELECT
+                    current.appid, entities.stable_id AS stable_game_id,
+                    current.classification, current.last_modified,
+                    current.price_change_number, current.observed_at,
+                    current.evidence_id, current.promoted_sync_run_id
+                FROM catalog_current AS current
+                JOIN external_game_identities AS identities
+                  ON identities.provider = 'steam'
+                 AND identities.identity_kind = 'application_appid'
+                 AND identities.external_id = CAST(current.appid AS TEXT)
+                JOIN game_entities AS entities
+                  ON entities.id = identities.game_entity_id
+                WHERE current.appid IN ({placeholders})
+                ORDER BY current.appid
+                """,
+                parameters,
+            )
+        )
+        facts = tuple(CatalogFact(**dict(row)) for row in fact_rows)
+        run_ids = tuple(sorted({fact.promoted_sync_run_id for fact in facts}))
+        sources: list[CatalogSourceProvenance] = []
+        for run_id in run_ids:
+            metadata = self._connection.execute(
+                """
+                SELECT provider, support_level FROM catalog_sync_metadata
+                WHERE sync_run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if metadata is None:
+                raise StorageError("catalog source provenance is missing")
+            stream_values: list[CatalogStreamProvenance] = []
+            for stream_row in self._connection.execute(
+                """
+                SELECT stream, termination, scanned_through_appid,
+                       filter_context_json
+                FROM catalog_stream_provenance
+                WHERE sync_run_id = ? ORDER BY stream
+                """,
+                (run_id,),
+            ):
+                page_values = tuple(
+                    CatalogPageInput(
+                        page_number=int(page["page_number"]),
+                        requested_last_appid=int(page["requested_last_appid"]),
+                        first_appid=page["first_appid"],
+                        last_appid=int(page["last_appid"]),
+                        item_count=int(page["item_count"]),
+                        have_more_results=bool(page["have_more_results"]),
+                        retrieved_at=str(page["retrieved_at"]),
+                    )
+                    for page in self._connection.execute(
+                        """
+                        SELECT page_number, requested_last_appid, first_appid,
+                               last_appid, item_count, have_more_results,
+                               retrieved_at
+                        FROM catalog_page_provenance
+                        WHERE sync_run_id = ? AND stream = ?
+                        ORDER BY page_number
+                        """,
+                        (run_id, stream_row["stream"]),
+                    )
+                )
+                stream_values.append(
+                    CatalogStreamProvenance(
+                        stream=stream_row["stream"],
+                        termination=stream_row["termination"],
+                        scanned_through_appid=int(
+                            stream_row["scanned_through_appid"]
+                        ),
+                        filter_context=json.loads(stream_row["filter_context_json"]),
+                        pages=page_values,
+                    )
+                )
+            if {stream.stream for stream in stream_values} != {"games", "non_games"}:
+                raise StorageError("catalog stream provenance is incomplete")
+            sources.append(
+                CatalogSourceProvenance(
+                    sync_run_id=run_id,
+                    provider=metadata["provider"],
+                    support_level=metadata["support_level"],
+                    streams=tuple(stream_values),
+                )
+            )
+        return CatalogSnapshot(
+            facts=facts,
+            sources=tuple(sources),
+            latest=latest,
+        )
+
     def _count_where(self, table: str, column: str, value: object) -> int:
         allowed = {
             ("owned_observations", "account_id"),
@@ -1957,10 +2332,57 @@ class Storage:
                   SELECT 1 FROM owned_current
                   WHERE owned_current.evidence_id = evidence.id
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_observations
+                  WHERE catalog_observations.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_current
+                  WHERE catalog_current.evidence_id = evidence.id
+              )
             """,
             evidence_ids,
         )
         return cursor.rowcount
+
+    def _prune_catalog_payloads(self) -> None:
+        evidence_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """
+                SELECT DISTINCT observations.evidence_id
+                FROM catalog_observations AS observations
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM catalog_current AS current
+                    WHERE current.appid = observations.appid
+                      AND current.promoted_sync_run_id = observations.sync_run_id
+                      AND current.evidence_id = observations.evidence_id
+                )
+                """
+            )
+        )
+        self._connection.execute(
+            """
+            DELETE FROM catalog_observations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM catalog_current AS current
+                WHERE current.appid = catalog_observations.appid
+                  AND current.promoted_sync_run_id = catalog_observations.sync_run_id
+                  AND current.evidence_id = catalog_observations.evidence_id
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            DELETE FROM catalog_sync_metadata
+            WHERE NOT EXISTS (
+                SELECT 1 FROM catalog_current
+                WHERE catalog_current.promoted_sync_run_id =
+                      catalog_sync_metadata.sync_run_id
+            )
+            """
+        )
+        self._delete_orphan_owned_evidence(evidence_ids)
 
     def _prune_owned_payloads(
         self,
@@ -2069,6 +2491,14 @@ class Storage:
                   SELECT 1 FROM owned_current
                   WHERE owned_current.appid = steam_apps.appid
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_observations
+                  WHERE catalog_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_current
+                  WHERE catalog_current.appid = steam_apps.appid
+              )
             """,
             appids,
         )
@@ -2127,6 +2557,18 @@ class Storage:
 
     def _require_running_owned_sync(self, sync_run_id: int) -> SyncRun:
         run = self._require_owned_sync(sync_run_id)
+        if run.status != "running":
+            raise InvalidSyncTransition(
+                f"sync run {sync_run_id} is already {run.status}"
+            )
+        return run
+
+    def _require_running_catalog_sync(self, sync_run_id: int) -> SyncRun:
+        run = self.get_sync_run(sync_run_id)
+        if run.capability != "catalog.application.read":
+            raise InvalidSyncTransition("sync run is not an application-catalog sync")
+        if run.account_id is not None or run.machine_id is not None:
+            raise InvalidSyncTransition("catalog sync cannot target an account or machine")
         if run.status != "running":
             raise InvalidSyncTransition(
                 f"sync run {sync_run_id} is already {run.status}"
@@ -2299,6 +2741,13 @@ __all__ = [
     "AccountDataConsent",
     "AccountDataDeletion",
     "AllSteamAccountDataDeletion",
+    "CatalogFact",
+    "CatalogObservation",
+    "CatalogPageInput",
+    "CatalogSnapshot",
+    "CatalogSourceProvenance",
+    "CatalogStreamInput",
+    "CatalogStreamProvenance",
     "CredentialReferenceRecord",
     "EvidenceInput",
     "InstalledGame",
@@ -2358,3 +2807,126 @@ def _account_alias(value: str) -> str:
             "account alias may contain only ASCII letters, digits, _ and -"
         )
     return value
+
+
+def _catalog_appids(values: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+    if any(
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= (1 << 32) - 1
+        for value in values
+    ):
+        raise ValueError("catalog AppIDs must be positive unsigned 32-bit integers")
+    normalized = tuple(sorted(set(values)))
+    if len(normalized) != len(values):
+        raise ValueError("catalog demanded AppIDs must be unique")
+    return normalized
+
+
+def _catalog_observations(
+    values: list[CatalogObservation] | tuple[CatalogObservation, ...],
+    *,
+    demanded: tuple[int, ...],
+) -> tuple[CatalogObservation, ...]:
+    by_appid: dict[int, CatalogObservation] = {}
+    for observation in values:
+        if observation.appid in by_appid:
+            raise ValueError("catalog observations must have unique AppIDs")
+        if observation.classification not in ("game", "non_game", "not_observed"):
+            raise ValueError("unsupported catalog classification")
+        for counter in (
+            observation.last_modified,
+            observation.price_change_number,
+        ):
+            if counter is not None and (
+                not isinstance(counter, int)
+                or isinstance(counter, bool)
+                or not 0 <= counter <= (1 << 64) - 1
+            ):
+                raise ValueError("catalog counters must be unsigned 64-bit integers")
+        if observation.classification == "not_observed" and (
+            observation.last_modified is not None
+            or observation.price_change_number is not None
+        ):
+            raise ValueError("not-observed catalog facts cannot have provider counters")
+        by_appid[observation.appid] = observation
+    if tuple(sorted(by_appid)) != demanded:
+        raise ValueError("catalog observations must exactly cover demanded AppIDs")
+    return tuple(by_appid[appid] for appid in demanded)
+
+
+def _catalog_streams(
+    games: CatalogStreamInput,
+    non_games: CatalogStreamInput,
+) -> tuple[tuple[CatalogStreamInput, tuple[tuple[CatalogPageInput, str], ...]], ...]:
+    if games.stream != "games" or non_games.stream != "non_games":
+        raise ValueError("catalog provenance requires games and non-games streams")
+    result: list[
+        tuple[CatalogStreamInput, tuple[tuple[CatalogPageInput, str], ...]]
+    ] = []
+    for stream in (games, non_games):
+        if stream.termination not in ("no_demand", "demand_boundary", "end_of_stream"):
+            raise ValueError("catalog stream must be complete before persistence")
+        if (
+            not isinstance(stream.scanned_through_appid, int)
+            or isinstance(stream.scanned_through_appid, bool)
+            or not 0 <= stream.scanned_through_appid <= (1 << 32) - 1
+        ):
+            raise ValueError("catalog scan boundary is invalid")
+        if not isinstance(stream.filter_context, Mapping):
+            raise ValueError("catalog filter context must be a mapping")
+        _validate_catalog_filter_context(stream.stream, stream.filter_context)
+        normalized_pages: list[tuple[CatalogPageInput, str]] = []
+        previous_last = 0
+        for expected_number, page in enumerate(stream.pages, start=1):
+            if page.page_number != expected_number:
+                raise ValueError("catalog page numbers must be contiguous")
+            if page.requested_last_appid != previous_last:
+                raise ValueError("catalog page cursor chain is inconsistent")
+            if (
+                page.first_appid is not None
+                and not 1 <= page.first_appid <= page.last_appid
+            ):
+                raise ValueError("catalog first AppID is invalid")
+            if not 0 <= page.last_appid <= (1 << 32) - 1 or page.item_count < 0:
+                raise ValueError("catalog page bounds are invalid")
+            if not isinstance(page.have_more_results, bool):
+                raise ValueError("catalog page continuation must be boolean")
+            normalized_pages.append((page, _timestamp(page.retrieved_at)))
+            previous_last = page.last_appid
+        if previous_last != stream.scanned_through_appid:
+            raise ValueError("catalog scan boundary does not match its final page")
+        result.append((stream, tuple(normalized_pages)))
+    return tuple(result)
+
+
+def _validate_catalog_filter_context(
+    stream: CatalogStreamName, context: Mapping[str, Any]
+) -> None:
+    boolean_keys = {
+        "include_games",
+        "include_dlc",
+        "include_software",
+        "include_videos",
+        "include_hardware",
+    }
+    if not boolean_keys <= set(context) or set(context) - boolean_keys - {"max_results"}:
+        raise ValueError("catalog filter context contains unsupported fields")
+    if any(not isinstance(context[key], bool) for key in boolean_keys):
+        raise ValueError("catalog include filters must be boolean")
+    expected_games = stream == "games"
+    expected = {
+        "include_games": expected_games,
+        "include_dlc": not expected_games,
+        "include_software": not expected_games,
+        "include_videos": not expected_games,
+        "include_hardware": not expected_games,
+    }
+    if any(context[key] is not value for key, value in expected.items()):
+        raise ValueError("catalog filter context does not match its stream")
+    if "max_results" in context and (
+        not isinstance(context["max_results"], int)
+        or isinstance(context["max_results"], bool)
+        or not 1 <= context["max_results"] <= 50_000
+    ):
+        raise ValueError("catalog max_results filter is invalid")
