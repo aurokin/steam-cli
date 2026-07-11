@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+import steam_agent.price_library as price_library
 from steam_agent.cheapshark import CheapSharkError
 from steam_agent.credentials import SecretValue
 from steam_agent.deal_query import build_deal_query_from_snapshot
@@ -200,6 +203,29 @@ class LowOnlyGg:
         )
 
 
+class ShuffledSparseGg:
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        assert tuple(appids) == (1, 2, 3)
+        return GgDealsBatch(
+            (1, 2, 3),
+            (
+                empty_snapshot("gg-deals", 3),
+                observed_snapshot("gg-deals", 2),
+            ),
+            (1,),
+            RateLimitMetadata(100, 99, 123),
+        )
+
+
+class RecordingCheap:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def lookup_steam_app(self, appid: int) -> DealEvidenceSnapshot:
+        self.calls.append(appid)
+        return observed_snapshot("cheapshark", appid)
+
+
 def test_forced_primary_not_found_completes_run_but_not_evidence_ladder(
     tmp_path,
 ) -> None:
@@ -339,6 +365,70 @@ def test_historical_low_without_current_offer_is_retained_and_falls_back(
             (attempt["provider"], attempt["status"])
             for attempt in item["deal"]["attempted_providers"]
         ] == [("gg-deals", "not_found"), ("cheapshark", "ready")]
+
+
+def test_shuffled_sparse_primary_response_uses_canonical_fallback_targets(
+    tmp_path,
+) -> None:
+    cheap = RecordingCheap()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 3)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=ShuffledSparseGg(),
+            cheapshark_client=cheap,
+            clock=lambda: NOW,
+        )
+
+        assert result.completeness == "complete"
+        assert result.fallback_total == 2
+        assert result.fallback_evaluated == 2
+        assert cheap.calls == [1, 3]
+        fallback = storage.read_price_snapshot(
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            now=NOW,
+        )
+        assert [
+            (row.appid, row.targeted, row.evaluated) for row in fallback.demand_rows
+        ] == [(1, True, True), (2, False, False), (3, True, True)]
+
+
+def test_fallback_client_setup_failure_does_not_create_running_attempt(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BrokenCheap:
+        def __init__(self) -> None:
+            raise ValueError("synthetic setup failure")
+
+    monkeypatch.setattr(price_library, "CheapSharkClient", BrokenCheap)
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 1)
+        with pytest.raises(ValueError, match="synthetic setup failure"):
+            sync_wishlist_prices(
+                storage,
+                account_id=account_id,
+                country="US",
+                provider="auto",
+                gg_api_key=SecretValue("secret"),
+                max_items=None,
+                gg_client=LowOnlyGg(),
+                clock=lambda: NOW,
+            )
+
+        snapshot = storage.read_price_snapshot(
+            account_id=account_id,
+            country="US",
+            provider="cheapshark",
+            now=NOW,
+        )
+        assert snapshot.attempts == ()
 
 
 class CheapOk:

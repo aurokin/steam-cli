@@ -226,11 +226,20 @@ def sync_wishlist_prices(
     if provider == "cheapshark":
         fallback_candidates = [item.appid for item in selected]
 
-    fallback_total = len(dict.fromkeys(fallback_candidates))
+    fallback_set = set(fallback_candidates)
+    fallback_total = len(fallback_set)
     use_cheap = provider == "cheapshark" or (provider == "auto" and fallback_total > 0)
     if use_cheap:
         fallback_limit = max_items or DEFAULT_CHEAPSHARK_LIMIT
-        targets = tuple(dict.fromkeys(fallback_candidates))[:fallback_limit]
+        # Provider response ordering is not part of the normalized contract.
+        # Canonicalize the sparse fallback set back into wishlist demand order
+        # before persisting the exact targeted subset.
+        targets = tuple(item.appid for item in demand if item.appid in fallback_set)[
+            :fallback_limit
+        ]
+        # Construct the client before beginning durable run lineage.  A local
+        # configuration/setup error must not strand a running provider attempt.
+        api = cheapshark_client or CheapSharkClient()
         run = storage.begin_price_sync(
             provider="cheapshark",
             account_id=account_id,
@@ -243,7 +252,6 @@ def sync_wishlist_prices(
         )
         outcomes = {}
         facts = []
-        api = cheapshark_client or CheapSharkClient()
         failure: CheapSharkError | PriceSyncError | None = None
         for appid in targets:
             try:
