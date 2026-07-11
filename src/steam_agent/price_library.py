@@ -129,9 +129,7 @@ def sync_wishlist_prices(
                 )
             except GgDealsError as exc:
                 failure = exc
-                fallback_candidates.extend(
-                    item.appid for item in selected[offset:]
-                )
+                fallback_candidates.extend(item.appid for item in selected[offset:])
                 break
             rate = batch.rate_limit
             for snapshot in batch.snapshots:
@@ -176,7 +174,14 @@ def sync_wishlist_prices(
             code = "PROVIDER_UNAVAILABLE" if failure is None else failure.code
             runs.append(
                 storage.finish_price_sync(
-                    run.id, completed_at=clock(), error_code=code
+                    run.id,
+                    completed_at=clock(),
+                    error_code=code,
+                    retry_after_seconds=(
+                        None
+                        if failure is None
+                        else getattr(failure, "retry_after_seconds", None)
+                    ),
                 )
             )
             if provider == "gg-deals":
@@ -191,9 +196,7 @@ def sync_wishlist_prices(
         fallback_candidates = [item.appid for item in selected]
 
     fallback_total = len(dict.fromkeys(fallback_candidates))
-    use_cheap = provider == "cheapshark" or (
-        provider == "auto" and fallback_total > 0
-    )
+    use_cheap = provider == "cheapshark" or (provider == "auto" and fallback_total > 0)
     if use_cheap:
         fallback_limit = max_items or DEFAULT_CHEAPSHARK_LIMIT
         targets = tuple(dict.fromkeys(fallback_candidates))[:fallback_limit]
@@ -254,7 +257,14 @@ def sync_wishlist_prices(
             code = "PROVIDER_UNAVAILABLE" if failure is None else failure.code
             runs.append(
                 storage.finish_price_sync(
-                    run.id, completed_at=clock(), error_code=code
+                    run.id,
+                    completed_at=clock(),
+                    error_code=code,
+                    retry_after_seconds=(
+                        None
+                        if failure is None
+                        else getattr(failure, "retry_after_seconds", None)
+                    ),
                 )
             )
             if provider == "cheapshark" and failure is not None:
@@ -291,9 +301,7 @@ def _facts(snapshot: DealEvidenceSnapshot) -> list[PriceFactObservation]:
             raise PriceSyncError("PROVIDER_RESPONSE_INVALID", retryable=False)
         _validate_context(offer.price.country, offer.price.currency)
         if offer.regular_price is not None:
-            _validate_context(
-                offer.regular_price.country, offer.regular_price.currency
-            )
+            _validate_context(offer.regular_price.country, offer.regular_price.currency)
         facts.append(
             PriceFactObservation(
                 appid=appid,

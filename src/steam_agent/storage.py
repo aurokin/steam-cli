@@ -340,6 +340,55 @@ class PriceSnapshot:
     stale_subject_count: int
     running: bool
     abandoned_running: bool
+    attempt_metadata: tuple[PriceAttemptMetadata, ...]
+    demand_rows: tuple[PriceDemandRow, ...]
+    latest_relevant_attempts: tuple[PriceRelevantAttempt, ...]
+
+
+@dataclass(frozen=True)
+class PriceAttemptMetadata:
+    run: SyncRun
+    account_id: int
+    country: str
+    provider: str
+    scope: str
+    wishlist_sync_run_id: int
+    demand_count: int
+    evaluated_count: int
+    requested_limit: int | None
+    rate_limit: int | None
+    rate_remaining: int | None
+    rate_reset_value: int | None
+    retry_after_seconds: int | None
+
+
+@dataclass(frozen=True)
+class PriceDemandRow:
+    sync_run_id: int
+    account_id: int
+    country: str
+    appid: int
+    demand_order: int
+    wishlist_priority: int
+    wishlist_date_added: int
+    evaluated: bool
+    outcome: str | None
+
+
+@dataclass(frozen=True)
+class PriceRelevantAttempt:
+    provider: str
+    appid: int
+    attempt: PriceAttemptMetadata
+    demand: PriceDemandRow
+    not_found_fresh: bool | None
+
+
+@dataclass(frozen=True)
+class WishlistDealSnapshot:
+    wishlist: WishlistSnapshot
+    prices: PriceSnapshot
+    stable_game_ids_by_appid: tuple[tuple[int, str], ...]
 
 
 @dataclass(frozen=True)
@@ -589,28 +638,23 @@ def _validate_price_fact(
         valid_url = (
             parsed.hostname == "gg.deals"
             and not parsed.query
-            and parsed.path.startswith(
-                ("/game/", "/dlc/", "/pack/", "/steam/app/")
-            )
+            and parsed.path.startswith(("/game/", "/dlc/", "/pack/", "/steam/app/"))
         )
     elif provider == "cheapshark":
         query = parse_qs(parsed.query, keep_blank_values=True)
-        valid_url = (
-            parsed.hostname == "www.cheapshark.com"
-            and (
-                (
-                    parsed.path == "/redirect"
-                    and set(query) == {"dealID"}
-                    and len(query["dealID"]) == 1
-                    and bool(query["dealID"][0])
-                )
-                or (
-                    parsed.path == "/search"
-                    and set(query) == {"steamAppID"}
-                    and len(query["steamAppID"]) == 1
-                    and query["steamAppID"][0].isdecimal()
-                    and 1 <= int(query["steamAppID"][0]) <= (1 << 32) - 1
-                )
+        valid_url = parsed.hostname == "www.cheapshark.com" and (
+            (
+                parsed.path == "/redirect"
+                and set(query) == {"dealID"}
+                and len(query["dealID"]) == 1
+                and bool(query["dealID"][0])
+            )
+            or (
+                parsed.path == "/search"
+                and set(query) == {"steamAppID"}
+                and len(query["steamAppID"]) == 1
+                and query["steamAppID"][0].isdecimal()
+                and 1 <= int(query["steamAppID"][0]) <= (1 << 32) - 1
             )
         )
     else:
@@ -2548,14 +2592,20 @@ class Storage:
                     observed, effective = _validate_price_fact(
                         fact, provider=run.provider, country=metadata["country"]
                     )
-                    observed_dt = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+                    observed_dt = datetime.fromisoformat(
+                        observed.replace("Z", "+00:00")
+                    )
                     started_dt = datetime.fromisoformat(
                         run.started_at.replace("Z", "+00:00")
                     )
-                    completed_dt = datetime.fromisoformat(completed.replace("Z", "+00:00"))
+                    completed_dt = datetime.fromisoformat(
+                        completed.replace("Z", "+00:00")
+                    )
                     if not started_dt <= observed_dt <= completed_dt:
                         raise ValueError("price observation is outside its sync run")
-                    fresh_seconds = 6 * 60 * 60 if fact.fact_kind == "offer" else 24 * 60 * 60
+                    fresh_seconds = (
+                        6 * 60 * 60 if fact.fact_kind == "offer" else 24 * 60 * 60
+                    )
                     fresh_until = _timestamp(
                         observed_dt + timedelta(seconds=fresh_seconds)
                     )
@@ -2721,8 +2771,12 @@ class Storage:
                 WHERE sync_run_id = ?
                 """,
                 (
-                    len(outcomes), rate_limit, rate_remaining, rate_reset_value,
-                    retry_after_seconds, sync_run_id,
+                    len(outcomes),
+                    rate_limit,
+                    rate_remaining,
+                    rate_reset_value,
+                    retry_after_seconds,
+                    sync_run_id,
                 ),
             )
             self._connection.execute(
@@ -2731,7 +2785,11 @@ class Storage:
                     records_seen=?, error_code=?, error_detail=NULL WHERE id=?
                 """,
                 (
-                    completed, status, int(promoted_any), len(facts), error_code,
+                    completed,
+                    status,
+                    int(promoted_any),
+                    len(facts),
+                    error_code,
                     sync_run_id,
                 ),
             )
@@ -2743,8 +2801,15 @@ class Storage:
             raise
 
     def finish_price_sync(
-        self, sync_run_id: int, *, completed_at: str | datetime, error_code: str
+        self,
+        sync_run_id: int,
+        *,
+        completed_at: str | datetime,
+        error_code: str,
+        retry_after_seconds: int | None = None,
     ) -> SyncRun:
+        if retry_after_seconds is not None and not 0 <= retry_after_seconds <= 86400:
+            raise ValueError("retry_after_seconds must be between 0 and 86400")
         completed = _timestamp(completed_at)
         with self._connection:
             run = self.get_sync_run(sync_run_id)
@@ -2757,17 +2822,50 @@ class Storage:
                 """,
                 (completed, error_code, sync_run_id),
             )
+            self._connection.execute(
+                """
+                UPDATE price_sync_metadata SET retry_after_seconds = ?
+                WHERE sync_run_id = ?
+                """,
+                (retry_after_seconds, sync_run_id),
+            )
         return self.get_sync_run(sync_run_id)
 
     def read_price_snapshot(
-        self, *, account_id: int, country: str, provider: str | None = None,
+        self,
+        *,
+        account_id: int,
+        country: str,
+        provider: str | None = None,
         now: str | datetime | None = None,
     ) -> PriceSnapshot:
         country = country.upper()
         evaluated_now = _timestamp(now or datetime.now(timezone.utc))
-        if now is not None:
-            with self._connection:
-                self._expire_price_data(evaluated_now)
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._expire_price_data(evaluated_now)
+            snapshot = self._read_price_snapshot(
+                account_id=account_id,
+                country=country,
+                provider=provider,
+                evaluated_now=evaluated_now,
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            self._rollback_transaction()
+            raise
+
+    def _read_price_snapshot(
+        self,
+        *,
+        account_id: int,
+        country: str,
+        provider: str | None,
+        evaluated_now: str,
+    ) -> PriceSnapshot:
         clauses = ["account_id = ?", "country = ?"]
         parameters: list[object] = [account_id, country]
         if provider is not None:
@@ -2801,6 +2899,100 @@ class Storage:
                 (account_id, country, provider, provider),
             )
         )
+        attempts_by_id = {attempt.id: attempt for attempt in attempts}
+        attempt_metadata = tuple(
+            PriceAttemptMetadata(
+                run=attempts_by_id[int(row["sync_run_id"])],
+                account_id=int(row["account_id"]),
+                country=str(row["country"]),
+                provider=str(row["provider"]),
+                scope=str(row["scope"]),
+                wishlist_sync_run_id=int(row["wishlist_sync_run_id"]),
+                demand_count=int(row["demand_count"]),
+                evaluated_count=int(row["evaluated_count"]),
+                requested_limit=(
+                    None
+                    if row["requested_limit"] is None
+                    else int(row["requested_limit"])
+                ),
+                rate_limit=None
+                if row["rate_limit"] is None
+                else int(row["rate_limit"]),
+                rate_remaining=(
+                    None
+                    if row["rate_remaining"] is None
+                    else int(row["rate_remaining"])
+                ),
+                rate_reset_value=(
+                    None
+                    if row["rate_reset_value"] is None
+                    else int(row["rate_reset_value"])
+                ),
+                retry_after_seconds=(
+                    None
+                    if row["retry_after_seconds"] is None
+                    else int(row["retry_after_seconds"])
+                ),
+            )
+            for row in self._connection.execute(
+                """
+                SELECT metadata.* FROM price_sync_metadata AS metadata
+                WHERE metadata.account_id = ? AND metadata.country = ?
+                  AND (? IS NULL OR metadata.provider = ?)
+                ORDER BY metadata.sync_run_id
+                """,
+                (account_id, country, provider, provider),
+            )
+        )
+        demand_rows = tuple(
+            PriceDemandRow(
+                sync_run_id=int(row["sync_run_id"]),
+                account_id=int(row["account_id"]),
+                country=str(row["country"]),
+                appid=int(row["appid"]),
+                demand_order=int(row["demand_order"]),
+                wishlist_priority=int(row["wishlist_priority"]),
+                wishlist_date_added=int(row["wishlist_date_added"]),
+                evaluated=bool(row["evaluated"]),
+                outcome=None if row["outcome"] is None else str(row["outcome"]),
+            )
+            for row in self._connection.execute(
+                """
+                SELECT demand.* FROM price_sync_demand AS demand
+                JOIN price_sync_metadata AS metadata
+                  ON metadata.sync_run_id = demand.sync_run_id
+                WHERE metadata.account_id = ? AND metadata.country = ?
+                  AND (? IS NULL OR metadata.provider = ?)
+                ORDER BY demand.sync_run_id, demand.demand_order, demand.appid
+                """,
+                (account_id, country, provider, provider),
+            )
+        )
+        metadata_by_id = {item.run.id: item for item in attempt_metadata}
+        latest_demand: dict[tuple[str, int], PriceDemandRow] = {}
+        for demand in demand_rows:
+            metadata = metadata_by_id[demand.sync_run_id]
+            latest_demand[(metadata.provider, demand.appid)] = demand
+        subjects_by_key = {
+            (subject.provider, subject.appid): subject for subject in subjects
+        }
+        latest_relevant_attempts = tuple(
+            PriceRelevantAttempt(
+                provider=key[0],
+                appid=key[1],
+                attempt=metadata_by_id[demand.sync_run_id],
+                demand=demand,
+                not_found_fresh=(
+                    subjects_by_key.get(key) is not None
+                    and subjects_by_key[key].outcome == "not_found"
+                    and subjects_by_key[key].promoted_sync_run_id == demand.sync_run_id
+                    and subjects_by_key[key].fresh_until > evaluated_now
+                )
+                if demand.outcome == "not_found"
+                else None,
+            )
+            for key, demand in sorted(latest_demand.items())
+        )
         running_attempts = tuple(run for run in attempts if run.status == "running")
         now_dt = datetime.fromisoformat(evaluated_now.replace("Z", "+00:00"))
         return PriceSnapshot(
@@ -2812,8 +3004,7 @@ class Storage:
                 for fact in facts
             ),
             stale_historical_low_count=sum(
-                fact.fact_kind == "historical_low"
-                and fact.fresh_until <= evaluated_now
+                fact.fact_kind == "historical_low" and fact.fresh_until <= evaluated_now
                 for fact in facts
             ),
             stale_subject_count=sum(
@@ -2821,14 +3012,23 @@ class Storage:
             ),
             running=bool(running_attempts),
             abandoned_running=any(
-                (now_dt - datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))).total_seconds()
+                (
+                    now_dt
+                    - datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))
+                ).total_seconds()
                 > 15 * 60
                 for run in running_attempts
             ),
+            attempt_metadata=attempt_metadata,
+            demand_rows=demand_rows,
+            latest_relevant_attempts=latest_relevant_attempts,
         )
 
     def delete_price_data(
-        self, *, provider: str, account_id: int | None = None,
+        self,
+        *,
+        provider: str,
+        account_id: int | None = None,
         credential_kind: str | None = None,
         credential_profile_id: str | None = None,
     ) -> PriceDataDeletion:
@@ -2836,24 +3036,41 @@ class Storage:
             raise ValueError("unsupported price provider")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            clause = "provider = ?" + (" AND account_id = ?" if account_id is not None else "")
-            params: tuple[object, ...] = (provider,) if account_id is None else (provider, account_id)
-            observations = int(self._connection.execute(
-                f"SELECT COUNT(*) FROM price_observations WHERE {clause}", params
-            ).fetchone()[0])
-            current = int(self._connection.execute(
-                f"SELECT COUNT(*) FROM price_current WHERE {clause}", params
-            ).fetchone()[0])
-            subjects = int(self._connection.execute(
-                f"SELECT COUNT(*) FROM price_subject_current WHERE {clause}", params
-            ).fetchone()[0])
-            evidence_ids = tuple(int(row[0]) for row in self._connection.execute(
-                f"SELECT evidence_id FROM price_observations WHERE {clause}", params
-            ))
-            run_rows = tuple(int(row[0]) for row in self._connection.execute(
-                "SELECT sync_run_id FROM price_sync_metadata WHERE provider = ?"
-                + (" AND account_id = ?" if account_id is not None else ""), params
-            ))
+            clause = "provider = ?" + (
+                " AND account_id = ?" if account_id is not None else ""
+            )
+            params: tuple[object, ...] = (
+                (provider,) if account_id is None else (provider, account_id)
+            )
+            observations = int(
+                self._connection.execute(
+                    f"SELECT COUNT(*) FROM price_observations WHERE {clause}", params
+                ).fetchone()[0]
+            )
+            current = int(
+                self._connection.execute(
+                    f"SELECT COUNT(*) FROM price_current WHERE {clause}", params
+                ).fetchone()[0]
+            )
+            subjects = int(
+                self._connection.execute(
+                    f"SELECT COUNT(*) FROM price_subject_current WHERE {clause}", params
+                ).fetchone()[0]
+            )
+            evidence_ids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    f"SELECT evidence_id FROM price_observations WHERE {clause}", params
+                )
+            )
+            run_rows = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT sync_run_id FROM price_sync_metadata WHERE provider = ?"
+                    + (" AND account_id = ?" if account_id is not None else ""),
+                    params,
+                )
+            )
             if run_rows:
                 placeholders = ",".join("?" for _ in run_rows)
                 self._connection.execute(
@@ -2862,15 +3079,24 @@ class Storage:
             evidence_removed = self._delete_orphan_owned_evidence(evidence_ids)
             credential_refs_removed = 0
             if credential_kind is not None or credential_profile_id is not None:
-                if account_id is not None or not credential_kind or not credential_profile_id:
+                if (
+                    account_id is not None
+                    or not credential_kind
+                    or not credential_profile_id
+                ):
                     raise ValueError("credential deletion requires provider-all scope")
                 credential_refs_removed = self._remove_credential_identity(
                     provider, credential_kind, credential_profile_id
                 )
             self._connection.commit()
             return PriceDataDeletion(
-                provider, observations, current, subjects, len(run_rows),
-                evidence_removed, credential_refs_removed
+                provider,
+                observations,
+                current,
+                subjects,
+                len(run_rows),
+                evidence_removed,
+                credential_refs_removed,
             )
         except BaseException:
             self._rollback_transaction()
@@ -2900,44 +3126,7 @@ class Storage:
             raise StorageError("cannot start a read snapshot inside a transaction")
         self._connection.execute("BEGIN")
         try:
-            rows = self._connection.execute(
-                """
-                SELECT account_id, appid, priority, date_added, observed_at,
-                       evidence_id, promoted_sync_run_id
-                FROM wishlist_current WHERE account_id = ? ORDER BY appid
-                """,
-                (account_id,),
-            )
-            games = tuple(WishlistGame(**dict(row)) for row in rows)
-            latest = self.latest_account_sync(
-                capability="wishlist.read", account_id=account_id
-            )
-            latest_complete = self.latest_account_sync(
-                capability="wishlist.read", account_id=account_id, status="complete"
-            )
-            provenance = None
-            if latest_complete is not None:
-                row = self._connection.execute(
-                    """
-                    SELECT sync_run_id, provider, support_level,
-                           item_list_retrieved_at, item_list_reported_count,
-                           item_count_retrieved_at, item_count_reported_count,
-                           validation_method
-                    FROM wishlist_sync_metadata WHERE sync_run_id = ?
-                    """,
-                    (latest_complete.id,),
-                ).fetchone()
-                if row is not None:
-                    provenance = WishlistSnapshotProvenance(**dict(row))
-            snapshot = WishlistSnapshot(
-                games=games,
-                latest=latest,
-                latest_complete=latest_complete,
-                latest_complete_provenance=provenance,
-                stable_game_ids_by_appid=self._stable_game_ids_for_appids(
-                    {game.appid for game in games}
-                ),
-            )
+            snapshot = self._read_wishlist_snapshot(account_id)
             self._connection.commit()
             return snapshot
         except BaseException:
@@ -2945,6 +3134,80 @@ class Storage:
                 self._rollback_or_reopen()
             except BaseException:
                 pass
+            raise
+
+    def _read_wishlist_snapshot(self, account_id: int) -> WishlistSnapshot:
+        rows = self._connection.execute(
+            """
+            SELECT account_id, appid, priority, date_added, observed_at,
+                   evidence_id, promoted_sync_run_id
+            FROM wishlist_current WHERE account_id = ? ORDER BY appid
+            """,
+            (account_id,),
+        )
+        games = tuple(WishlistGame(**dict(row)) for row in rows)
+        latest = self.latest_account_sync(
+            capability="wishlist.read", account_id=account_id
+        )
+        latest_complete = self.latest_account_sync(
+            capability="wishlist.read", account_id=account_id, status="complete"
+        )
+        provenance = None
+        if latest_complete is not None:
+            row = self._connection.execute(
+                """
+                SELECT sync_run_id, provider, support_level,
+                       item_list_retrieved_at, item_list_reported_count,
+                       item_count_retrieved_at, item_count_reported_count,
+                       validation_method
+                FROM wishlist_sync_metadata WHERE sync_run_id = ?
+                """,
+                (latest_complete.id,),
+            ).fetchone()
+            if row is not None:
+                provenance = WishlistSnapshotProvenance(**dict(row))
+        return WishlistSnapshot(
+            games=games,
+            latest=latest,
+            latest_complete=latest_complete,
+            latest_complete_provenance=provenance,
+            stable_game_ids_by_appid=self._stable_game_ids_for_appids(
+                {game.appid for game in games}
+            ),
+        )
+
+    def read_wishlist_deal_snapshot(
+        self,
+        *,
+        account_id: int,
+        country: str,
+        now: str | datetime | None = None,
+    ) -> WishlistDealSnapshot:
+        """Read wishlist and deal evidence from one post-expiry SQLite snapshot."""
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        country = country.upper()
+        evaluated_now = _timestamp(now or datetime.now(timezone.utc))
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._expire_price_data(evaluated_now)
+            wishlist = self._read_wishlist_snapshot(account_id)
+            prices = self._read_price_snapshot(
+                account_id=account_id,
+                country=country,
+                provider=None,
+                evaluated_now=evaluated_now,
+            )
+            snapshot = WishlistDealSnapshot(
+                wishlist=wishlist,
+                prices=prices,
+                stable_game_ids_by_appid=wishlist.stable_game_ids_by_appid,
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            self._rollback_transaction()
             raise
 
     def read_catalog_snapshot(
