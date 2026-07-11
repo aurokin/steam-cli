@@ -263,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_account = account_commands.add_parser(
         "remove",
         help=(
-            "Remove an account alias and all account-scoped owned data while "
+            "Remove an account alias and all account-scoped Steam data while "
             "preserving the shared API key."
         ),
     )
