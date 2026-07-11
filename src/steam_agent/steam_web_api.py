@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.client
 import json
-from typing import Mapping, Protocol
+from typing import Literal, Mapping, Protocol
 from urllib.parse import urlencode
 
 from steam_agent.credentials import SecretValue
@@ -20,6 +20,7 @@ STEAM_WEB_API_HOST = "api.steampowered.com"
 OWNED_GAMES_PATH = "/IPlayerService/GetOwnedGames/v1/"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10.0
+MAX_UNSIGNED_32 = (1 << 32) - 1
 
 
 class SteamApiError(RuntimeError):
@@ -89,6 +90,39 @@ class OwnedGamesProbe:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class VisibleOwnedGame:
+    """Normalized visible-owned fields returned by ``GetOwnedGames``.
+
+    Nullable numeric fields deliberately preserve a provider omission as
+    distinct from a reported zero.  The raw response is never attached to the
+    object.
+    """
+
+    appid: int
+    name: str | None
+    playtime_forever_minutes: int | None
+    playtime_windows_forever_minutes: int | None
+    playtime_mac_forever_minutes: int | None
+    playtime_linux_forever_minutes: int | None
+    last_played_unix: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class VisibleOwnedSnapshot:
+    """A fully validated, memory-only normalized provider snapshot."""
+
+    snapshot_state: Literal["ready", "data_inaccessible"]
+    games: tuple[VisibleOwnedGame, ...]
+    reported_game_count: int | None
+    include_appinfo: bool
+    include_played_free_games: bool
+    limitations: tuple[str, ...] = (
+        "individually_private_games_may_be_omitted",
+        "unplayed_free_entitlements_are_not_complete",
+    )
+
+
 class SteamWebApiClient:
     def __init__(
         self,
@@ -102,13 +136,51 @@ class SteamWebApiClient:
     def probe_visible_owned_games(
         self, *, steamid: str, api_key: SecretValue
     ) -> OwnedGamesProbe:
+        response = self._request_visible_owned_games(
+            steamid=steamid,
+            api_key=api_key,
+            include_appinfo=False,
+            include_played_free_games=True,
+        )
+        return _interpret_owned_response(response)
+
+    def fetch_visible_owned_games(
+        self,
+        *,
+        steamid: str,
+        api_key: SecretValue,
+        include_played_free_games: bool,
+    ) -> VisibleOwnedSnapshot:
+        """Fetch and normalize a complete visible-owned response in memory."""
+
+        if not isinstance(include_played_free_games, bool):
+            raise ValueError("include_played_free_games must be a boolean")
+        response = self._request_visible_owned_games(
+            steamid=steamid,
+            api_key=api_key,
+            include_appinfo=True,
+            include_played_free_games=include_played_free_games,
+        )
+        return _interpret_visible_owned_snapshot(
+            response,
+            include_played_free_games=include_played_free_games,
+        )
+
+    def _request_visible_owned_games(
+        self,
+        *,
+        steamid: str,
+        api_key: SecretValue,
+        include_appinfo: bool,
+        include_played_free_games: bool,
+    ) -> HttpResponse:
         if not steamid.isdecimal() or not 1 <= int(steamid) <= (1 << 64) - 1:
             raise ValueError("steamid must be an unsigned 64-bit decimal value")
         request_input = json.dumps(
             {
                 "steamid": steamid,
-                "include_appinfo": False,
-                "include_played_free_games": True,
+                "include_appinfo": include_appinfo,
+                "include_played_free_games": include_played_free_games,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -124,7 +196,7 @@ class SteamWebApiClient:
             },
             timeout=self._timeout,
         )
-        return _interpret_owned_response(response)
+        return response
 
 
 def _interpret_owned_response(response: HttpResponse) -> OwnedGamesProbe:
@@ -176,6 +248,114 @@ def _interpret_owned_response(response: HttpResponse) -> OwnedGamesProbe:
     )
 
 
+def _interpret_visible_owned_snapshot(
+    response: HttpResponse, *, include_played_free_games: bool
+) -> VisibleOwnedSnapshot:
+    _raise_for_response_status(response.status)
+    decoded, payload = _decode_json(response.body)
+    if not decoded or not isinstance(payload, dict) or "response" not in payload:
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    body = payload["response"]
+    if not isinstance(body, dict):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    if body == {}:
+        return VisibleOwnedSnapshot(
+            snapshot_state="data_inaccessible",
+            games=(),
+            reported_game_count=None,
+            include_appinfo=True,
+            include_played_free_games=include_played_free_games,
+        )
+
+    count = body.get("game_count")
+    games_value = body.get("games")
+    if not _unsigned_32(count):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    if count == 0 and games_value is None:
+        games_value = []
+    if not isinstance(games_value, list) or len(games_value) != count:
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+
+    normalized: list[VisibleOwnedGame] = []
+    appids: set[int] = set()
+    for item in games_value:
+        game = _normalize_visible_owned_game(item)
+        if game.appid in appids:
+            raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+        appids.add(game.appid)
+        normalized.append(game)
+
+    return VisibleOwnedSnapshot(
+        snapshot_state="ready",
+        games=tuple(normalized),
+        reported_game_count=count,
+        include_appinfo=True,
+        include_played_free_games=include_played_free_games,
+    )
+
+
+def _raise_for_response_status(status: int) -> None:
+    if status in (401, 403):
+        raise SteamApiError("AUTHENTICATION_FAILED", retryable=False)
+    if status == 400:
+        raise SteamApiError("INVALID_REQUEST", retryable=False)
+    if status == 429:
+        raise SteamApiError("RATE_LIMITED", retryable=True)
+    if status >= 500:
+        raise SteamApiError("PROVIDER_UNAVAILABLE", retryable=True)
+    if status != 200:
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+
+
+def _normalize_visible_owned_game(value: object) -> VisibleOwnedGame:
+    if not isinstance(value, dict):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    appid = value.get("appid")
+    if not _positive_unsigned_32(appid):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    name = value.get("name")
+    if name is not None and not isinstance(name, str):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    return VisibleOwnedGame(
+        appid=appid,
+        name=name,
+        playtime_forever_minutes=_optional_unsigned_32(
+            value, "playtime_forever"
+        ),
+        playtime_windows_forever_minutes=_optional_unsigned_32(
+            value, "playtime_windows_forever"
+        ),
+        playtime_mac_forever_minutes=_optional_unsigned_32(
+            value, "playtime_mac_forever"
+        ),
+        playtime_linux_forever_minutes=_optional_unsigned_32(
+            value, "playtime_linux_forever"
+        ),
+        last_played_unix=_optional_unsigned_32(value, "rtime_last_played"),
+    )
+
+
+def _optional_unsigned_32(value: dict[object, object], key: str) -> int | None:
+    if key not in value:
+        return None
+    candidate = value[key]
+    if not _unsigned_32(candidate):
+        raise SteamApiError("PROVIDER_RESPONSE_INVALID", retryable=False)
+    return candidate
+
+
+def _unsigned_32(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_UNSIGNED_32
+    )
+
+
+def _positive_unsigned_32(value: object) -> bool:
+    return _unsigned_32(value) and value > 0
+
+
 def _decode_json(body: bytes) -> tuple[bool, object]:
     try:
         return True, json.loads(body)
@@ -206,9 +386,12 @@ __all__ = [
     "HttpResponse",
     "HttpTransport",
     "MAX_RESPONSE_BYTES",
+    "MAX_UNSIGNED_32",
     "OWNED_GAMES_PATH",
     "OwnedGamesProbe",
     "STEAM_WEB_API_HOST",
     "SteamApiError",
     "SteamWebApiClient",
+    "VisibleOwnedGame",
+    "VisibleOwnedSnapshot",
 ]
