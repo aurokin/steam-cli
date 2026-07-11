@@ -64,6 +64,12 @@ from steam_agent.local_accounts import (
     select_primary_local_account,
 )
 from steam_agent.steam_web_api import SteamApiError, SteamWebApiClient
+from steam_agent.steam_wishlist import SteamWishlistClient
+from steam_agent.wishlist_library import (
+    WISHLIST_DISCLOSURE_VERSION,
+    WishlistSyncError,
+    sync_wishlist,
+)
 from steam_agent.steam_store_catalog import (
     CatalogApiError,
     SteamStoreCatalogClient,
@@ -81,6 +87,7 @@ _SAFE_WARNING_SOURCE = re.compile(r"(?:libraryfolders\.vdf|appmanifest_\d+\.acf)
 _OWNED_CAPABILITY = "owned.visible.read"
 _OWNED_PROBE_FRESHNESS_SECONDS = 24 * 60 * 60
 _OWNED_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
+_WISHLIST_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
 _CATALOG_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
 _SYNC_ABANDONED_SECONDS = 15 * 60
 _PROVIDER_MINIMUM_INTERVAL_SECONDS = 1.0
@@ -205,13 +212,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(catalog_sync)
     catalog_sync.add_argument("--account", default="primary")
     catalog_sync.add_argument("--machine", default="local")
+    wishlist_sync = sync_commands.add_parser(
+        "wishlist", help="Synchronize the provisional Steam wishlist."
+    )
+    _add_leaf_format(wishlist_sync)
+    wishlist_sync.add_argument("--account", default="primary")
+    wishlist_sync.add_argument(
+        "--acknowledge-local-storage",
+        action="store_true",
+        help="Accept the versioned wishlist storage and backup disclosure.",
+    )
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
     query = game_commands.add_parser("query", help="Query games in a scope.")
     _add_leaf_format(query)
     query.add_argument(
-        "--scope", choices=("installed", "owned", "library"), required=True
+        "--scope", choices=("installed", "owned", "wishlist", "library"), required=True
     )
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
@@ -454,6 +471,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_owned(args, database_path)
     if args.command == "sync" and args.sync_command == "catalog":
         return _dispatch_sync_catalog(args, database_path)
+    if args.command == "sync" and args.sync_command == "wishlist":
+        return _dispatch_sync_wishlist(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -515,6 +534,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.command == "games" and args.games_command == "query":
+        if args.scope == "wishlist":
+            return _dispatch_wishlist_games_query(args, database_path)
         if args.scope in ("owned", "library"):
             return _dispatch_account_games_query(args, database_path)
         with Storage(database_path) as storage:
@@ -754,6 +775,128 @@ def _credential_error_code(state: str) -> str:
     }.get(state, str(ErrorCode.CREDENTIAL_READ_FAILED))
 
 
+def _dispatch_sync_wishlist(args: argparse.Namespace, database_path: Path) -> int:
+    with _credential_operation_lock(database_path):
+        credential_ref = _steam_credential_ref(database_path)
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="sync.wishlist",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            if account is None:
+                return _emit_error(
+                    args,
+                    command="sync.wishlist",
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            consent = storage.get_wishlist_data_consent(account.id)
+            if (
+                consent is None
+                or consent.disclosure_version != WISHLIST_DISCLOSURE_VERSION
+            ):
+                if not args.acknowledge_local_storage:
+                    return _emit_error(
+                        args,
+                        command="sync.wishlist",
+                        code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                        message=(
+                            "The provisional Steam wishlist stores one last-good local "
+                            "projection containing AppID, priority, date added, "
+                            "provenance, and coarse sync metadata. It retains no raw "
+                            "response body. An inaccessible or authentication-like "
+                            "empty response cannot establish an empty wishlist. "
+                            "Account deletion removes this projection; external backups "
+                            "and storage snapshots remain user-controlled."
+                        ),
+                        remediation=(
+                            "Rerun with --acknowledge-local-storage to accept this "
+                            "versioned local-storage policy."
+                        ),
+                    )
+                storage.record_wishlist_data_consent(
+                    account_id=account.id,
+                    disclosure_version=WISHLIST_DISCLOSURE_VERSION,
+                    accepted_at=_utc_now(),
+                    backups_acknowledged=True,
+                )
+            metadata = storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            if metadata is None:
+                return _emit_error(
+                    args,
+                    command="sync.wishlist",
+                    code=ErrorCode.AUTH_REQUIRED,
+                    message="A Steam Web API user key has not been configured.",
+                )
+            resolved = _resolve_credential(metadata, credential_ref)
+            if resolved["state"] != "configured":
+                return _emit_error(
+                    args,
+                    command="sync.wishlist",
+                    code=_credential_error_code(resolved["state"]),
+                    message="The Steam Web API credential is unavailable.",
+                )
+
+            def request_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "steam-web-api",
+                        _utc_now(),
+                        _PROVIDER_MINIMUM_INTERVAL_SECONDS,
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise WishlistSyncError("REQUEST_THROTTLED", retryable=True)
+
+            try:
+                result = sync_wishlist(
+                    storage,
+                    account_id=account.id,
+                    steamid=account.provider_account_id,
+                    api_key=resolved["secret"],
+                    client=_steam_wishlist_client(),
+                    request_gate=request_gate,
+                    clock=_utc_now,
+                )
+            except WishlistSyncError as exc:
+                return _emit_error(
+                    args,
+                    command="sync.wishlist",
+                    code=exc.code,
+                    message="The wishlist synchronization did not complete.",
+                    retryable=exc.retryable,
+                )
+    return _emit_success(
+        args,
+        command="sync.wishlist",
+        context={"account_alias": account.alias, "identifiers_included": False},
+        data={
+            "sync_run_id": result.run.id,
+            "sync_status": result.run.status,
+            "records_seen": result.run.records_seen,
+            "wishlist_count": result.item_count,
+            "disclosure_version": WISHLIST_DISCLOSURE_VERSION,
+            "support_level": "official_undocumented_provisional",
+            "limitations": [
+                "provider_contract_is_provisional",
+                "empty_auth_like_response_is_ambiguous",
+                "sequential_pair_may_detect_concurrent_wishlist_change",
+            ],
+        },
+    )
+
+
 def _dispatch_sync_catalog(args: argparse.Namespace, database_path: Path) -> int:
     with _credential_operation_lock(database_path):
         credential_ref = _steam_credential_ref(database_path)
@@ -866,13 +1009,21 @@ def _account_snapshot_completeness(
     latest = snapshot.latest
     latest_complete = snapshot.latest_complete
     last_good_stale = False
-    if capability == "owned.visible.read" and latest_complete is not None:
+    if (
+        capability in ("owned.visible.read", "wishlist.read")
+        and latest_complete is not None
+    ):
         last_good_at = datetime.fromisoformat(
             latest_complete.completed_at.replace("Z", "+00:00")
         )
+        freshness_seconds = (
+            _OWNED_SYNC_FRESHNESS_SECONDS
+            if capability == "owned.visible.read"
+            else _WISHLIST_SYNC_FRESHNESS_SECONDS
+        )
         last_good_stale = (
             _utc_now() - last_good_at
-        ).total_seconds() > _OWNED_SYNC_FRESHNESS_SECONDS
+        ).total_seconds() > freshness_seconds
     if latest is None:
         return completeness(
             CompletenessStatus.UNAVAILABLE,
@@ -892,7 +1043,7 @@ def _account_snapshot_completeness(
                 warnings=[
                     WarningRecord(
                         code=ErrorCode.STALE_LAST_GOOD,
-                        message="The visible-owned snapshot is older than the freshness policy.",
+                        message=f"The {subject.lower()} snapshot is older than the freshness policy.",
                     )
                 ],
             ), {
@@ -905,9 +1056,7 @@ def _account_snapshot_completeness(
         }
     if latest.status == "running":
         started_at = datetime.fromisoformat(latest.started_at.replace("Z", "+00:00"))
-        abandoned = (
-            _utc_now() - started_at
-        ).total_seconds() > _SYNC_ABANDONED_SECONDS
+        abandoned = (_utc_now() - started_at).total_seconds() > _SYNC_ABANDONED_SECONDS
         warning = WarningRecord(
             code=(
                 ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS
@@ -933,7 +1082,7 @@ def _account_snapshot_completeness(
                     WarningRecord(
                         code=ErrorCode.STALE_LAST_GOOD,
                         message=(
-                            "The visible-owned snapshot is older than the "
+                            f"The {subject.lower()} snapshot is older than the "
                             "freshness policy."
                         ),
                     ),
@@ -1080,9 +1229,7 @@ def _catalog_completeness(
         attempt_values = tuple(
             (attempt.run, attempt.appids) for attempt in relevant_attempts
         )
-    attempted_appids = {
-        appid for _, appids in attempt_values for appid in appids
-    }
+    attempted_appids = {appid for _, appids in attempt_values for appid in appids}
     missing_attempts = demanded_appids - attempted_appids
     sole_attempt = attempt_values[0][0] if len(attempt_values) == 1 else None
     metadata = {
@@ -1134,8 +1281,7 @@ def _catalog_completeness(
     )
     abandoned_running = bool(running_attempts) and any(
         (
-            _utc_now()
-            - datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))
+            _utc_now() - datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))
         ).total_seconds()
         > _SYNC_ABANDONED_SECONDS
         for run in running_attempts
@@ -1256,6 +1402,109 @@ def _catalog_completeness(
             ],
         ), metadata
     return completeness(CompletenessStatus.COMPLETE), metadata
+
+
+def _dispatch_wishlist_games_query(
+    args: argparse.Namespace, database_path: Path
+) -> int:
+    if args.include_paths:
+        return _emit_error(
+            args,
+            command="games.query",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="--include-paths is available only for installed-scope queries.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            return _emit_error(
+                args,
+                command="games.query",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
+        if account is None:
+            return _emit_success(
+                args,
+                command="games.query",
+                context={
+                    "account_alias": args.account,
+                    "scopes": ["wishlist"],
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["account.identity"],
+                    warnings=[
+                        WarningRecord(
+                            code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                            message="The requested account alias is not configured.",
+                        )
+                    ],
+                ),
+                data={
+                    "items": [],
+                    "empty": False,
+                    "next_cursor": None,
+                    "source": None,
+                    "snapshot": {
+                        "last_attempt_status": None,
+                        "last_successful_sync_at": None,
+                    },
+                },
+            )
+        snapshot = storage.read_wishlist_snapshot(account.id)
+    value, metadata = _account_snapshot_completeness(
+        snapshot, capability="wishlist.read", subject="Wishlist items"
+    )
+    stable_ids = dict(snapshot.stable_game_ids_by_appid)
+    source = snapshot.latest_complete_provenance
+    return _emit_success(
+        args,
+        command="games.query",
+        context={
+            "account_alias": account.alias,
+            "scopes": ["wishlist"],
+            "identifiers_included": False,
+        },
+        completeness_value=value,
+        data={
+            "items": [
+                {
+                    "appid": game.appid,
+                    "game_id": f"game:{stable_ids[game.appid]}",
+                    "wishlisted": True,
+                    "priority": game.priority,
+                    "date_added_unix": game.date_added,
+                    "observed_at": game.observed_at,
+                    "evidence_ids": [game.evidence_id],
+                }
+                for game in snapshot.games
+            ],
+            "empty": bool(snapshot.latest_complete is not None and not snapshot.games),
+            "next_cursor": None,
+            "source": (
+                None
+                if source is None
+                else {
+                    "provider": source.provider,
+                    "support_level": source.support_level,
+                    "validation_method": source.validation_method,
+                    "item_list_retrieved_at": source.item_list_retrieved_at,
+                    "item_count_retrieved_at": source.item_count_retrieved_at,
+                    "reported_count": source.item_count_reported_count,
+                }
+            ),
+            "snapshot": metadata,
+            "limitations": [
+                "provider_contract_is_provisional",
+                "empty_auth_like_response_is_ambiguous",
+            ],
+        },
+    )
 
 
 def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path) -> int:
@@ -1566,6 +1815,8 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                             "removed": False,
                             "owned_observations_removed": 0,
                             "owned_current_removed": 0,
+                            "wishlist_observations_removed": 0,
+                            "wishlist_current_removed": 0,
                             "sync_runs_removed": 0,
                             "probes_removed": 0,
                             "consents_removed": 0,
@@ -1585,6 +1836,8 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                     "removed": result.account_removed,
                     "owned_observations_removed": result.owned_observations_removed,
                     "owned_current_removed": result.owned_current_removed,
+                    "wishlist_observations_removed": result.wishlist_observations_removed,
+                    "wishlist_current_removed": result.wishlist_current_removed,
                     "sync_runs_removed": result.sync_runs_removed,
                     "probes_removed": result.probes_removed,
                     "consents_removed": result.consents_removed,
@@ -1668,6 +1921,8 @@ def _delete_all_steam_web_api_data(
             "accounts_removed": deletion.accounts_removed,
             "owned_observations_removed": deletion.owned_observations_removed,
             "owned_current_removed": deletion.owned_current_removed,
+            "wishlist_observations_removed": deletion.wishlist_observations_removed,
+            "wishlist_current_removed": deletion.wishlist_current_removed,
             "sync_runs_removed": deletion.sync_runs_removed,
             "probes_removed": deletion.probes_removed,
             "consents_removed": deletion.consents_removed,
@@ -1886,6 +2141,12 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 ),
                 "owned_current_removed": (
                     0 if deletion is None else deletion.owned_current_removed
+                ),
+                "wishlist_observations_removed": (
+                    0 if deletion is None else deletion.wishlist_observations_removed
+                ),
+                "wishlist_current_removed": (
+                    0 if deletion is None else deletion.wishlist_current_removed
                 ),
                 "sync_runs_removed": 0
                 if deletion is None
@@ -2564,6 +2825,10 @@ def _steam_web_api_client() -> SteamWebApiClient:
     return SteamWebApiClient()
 
 
+def _steam_wishlist_client() -> SteamWishlistClient:
+    return SteamWishlistClient()
+
+
 def _provider_budget_database_path() -> Path:
     """One OS-user-local request budget shared by every data profile."""
 
@@ -2766,6 +3031,15 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
                     item["visible_in_owned_games"],
                     item["inclusion_basis"],
                     item["playtime_forever_minutes"],
+                )
+        elif scopes == ["wishlist"]:
+            _print_table_fields("APPID", "WISHLISTED", "PRIORITY", "DATE_ADDED")
+            for item in envelope["data"]["items"]:
+                _print_table_fields(
+                    item["appid"],
+                    item["wishlisted"],
+                    item["priority"],
+                    item["date_added_unix"],
                 )
         else:
             _print_table_fields(

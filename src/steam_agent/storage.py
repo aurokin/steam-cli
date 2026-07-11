@@ -222,6 +222,46 @@ class OwnedSnapshotProvenance:
     classification_method: str
 
 
+@dataclass(frozen=True)
+class WishlistObservation:
+    appid: int
+    priority: int
+    date_added: int
+    observed_at: str | datetime
+
+
+@dataclass(frozen=True)
+class WishlistGame:
+    account_id: int
+    appid: int
+    priority: int
+    date_added: int
+    observed_at: str
+    evidence_id: int
+    promoted_sync_run_id: int
+
+
+@dataclass(frozen=True)
+class WishlistSnapshotProvenance:
+    sync_run_id: int
+    provider: str
+    support_level: str
+    item_list_retrieved_at: str
+    item_list_reported_count: int
+    item_count_retrieved_at: str
+    item_count_reported_count: int
+    validation_method: str
+
+
+@dataclass(frozen=True)
+class WishlistSnapshot:
+    games: tuple[WishlistGame, ...]
+    latest: SyncRun | None
+    latest_complete: SyncRun | None
+    latest_complete_provenance: WishlistSnapshotProvenance | None
+    stable_game_ids_by_appid: tuple[tuple[int, str], ...]
+
+
 CatalogClassification = Literal["game", "non_game", "not_observed"]
 CatalogStreamName = Literal["games", "non_games"]
 
@@ -319,6 +359,8 @@ class AccountDataDeletion:
     evidence_removed: int
     orphan_apps_removed: int
     shared_credential_preserved: bool = True
+    wishlist_observations_removed: int = 0
+    wishlist_current_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -340,6 +382,8 @@ class AllSteamAccountDataDeletion:
     catalog_pages_removed: int = 0
     catalog_evidence_removed: int = 0
     shared_credential_preserved: bool = True
+    wishlist_observations_removed: int = 0
+    wishlist_current_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -1034,6 +1078,242 @@ class Storage:
         values = dict(row)
         values["backups_acknowledged"] = bool(values["backups_acknowledged"])
         return AccountDataConsent(**values)
+
+    def record_wishlist_data_consent(
+        self,
+        *,
+        account_id: int,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> AccountDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO account_data_consents(
+                    account_id, consent_kind, disclosure_version,
+                    backups_acknowledged, accepted_at
+                ) VALUES (?, 'wishlist_persistence', ?, 1, ?)
+                ON CONFLICT(account_id, consent_kind) DO UPDATE SET
+                    disclosure_version = excluded.disclosure_version,
+                    backups_acknowledged = excluded.backups_acknowledged,
+                    accepted_at = excluded.accepted_at
+                """,
+                (account_id, disclosure_version, timestamp),
+            )
+        consent = self.get_wishlist_data_consent(account_id)
+        assert consent is not None
+        return consent
+
+    def get_wishlist_data_consent(self, account_id: int) -> AccountDataConsent | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM account_data_consents
+            WHERE account_id = ? AND consent_kind = 'wishlist_persistence'
+            """,
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return AccountDataConsent(**values)
+
+    def complete_wishlist_snapshot(
+        self,
+        sync_run_id: int,
+        observations: list[WishlistObservation] | tuple[WishlistObservation, ...],
+        *,
+        item_list_retrieved_at: str | datetime,
+        item_count_retrieved_at: str | datetime,
+        item_list_reported_count: int,
+        item_count_reported_count: int,
+        completed_at: str | datetime,
+        support_level: str = "official_undocumented_provisional",
+    ) -> SyncRun:
+        list_at = _timestamp(item_list_retrieved_at)
+        count_at = _timestamp(item_count_retrieved_at)
+        completed = _timestamp(completed_at)
+        if (
+            not isinstance(item_list_reported_count, int)
+            or isinstance(item_list_reported_count, bool)
+            or not isinstance(item_count_reported_count, int)
+            or isinstance(item_count_reported_count, bool)
+            or item_list_reported_count < 0
+            or item_count_reported_count < 0
+            or item_list_reported_count != item_count_reported_count
+            or item_list_reported_count != len(observations)
+        ):
+            raise ValueError("wishlist list and count must match")
+        normalized: list[tuple[WishlistObservation, str]] = []
+        seen: set[int] = set()
+        for observation in observations:
+            if (
+                observation.appid <= 0
+                or observation.appid in seen
+                or observation.priority < 0
+                or observation.date_added < 0
+            ):
+                raise ValueError("wishlist observations are invalid")
+            seen.add(observation.appid)
+            normalized.append((observation, _timestamp(observation.observed_at)))
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._require_wishlist_sync(sync_run_id)
+            if run.status != "running":
+                raise InvalidSyncTransition("wishlist sync is already terminal")
+            consent = self._connection.execute(
+                """
+                SELECT 1 FROM account_data_consents
+                WHERE account_id = ? AND consent_kind = 'wishlist_persistence'
+                """,
+                (run.account_id,),
+            ).fetchone()
+            if consent is None:
+                raise InvalidSyncTransition("wishlist persistence consent is required")
+            self._connection.execute(
+                """
+                INSERT INTO wishlist_sync_metadata(
+                    sync_run_id, account_id, provider, support_level,
+                    item_list_retrieved_at, item_list_reported_count,
+                    item_count_retrieved_at, item_count_reported_count,
+                    validation_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sequential_count_match')
+                """,
+                (
+                    sync_run_id,
+                    run.account_id,
+                    run.provider,
+                    support_level,
+                    list_at,
+                    item_list_reported_count,
+                    count_at,
+                    item_count_reported_count,
+                ),
+            )
+            for observation, observed_at in normalized:
+                self._ensure_steam_application_identity(
+                    observation.appid, observed_at=observed_at
+                )
+                evidence_id = self._insert_evidence(
+                    EvidenceInput(
+                        provider=run.provider,
+                        capability=run.capability,
+                        source_kind="steam_web_api",
+                        source_locator=f"GetWishlist:app:{observation.appid}",
+                        retrieved_at=list_at,
+                        support_level=support_level,
+                        context={
+                            "account_id": run.account_id,
+                            "validation_method": "sequential_count_match",
+                            "item_list_reported_count": item_list_reported_count,
+                            "item_count_reported_count": item_count_reported_count,
+                        },
+                        payload={
+                            "appid": observation.appid,
+                            "priority": observation.priority,
+                            "date_added": observation.date_added,
+                        },
+                        account_id=run.account_id,
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO wishlist_observations(
+                        sync_run_id, evidence_id, account_id, appid,
+                        priority, date_added, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sync_run_id,
+                        evidence_id,
+                        run.account_id,
+                        observation.appid,
+                        observation.priority,
+                        observation.date_added,
+                        observed_at,
+                    ),
+                )
+            newer = self._connection.execute(
+                """
+                SELECT 1 FROM sync_runs
+                WHERE capability = 'wishlist.read' AND account_id = ?
+                  AND id > ? AND status = 'complete' LIMIT 1
+                """,
+                (run.account_id, sync_run_id),
+            ).fetchone()
+            promoted = 0
+            if newer is None:
+                self._connection.execute(
+                    "DELETE FROM wishlist_current WHERE account_id = ?",
+                    (run.account_id,),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO wishlist_current(
+                        account_id, appid, evidence_id, promoted_sync_run_id,
+                        priority, date_added, observed_at
+                    )
+                    SELECT account_id, appid, evidence_id, sync_run_id,
+                           priority, date_added, observed_at
+                    FROM wishlist_observations WHERE sync_run_id = ?
+                    """,
+                    (sync_run_id,),
+                )
+                promoted = 1
+            self._connection.execute(
+                """
+                UPDATE sync_runs SET status = 'complete', completed_at = ?,
+                    promoted = ?, records_seen = ?, error_code = NULL,
+                    error_detail = NULL WHERE id = ?
+                """,
+                (completed, promoted, len(normalized), sync_run_id),
+            )
+            self._prune_wishlist_payloads(run.account_id, sync_run_id)
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def finish_wishlist_sync(
+        self,
+        sync_run_id: int,
+        *,
+        completed_at: str | datetime,
+        error_code: str,
+    ) -> SyncRun:
+        completed = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._require_wishlist_sync(sync_run_id)
+            if run.status != "running":
+                raise InvalidSyncTransition("wishlist sync is already terminal")
+            self._connection.execute(
+                """
+                UPDATE sync_runs SET status = 'failed', completed_at = ?,
+                    promoted = 0, error_code = ?, error_detail = NULL WHERE id = ?
+                """,
+                (completed, error_code, sync_run_id),
+            )
+            self._prune_wishlist_payloads(run.account_id, sync_run_id)
+            self._connection.commit()
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+        return self.get_sync_run(sync_run_id)
 
     def record_owned_snapshot(
         self,
@@ -1855,6 +2135,58 @@ class Storage:
                 pass
             raise
 
+    def read_wishlist_snapshot(self, account_id: int) -> WishlistSnapshot:
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT account_id, appid, priority, date_added, observed_at,
+                       evidence_id, promoted_sync_run_id
+                FROM wishlist_current WHERE account_id = ? ORDER BY appid
+                """,
+                (account_id,),
+            )
+            games = tuple(WishlistGame(**dict(row)) for row in rows)
+            latest = self.latest_account_sync(
+                capability="wishlist.read", account_id=account_id
+            )
+            latest_complete = self.latest_account_sync(
+                capability="wishlist.read", account_id=account_id, status="complete"
+            )
+            provenance = None
+            if latest_complete is not None:
+                row = self._connection.execute(
+                    """
+                    SELECT sync_run_id, provider, support_level,
+                           item_list_retrieved_at, item_list_reported_count,
+                           item_count_retrieved_at, item_count_reported_count,
+                           validation_method
+                    FROM wishlist_sync_metadata WHERE sync_run_id = ?
+                    """,
+                    (latest_complete.id,),
+                ).fetchone()
+                if row is not None:
+                    provenance = WishlistSnapshotProvenance(**dict(row))
+            snapshot = WishlistSnapshot(
+                games=games,
+                latest=latest,
+                latest_complete=latest_complete,
+                latest_complete_provenance=provenance,
+                stable_game_ids_by_appid=self._stable_game_ids_for_appids(
+                    {game.appid for game in games}
+                ),
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
     def read_catalog_snapshot(
         self,
         appids: list[int] | tuple[int, ...],
@@ -1976,6 +2308,12 @@ class Storage:
                 "owned_current": self._count_where(
                     "owned_current", "account_id", account_id
                 ),
+                "wishlist_observations": self._count_where(
+                    "wishlist_observations", "account_id", account_id
+                ),
+                "wishlist_current": self._count_where(
+                    "wishlist_current", "account_id", account_id
+                ),
                 "sync_runs": self._count_where("sync_runs", "account_id", account_id),
                 "consents": self._count_where(
                     "account_data_consents", "account_id", account_id
@@ -1991,17 +2329,23 @@ class Storage:
             evidence_ids = tuple(
                 int(row[0])
                 for row in self._connection.execute(
-                    "SELECT DISTINCT evidence_id FROM owned_observations "
-                    "WHERE account_id = ?",
-                    (account_id,),
+                    """
+                    SELECT evidence_id FROM owned_observations WHERE account_id = ?
+                    UNION
+                    SELECT evidence_id FROM wishlist_observations WHERE account_id = ?
+                    """,
+                    (account_id, account_id),
                 )
             )
             appids = tuple(
                 int(row[0])
                 for row in self._connection.execute(
-                    "SELECT DISTINCT appid FROM owned_observations "
-                    "WHERE account_id = ?",
-                    (account_id,),
+                    """
+                    SELECT appid FROM owned_observations WHERE account_id = ?
+                    UNION
+                    SELECT appid FROM wishlist_observations WHERE account_id = ?
+                    """,
+                    (account_id, account_id),
                 )
             )
             (
@@ -2054,6 +2398,8 @@ class Storage:
                 consents_removed=counts["consents"],
                 evidence_removed=evidence_removed,
                 orphan_apps_removed=orphan_apps_removed,
+                wishlist_observations_removed=counts["wishlist_observations"],
+                wishlist_current_removed=counts["wishlist_current"],
             )
         except BaseException:
             try:
@@ -2100,6 +2446,8 @@ class Storage:
             counts = {
                 "owned_observations": 0,
                 "owned_current": 0,
+                "wishlist_observations": 0,
+                "wishlist_current": 0,
                 "sync_runs": 0,
                 "consents": 0,
                 "probes": 0,
@@ -2120,6 +2468,20 @@ class Storage:
                     "owned_current": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM owned_current "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "wishlist_observations": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM wishlist_observations "
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "wishlist_current": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM wishlist_current "
                             f"WHERE account_id IN ({id_placeholders})",
                             account_ids,
                         ).fetchone()[0]
@@ -2150,17 +2512,27 @@ class Storage:
                 evidence_ids = tuple(
                     int(row[0])
                     for row in self._connection.execute(
-                        f"SELECT DISTINCT evidence_id FROM owned_observations "
-                        f"WHERE account_id IN ({id_placeholders})",
-                        account_ids,
+                        f"""
+                        SELECT evidence_id FROM owned_observations
+                        WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT evidence_id FROM wishlist_observations
+                        WHERE account_id IN ({id_placeholders})
+                        """,
+                        (*account_ids, *account_ids),
                     )
                 )
                 account_appids = tuple(
                     int(row[0])
                     for row in self._connection.execute(
-                        f"SELECT DISTINCT appid FROM owned_observations "
-                        f"WHERE account_id IN ({id_placeholders})",
-                        account_ids,
+                        f"""
+                        SELECT appid FROM owned_observations
+                        WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT appid FROM wishlist_observations
+                        WHERE account_id IN ({id_placeholders})
+                        """,
+                        (*account_ids, *account_ids),
                     )
                 )
 
@@ -2254,6 +2626,8 @@ class Storage:
                 catalog_pages_removed=catalog_counts["pages"],
                 catalog_evidence_removed=catalog_evidence_removed,
                 shared_credential_preserved=not credential_identity_supplied,
+                wishlist_observations_removed=counts["wishlist_observations"],
+                wishlist_current_removed=counts["wishlist_current"],
             )
         except BaseException:
             try:
@@ -2478,9 +2852,7 @@ class Storage:
                 else None
             )
         if not appids:
-            return CatalogSnapshot(
-                facts=(), sources=(), latest=None, attempts=()
-            )
+            return CatalogSnapshot(facts=(), sources=(), latest=None, attempts=())
         parameters = tuple(sorted(appids))
         placeholders = ",".join("?" for _ in parameters)
         if account_id is None:
@@ -2639,6 +3011,8 @@ class Storage:
         allowed = {
             ("owned_observations", "account_id"),
             ("owned_current", "account_id"),
+            ("wishlist_observations", "account_id"),
+            ("wishlist_current", "account_id"),
             ("sync_runs", "account_id"),
             ("account_data_consents", "account_id"),
         }
@@ -2673,6 +3047,14 @@ class Storage:
               AND NOT EXISTS (
                   SELECT 1 FROM owned_current
                   WHERE owned_current.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM wishlist_observations
+                  WHERE wishlist_observations.evidence_id = evidence.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM wishlist_current
+                  WHERE wishlist_current.evidence_id = evidence.id
               )
               AND NOT EXISTS (
                   SELECT 1 FROM catalog_observations
@@ -3006,6 +3388,58 @@ class Storage:
         self._delete_orphan_owned_evidence(evidence_ids)
         self._delete_orphan_apps(appids)
 
+    def _prune_wishlist_payloads(
+        self, account_id: int | None, selected_sync_run_id: int
+    ) -> None:
+        if account_id is None:
+            raise ValueError("wishlist payload pruning requires an account")
+        status = self.get_sync_run(selected_sync_run_id).status
+        operator = "<>" if status == "complete" else "="
+        evidence_ids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                f"""
+                SELECT DISTINCT evidence_id FROM wishlist_observations
+                WHERE account_id = ? AND sync_run_id {operator} ?
+                  AND sync_run_id IN (
+                      SELECT id FROM sync_runs WHERE status <> 'running'
+                  )
+                """,
+                (account_id, selected_sync_run_id),
+            )
+        )
+        appids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                f"""
+                SELECT DISTINCT appid FROM wishlist_observations
+                WHERE account_id = ? AND sync_run_id {operator} ?
+                  AND sync_run_id IN (
+                      SELECT id FROM sync_runs WHERE status <> 'running'
+                  )
+                """,
+                (account_id, selected_sync_run_id),
+            )
+        )
+        self._connection.execute(
+            f"""
+            DELETE FROM wishlist_observations
+            WHERE account_id = ? AND sync_run_id {operator} ?
+              AND sync_run_id IN (SELECT id FROM sync_runs WHERE status <> 'running')
+            """,
+            (account_id, selected_sync_run_id),
+        )
+        self._connection.execute(
+            f"""
+            DELETE FROM wishlist_sync_metadata
+            WHERE account_id = ? AND sync_run_id {operator} ?
+              AND sync_run_id IN (SELECT id FROM sync_runs WHERE status <> 'running')
+            """,
+            (account_id, selected_sync_run_id),
+        )
+        self._delete_orphan_owned_evidence(evidence_ids)
+        self._delete_orphan_apps(appids)
+
     def _remove_credential_identity(
         self,
         provider: str | None,
@@ -3046,6 +3480,14 @@ class Storage:
               AND NOT EXISTS (
                   SELECT 1 FROM owned_current
                   WHERE owned_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM wishlist_observations
+                  WHERE wishlist_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM wishlist_current
+                  WHERE wishlist_current.appid = steam_apps.appid
               )
               AND NOT EXISTS (
                   SELECT 1 FROM catalog_observations
@@ -3121,6 +3563,14 @@ class Storage:
             raise InvalidSyncTransition(
                 f"sync run {sync_run_id} is already {run.status}"
             )
+        return run
+
+    def _require_wishlist_sync(self, sync_run_id: int) -> SyncRun:
+        run = self.get_sync_run(sync_run_id)
+        if run.capability != "wishlist.read":
+            raise InvalidSyncTransition("sync run is not a wishlist sync")
+        if run.account_id is None or run.machine_id is not None:
+            raise InvalidSyncTransition("wishlist sync requires only an account_id")
         return run
 
     def _require_running_catalog_sync(self, sync_run_id: int) -> SyncRun:
@@ -3329,6 +3779,10 @@ __all__ = [
     "StorageError",
     "SyncRun",
     "UnknownSyncRun",
+    "WishlistGame",
+    "WishlistObservation",
+    "WishlistSnapshot",
+    "WishlistSnapshotProvenance",
     "steam_application_stable_id",
 ]
 
