@@ -1,6 +1,7 @@
 # CLI and JSON contract
 
-Status: M1 installed-library contract implemented; M2 capability gate in progress
+Status: M1 installed-library contract implemented; M2 capability gate
+implemented and persistent inventory contract planned
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -86,6 +87,58 @@ The accepted M1 `capabilities` payload remains unchanged for schema `0.1`.
 During the M2 gate, `owned capability` is the canonical detailed account
 capability surface. Merging it into the top-level index requires an explicit
 schema-contract change rather than silently altering the accepted M1 payload.
+
+The 2026-07-11 live evidence for this gate contains only coarse
+classifications: the configured primary account returned `ready`, a deliberately
+invalid key returned `authentication_failed`, and a syntactically valid
+nonexistent SteamID64 returned `data_inaccessible`. The last state means
+inaccessible or ambiguous; it is not serialized as `private`.
+
+## Planned M2 persistent-inventory commands
+
+The following surface is an implementation plan, not yet an implemented or
+accepted CLI contract:
+
+```text
+steam-agent data policy show steam-web-api
+steam-agent data policy accept steam-web-api --yes
+steam-agent sync owned --account ALIAS
+steam-agent games query --scope owned --account ALIAS
+steam-agent games query --scope account --account ALIAS --machine ID
+steam-agent data delete --provider steam-web-api --account ALIAS --yes
+steam-agent data delete --provider steam-web-api --all --yes
+```
+
+The first `sync owned` returns a typed `DATA_POLICY_ACKNOWLEDGMENT_REQUIRED`
+result until the current disclosure is acknowledged. Policy display and
+acknowledgment make no provider request. The acknowledgment is local-profile
+scoped and records only policy version and time.
+
+`sync owned` performs the documented false/true
+`include_played_free_games` request pair. It promotes only when both responses
+are structurally valid and the default set is a subset of the expanded set.
+The query reports `default_owned_set` and `played_free_only`; neither is a
+purchase or license-kind claim. Authentication, visibility ambiguity, provider
+failure, malformed data, inconsistent pairs, and interrupted runs preserve the
+last-known-good projection. Only an explicit valid empty pair clears it.
+
+Normal owned and joined query output omits SteamID64 and local filesystem paths.
+It keeps the following independent:
+
+- visible in the default owned response;
+- included only by the played-free flag;
+- installed on the selected machine;
+- application type from catalog/local evidence; and
+- family availability, playable-now, purchasability, and license kind, which
+  remain `unknown` without separate evidence.
+
+Per-account deletion removes that target's normalized projection, account-
+scoped evidence, sync/probe history, and account metadata. It does not remove
+the data-profile-wide Steam Web API key. `--all` is the local Web API
+termination path and also removes the shared key and reference; it does not
+claim Valve revoked the key. Deletion results distinguish logical deletion,
+SQLite compaction/rebuild, key-store deletion, and user-controlled backup
+remediation rather than returning one misleading boolean.
 
 ## Implemented process behavior
 

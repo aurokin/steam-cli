@@ -16,7 +16,7 @@ them.
 | D008 | SteamGridDB integration | Optional | Easy | Art use cases and terms/attribution review |
 | D009 | High-trust SteamKit/SteamCMD mode | Deferred | Moderate | Private-data value vs account/session risk |
 | D010 | MCP surface | Deferred until CLI stabilizes | Easy | Multiple consumers needing typed live tools |
-| D011 | Raw-response retention and deletion | Bounded for M2 account data: no raw probe or owned-response body by default; broader providers remain open | Costly for privacy | [Steam account lifecycle policy](../design/steam-data-lifecycle.md), adversarial redaction tests, implemented per-profile/all-account deletion before AUR-627 persists data |
+| D011 | Raw-response retention and deletion | Bounded for the M2 probe; AUR-627 implementation plan reviewed but not yet accepted: no raw body, one last-good normalized projection, account-subject deletion, and shared-key removal only on all-Steam-data termination | Costly for privacy | [Steam account lifecycle policy](../design/steam-data-lifecycle.md), [M2 execution plan](../design/m2-execution.md), adversarial redaction/retention tests, implemented per-profile/all-account deletion before AUR-627 persists live data |
 | D012 | Ranking recipe semantics | Open | Costly once agents depend on it | Golden scenarios, user overrides, versioning plan |
 | D013 | Public binary/package name | [Accepted: `steam-agent`](0002-steam-agent-command-name.md) | Costly after release | Avoids the known `steam` client collision |
 | D014 | Read/plan/open/execute action boundary | Proposed direction | Costly and safety-critical | Steam policy review and action-specific capability probes |
