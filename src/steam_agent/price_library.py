@@ -290,10 +290,15 @@ def sync_wishlist_prices(
         if isinstance(failure, PriceSyncError):
             raise failure
 
+    # A forced provider run can complete its own bounded work while the overall
+    # deal capability remains partial. In particular, a GG.deals ``not_found``
+    # still requires the fallback rung before the price can truthfully be called
+    # unknown. The individual SyncRun records provider-run completeness; this
+    # result records completeness of the full evidence ladder.
     fallback_complete = fallback_evaluated >= fallback_total
     overall_complete = (
         len(evaluated) == total
-        and (provider != "auto" or fallback_complete)
+        and fallback_complete
         and all(run.status != "failed" for run in runs)
     )
     return PriceSyncResult(

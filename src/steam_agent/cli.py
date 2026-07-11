@@ -1190,7 +1190,10 @@ def _dispatch_sync_prices(args: argparse.Namespace, database_path: Path) -> int:
         warnings.append(
             WarningRecord(
                 code=ErrorCode.PARTIAL_SCAN,
-                message="Only a bounded subset of wishlist price evidence was evaluated.",
+                message=(
+                    "The requested synchronization did not complete every required "
+                    "deal-evidence evaluation."
+                ),
             )
         )
     return _emit_success(

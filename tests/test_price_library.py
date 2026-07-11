@@ -118,6 +118,29 @@ class SparseGgFallback:
         )
 
 
+def test_forced_primary_not_found_completes_run_but_not_evidence_ladder(
+    tmp_path,
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 3)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="gg-deals",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=SparseGgFallback(),
+            clock=lambda: NOW,
+        )
+
+        assert result.runs[0].status == "complete"
+        assert result.evaluated_items == 3
+        assert result.fallback_total == 1
+        assert result.fallback_evaluated == 0
+        assert result.completeness == "partial"
+
+
 def test_sparse_cheapshark_fallback_persists_exact_targets(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup(storage, 3)
