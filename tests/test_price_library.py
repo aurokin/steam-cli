@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 from steam_agent.cheapshark import CheapSharkError
 from steam_agent.credentials import SecretValue
-from steam_agent.deal_evidence import DealEvidenceSnapshot, ProductIdentity
+from steam_agent.deal_query import build_deal_query_from_snapshot
+from steam_agent.deal_evidence import (
+    DealEvidenceSnapshot,
+    HistoricalLowSummary,
+    ProductIdentity,
+)
 from steam_agent.deal_evidence import ManualReference, Money, OfferEvidence
 from steam_agent.gg_deals import GgDealsBatch, GgDealsError, RateLimitMetadata
 from steam_agent.price_library import PriceSyncError, sync_wishlist_prices
@@ -85,6 +90,28 @@ def observed_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
     )
 
 
+def low_only_snapshot(provider: str, appid: int) -> DealEvidenceSnapshot:
+    product = ProductIdentity(f"product-{appid}", appid)
+    low = HistoricalLowSummary(
+        provider,
+        product,
+        Money(75, "USD", "US"),
+        "2026-07-11T12:00:00Z",
+        None,
+        "all_time_official_stores",
+        ManualReference(f"https://gg.deals/game/synthetic-{appid}/", "manual"),
+        "normalized_game",
+    )
+    return DealEvidenceSnapshot(
+        provider,
+        product,
+        (),
+        (low,),
+        "2026-07-11T12:00:00Z",
+        (),
+    )
+
+
 class MidBatchGg:
     calls = 0
 
@@ -142,9 +169,7 @@ class SparseGgFallback:
         return GgDealsBatch(
             values,
             tuple(
-                observed_snapshot("gg-deals", appid)
-                for appid in values
-                if appid != 2
+                observed_snapshot("gg-deals", appid) for appid in values if appid != 2
             ),
             (2,) if 2 in values else (),
             RateLimitMetadata(100, 99, 123),
@@ -160,6 +185,17 @@ class EmptyAndNullGg:
             (1, 2),
             (empty_snapshot("gg-deals", 1),),
             (2,),
+            RateLimitMetadata(100, 99, 123),
+        )
+
+
+class LowOnlyGg:
+    def fetch_app_price_summaries(self, *, appids, api_key):
+        assert tuple(appids) == (1,)
+        return GgDealsBatch(
+            (1,),
+            (low_only_snapshot("gg-deals", 1),),
+            (),
             RateLimitMetadata(100, 99, 123),
         )
 
@@ -259,6 +295,50 @@ def test_empty_and_null_primary_prices_enter_successful_fallback(tmp_path) -> No
             (2, "not_found"),
         ]
         assert primary.facts == ()
+
+
+def test_historical_low_without_current_offer_is_retained_and_falls_back(
+    tmp_path,
+) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup(storage, 1)
+        result = sync_wishlist_prices(
+            storage,
+            account_id=account_id,
+            country="US",
+            provider="auto",
+            gg_api_key=SecretValue("secret"),
+            max_items=None,
+            gg_client=LowOnlyGg(),
+            cheapshark_client=CheapOk(),
+            clock=lambda: NOW,
+        )
+
+        assert result.fallback_total == 1
+        assert result.fallback_evaluated == 1
+        assert result.completeness == "complete"
+        snapshot = storage.read_wishlist_deal_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        assert {(fact.provider, fact.fact_kind) for fact in snapshot.prices.facts} == {
+            ("gg-deals", "historical_low"),
+            ("cheapshark", "offer"),
+        }
+        query = build_deal_query_from_snapshot(
+            snapshot,
+            account_alias="primary",
+            country="US",
+            store_class="unknown",
+            generated_at=NOW,
+            gg_credential_configured=True,
+        )
+        assert query["completeness"]["status"] == "complete"
+        item = query["data"]["items"][0]
+        assert item["deal"]["current_offer"]["provider"] == "cheapshark"
+        assert [
+            (attempt["provider"], attempt["status"])
+            for attempt in item["deal"]["attempted_providers"]
+        ] == [("gg-deals", "not_found"), ("cheapshark", "ready")]
 
 
 class CheapOk:

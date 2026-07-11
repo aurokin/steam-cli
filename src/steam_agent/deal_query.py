@@ -444,6 +444,11 @@ def _stored_provider_states(
         (subject.appid, subject.provider): subject
         for subject in snapshot.prices.subjects
     }
+    current_offer_keys = {
+        (fact.appid, fact.provider)
+        for fact in snapshot.prices.facts
+        if fact.fact_kind == "offer"
+    }
     relevant = {
         (item.appid, item.provider): item
         for item in snapshot.prices.latest_relevant_attempts
@@ -471,11 +476,27 @@ def _stored_provider_states(
                         )
                     )
                 else:
-                    result.append(_subject_state(candidate.appid, provider, subject))
+                    result.append(
+                        _subject_state(
+                            candidate.appid,
+                            provider,
+                            subject,
+                            current_offer_available=(
+                                (candidate.appid, provider) in current_offer_keys
+                            ),
+                        )
+                    )
                 continue
             if not item.demand.targeted:
                 result.append(
-                    _subject_state(candidate.appid, provider, subject)
+                    _subject_state(
+                        candidate.appid,
+                        provider,
+                        subject,
+                        current_offer_available=(
+                            (candidate.appid, provider) in current_offer_keys
+                        ),
+                    )
                     if subject is not None
                     else ProviderStateInput(candidate.appid, provider, "unevaluated")
                 )
@@ -501,13 +522,27 @@ def _stored_provider_states(
             elif item.demand.evaluated:
                 if item.demand.outcome == "not_found":
                     result.append(
-                        _subject_state(candidate.appid, provider, subject)
+                        _subject_state(
+                            candidate.appid,
+                            provider,
+                            subject,
+                            current_offer_available=(
+                                (candidate.appid, provider) in current_offer_keys
+                            ),
+                        )
                         if subject is not None
                         else ProviderStateInput(candidate.appid, provider, "expired")
                     )
                 else:
                     result.append(
-                        _subject_state(candidate.appid, provider, subject)
+                        _subject_state(
+                            candidate.appid,
+                            provider,
+                            subject,
+                            current_offer_available=(
+                                (candidate.appid, provider) in current_offer_keys
+                            ),
+                        )
                         if subject is not None
                         else ProviderStateInput(candidate.appid, provider, "expired")
                     )
@@ -525,12 +560,20 @@ def _stored_provider_states(
 
 
 def _subject_state(
-    appid: int, provider: str, subject: StoredPriceSubject
+    appid: int,
+    provider: str,
+    subject: StoredPriceSubject,
+    *,
+    current_offer_available: bool,
 ) -> ProviderStateInput:
     return ProviderStateInput(
         appid=appid,
         provider=provider,  # type: ignore[arg-type]
-        state=("not_found" if subject.outcome == "not_found" else "ready"),
+        state=(
+            "ready"
+            if subject.outcome == "observed" and current_offer_available
+            else "not_found"
+        ),
         observed_at=subject.observed_at,
         fresh_until=subject.fresh_until,
     )
@@ -933,13 +976,10 @@ def _state_fresh(state: ProviderStateInput, now: datetime) -> bool:
 
 
 def _state_is_stale(state: ProviderStateInput, now: datetime) -> bool:
-    return (
-        state.state == "expired"
-        or (
-            state.state in {"ready", "not_found"}
-            and state.fresh_until is not None
-            and not _fresh(state.fresh_until, now)
-        )
+    return state.state == "expired" or (
+        state.state in {"ready", "not_found"}
+        and state.fresh_until is not None
+        and not _fresh(state.fresh_until, now)
     )
 
 

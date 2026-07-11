@@ -160,6 +160,11 @@ def sync_wishlist_prices(
                     outcomes[appid] = "observed"
                     observed.add(appid)
                     facts.extend(normalized_facts)
+                    if not any(fact.fact_kind == "offer" for fact in normalized_facts):
+                        # Historical-low evidence remains useful and is retained,
+                        # but it does not answer the current-price question.  Keep
+                        # walking the evidence ladder for a current offer.
+                        fallback_candidates.append(appid)
                 else:
                     # A product-shaped response with no normalized price facts
                     # does not prove that a usable price was observed.  It is a
