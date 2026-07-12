@@ -523,6 +523,10 @@ def test_account_deletion_removes_private_lineage_but_retains_global_public_fact
     assert storage._connection.execute(  # noqa: SLF001
         "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
     ).fetchone()[0] == 1
+    storage._prune_declared_apps("2026-08-10T12:02:00Z")  # noqa: SLF001
+    assert storage._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
+    ).fetchone()[0] == 0
 
 
 def test_provider_deletion_removes_global_fact_cooldown_and_all_private_lineage(

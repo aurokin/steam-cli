@@ -522,6 +522,7 @@ def _declared(
         and demand.get("evaluated") is False
         and demand.get("error_code") == "NOT_FOUND_CACHE"
     )
+    superseding_failure = False
     if demand is not None and (
         (demand.get("evaluated") is True and demand.get("state") == "not_found")
         or cached_not_found
@@ -529,11 +530,20 @@ def _declared(
         demand_at = _parse_time(demand.get("observed_at"))
         if demand_at is not None and (observed is None or demand_at >= observed):
             conflict = True
-    elif (
-        demand is not None
-        and demand.get("evaluated") is True
-        and demand.get("state") not in {None, "ready", "not_found"}
-    ):
+    else:
+        superseding_failure = demand is not None and (
+            (
+                demand.get("evaluated") is True
+                and demand.get("state") not in {None, "ready", "not_found"}
+            )
+            or (
+                demand.get("targeted") is True
+                and demand.get("evaluated") is False
+                and demand.get("state") == "unevaluated"
+                and demand.get("error_code") is not None
+            )
+        )
+    if demand is not None and superseding_failure:
         demand_at = _parse_time(demand.get("observed_at")) or _parse_time(
             demand.get("started_at")
         )

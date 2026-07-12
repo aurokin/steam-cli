@@ -3577,6 +3577,21 @@ class Storage:
         cutoff = _timestamp(
             datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=30)
         )
+        affected_appids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """SELECT appid FROM declared_app_current WHERE observed_at < ?
+                   UNION SELECT o.appid FROM declared_app_observations o
+                     JOIN sync_runs r ON r.id=o.sync_run_id
+                     WHERE r.capability='compatibility.declared.read'
+                       AND r.started_at < ?
+                   UNION SELECT d.appid FROM declared_app_sync_demand d
+                     JOIN sync_runs r ON r.id=d.sync_run_id
+                     WHERE r.capability='compatibility.declared.read'
+                       AND r.started_at < ?""",
+                (cutoff, cutoff, cutoff),
+            )
+        )
         self._connection.execute(
             "DELETE FROM declared_app_current WHERE observed_at < ?", (cutoff,)
         )
@@ -3585,6 +3600,8 @@ class Storage:
                WHERE capability='compatibility.declared.read' AND started_at < ?""",
             (cutoff,),
         )
+        if affected_appids:
+            self._delete_orphan_apps(affected_appids)
 
     def delete_declared_app_data(
         self, *, account_id: int | None = None

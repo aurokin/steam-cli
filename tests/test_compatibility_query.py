@@ -500,6 +500,27 @@ def test_unevaluated_declared_skip_does_not_stale_last_good(error_code: str) -> 
     assert native.original_freshness == "fresh"
 
 
+def test_interrupted_targeted_declared_attempt_stales_last_good() -> None:
+    snapshot = dict(
+        declared(
+            10,
+            observed_at=NOW - timedelta(hours=1),
+            demand_state="unevaluated",
+            demand_at=NOW,
+            evaluated=False,
+        )
+    )
+    demand = dict(snapshot["latest_demand"][0])
+    demand.update(targeted=True, error_code="SYNC_INTERRUPTED")
+    snapshot["latest_demand"] = (demand,)
+
+    item = result(snapshot=snapshot)
+    native = next(gate for gate in item.gates if gate.name == "declared_native_build")
+
+    assert native.original == "pass"
+    assert native.original_freshness == "stale"
+
+
 def test_not_found_cache_skip_preserves_retained_last_good_conflict() -> None:
     snapshot = dict(
         declared(
