@@ -1797,6 +1797,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
 
     command = "compatibility.assess"
     now = _utc_now()
+    country = args.country.upper()
     # Validate the caller-controlled contract before touching cached evidence so
     # request mistakes remain distinct from malformed persisted projections.
     try:
@@ -1818,7 +1819,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         # Compatibility facts use the same closed request-context vocabulary
         # as their provider adapter.  Accepting an arbitrary language slug here
         # would create a cache key the sync boundary can never populate.
-        SteamDeclaredFactsRequestContext(args.country, args.language)
+        SteamDeclaredFactsRequestContext(country, args.language)
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", args.account) is None:
             raise ValueError("account alias is invalid")
         _validate_compatibility_target_syntax(args.target, args.context_machine)
@@ -1880,10 +1881,11 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             snapshot = storage.read_compatibility_snapshot(
                 account.id,
                 machine_id,
-                args.country,
+                country,
                 args.language,
                 appids,
                 now,
+                include_local_target_evidence=(target.kind == "machine"),
             )
         # Reconstruct once without caller overrides.  That keeps malformed
         # persisted evidence classified as DATABASE_ERROR while giving us the
@@ -2009,7 +2011,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             "account_alias": args.account,
             "target": args.target,
             "evidence_machine": machine_id,
-            "country": args.country,
+            "country": country,
             "language": args.language,
             "cache_only": True,
             "requirements": [f"{item.kind}:{item.name}" for item in requirements],

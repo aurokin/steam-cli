@@ -119,7 +119,7 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
         "--machine",
         "desktop",
         "--country",
-        "US",
+        "us",
     )
     assert code == 1
     assert blocked["error"]["code"] == "DATA_POLICY_ACKNOWLEDGMENT_REQUIRED"
@@ -139,7 +139,7 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
         "--machine",
         "desktop",
         "--country",
-        "US",
+        "us",
         "--acknowledge-local-storage",
     )
     assert code == 0 and error == ""
@@ -168,6 +168,28 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     assert cached["data"]["targeted"] == []
     assert cached["data"]["demand"][0]["error_code"] == "FRESH_LAST_GOOD"
     assert calls == [400]
+
+    code, assessed, error = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:desktop",
+        "--country",
+        "us",
+        "--language",
+        "english",
+    )
+    assert code == 0 and error == ""
+    assert assessed["context"]["country"] == "US"
+    assert (
+        "compatibility.declared.read"
+        not in assessed["data"]["source_completeness"]["missing_capabilities"]
+    )
 
     code, confirmation, _ = invoke(
         tmp_path,
