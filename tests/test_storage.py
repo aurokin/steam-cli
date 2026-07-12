@@ -529,6 +529,7 @@ def test_readonly_storage_never_migrates_or_accepts_writes(tmp_path: Path) -> No
             observed_at=T0,
         )
     before = database_path.read_bytes()
+    files_before = {path.name for path in tmp_path.iterdir()}
 
     with Storage(database_path, readonly=True) as readonly:
         assert readonly.get_machine("desktop") is not None
@@ -538,6 +539,7 @@ def test_readonly_storage_never_migrates_or_accepts_writes(tmp_path: Path) -> No
             )
 
     assert database_path.read_bytes() == before
+    assert {path.name for path in tmp_path.iterdir()} == files_before
 
 
 def test_readonly_storage_requires_an_existing_file(tmp_path: Path) -> None:
