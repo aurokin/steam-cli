@@ -77,6 +77,11 @@ class Client:
         )
 
 
+class InterruptClient:
+    def fetch_summary(self, appid: int) -> SteamReviewSummary:
+        raise KeyboardInterrupt
+
+
 def setup_wishlist(storage: Storage, count: int = 25, *, alias: str = "primary") -> int:
     account = storage.configure_steam_account(
         alias=alias,
@@ -277,6 +282,65 @@ def test_active_review_target_is_reserved_across_concurrent_schedulers(tmp_path)
         )
         storage.finish_review_sync(first.id, completed_at=NOW)
         storage.finish_review_sync(second.id, completed_at=NOW)
+
+
+def test_stale_running_review_schedule_is_recovered_before_rescheduling(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 3)
+        first, _, first_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=1,
+            skip_fresh_terminal=False,
+            started_at=NOW,
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        second, second_candidates, second_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=1,
+            skip_fresh_terminal=False,
+            started_at=NOW + timedelta(minutes=16),
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        assert first_targets == (100,)
+        assert second_candidates == (100, 101, 102) and second_targets == (100,)
+        recovered = storage.get_sync_run(first.id)
+        assert recovered.status == "failed" and recovered.error_code == "SYNC_INTERRUPTED"
+        demand = storage._connection.execute(  # noqa: SLF001
+            """SELECT evaluated, state, error_code FROM review_sync_demand
+               WHERE sync_run_id=? AND appid=100""",
+            (first.id,),
+        ).fetchone()
+        assert tuple(demand) == (0, "unevaluated", "SYNC_INTERRUPTED")
+        storage.mark_remaining_reviews_unevaluated(
+            second.id, observed_at=NOW, error_code="TEST_CLEANUP"
+        )
+        storage.finish_review_sync(second.id, completed_at=NOW)
+
+
+def test_keyboard_interrupt_finishes_review_run_without_masking_cancel(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 2)
+        with pytest.raises(KeyboardInterrupt):
+            sync_wishlist_reviews(
+                storage,
+                account_id=account_id,
+                max_items=2,
+                client=InterruptClient(),  # type: ignore[arg-type]
+                clock=Clock(),
+            )
+        run = storage._connection.execute(  # noqa: SLF001
+            """SELECT status FROM sync_runs
+               WHERE capability='reviews.aggregate.read'"""
+        ).fetchone()
+        assert run["status"] == "complete"
+        demand = storage._connection.execute(  # noqa: SLF001
+            """SELECT evaluated, state, error_code FROM review_sync_demand
+               ORDER BY ordinal"""
+        ).fetchall()
+        assert [tuple(row) for row in demand] == [
+            (0, "unevaluated", "SYNC_INTERRUPTED"),
+            (0, "unevaluated", "SYNC_INTERRUPTED"),
+        ]
 
 
 def test_retryable_failure_without_header_persists_default_restart_cooldown(

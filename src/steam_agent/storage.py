@@ -2646,6 +2646,39 @@ class Storage:
             ):
                 raise InvalidSyncTransition("current review persistence consent is required")
             self._prune_reviews(timestamp)
+            stale_cutoff = _timestamp(
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                - timedelta(minutes=15)
+            )
+            stale_runs = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    """SELECT id FROM sync_runs
+                       WHERE account_id=?
+                         AND capability='reviews.aggregate.read'
+                         AND status='running' AND started_at<?""",
+                    (account_id, stale_cutoff),
+                )
+            )
+            for stale_run_id in stale_runs:
+                self._connection.execute(
+                    """UPDATE review_sync_demand
+                       SET state='unevaluated', evaluated=0,
+                           error_code='SYNC_INTERRUPTED', observed_at=?
+                       WHERE sync_run_id=? AND state='running'""",
+                    (timestamp, stale_run_id),
+                )
+                self._connection.execute(
+                    """UPDATE sync_runs SET status='failed', promoted=0,
+                           completed_at=?, error_code='SYNC_INTERRUPTED',
+                           error_detail=NULL,
+                           records_seen=(
+                             SELECT COUNT(*) FROM review_sync_demand
+                             WHERE sync_run_id=? AND evaluated=1
+                           )
+                       WHERE id=? AND status='running'""",
+                    (timestamp, stale_run_id, stale_run_id),
+                )
             candidates = self.review_sync_candidates(
                 account_id,
                 now=timestamp,

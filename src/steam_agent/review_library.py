@@ -157,6 +157,17 @@ def sync_wishlist_reviews(
                     run.id, observed_at=clock(), error_code="PROVIDER_FANOUT_STOPPED"
                 )
                 break
+        except BaseException:
+            # Preserve cancellation/unexpected failure as the caller's primary
+            # exception while making the durable run truthful and restartable.
+            try:
+                storage.mark_remaining_reviews_unevaluated(
+                    run.id, observed_at=clock(), error_code="SYNC_INTERRUPTED"
+                )
+                storage.finish_review_sync(run.id, completed_at=clock())
+            except BaseException:
+                pass
+            raise
     completed = storage.finish_review_sync(run.id, completed_at=clock())
     unevaluated = len(targeted) - sum(counts.values())
     if unevaluated:
