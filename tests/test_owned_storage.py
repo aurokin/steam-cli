@@ -68,6 +68,59 @@ def _consent(storage: Storage, account_id: int) -> None:
     )
 
 
+def test_v18_upgrade_backfills_empty_ready_achievement_projection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v18-empty-achievement.sqlite3"
+    with sqlite3.connect(path) as connection:
+        _apply_migrations_through(connection, 18)
+        account_id = int(
+            connection.execute(
+                """INSERT INTO accounts(
+                       alias, provider, provider_account_id, source_kind,
+                       created_at, updated_at
+                   ) VALUES ('primary', 'steam', '76561198000000000',
+                             'upgrade-test', ?, ?)""",
+                (T0, T0),
+            ).lastrowid
+        )
+        connection.execute(
+            """INSERT INTO steam_apps(appid, name, app_type, updated_at)
+               VALUES (10, 'Empty Achievement Game', 'game', ?)""",
+            (T0,),
+        )
+        run_id = int(
+            connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, completed_at,
+                       status, promoted, records_seen
+                   ) VALUES ('steam_web_api', 'achievements.read', ?, ?, ?,
+                             'complete', 1, 1)""",
+                (account_id, T0, T1),
+            ).lastrowid
+        )
+        connection.execute(
+            """INSERT INTO achievement_sync_demand(
+                   sync_run_id, account_id, appid, ordinal, targeted, evaluated,
+                   state, observed_at
+               ) VALUES (?, ?, 10, 0, 1, 1, 'ready', ?)""",
+            (run_id, account_id, T0),
+        )
+        connection.commit()
+
+    with Storage(path) as storage:
+        projection = storage._connection.execute(
+            """SELECT observed_at, promoted_sync_run_id
+               FROM achievement_player_projection
+               WHERE account_id=? AND appid=10""",
+            (account_id,),
+        ).fetchone()
+        assert tuple(projection) == (T0, run_id)
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM achievement_player_current"
+        ).fetchone()[0] == 0
+
+
 def _owned(
     appid: int,
     at: str,

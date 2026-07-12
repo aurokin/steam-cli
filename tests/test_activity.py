@@ -337,6 +337,67 @@ def test_schema_invalid_response_is_a_per_game_failure_not_unsupported_schema(
     ).fetchone()[0] == 0
 
 
+def test_failed_storage_result_cannot_replace_cached_schema_by_default(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    ready = storage.begin_achievement_sync(
+        account_id=account_id,
+        candidates=(10,),
+        targeted=(10,),
+        started_at=NOW,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    storage.record_achievement_result(
+        ready.id,
+        account_id=account_id,
+        appid=10,
+        state="ready",
+        player=(),
+        schema_state="ready",
+        schema=(
+            {
+                "api_name": "KEEP",
+                "display_name": "Keep",
+                "description": None,
+                "hidden": False,
+            },
+        ),
+        observed_at=NOW,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    storage.finish_achievement_sync(ready.id, completed_at=NOW)
+
+    failed = storage.begin_achievement_sync(
+        account_id=account_id,
+        candidates=(10,),
+        targeted=(10,),
+        started_at=NOW + timedelta(hours=1),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    storage.record_achievement_result(
+        failed.id,
+        account_id=account_id,
+        appid=10,
+        state="failed",
+        player=(),
+        schema_state="achievements_not_supported",
+        schema=(),
+        observed_at=NOW + timedelta(hours=1),
+        error_code="PROVIDER_UNAVAILABLE",
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+
+    status = storage._connection.execute(
+        "SELECT state, observed_at FROM achievement_schema_status WHERE appid=10"
+    ).fetchone()
+    rows = storage._connection.execute(
+        "SELECT api_name FROM achievement_schema_current WHERE appid=10"
+    ).fetchall()
+    assert tuple(status) == ("ready", "2026-07-11T12:00:00Z")
+    assert [row[0] for row in rows] == ["KEEP"]
+
+
 def test_activity_query_hard_deletes_expired_provider_rows(configured: tuple[Storage, int]) -> None:
     storage, account_id = configured
     client = FakeClient()

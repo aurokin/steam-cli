@@ -2385,7 +2385,7 @@ class Storage:
                              promoted_sync_run_id=excluded.promoted_sync_run_id""",
                         (account_id, appid, timestamp, sync_run_id),
                     )
-            if write_schema:
+            if write_schema and state != "failed":
                 existing_schema = self._connection.execute(
                         """SELECT observed_at FROM achievement_schema_status
                            WHERE appid = ? AND language = 'english'""",
