@@ -2305,7 +2305,8 @@ class Storage:
             return None
         observed = datetime.fromisoformat(str(status["observed_at"]).replace("Z", "+00:00"))
         lifetime = timedelta(days=30 if status["state"] == "ready" else 7)
-        if evaluated - observed > lifetime:
+        age = evaluated - observed
+        if age < timedelta(0) or age > lifetime:
             return None
         rows = tuple(
             dict(row)

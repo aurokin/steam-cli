@@ -129,7 +129,9 @@ def query_activity(
         recent_minutes = row["recent_window_minutes"]
         recent_state = "unknown"
         if recent_minutes is not None and recent_age is not None:
-            if recent_age <= RECENT_FRESH:
+            if recent_age < timedelta(0):
+                recent_state = "unknown"
+            elif recent_age <= RECENT_FRESH:
                 recent_state = "fresh"
             elif recent_age <= RECENT_CURRENT_USE:
                 recent_state = "stale"
@@ -154,7 +156,9 @@ def query_activity(
                 else datetime.fromtimestamp(row["last_played_unix"], timezone.utc).isoformat().replace("+00:00", "Z")
             ),
             "freshness": {
-                "activity": "fresh" if now - observed <= ACTIVITY_FRESH else ("stale" if now - observed <= HARD_RETENTION else "expired"),
+                "activity": _evidence_freshness(
+                    now - observed, fresh_for=ACTIVITY_FRESH, retained_for=HARD_RETENTION
+                ),
                 "recent_window": recent_state,
             },
             "observed_at": row["observed_at"],
@@ -326,6 +330,9 @@ def query_achievements(
             })
         observed_at = row["observed_at"]
         age = None if observed_at is None else now - _parse(observed_at)
+        freshness = _evidence_freshness(
+            age, fresh_for=ACHIEVEMENT_FRESH, retained_for=HARD_RETENTION
+        )
         state = row["state"]
         if age is not None and age > HARD_RETENTION and state not in {"unevaluated", "running"}:
             state = "expired"
@@ -333,7 +340,7 @@ def query_achievements(
             "unlocked": unlocked,
             "total": len(visible),
             "newest_unlock_at": None if newest is None else datetime.fromtimestamp(newest, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "freshness": None if age is None else ("fresh" if age <= ACHIEVEMENT_FRESH else "stale"),
+            "freshness": freshness,
         } if visible else None
         items.append({
             "appid": row["appid"],
@@ -346,16 +353,12 @@ def query_achievements(
                 "unlocked": unlocked if state == "ready" else None,
                 "total": len(visible) if state == "ready" else None,
                 "newest_unlock_at": None if newest is None else datetime.fromtimestamp(newest, timezone.utc).isoformat().replace("+00:00", "Z"),
-                "freshness": None if age is None else ("fresh" if age <= ACHIEVEMENT_FRESH else "stale"),
+                "freshness": freshness,
             },
             "last_good_summary": last_good_summary if state != "ready" else None,
             "achievements": visible if state == "ready" else [],
             "observed_at": observed_at,
-            "freshness": (
-                None
-                if age is None
-                else ("fresh" if age <= ACHIEVEMENT_FRESH else "stale")
-            ),
+            "freshness": freshness,
             "error_code": row["error_code"],
             "limitations": ["achievement_percentage_is_not_game_progress"],
         })
@@ -376,6 +379,20 @@ def _provider_error(exc: BaseException) -> tuple[str, bool]:
 
 def _parse(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _evidence_freshness(
+    age: timedelta | None, *, fresh_for: timedelta, retained_for: timedelta
+) -> str | None:
+    if age is None:
+        return None
+    if age < timedelta(0):
+        return "unknown"
+    if age <= fresh_for:
+        return "fresh"
+    if age <= retained_for:
+        return "stale"
+    return "expired"
 
 
 __all__ = [

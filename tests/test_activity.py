@@ -269,6 +269,62 @@ def test_activity_query_hard_deletes_expired_provider_rows(configured: tuple[Sto
     assert storage._connection.execute("SELECT COUNT(*) FROM activity_observations").fetchone()[0] == 0
 
 
+def test_future_activity_observation_has_unknown_freshness(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    sync_activity(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        client=FakeClient(),
+        clock=lambda: NOW,
+    )
+
+    item = query_activity(
+        storage, account_id=account_id, clock=lambda: NOW - timedelta(minutes=1)
+    )["items"][0]
+    assert item["freshness"] == {
+        "activity": "unknown",
+        "recent_window": "unknown",
+    }
+
+
+def test_future_achievement_observation_has_unknown_freshness_and_schema_is_not_cached(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(
+        10, "ready", (PlayerAchievement("A", True, 1),)
+    )
+    client.schema[10] = GameAchievementSchema(
+        10,
+        "ready",
+        "english",
+        (AchievementDefinition("A", "A", None, False),),
+    )
+    sync_achievements(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        scope="owned",
+        explicit_appids=(10,),
+        client=client,
+        clock=lambda: NOW,
+    )
+
+    earlier = NOW - timedelta(minutes=1)
+    item = query_achievements(
+        storage, account_id=account_id, clock=lambda: earlier
+    )["items"][0]
+    assert item["freshness"] == "unknown"
+    assert item["summary"]["freshness"] == "unknown"
+    assert storage.read_cached_achievement_schema(10, now=earlier) is None
+
+
 def test_account_deletion_removes_orphan_public_schema(configured: tuple[Storage, int]) -> None:
     storage, account_id = configured
     client = FakeClient()
