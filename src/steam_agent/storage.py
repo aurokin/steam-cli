@@ -535,6 +535,15 @@ class AccountDataConsent:
 
 
 @dataclass(frozen=True)
+class MachineDataConsent:
+    machine_id: str
+    consent_kind: str
+    disclosure_version: str
+    backups_acknowledged: bool
+    accepted_at: str
+
+
+@dataclass(frozen=True)
 class AccountDataDeletion:
     account_removed: bool
     owned_observations_removed: int
@@ -955,6 +964,15 @@ class Storage:
                 ),
             )
         return machine
+
+    def get_machine(self, machine_id: str) -> Machine | None:
+        if not isinstance(machine_id, str) or not 1 <= len(machine_id) <= 256:
+            raise ValueError("machine ID is invalid")
+        row = self._connection.execute(
+            "SELECT id, name, platform, architecture FROM machines WHERE id = ?",
+            (machine_id,),
+        ).fetchone()
+        return None if row is None else Machine(**dict(row))
 
     def configure_steam_account(
         self,
@@ -2108,6 +2126,309 @@ class Storage:
         values = dict(row)
         values["backups_acknowledged"] = bool(values["backups_acknowledged"])
         return AccountDataConsent(**values)
+
+    def record_system_profile_consent(
+        self,
+        *,
+        machine_id: str,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> MachineDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            if self.get_machine(machine_id) is None:
+                raise ValueError("machine is not configured")
+            self._connection.execute(
+                """INSERT INTO machine_data_consents(
+                       machine_id, consent_kind, disclosure_version,
+                       backups_acknowledged, accepted_at
+                   ) VALUES (?, 'system_profile', ?, 1, ?)
+                   ON CONFLICT(machine_id, consent_kind) DO UPDATE SET
+                     disclosure_version=excluded.disclosure_version,
+                     backups_acknowledged=excluded.backups_acknowledged,
+                     accepted_at=excluded.accepted_at""",
+                (machine_id, disclosure_version, timestamp),
+            )
+        consent = self.get_system_profile_consent(machine_id)
+        assert consent is not None
+        return consent
+
+    def get_system_profile_consent(
+        self, machine_id: str
+    ) -> MachineDataConsent | None:
+        row = self._connection.execute(
+            """SELECT * FROM machine_data_consents
+               WHERE machine_id=? AND consent_kind='system_profile'""",
+            (machine_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return MachineDataConsent(**values)
+
+    def begin_system_profile_sync(
+        self,
+        *,
+        machine_id: str,
+        disclosure_version: str,
+        started_at: str | datetime,
+    ) -> SyncRun:
+        timestamp = _timestamp(started_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            consent = self.get_system_profile_consent(machine_id)
+            if consent is None or consent.disclosure_version != disclosure_version:
+                raise InvalidSyncTransition("current system-profile consent is required")
+            # History is diagnostic only and bounded to 30 days. Never delete the
+            # promoted run because the current projection references it.
+            cutoff = _timestamp(
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                - timedelta(days=30)
+            )
+            self._connection.execute(
+                """DELETE FROM sync_runs
+                   WHERE capability='system_profile.read' AND machine_id=?
+                     AND completed_at IS NOT NULL AND completed_at < ?
+                     AND id NOT IN (
+                       SELECT promoted_sync_run_id FROM system_profile_current
+                       WHERE machine_id=?
+                     )""",
+                (machine_id, cutoff, machine_id),
+            )
+            cursor = self._connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, machine_id, started_at, status
+                   ) VALUES ('local_system', 'system_profile.read', ?, ?, 'running')""",
+                (machine_id, timestamp),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(int(cursor.lastrowid))
+
+    def complete_system_profile_sync(
+        self,
+        sync_run_id: int,
+        *,
+        profile: Mapping[str, Any],
+        observed_at: str | datetime,
+        completed_at: str | datetime,
+        disclosure_version: str,
+    ) -> SyncRun:
+        from steam_agent.system_profile import (
+            system_profile_is_complete,
+            validate_system_profile,
+        )
+
+        validated = validate_system_profile(profile)
+        if not system_profile_is_complete(validated):
+            raise ValueError("only a complete system profile can be promoted")
+        observed = _timestamp(observed_at)
+        completed = _timestamp(completed_at)
+        profile_json = _canonical_json(validated)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self.get_sync_run(sync_run_id)
+            if (
+                run.capability != "system_profile.read"
+                or run.machine_id is None
+                or run.status != "running"
+            ):
+                raise InvalidSyncTransition("system-profile sync is not running")
+            consent = self.get_system_profile_consent(run.machine_id)
+            if consent is None or consent.disclosure_version != disclosure_version:
+                raise InvalidSyncTransition("current system-profile consent is required")
+            machine = self.get_machine(run.machine_id)
+            assert machine is not None
+            profile_family = validated["os"]["family"]["value"]
+            stored_family = {
+                "darwin": "macos", "macos": "macos", "win32": "windows",
+                "windows": "windows", "linux": "linux", "unknown": profile_family,
+            }.get(machine.platform.casefold())
+            profile_architecture = validated["cpu"]["architecture"]["value"]
+            stored_architecture = None if machine.architecture is None else {
+                "amd64": "x86_64", "aarch64": "arm64",
+            }.get(machine.architecture.casefold(), machine.architecture.casefold())
+            if stored_family != profile_family or (
+                stored_architecture is not None
+                and stored_architecture != profile_architecture
+            ):
+                raise InvalidSyncTransition(
+                    "system profile conflicts with the configured machine"
+                )
+            evidence_id = self._insert_evidence(
+                EvidenceInput(
+                    provider="local_system",
+                    capability="system_profile.read",
+                    source_kind="local_normalized_observation",
+                    source_locator="local-system:allowlisted-facts",
+                    retrieved_at=observed,
+                    support_level="core",
+                    context={
+                        "machine_alias": run.machine_id,
+                        "schema_id": "system-profile/0.1",
+                    },
+                    # Do not duplicate the hardware profile into generic evidence.
+                    # The typed observation owns it; evidence proves only collection.
+                    payload={"schema_id": "system-profile/0.1", "normalized": True},
+                )
+            )
+            self._connection.execute(
+                """INSERT INTO system_profile_observations(
+                       sync_run_id,machine_id,evidence_id,schema_id,profile_json,observed_at
+                   ) VALUES (?, ?, ?, 'system-profile/0.1', ?, ?)""",
+                (sync_run_id, run.machine_id, evidence_id, profile_json, observed),
+            )
+            newer = self._connection.execute(
+                """SELECT 1 FROM sync_runs
+                   WHERE capability='system_profile.read' AND machine_id=?
+                     AND id>? AND status='complete' LIMIT 1""",
+                (run.machine_id, sync_run_id),
+            ).fetchone()
+            promoted = 0
+            if newer is None:
+                self._connection.execute(
+                    """INSERT INTO system_profile_current(
+                           machine_id,promoted_sync_run_id,evidence_id,schema_id,
+                           profile_json,observed_at
+                       ) VALUES (?, ?, ?, 'system-profile/0.1', ?, ?)
+                       ON CONFLICT(machine_id) DO UPDATE SET
+                         promoted_sync_run_id=excluded.promoted_sync_run_id,
+                         evidence_id=excluded.evidence_id,
+                         schema_id=excluded.schema_id,
+                         profile_json=excluded.profile_json,
+                         observed_at=excluded.observed_at""",
+                    (run.machine_id, sync_run_id, evidence_id, profile_json, observed),
+                )
+                promoted = 1
+            self._connection.execute(
+                """UPDATE sync_runs SET status='complete',completed_at=?,promoted=?,
+                     records_seen=1,error_code=NULL,error_detail=NULL WHERE id=?""",
+                (completed, promoted, sync_run_id),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def finish_system_profile_sync_failed(
+        self,
+        sync_run_id: int,
+        *,
+        status: Literal["partial", "failed"],
+        error_code: str,
+        completed_at: str | datetime,
+    ) -> SyncRun:
+        if status not in ("partial", "failed") or not error_code:
+            raise ValueError("system-profile failure is invalid")
+        completed = _timestamp(completed_at)
+        with self._connection:
+            run = self.get_sync_run(sync_run_id)
+            if run.capability != "system_profile.read" or run.status != "running":
+                raise InvalidSyncTransition("system-profile sync is not running")
+            self._connection.execute(
+                """UPDATE sync_runs SET status=?,completed_at=?,promoted=0,
+                     error_code=?,error_detail=NULL WHERE id=?""",
+                (status, completed, error_code, sync_run_id),
+            )
+        return self.get_sync_run(sync_run_id)
+
+    def read_system_profile_snapshot(self, machine_id: str) -> Mapping[str, Any]:
+        self._connection.execute("BEGIN")
+        try:
+            row = self._connection.execute(
+                """SELECT schema_id,profile_json,observed_at,promoted_sync_run_id
+                   FROM system_profile_current WHERE machine_id=?""",
+                (machine_id,),
+            ).fetchone()
+            latest = self.latest_sync(
+                capability="system_profile.read", machine_id=machine_id
+            )
+            latest_complete = self.latest_sync(
+                capability="system_profile.read", machine_id=machine_id, status="complete"
+            )
+            result = {
+                "profile": None if row is None else json.loads(row["profile_json"]),
+                "observed_at": None if row is None else row["observed_at"],
+                "promoted_sync_run_id": (
+                    None if row is None else int(row["promoted_sync_run_id"])
+                ),
+                "latest": latest,
+                "latest_complete": latest_complete,
+            }
+            self._connection.commit()
+            return result
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def delete_system_profile_data(self, machine_id: str) -> Mapping[str, int]:
+        """Delete only system-profile facts; preserve machine and M1 installs."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            observation_count = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM system_profile_observations WHERE machine_id=?",
+                    (machine_id,),
+                ).fetchone()[0]
+            )
+            current_count = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM system_profile_current WHERE machine_id=?",
+                    (machine_id,),
+                ).fetchone()[0]
+            )
+            sync_run_count = int(
+                self._connection.execute(
+                    """SELECT COUNT(*) FROM sync_runs
+                       WHERE capability='system_profile.read' AND machine_id=?""",
+                    (machine_id,),
+                ).fetchone()[0]
+            )
+            evidence_ids = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT evidence_id FROM system_profile_observations WHERE machine_id=?",
+                    (machine_id,),
+                )
+            )
+            self._connection.execute(
+                "DELETE FROM system_profile_current WHERE machine_id=?", (machine_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM sync_runs WHERE capability='system_profile.read' AND machine_id=?",
+                (machine_id,),
+            )
+            consent_cursor = self._connection.execute(
+                "DELETE FROM machine_data_consents WHERE machine_id=? AND consent_kind='system_profile'",
+                (machine_id,),
+            )
+            evidence_removed = 0
+            if evidence_ids:
+                placeholders = ",".join("?" for _ in evidence_ids)
+                evidence_removed = self._connection.execute(
+                    f"DELETE FROM evidence WHERE id IN ({placeholders})", evidence_ids
+                ).rowcount
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return {
+            "observations_removed": observation_count,
+            "current_removed": current_count,
+            "sync_runs_removed": sync_run_count,
+            "consents_removed": consent_cursor.rowcount,
+            "evidence_removed": evidence_removed,
+        }
 
     def begin_activity_sync(
         self,

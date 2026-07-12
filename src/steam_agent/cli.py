@@ -26,6 +26,7 @@ from steam_agent.application import (
     default_database_path,
     discover_steam_root,
     installed_item,
+    machine_for,
     sync_installed,
     usable_steam_root,
 )
@@ -100,6 +101,13 @@ from steam_agent.review_library import (
 from steam_agent.wishlist_recommendations import GateOverride
 from steam_agent.wishlist_recommendation_query import (
     build_wishlist_recommendation_query,
+)
+from steam_agent.system_profile import (
+    SYSTEM_PROFILE_DISCLOSURE_VERSION,
+    SystemProfileError,
+    collect_system_profile,
+    query_system_profile,
+    sync_system_profile,
 )
 
 
@@ -284,6 +292,12 @@ def build_parser() -> argparse.ArgumentParser:
     reviews_sync.add_argument("--account", default="primary")
     reviews_sync.add_argument("--max-items", type=int)
     reviews_sync.add_argument("--acknowledge-local-storage", action="store_true")
+    system_sync = sync_commands.add_parser(
+        "system", help="Synchronize a privacy-bounded local system profile."
+    )
+    _add_leaf_format(system_sync)
+    system_sync.add_argument("--machine", default="local")
+    system_sync.add_argument("--acknowledge-local-storage", action="store_true")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -369,6 +383,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(achievement_query)
     achievement_query.add_argument("--account", default="primary")
     achievement_query.add_argument("--appid", type=int)
+
+    system_command = commands.add_parser(
+        "system", help="Query cached local system compatibility facts."
+    )
+    system_commands = system_command.add_subparsers(
+        dest="system_command", required=True
+    )
+    system_query = system_commands.add_parser(
+        "query", help="Query one cached system profile."
+    )
+    _add_leaf_format(system_query)
+    system_query.add_argument("--machine", default="local")
 
     feedback = commands.add_parser("feedback", help="Manage explicit local game feedback.")
     feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
@@ -526,11 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(delete_data)
     delete_data.add_argument(
         "--provider",
-        choices=("steam-web-api", "steam-store-reviews", "gg-deals", "cheapshark"),
+        choices=("steam-web-api", "steam-store-reviews", "gg-deals", "cheapshark", "local-system"),
         required=True,
     )
     target = delete_data.add_mutually_exclusive_group(required=True)
     target.add_argument("--account")
+    target.add_argument("--machine")
     target.add_argument("--all", action="store_true")
     delete_data.add_argument("--yes", action="store_true")
     return parser
@@ -688,6 +715,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_activity(args, database_path)
     if args.command == "sync" and args.sync_command == "reviews":
         return _dispatch_sync_reviews(args, database_path)
+    if args.command == "sync" and args.sync_command == "system":
+        return _dispatch_system(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -844,6 +873,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
                 "snapshot": snapshot,
             },
         )
+    if args.command == "system":
+        return _dispatch_system(args, database_path)
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
     if args.command == "recommendations" and args.recommendations_command == "wishlist":
@@ -1045,6 +1076,213 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
             context={"account_alias": account.alias, "identifiers_included": False},
             data=data,
         )
+
+
+def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
+    command = _command_name(args)
+    machine_id = args.machine
+    if (
+        not isinstance(machine_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine_id) is None
+    ):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The machine alias is invalid.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        if args.command == "system":
+            result = query_system_profile(
+                storage, machine_id=machine_id, clock=_utc_now
+            )
+            snapshot = result["snapshot"]
+            latest_status = snapshot["last_attempt_status"]
+            warnings: list[WarningRecord] = []
+            missing: list[str] = []
+            stale: list[str] = []
+            status = CompletenessStatus.COMPLETE
+            if latest_status is None or result["profile"] is None:
+                status = CompletenessStatus.UNAVAILABLE
+                missing.append("system_profile.read")
+                warnings.append(
+                    WarningRecord(
+                        code=ErrorCode.NOT_SYNCED,
+                        message="A system profile has not been synchronized for this machine.",
+                    )
+                )
+            elif latest_status == "running":
+                status = CompletenessStatus.PARTIAL
+                warnings.append(
+                    WarningRecord(
+                        code=ErrorCode.SYNC_IN_PROGRESS,
+                        message="System-profile synchronization is in progress; results use the last-good snapshot.",
+                    )
+                )
+            elif latest_status != "complete":
+                status = CompletenessStatus.PARTIAL
+                stale.append("system_profile.read")
+                warnings.append(
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message="The latest system-profile synchronization was incomplete; results use the last-good snapshot.",
+                    )
+                )
+            if result["profile"] is not None and any(
+                value == "stale" for value in result["freshness"].values()
+            ):
+                status = CompletenessStatus.PARTIAL
+                if "system_profile.read" not in stale:
+                    stale.append("system_profile.read")
+                if not any(warning.code == ErrorCode.STALE_LAST_GOOD for warning in warnings):
+                    warnings.append(
+                        WarningRecord(
+                            code=ErrorCode.STALE_LAST_GOOD,
+                            message="Some cached system-profile facts are older than their freshness policy.",
+                        )
+                    )
+            return _emit_success(
+                args,
+                command=command,
+                context={"machine_alias": machine_id, "identifiers_included": False},
+                completeness_value=completeness(
+                    status,
+                    missing_capabilities=missing,
+                    stale_capabilities=stale,
+                    warnings=warnings,
+                ),
+                data=result,
+            )
+
+        candidate = machine_for(machine_id)
+        existing = storage.get_machine(machine_id)
+        if existing is not None and not _machine_profile_identity_matches(
+            existing.platform,
+            existing.architecture,
+            candidate.platform,
+            candidate.architecture,
+        ):
+            return _emit_error(
+                args,
+                command=command,
+                code="MACHINE_PROFILE_CONFLICT",
+                message="The machine alias is already associated with another platform or architecture.",
+            )
+        if existing is None:
+            # Create only the explicit alias needed by the foreign key. Hardware
+            # facts are not persisted until the disclosure is acknowledged.
+            storage.upsert_machine(
+                type(candidate)(machine_id, machine_id, "unknown", None),
+                observed_at=_utc_now(),
+            )
+        consent = storage.get_system_profile_consent(machine_id)
+        if (
+            consent is None
+            or consent.disclosure_version != SYSTEM_PROFILE_DISCLOSURE_VERSION
+        ):
+            if not args.acknowledge_local_storage:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                    message=(
+                        "A normalized local system profile will store OS, CPU, memory, "
+                        "graphics, coarse storage capacity, and conclusive peripheral "
+                        "presence facts. It excludes hostname, username, serial numbers, "
+                        "UUIDs, MAC/IP addresses, device nodes, labels, and filesystem paths. "
+                        "The selected filesystem, replicas, snapshots, and user-controlled "
+                        "backups may retain copies after local deletion."
+                    ),
+                    remediation="Rerun with --acknowledge-local-storage to accept this versioned local-storage policy.",
+                )
+            storage.record_system_profile_consent(
+                machine_id=machine_id,
+                disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+                accepted_at=_utc_now(),
+                backups_acknowledged=True,
+            )
+        storage.upsert_machine(
+            type(candidate)(
+                candidate.id,
+                candidate.name if existing is None else existing.name,
+                candidate.platform,
+                candidate.architecture,
+            ),
+            observed_at=_utc_now(),
+        )
+        try:
+            result = sync_system_profile(
+                storage,
+                machine_id=machine_id,
+                collector=_system_profile_collector,
+                clock=_utc_now,
+            )
+        except SystemProfileError as exc:
+            return _emit_error(
+                args,
+                command=command,
+                code=exc.code,
+                message="The local system profile could not be collected.",
+                retryable=exc.retryable,
+            )
+        status = (
+            CompletenessStatus.COMPLETE
+            if result.run.status == "complete"
+            else CompletenessStatus.PARTIAL
+        )
+        warnings = [] if result.run.status == "complete" else [
+            WarningRecord(
+                code=result.run.error_code or ErrorCode.PARTIAL_SCAN,
+                message="Required system facts were unavailable; the last-good profile was preserved.",
+            )
+        ]
+        return _emit_success(
+            args,
+            command=command,
+            context={"machine_alias": machine_id, "identifiers_included": False},
+            completeness_value=completeness(
+                status,
+                stale_capabilities=(
+                    ["system_profile.read"] if result.run.status != "complete" else []
+                ),
+                warnings=warnings,
+            ),
+            data={
+                "sync_run_id": result.run.id,
+                "sync_status": result.run.status,
+                "promoted": result.run.promoted,
+                "schema_id": "system-profile/0.1",
+                "disclosure_version": SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            },
+        )
+
+
+def _system_profile_collector() -> Any:
+    return collect_system_profile()
+
+
+def _machine_profile_identity_matches(
+    stored_platform: str,
+    stored_architecture: str | None,
+    candidate_platform: str,
+    candidate_architecture: str | None,
+) -> bool:
+    platform_matches = stored_platform == "unknown" or (
+        stored_platform.casefold() == candidate_platform.casefold()
+    )
+
+    def canonical(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.casefold().replace("-", "_")
+        return {"amd64": "x86_64", "aarch64": "arm64"}.get(normalized, normalized)
+
+    stored_arch = canonical(stored_architecture)
+    candidate_arch = canonical(candidate_architecture)
+    return platform_matches and (
+        stored_arch is None or candidate_arch is None or stored_arch == candidate_arch
+    )
 
 
 def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
@@ -3147,6 +3385,38 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
             code=ErrorCode.CONFIRMATION_REQUIRED,
             message="Steam Web API data deletion requires --yes.",
         )
+    if args.provider == "local-system":
+        if args.machine is None or args.account is not None or args.all:
+            return _emit_error(
+                args,
+                command="data.delete",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="Local system-profile deletion requires exactly --machine.",
+                exit_code=2,
+            )
+        with Storage(database_path) as storage:
+            deletion = storage.delete_system_profile_data(args.machine)
+        return _emit_success(
+            args,
+            command="data.delete",
+            data={
+                "scope": "local-system-machine",
+                "provider": "local-system",
+                "machine_alias": args.machine,
+                **deletion,
+                "machine_preserved": True,
+                "installed_data_preserved": True,
+                "backup_copies_require_separate_deletion": True,
+            },
+        )
+    if args.machine is not None:
+        return _emit_error(
+            args,
+            command="data.delete",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="This provider does not support a machine deletion target.",
+            exit_code=2,
+        )
     if args.provider in {"gg-deals", "cheapshark"}:
         return _delete_price_provider_data(args, database_path)
     if args.provider == "steam-store-reviews":
@@ -4567,6 +4837,7 @@ def _command_name(args: argparse.Namespace) -> str:
         "rule_command",
         "activity_command",
         "achievements_command",
+        "system_command",
         "recommendations_command",
     ):
         value = getattr(args, name, None)
@@ -4766,6 +5037,28 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "system.query":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        profile = envelope["data"]["profile"]
+        if profile is None:
+            return
+        _print_table_fields("SECTION", "FACT", "STATE", "VALUE", "FRESHNESS")
+        for section in ("os", "cpu", "memory"):
+            for name, item in profile[section].items():
+                _print_table_fields(
+                    section, name, item["state"], item.get("value", ""),
+                    envelope["data"]["freshness"].get(section, "unknown"),
+                )
+        for section in ("graphics", "storage", "gamepad", "vr"):
+            item = profile[section]
+            _print_table_fields(
+                section, "summary", item["state"], item.get("value", ""),
+                envelope["data"]["freshness"].get(section, "unknown"),
+            )
+        return
     if command == "recommendations.wishlist":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])
