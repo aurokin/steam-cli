@@ -187,10 +187,19 @@ def achievement_candidates(
         candidates = explicit_appids
     elif scope == "recent":
         snapshot = storage.read_activity_snapshot(account_id, now=now)
+        evaluated_at = (now or now_utc()).astimezone(timezone.utc)
         candidates = tuple(
             int(row["appid"])
             for row in sorted(
-                (row for row in snapshot["items"] if row["recent_window_minutes"] is not None),
+                (
+                    row
+                    for row in snapshot["items"]
+                    if row["recent_window_minutes"] is not None
+                    and row["recent_observed_at"] is not None
+                    and timedelta(0)
+                    <= evaluated_at - _parse(str(row["recent_observed_at"]))
+                    <= RECENT_CURRENT_USE
+                ),
                 key=lambda row: (-(row["last_played_unix"] or 0), row["appid"]),
             )
         )
@@ -344,14 +353,7 @@ def query_achievements(
         state = row["state"]
         if age is not None and age > HARD_RETENTION and state not in {"unevaluated", "running"}:
             state = "expired"
-        player_observed_at = next(
-            (
-                achievement["observed_at"]
-                for achievement in row["achievements"]
-                if achievement["observed_at"] is not None
-            ),
-            None,
-        )
+        player_observed_at = row["player_projection_observed_at"]
         player_age = (
             None
             if player_observed_at is None
@@ -365,7 +367,7 @@ def query_achievements(
             "total": len(visible),
             "newest_unlock_at": None if newest is None else datetime.fromtimestamp(newest, timezone.utc).isoformat().replace("+00:00", "Z"),
             "freshness": last_good_freshness,
-        } if visible else None
+        } if player_observed_at is not None else None
         items.append({
             "appid": row["appid"],
             "game_id": steam_application_stable_id(row["appid"]),

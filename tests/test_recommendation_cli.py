@@ -252,6 +252,28 @@ def test_recommendation_query_accepts_ready_zero_achievement_aggregate(
             disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         )
         storage.finish_achievement_sync(run.id, completed_at="2026-07-12T04:03:00Z")
+        private = storage.begin_achievement_sync(
+            account_id=account_id,
+            candidates=(30,),
+            targeted=(30,),
+            started_at="2026-07-12T04:04:00Z",
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.record_achievement_result(
+            private.id,
+            account_id=account_id,
+            appid=30,
+            state="profile_not_public",
+            player=(),
+            schema_state="achievements_not_supported",
+            schema=(),
+            observed_at="2026-07-12T04:04:00Z",
+            write_schema=False,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.finish_achievement_sync(
+            private.id, completed_at="2026-07-12T04:05:00Z"
+        )
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
 
     code, result, stderr = invoke(
@@ -274,9 +296,11 @@ def test_recommendation_query_accepts_ready_zero_achievement_aggregate(
             account_id, "local", now=NOW
         )
     row = next(item for item in snapshot.achievement_items if item["appid"] == 30)
-    assert row["state"] == "ready"
+    assert row["state"] == "profile_not_public"
     assert row["unlocked"] == 0
     assert row["total"] == 0
+    assert row["player_sync_run_id"] != row["sync_run_id"]
+    assert row["player_observed_at"] == "2026-07-12T04:02:00Z"
 
 
 def test_feedback_components_keep_field_specific_event_lineage(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2190,14 +2190,15 @@ class Storage:
                     (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     values,
                 )
-            newer = self._connection.execute(
+            newer_success = self._connection.execute(
                 """SELECT 1 FROM sync_runs
                    WHERE account_id = ? AND capability = 'activity.read'
+                     AND status = 'complete' AND promoted = 1
                      AND (started_at > ? OR (started_at = ? AND id > ?))
                    LIMIT 1""",
                 (account_id, run["started_at"], run["started_at"], sync_run_id),
             ).fetchone()
-            promoted = newer is None
+            promoted = newer_success is None
             if promoted:
                 self._connection.execute(
                     "DELETE FROM activity_current WHERE account_id = ?", (account_id,)
@@ -2334,24 +2335,28 @@ class Storage:
         try:
             self._require_activity_consent(account_id, disclosure_version)
             demand = self._connection.execute(
-                """SELECT * FROM achievement_sync_demand
-                   WHERE sync_run_id = ? AND account_id = ? AND appid = ? AND targeted = 1""",
+                """SELECT demand.*, runs.started_at
+                   FROM achievement_sync_demand AS demand
+                   JOIN sync_runs AS runs ON runs.id = demand.sync_run_id
+                   WHERE demand.sync_run_id = ? AND demand.account_id = ?
+                     AND demand.appid = ? AND demand.targeted = 1""",
                 (sync_run_id, account_id, appid),
             ).fetchone()
             if demand is None or demand["state"] != "running":
                 raise InvalidSyncTransition("achievement target is not running")
-            if state != "failed":
-                newer = self._connection.execute(
-                    """SELECT 1 FROM achievement_sync_demand AS demand
-                       JOIN sync_runs AS runs ON runs.id = demand.sync_run_id
-                       JOIN sync_runs AS current_run ON current_run.id = ?
-                       WHERE demand.account_id = ? AND demand.appid = ?
-                         AND (runs.started_at > current_run.started_at OR
-                              (runs.started_at = current_run.started_at AND runs.id > current_run.id))
-                       LIMIT 1""",
-                    (sync_run_id, account_id, appid),
+            if state == "ready":
+                current = self._connection.execute(
+                    """SELECT projection.promoted_sync_run_id, runs.started_at
+                       FROM achievement_player_projection AS projection
+                       JOIN sync_runs AS runs
+                         ON runs.id = projection.promoted_sync_run_id
+                       WHERE projection.account_id = ? AND projection.appid = ?""",
+                    (account_id, appid),
                 ).fetchone()
-                promote = newer is None
+                promote = current is None or (
+                    (str(demand["started_at"]), sync_run_id)
+                    > (str(current["started_at"]), int(current["promoted_sync_run_id"]))
+                )
                 if promote:
                     self._connection.execute(
                         "DELETE FROM achievement_player_current WHERE account_id = ? AND appid = ?",
@@ -2370,24 +2375,34 @@ class Storage:
                             "INSERT INTO achievement_player_current VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (account_id, appid, item["api_name"], bool(item["achieved"]), item.get("unlock_time_unix"), timestamp, sync_run_id),
                         )
-                if write_schema:
-                    existing_schema = self._connection.execute(
+                if promote:
+                    self._connection.execute(
+                        """INSERT INTO achievement_player_projection
+                           (account_id, appid, observed_at, promoted_sync_run_id)
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT(account_id, appid) DO UPDATE SET
+                             observed_at=excluded.observed_at,
+                             promoted_sync_run_id=excluded.promoted_sync_run_id""",
+                        (account_id, appid, timestamp, sync_run_id),
+                    )
+            if write_schema:
+                existing_schema = self._connection.execute(
                         """SELECT observed_at FROM achievement_schema_status
                            WHERE appid = ? AND language = 'english'""",
                         (appid,),
                     ).fetchone()
-                    if existing_schema is None or existing_schema["observed_at"] <= timestamp:
-                        self._connection.execute(
+                if existing_schema is None or existing_schema["observed_at"] <= timestamp:
+                    self._connection.execute(
                             "DELETE FROM achievement_schema_current WHERE appid = ? AND language = 'english'",
                             (appid,),
                         )
-                        for item in schema:
-                            self._connection.execute(
+                    for item in schema:
+                        self._connection.execute(
                                 """INSERT INTO achievement_schema_current VALUES
                                    (?, 'english', ?, ?, ?, ?, ?, ?)""",
                                 (appid, item["api_name"], schema_state, item.get("display_name"), item.get("description"), bool(item["hidden"]), timestamp),
                             )
-                        self._connection.execute(
+                    self._connection.execute(
                             """INSERT INTO achievement_schema_status VALUES (?, 'english', ?, ?)
                                ON CONFLICT(appid, language) DO UPDATE SET state=excluded.state, observed_at=excluded.observed_at""",
                             (appid, schema_state, timestamp),
@@ -2514,6 +2529,12 @@ class Storage:
                 ))
                 items: list[dict[str, Any]] = []
                 for row in rows:
+                    projection = self._connection.execute(
+                        """SELECT observed_at, promoted_sync_run_id
+                           FROM achievement_player_projection
+                           WHERE account_id=? AND appid=?""",
+                        (account_id, row["appid"]),
+                    ).fetchone()
                     achievements = tuple(dict(item) for item in self._connection.execute(
                         """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
                                   s.display_name, s.description, COALESCE(s.hidden, 0) AS hidden
@@ -2523,6 +2544,12 @@ class Storage:
                            WHERE p.account_id=? AND p.appid=? ORDER BY p.api_name""",
                         (account_id, row["appid"]),
                     ))
+                    row["player_projection_observed_at"] = (
+                        None if projection is None else projection["observed_at"]
+                    )
+                    row["player_projection_sync_run_id"] = (
+                        None if projection is None else projection["promoted_sync_run_id"]
+                    )
                     row["achievements"] = achievements
                     items.append(row)
                 result = {"items": tuple(items), "latest": SyncRun(**dict(latest))}
@@ -2977,6 +3004,10 @@ class Storage:
         )
         self._connection.execute(
             "DELETE FROM achievement_player_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
+        )
+        self._connection.execute(
+            "DELETE FROM achievement_player_projection WHERE account_id=? AND observed_at < ?",
+            (account_id, cutoff),
         )
         self._connection.execute(
             "DELETE FROM achievement_schema_current WHERE observed_at < ?", (schema_cutoff,)
@@ -5275,12 +5306,15 @@ class Storage:
                 for row in self._connection.execute(
                     """SELECT d.sync_run_id, d.appid, d.targeted, d.evaluated,
                               d.state, d.error_code, d.observed_at,
-                              MAX(p.observed_at) AS player_observed_at,
-                              MAX(p.promoted_sync_run_id) AS player_sync_run_id,
+                              projection.observed_at AS player_observed_at,
+                              projection.promoted_sync_run_id AS player_sync_run_id,
                               COALESCE(SUM(CASE WHEN p.achieved = 1 THEN 1 ELSE 0 END), 0) AS unlocked,
                               COUNT(p.api_name) AS total
                        FROM achievement_sync_demand d
                        JOIN sync_runs r ON r.id = d.sync_run_id
+                       LEFT JOIN achievement_player_projection projection
+                         ON projection.account_id = d.account_id
+                        AND projection.appid = d.appid
                        LEFT JOIN achievement_player_current p
                          ON p.account_id = d.account_id AND p.appid = d.appid
                        WHERE d.account_id = ?
@@ -5291,7 +5325,9 @@ class Storage:
                            ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
                          )
                        GROUP BY d.sync_run_id, d.appid, d.targeted, d.evaluated,
-                                d.state, d.error_code, d.observed_at
+                                d.state, d.error_code, d.observed_at,
+                                projection.observed_at,
+                                projection.promoted_sync_run_id
                        ORDER BY d.appid""",
                     (account_id,),
                 )
@@ -6251,6 +6287,7 @@ class Storage:
             ("achievement_sync_demand", "account_id"),
             ("achievement_player_observations", "account_id"),
             ("achievement_player_current", "account_id"),
+            ("achievement_player_projection", "account_id"),
             ("sync_runs", "account_id"),
             ("account_data_consents", "account_id"),
         }
@@ -6720,6 +6757,10 @@ class Storage:
                   AND NOT EXISTS (
                     SELECT 1 FROM achievement_player_current p
                     WHERE p.appid = achievement_schema_current.appid
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM achievement_player_projection p
+                    WHERE p.appid = achievement_schema_current.appid
                   )""",
             appids,
         )
@@ -6826,6 +6867,10 @@ class Storage:
               AND NOT EXISTS (
                   SELECT 1 FROM achievement_player_current
                   WHERE achievement_player_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM achievement_player_projection
+                  WHERE achievement_player_projection.appid = steam_apps.appid
               )
               AND NOT EXISTS (
                   SELECT 1 FROM achievement_schema_status

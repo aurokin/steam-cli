@@ -7,6 +7,7 @@ import pytest
 from steam_agent.activity import (
     ACTIVITY_DISCLOSURE_VERSION,
     ActivitySyncError,
+    achievement_candidates,
     query_activity,
     query_achievements,
     sync_activity,
@@ -147,6 +148,79 @@ def test_achievement_failure_is_per_app_and_preserves_previous_current(configure
     assert item["last_good_summary"]["freshness"] == "stale"
     with storage._connection as connection:
         assert connection.execute("SELECT COUNT(*) FROM achievement_player_current WHERE account_id=?", (account_id,)).fetchone()[0] == 1
+
+
+def test_private_and_unsupported_player_results_preserve_last_good(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(
+        10, "ready", (PlayerAchievement("A", True, 1),)
+    )
+    client.schema[10] = GameAchievementSchema(
+        10, "ready", "english", (AchievementDefinition("A", "A", None, False),)
+    )
+    sync_achievements(
+        storage, account_id=account_id, steamid="76561198000000001",
+        api_key=SecretValue("s"), scope="owned", explicit_appids=(10,),
+        client=client, clock=lambda: NOW,
+    )
+
+    for offset, state in enumerate(
+        ("profile_not_public", "achievements_not_supported"), start=1
+    ):
+        client.player[10] = PlayerAchievements(10, state)  # type: ignore[arg-type]
+        sync_achievements(
+            storage, account_id=account_id, steamid="76561198000000001",
+            api_key=SecretValue("s"), scope="owned", explicit_appids=(10,),
+            client=client, clock=lambda offset=offset: NOW + timedelta(hours=offset),
+        )
+        item = query_achievements(
+            storage, account_id=account_id,
+            clock=lambda offset=offset: NOW + timedelta(hours=offset),
+        )["items"][0]
+        assert item["state"] == state
+        assert item["achievements"] == []
+        assert item["last_good_summary"]["unlocked"] == 1
+        assert item["last_good_summary"]["total"] == 1
+
+
+def test_ready_zero_achievement_projection_survives_later_nonready_results(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(10, "ready", ())
+    client.schema[10] = GameAchievementSchema(
+        10, "achievements_not_supported", "english", ()
+    )
+    sync_achievements(
+        storage, account_id=account_id, steamid="76561198000000001",
+        api_key=SecretValue("s"), scope="owned", explicit_appids=(10,),
+        client=client, clock=lambda: NOW,
+    )
+    ready = query_achievements(storage, account_id=account_id, clock=lambda: NOW)[
+        "items"
+    ][0]
+    assert ready["summary"]["unlocked"] == 0
+    assert ready["summary"]["total"] == 0
+
+    for offset, state in enumerate(
+        ("profile_not_public", "achievements_not_supported"), start=1
+    ):
+        client.player[10] = PlayerAchievements(10, state)  # type: ignore[arg-type]
+        sync_achievements(
+            storage, account_id=account_id, steamid="76561198000000001",
+            api_key=SecretValue("s"), scope="owned", explicit_appids=(10,),
+            client=client, clock=lambda offset=offset: NOW + timedelta(hours=offset),
+        )
+        item = query_achievements(
+            storage, account_id=account_id,
+            clock=lambda offset=offset: NOW + timedelta(hours=offset),
+        )["items"][0]
+        assert item["last_good_summary"]["unlocked"] == 0
+        assert item["last_good_summary"]["total"] == 0
 
 
 def test_account_deletion_reports_and_removes_activity(configured: tuple[Storage, int]) -> None:
@@ -500,6 +574,25 @@ def test_recent_achievement_sync_prunes_expired_activity_before_demand(
     ).fetchone()[0] == 0
 
 
+def test_recent_achievement_candidates_require_current_recent_evidence(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    sync_activity(
+        storage, account_id=account_id, steamid="76561198000000001",
+        api_key=SecretValue("s"), client=FakeClient(), clock=lambda: NOW,
+    )
+
+    assert achievement_candidates(
+        storage, account_id=account_id, scope="recent", explicit_appids=(),
+        now=NOW + timedelta(hours=24),
+    ) == (10,)
+    assert achievement_candidates(
+        storage, account_id=account_id, scope="recent", explicit_appids=(),
+        now=NOW + timedelta(hours=24, microseconds=1),
+    ) == ()
+
+
 def test_late_older_activity_completion_cannot_replace_newer_projection(
     configured: tuple[Storage, int],
 ) -> None:
@@ -539,6 +632,41 @@ def test_late_older_activity_completion_cannot_replace_newer_projection(
     assert completed_older.promoted is False
     item = query_activity(storage, account_id=account_id, clock=lambda: NOW)["items"][0]
     assert item["playtime"]["lifetime_minutes"] == 200
+
+
+def test_newer_failed_activity_attempt_does_not_block_older_success(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    older = storage.begin_activity_sync(
+        account_id=account_id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        started_at=NOW,
+    )
+    newer = storage.begin_activity_sync(
+        account_id=account_id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        started_at=NOW + timedelta(seconds=1),
+    )
+    completed = storage.complete_activity_snapshot(
+        older.id,
+        account_id=account_id,
+        games=({"appid": 10, "playtime_forever_minutes": 100},),
+        observed_at=NOW,
+        recent_observed_at=NOW,
+        completed_at=NOW + timedelta(seconds=2),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    storage.finish_activity_sync_failed(
+        newer.id,
+        error_code="PROVIDER_UNAVAILABLE",
+        completed_at=NOW + timedelta(seconds=3),
+    )
+
+    assert completed.promoted is True
+    result = query_activity(storage, account_id=account_id, clock=lambda: NOW)
+    assert result["items"][0]["playtime"]["lifetime_minutes"] == 100
+    assert result["snapshot"]["using_last_good"] is True
 
 
 def test_late_older_achievement_result_cannot_cross_join_with_newer_demand(
