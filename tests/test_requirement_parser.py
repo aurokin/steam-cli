@@ -55,6 +55,30 @@ def test_legacy_embedded_recommended_tail_is_never_parsed() -> None:
     assert result.storage.state == "missing"
 
 
+def test_inline_recommended_tail_stops_after_final_minimum_fact() -> None:
+    result = parse(
+        "Minimum:\nMemory: 2 GB RAM Recommended: Memory: 64 GiB RAM\n"
+        "Storage: 2 GiB"
+    )
+    assert result.input_state == "accepted"
+    assert result.memory.interval == ByteInterval(2_000_000_000, 2 * (1 << 30))
+    assert result.storage.state == "missing"
+
+
+def test_recommended_prefix_with_inline_fact_is_not_a_minimum_boundary() -> None:
+    result = parse("Recommended: Memory: 64 GiB RAM")
+    assert result.input_state == "rejected"
+    assert result.input_reason == "unknown_or_localized_label"
+    assert result.memory.state == "unknown"
+
+
+def test_inline_wrapper_prose_cannot_smuggle_a_recommended_boundary() -> None:
+    result = parse("Minimum: Memory: 2 GB RAM Recommended: Memory: 64 GiB RAM")
+    assert result.input_state == "rejected"
+    assert result.input_reason == "unanchored_or_malformed_line"
+    assert result.memory.state == "unknown"
+
+
 def test_inline_minimum_wrapper_prose_is_not_guessed() -> None:
     result = parse("Minimum: 512MB RAM")
     assert result.input_state == "accepted"

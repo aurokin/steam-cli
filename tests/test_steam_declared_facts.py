@@ -412,8 +412,16 @@ def test_sanitizer_tracks_nested_tags_inside_hidden_regions() -> None:
         sanitize_html("<template><div>hidden</template></div>Memory: 64 GB")
 
 
-def test_sanitizer_self_closing_hidden_and_void_tags_do_not_open_regions() -> None:
-    assert sanitize_html("<template/><img/><br/>Memory: 8 GB") == "Memory: 8 GB"
+@pytest.mark.parametrize("tag", ["script", "style", "template"])
+def test_sanitizer_rejects_self_closing_syntax_for_non_void_hidden_tags(
+    tag: str,
+) -> None:
+    with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
+        sanitize_html(f"<{tag}/>Memory: 64 GB RAM")
+
+
+def test_sanitizer_allows_real_self_closing_void_tags() -> None:
+    assert sanitize_html("<img/><br/>Memory: 8 GB") == "Memory: 8 GB"
 
 
 @pytest.mark.parametrize(

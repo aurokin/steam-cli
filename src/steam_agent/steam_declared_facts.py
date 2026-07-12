@@ -884,6 +884,11 @@ class _BoundedHTMLParser(HTMLParser):
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._token()
         lowered = tag.casefold()
+        # In HTML, a slash does not make script/style/template void.  Treating
+        # one as closed here could expose the following hidden text as trusted
+        # requirement prose, so reject the malformed provider field.
+        if lowered in self._SKIP_TAGS:
+            raise _invalid()
         if not self.skip_depth and lowered in self._BREAK_TAGS:
             self.parts.append("\n")
 

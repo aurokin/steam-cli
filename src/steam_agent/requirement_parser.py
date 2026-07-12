@@ -32,6 +32,7 @@ Section = Literal["minimum", "recommended"]
 Architecture = Literal["x86", "x86_64", "arm64"]
 
 _LABEL = re.compile(r"(?P<label>[A-Za-z][A-Za-z ]{0,31}):\s*(?P<value>.*)\Z")
+_INLINE_RECOMMENDED = re.compile(r"\s+Recommended:\s*")
 _CAPACITY = re.compile(
     r"(?P<number>(?:0|[1-9][0-9]*)(?:\.[0-9]+)?)\s*"
     r"(?P<unit>MB|GB|MiB|GiB)"
@@ -200,6 +201,15 @@ def parse_declared_minimum(
             continue
         if line == "Recommended:":
             break
+        # Steam sometimes flattens the section boundary onto the final
+        # minimum fact.  Parse only the anchored fact before that exact
+        # boundary, then stop.  A line beginning with ``Recommended:`` is not
+        # such a boundary and continues through the closed grammar below,
+        # where it is rejected rather than mistaken for minimum evidence.
+        recommended_tail = _INLINE_RECOMMENDED.search(line)
+        stop_after_line = recommended_tail is not None
+        if recommended_tail is not None:
+            line = line[: recommended_tail.start()].rstrip()
         match = _LABEL.fullmatch(line)
         if match is None:
             if ":" in line:
@@ -209,8 +219,12 @@ def parse_declared_minimum(
         if label == "Minimum":
             # A wrapper sharing a line with prose does not establish which
             # component that prose constrains, so it contributes no fact.
+            if stop_after_line:
+                return _rejected("unanchored_or_malformed_line")
             continue
         if label in _IGNORED_LABELS:
+            if stop_after_line:
+                break
             continue
         component = _COMPONENT_LABELS.get(label)
         if component is None:
@@ -234,6 +248,8 @@ def parse_declared_minimum(
                 else f"{component}_requirement_malformed",
             )
         found[component].append(fact)
+        if stop_after_line:
+            break
 
     facts = {name: _merge(name, values) for name, values in found.items()}
     return ParsedMinimumRequirements(
