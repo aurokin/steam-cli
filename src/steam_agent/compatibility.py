@@ -350,22 +350,9 @@ def assess_compatibility(
         raise ValueError("target must be CompatibilityTarget")
     if not isinstance(requested_appids, tuple) or not isinstance(candidates, tuple):
         raise ValueError("requested_appids and candidates must be tuples")
-    if not isinstance(requirements, tuple) or not isinstance(overrides, tuple):
-        raise ValueError("requirements and overrides must be tuples")
-    if len(requested_appids) > MAX_ITEMS:
-        raise ValueError("requested AppID set exceeds the supported bound")
-    if len(requirements) > MAX_COMPONENTS or len(overrides) > MAX_ITEMS:
-        raise ValueError("requirements or overrides exceed the supported bound")
-    for appid in requested_appids:
-        _int(appid, name="requested appid", minimum=1, maximum=MAX_APPID)
-    if len(requested_appids) != len(set(requested_appids)):
-        raise ValueError("requested AppIDs must be unique")
+    validate_compatibility_request(requested_appids, requirements, overrides)
     if any(not isinstance(item, CompatibilityCandidate) for item in candidates):
         raise ValueError("candidates must contain CompatibilityCandidate values")
-    if any(not isinstance(item, FeatureRequirement) for item in requirements):
-        raise ValueError("requirements must contain FeatureRequirement values")
-    if any(not isinstance(item, GateOverride) for item in overrides):
-        raise ValueError("overrides must contain GateOverride values")
     candidate_ids = [item.appid for item in candidates]
     if len(candidate_ids) != len(set(candidate_ids)):
         raise ValueError("candidate AppIDs must be unique")
@@ -374,20 +361,9 @@ def assess_compatibility(
         raise ValueError("candidate AppIDs must be explicitly requested")
     if any(item.target != target for item in candidates):
         raise ValueError("candidate evidence target does not match the assessed target")
-    req_keys = [(item.kind, item.name) for item in requirements]
-    if len(req_keys) != len(set(req_keys)):
-        raise ValueError("feature requirements must be unique")
-    override_keys = [(item.appid, item.gate) for item in overrides]
-    if len(override_keys) != len(set(override_keys)):
-        raise ValueError("overrides must be unique by AppID and gate")
-    if any(item.appid not in requested for item in overrides):
-        raise ValueError("override AppID was not requested")
-
-    total_gates = sum(
-        7 + len(item.runtime_risks) + len(item.features) + len(requirements)
-        for item in candidates
+    total_gates = len(requested) * (7 + len(requirements)) + sum(
+        len(item.runtime_risks) + len(item.features) for item in candidates
     )
-    total_gates += (len(requested) - len(candidates)) * (7 + len(requirements))
     if total_gates > MAX_TOTAL_GATES:
         raise ValueError("assessment output exceeds the supported total-work bound")
 
@@ -413,6 +389,46 @@ def assess_compatibility(
         "complete" if all(item.completeness == "complete" for item in results) else "partial"
     )
     return CompatibilityBatch(SCHEMA, target, tuple(sorted(requested)), results, completeness)
+
+
+def validate_compatibility_request(
+    requested_appids: tuple[int, ...],
+    requirements: tuple[FeatureRequirement, ...] = (),
+    overrides: tuple[GateOverride, ...] = (),
+) -> None:
+    """Validate caller-controlled bounds without reading candidate evidence.
+
+    Keeping this request-only envelope public lets process adapters reject work
+    before opening storage while sharing the engine's exact limits.
+    """
+
+    if not isinstance(requested_appids, tuple):
+        raise ValueError("requested_appids must be a tuple")
+    if not isinstance(requirements, tuple) or not isinstance(overrides, tuple):
+        raise ValueError("requirements and overrides must be tuples")
+    if len(requested_appids) > MAX_ITEMS:
+        raise ValueError("requested AppID set exceeds the supported bound")
+    if len(requirements) > MAX_COMPONENTS or len(overrides) > MAX_ITEMS:
+        raise ValueError("requirements or overrides exceed the supported bound")
+    for appid in requested_appids:
+        _int(appid, name="requested appid", minimum=1, maximum=MAX_APPID)
+    if len(requested_appids) != len(set(requested_appids)):
+        raise ValueError("requested AppIDs must be unique")
+    if any(not isinstance(item, FeatureRequirement) for item in requirements):
+        raise ValueError("requirements must contain FeatureRequirement values")
+    if any(not isinstance(item, GateOverride) for item in overrides):
+        raise ValueError("overrides must contain GateOverride values")
+    requirement_keys = [(item.kind, item.name) for item in requirements]
+    if len(requirement_keys) != len(set(requirement_keys)):
+        raise ValueError("feature requirements must be unique")
+    override_keys = [(item.appid, item.gate) for item in overrides]
+    if len(override_keys) != len(set(override_keys)):
+        raise ValueError("overrides must be unique by AppID and gate")
+    requested = set(requested_appids)
+    if any(item.appid not in requested for item in overrides):
+        raise ValueError("override AppID was not requested")
+    if len(requested) * (7 + len(requirements)) > MAX_TOTAL_GATES:
+        raise ValueError("assessment output exceeds the supported total-work bound")
 
 
 def _missing_candidate(appid: int, target: CompatibilityTarget) -> CompatibilityCandidate:

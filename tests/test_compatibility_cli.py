@@ -934,3 +934,93 @@ def test_assess_rejects_noncanonical_locale_context(
     assert code == 2
     assert stderr == ""
     assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize(
+    "request_arguments",
+    (
+        ("400", "--require", "language:english", "--require", "language:english"),
+        (
+            "400",
+            *(value for index in range(257) for value in ("--require", f"language:l{index}")),
+        ),
+        (
+            *(str(appid) for appid in range(1, 3_804)),
+            *(value for index in range(256) for value in ("--require", f"language:l{index}")),
+        ),
+    ),
+    ids=("duplicate-requirement", "requirement-list-bound", "total-work-bound"),
+)
+def test_assess_rejects_requirement_work_bounds_before_storage(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    request_arguments: tuple[str, ...],
+) -> None:
+    class StorageMustNotOpen:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("invalid request must not open storage")
+
+    monkeypatch.setattr(cli, "Storage", StorageMustNotOpen)
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        *request_arguments,
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.parametrize(
+    ("target", "context_machine"),
+    (
+        ("valve:steamdeck", None),
+        ("machine:", None),
+        ("machine:local", "bad/context"),
+        ("machine:local", "other"),
+    ),
+)
+def test_assess_rejects_target_grammar_before_storage(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    context_machine: str | None,
+) -> None:
+    class StorageMustNotOpen:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("invalid request must not open storage")
+
+    monkeypatch.setattr(cli, "Storage", StorageMustNotOpen)
+    arguments = [
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        target,
+        "--country",
+        "US",
+        "--language",
+        "english",
+    ]
+    if context_machine is not None:
+        arguments.extend(("--context-machine", context_machine))
+    code, value, stderr = invoke(tmp_path, capsys, *arguments)
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"

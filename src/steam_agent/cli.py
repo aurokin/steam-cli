@@ -121,6 +121,7 @@ from steam_agent.compatibility import (
     CompatibilityTarget,
     FeatureRequirement,
     GateOverride as CompatibilityGateOverride,
+    validate_compatibility_request,
 )
 from steam_agent.compatibility_adapter import (
     assess_compatibility_snapshot,
@@ -1810,15 +1811,17 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             )
         ):
             raise ValueError("AppIDs must be positive uint32 values")
+        # The CLI has historically treated repeated positional AppIDs as one
+        # requested subject.  Normalize that surface before applying the pure
+        # engine request envelope.
         appids = tuple(sorted(set(supplied_appids)))
-        if len(appids) > 10_000:
-            raise ValueError("compatibility query exceeds the bounded AppID maximum")
         # Compatibility facts use the same closed request-context vocabulary
         # as their provider adapter.  Accepting an arbitrary language slug here
         # would create a cache key the sync boundary can never populate.
         SteamDeclaredFactsRequestContext(args.country, args.language)
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", args.account) is None:
             raise ValueError("account alias is invalid")
+        _validate_compatibility_target_syntax(args.target, args.context_machine)
         requirements = tuple(_compatibility_requirement(item) for item in args.require)
         overrides = tuple(
             _compatibility_override(item, requested=set(appids), applied_at=now)
@@ -1827,6 +1830,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         override_keys = tuple((item.appid, item.gate) for item in overrides)
         if len(override_keys) != len(set(override_keys)):
             raise ValueError("compatibility overrides must be unique")
+        validate_compatibility_request(appids, requirements, overrides)
     except ValueError:
         return _emit_error(
             args,
@@ -2055,6 +2059,23 @@ def _compatibility_target(
         CompatibilityTarget("machine", machine_id, platform_name),  # type: ignore[arg-type]
         machine_id,
     )
+
+
+def _validate_compatibility_target_syntax(
+    raw: str, context_machine: str | None
+) -> None:
+    """Validate target identifiers without consulting configured machines."""
+
+    if context_machine is not None:
+        CompatibilityTarget("machine", context_machine, "linux")
+    if raw == "valve:steam-deck":
+        return
+    if not isinstance(raw, str) or not raw.startswith("machine:"):
+        raise ValueError("target is invalid")
+    machine_id = raw.removeprefix("machine:")
+    CompatibilityTarget("machine", machine_id, "linux")
+    if context_machine is not None and context_machine != machine_id:
+        raise ValueError("machine target and evidence context must match")
 
 
 def _compatibility_requirement(raw: str) -> FeatureRequirement:
