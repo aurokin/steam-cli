@@ -519,6 +519,10 @@ def test_account_deletion_removes_private_lineage_but_retains_global_public_fact
         "SELECT COUNT(*) FROM declared_app_sync_demand WHERE account_id=?",
         (account_id,),
     ).fetchone()[0] == 0
+    assert storage.remove_account("primary") is True
+    assert storage._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
+    ).fetchone()[0] == 1
 
 
 def test_provider_deletion_removes_global_fact_cooldown_and_all_private_lineage(

@@ -123,6 +123,7 @@ from steam_agent.steam_declared_facts import (
     declared_facts_payload,
 )
 from steam_agent.compatibility import (
+    MAX_COMPONENTS,
     CompatibilityTarget,
     FeatureRequirement,
     GateOverride as CompatibilityGateOverride,
@@ -1842,7 +1843,12 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         override_keys = tuple((item.appid, item.gate) for item in overrides)
         if len(override_keys) != len(set(override_keys)):
             raise ValueError("compatibility overrides must be unique")
-        validate_compatibility_request(appids, requirements, overrides)
+        validate_compatibility_request(
+            appids,
+            requirements,
+            overrides,
+            candidate_gate_capacity=2 * MAX_COMPONENTS,
+        )
     except ValueError:
         return _emit_error(
             args,

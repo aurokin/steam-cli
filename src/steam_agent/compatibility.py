@@ -395,6 +395,8 @@ def validate_compatibility_request(
     requested_appids: tuple[int, ...],
     requirements: tuple[FeatureRequirement, ...] = (),
     overrides: tuple[GateOverride, ...] = (),
+    *,
+    candidate_gate_capacity: int = 0,
 ) -> None:
     """Validate caller-controlled bounds without reading candidate evidence.
 
@@ -406,6 +408,12 @@ def validate_compatibility_request(
         raise ValueError("requested_appids must be a tuple")
     if not isinstance(requirements, tuple) or not isinstance(overrides, tuple):
         raise ValueError("requirements and overrides must be tuples")
+    if (
+        isinstance(candidate_gate_capacity, bool)
+        or not isinstance(candidate_gate_capacity, int)
+        or not 0 <= candidate_gate_capacity <= 2 * MAX_COMPONENTS
+    ):
+        raise ValueError("candidate gate capacity is invalid")
     if len(requested_appids) > MAX_ITEMS:
         raise ValueError("requested AppID set exceeds the supported bound")
     if len(requirements) > MAX_COMPONENTS or len(overrides) > MAX_ITEMS:
@@ -427,7 +435,9 @@ def validate_compatibility_request(
     requested = set(requested_appids)
     if any(item.appid not in requested for item in overrides):
         raise ValueError("override AppID was not requested")
-    if len(requested) * (7 + len(requirements)) > MAX_TOTAL_GATES:
+    if len(requested) * (
+        7 + len(requirements) + candidate_gate_capacity
+    ) > MAX_TOTAL_GATES:
         raise ValueError("assessment output exceeds the supported total-work bound")
 
 

@@ -8600,6 +8600,18 @@ class Storage:
                   SELECT 1 FROM review_current
                   WHERE review_current.appid = steam_apps.appid
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM declared_app_current
+                  WHERE declared_app_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM declared_app_observations
+                  WHERE declared_app_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM declared_app_sync_demand
+                  WHERE declared_app_sync_demand.appid = steam_apps.appid
+              )
             """,
             appids,
         )
