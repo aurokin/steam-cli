@@ -2905,8 +2905,9 @@ class Storage:
                     current = self._connection.execute(
                         """SELECT 1 FROM declared_app_current
                            WHERE appid=? AND country=? AND language=?
-                             AND provider='steam_store' AND observed_at>=?""",
-                        (appid, country, language, fresh_cutoff),
+                             AND provider='steam_store'
+                             AND observed_at>=? AND observed_at<=?""",
+                        (appid, country, language, fresh_cutoff, timestamp),
                     ).fetchone()
                     negative = self._connection.execute(
                         """SELECT 1 FROM declared_app_sync_demand d

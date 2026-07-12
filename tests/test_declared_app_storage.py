@@ -578,6 +578,29 @@ def test_retention_prunes_global_current_after_thirty_days(
     storage.finish_declared_app_sync(later.id, completed_at="2026-08-10T12:03:00Z")
 
 
+def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    first, _, _ = begin(storage, account_id, [400], at=T0)
+    future = "2026-07-11T12:01:00Z"
+    storage.record_declared_app_result(
+        first.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=future,
+    )
+    storage.finish_declared_app_sync(first.id, completed_at=future)
+
+    second, candidates, targeted = begin(storage, account_id, [400], at=T2)
+
+    assert candidates == (400,)
+    assert targeted == (400,)
+    storage.finish_declared_app_sync(second.id, completed_at=T2)
+
+
 def test_expired_declared_rows_are_not_exposed_by_cache_reads(
     configured: tuple[Storage, int],
 ) -> None:
