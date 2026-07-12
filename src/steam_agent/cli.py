@@ -2071,22 +2071,36 @@ def _declared_scope_appids(
 ) -> tuple[int, ...]:
     """Authorize one deterministic candidate set without consulting global demand."""
 
-    owned = {
-        game.appid
-        for game in storage.read_owned_snapshot(account_id).games
-        if game.inclusion_basis == "visible_owned"
-    }
-    wishlist = {game.appid for game in storage.read_wishlist_snapshot(account_id).games}
-    installed = {
-        game.appid for game in storage.read_installed_snapshot(machine_id).games
-    }
-    prior_explicit = set(
-        storage.read_explicit_declared_appids(
-            account_id=account_id,
-            machine_id=machine_id,
-            country=country,
-            language=language,
+    owned = (
+        {
+            game.appid
+            for game in storage.read_owned_snapshot(account_id).games
+            if game.inclusion_basis == "visible_owned"
+        }
+        if scope in {"library", "known"}
+        else set()
+    )
+    wishlist = (
+        {game.appid for game in storage.read_wishlist_snapshot(account_id).games}
+        if scope in {"wishlist", "known"}
+        else set()
+    )
+    installed = (
+        {game.appid for game in storage.read_installed_snapshot(machine_id).games}
+        if scope in {"installed", "known"}
+        else set()
+    )
+    prior_explicit = (
+        set(
+            storage.read_explicit_declared_appids(
+                account_id=account_id,
+                machine_id=machine_id,
+                country=country,
+                language=language,
+            )
         )
+        if scope == "known"
+        else set()
     )
     scoped = {
         "library": owned,

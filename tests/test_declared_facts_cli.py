@@ -43,6 +43,22 @@ class InterruptingClient:
         raise KeyboardInterrupt
 
 
+def test_explicit_candidate_scope_reads_no_private_inventories() -> None:
+    class NoInventoryStorage:
+        def __getattr__(self, name: str):
+            pytest.fail(f"unexpected private inventory read: {name}")
+
+    assert cli._declared_scope_appids(  # noqa: SLF001
+        NoInventoryStorage(),  # type: ignore[arg-type]
+        account_id=1,
+        machine_id="local",
+        country="US",
+        language="english",
+        scope="appids",
+        explicit=(400,),
+    ) == (400,)
+
+
 def invoke(tmp_path: Path, capsys, *args: str):
     arguments = list(args)
     if arguments[:2] == ["sync", "compatibility"] and "--language" not in arguments:
