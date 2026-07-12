@@ -199,6 +199,31 @@ def test_family_edges_require_explicit_distinct_source_and_are_typed(tmp_path) -
         assert storage.clear_group_family(GUEST, source=OWNER, appid=10)
 
 
+def test_family_edge_requires_current_disclosure_from_source_profile(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        synthetic(storage)
+        account(storage)
+        with pytest.raises(StorageError, match="disclosure"):
+            storage.set_group_family(
+                GUEST,
+                source=PRIMARY,
+                appid=10,
+                state="available",
+                updated_at=T0,
+            )
+        assert storage.read_group_family(GUEST) == ()
+
+        acknowledge(storage)
+        edge = storage.set_group_family(
+            GUEST,
+            source=PRIMARY,
+            appid=10,
+            state="available",
+            updated_at=T1,
+        )
+        assert storage.read_group_family(GUEST) == (edge,)
+
+
 @pytest.mark.parametrize(
     ("fact", "value", "state", "stored"),
     (

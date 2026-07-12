@@ -1575,6 +1575,7 @@ class Storage:
             recipient_id = self._ensure_group_profile(recipient, timestamp)
             self._require_group_profile_consent(recipient_id)
             source_id = self._ensure_group_profile(source, timestamp)
+            self._require_group_profile_consent(source_id)
             self._ensure_steam_application_identity(appid, observed_at=timestamp)
             self._connection.execute(
                 """INSERT INTO group_family_current(
