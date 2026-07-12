@@ -39,6 +39,19 @@ def _freshness(observed_at: str | None, now: datetime, fresh_for: timedelta) -> 
     return "expired"
 
 
+def _recent_freshness(observed_at: str | None, now: datetime) -> str:
+    if observed_at is None:
+        return "unknown"
+    age = now - _parse(observed_at)
+    if age < timedelta(0):
+        return "unknown"
+    if age <= timedelta(hours=1):
+        return "fresh"
+    if age <= timedelta(hours=24):
+        return "stale"
+    return "expired"
+
+
 def _achievement_state(row: dict[str, Any]) -> str:
     state = row["state"]
     if state == "ready":
@@ -91,8 +104,8 @@ def build_recommendation_query(
     achievements = {int(item["appid"]): dict(item) for item in snapshot.achievement_items}
     feedback = {item.appid: item for item in snapshot.feedback}
     classifications = {
-        appid: (classification, evidence_id)
-        for appid, classification, evidence_id in snapshot.classifications
+        fact.appid: fact
+        for fact in snapshot.catalog.facts
     }
     stable_ids = dict(snapshot.owned.stable_game_ids_by_appid)
 
@@ -116,6 +129,7 @@ def build_recommendation_query(
                     else datetime.fromtimestamp(activity_row["last_played_unix"], timezone.utc)
                 ),
                 evidence_ids=(f"activity:{activity_row['promoted_sync_run_id']}:{owned.appid}",),
+                recent_freshness=_recent_freshness(recent_observed, now),
             )
         achievement_row = achievements.get(owned.appid)
         achievement_value = None
@@ -166,8 +180,14 @@ def build_recommendation_query(
                 minimum_session_evidence_ids=field_ids("minimum_session_minutes"),
                 remaining_evidence_ids=field_ids("remaining_minutes"),
             )
-        classification, classification_id = classifications.get(
-            owned.appid, ("not_observed", None)
+        classification_fact = classifications.get(owned.appid)
+        classification = (
+            "not_observed" if classification_fact is None else classification_fact.classification
+        )
+        classification_fresh = (
+            classification_fact is not None
+            and now - _parse(classification_fact.observed_at) <= timedelta(hours=24)
+            and now >= _parse(classification_fact.observed_at)
         )
         candidates.append(
             RecommendationCandidate(
@@ -186,10 +206,10 @@ def build_recommendation_query(
                     else (f"installed-snapshot:{snapshot.installed.latest_complete.id}",)
                 ),
                 is_game=(
-                    True if classification == "game" else False if classification == "non_game" else None
+                    True if classification_fresh and classification == "game" else False if classification_fresh and classification == "non_game" else None
                 ),
                 classification_evidence_ids=(
-                    () if classification_id is None else (f"catalog:{classification_id}",)
+                    () if classification_fact is None else (f"catalog:{classification_fact.evidence_id}",)
                 ),
             )
         )

@@ -1143,6 +1143,11 @@ _RECOMMEND_OVERRIDE = re.compile(
 _MAX_RECOMMEND_FILTERS = 32
 
 
+def _seconds_old(value: str, now: datetime) -> float:
+    observed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return (now - observed).total_seconds()
+
+
 def _recommendation_filters(
     args: argparse.Namespace,
 ) -> tuple[tuple[Requirement, ...], tuple[ConstraintOverride, ...]]:
@@ -1286,30 +1291,68 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
     warnings: list[WarningRecord] = []
     owned_appids = {item.appid for item in snapshot.owned.games}
     classified = {
-        appid: classification
-        for appid, classification, _ in snapshot.classifications
-        if appid in owned_appids
+        fact.appid: fact for fact in snapshot.catalog.facts if fact.appid in owned_appids
     }
     if owned_appids and (
         set(classified) != owned_appids
-        or any(value == "not_observed" for value in classified.values())
+        or any(value.classification == "not_observed" for value in classified.values())
     ):
         missing.add("catalog.classification")
+    if any(
+        _seconds_old(fact.observed_at, generated_at) > _CATALOG_SYNC_FRESHNESS_SECONDS
+        or _seconds_old(fact.observed_at, generated_at) < 0
+        for fact in classified.values()
+    ):
+        stale.add("catalog.classification")
+    attempted_catalog_appids = {
+        appid for attempt in snapshot.catalog.attempts for appid in attempt.appids
+    }
+    if owned_appids - attempted_catalog_appids:
+        missing.add("catalog.application.read")
+    for attempt in snapshot.catalog.attempts:
+        run = attempt.run
+        if run.status in {"failed", "partial"}:
+            stale.add("catalog.application.read")
+            warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "A relevant catalog refresh did not replace its last-good classification."))
+        elif run.status == "running":
+            abandoned = _seconds_old(run.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            if abandoned:
+                stale.add("catalog.application.read")
+            warnings.append(WarningRecord(
+                ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS,
+                "A relevant catalog refresh appears abandoned." if abandoned else "A relevant catalog refresh is in progress.",
+            ))
     if owned_appids and any(item.name == "installed" for item in requirements) and snapshot.installed.latest_complete is None:
         missing.add("installed.read")
     if owned_appids and args.recipe in {"resume/0.1", "preference-fit/0.1"} and snapshot.activity_latest_complete is None:
         missing.add("activity.read")
     if owned_appids and args.recipe in {"resume/0.1", "finishability/0.1"} and snapshot.achievement_latest is None:
         missing.add("achievements.read")
-    if snapshot.owned.latest is not None and snapshot.owned.latest.status != "complete":
-        stale.add("owned.visible.read")
-        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "Recommendations use the last-good visible-owned snapshot."))
-    if snapshot.activity_latest is not None and snapshot.activity_latest.status != "complete":
-        stale.add("activity.read")
-        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "Behavioral factors use the last-good activity snapshot."))
-    if snapshot.installed.latest is not None and snapshot.installed.latest.status != "complete" and any(item.name == "installed" for item in requirements):
-        stale.add("installed.read")
-        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "The installed constraint uses the last-good machine snapshot."))
+    owned_good = snapshot.owned.latest_complete
+    if owned_good is not None:
+        owned_age = _seconds_old(
+            owned_good.completed_at or owned_good.started_at, generated_at
+        )
+        if owned_age > _OWNED_SYNC_FRESHNESS_SECONDS or owned_age < 0:
+            stale.add("owned.visible.read")
+    for latest, capability, relevant in (
+        (snapshot.owned.latest, "owned.visible.read", True),
+        (snapshot.activity_latest, "activity.read", args.recipe in {"resume/0.1", "preference-fit/0.1"}),
+        (snapshot.installed.latest, "installed.read", any(item.name == "installed" for item in requirements)),
+    ):
+        if latest is None or not relevant or latest.status == "complete":
+            continue
+        if latest.status == "running":
+            abandoned = _seconds_old(latest.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            if abandoned:
+                stale.add(capability)
+            warnings.append(WarningRecord(
+                ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS,
+                f"The {capability} refresh appears abandoned." if abandoned else f"The {capability} refresh is in progress.",
+            ))
+        else:
+            stale.add(capability)
+            warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, f"The {capability} refresh did not replace its last-good snapshot."))
     components = [
         component
         for item in ranking["results"]

@@ -107,10 +107,15 @@ class ActivityEvidence:
     recent_window_minutes: int | None = None
     last_played_at: datetime | None = None
     evidence_ids: tuple[str, ...] = ()
+    recent_freshness: Freshness | None = None
 
     def __post_init__(self) -> None:
         if self.freshness not in {"fresh", "stale", "expired", "unknown"}:
             raise ValueError("activity freshness is invalid")
+        if self.recent_freshness is None:
+            object.__setattr__(self, "recent_freshness", self.freshness)
+        elif self.recent_freshness not in {"fresh", "stale", "expired", "unknown"}:
+            raise ValueError("recent activity freshness is invalid")
         if self.observed_at is not None:
             object.__setattr__(self, "observed_at", _timestamp(self.observed_at, name="observed_at"))
         for name in ("lifetime_minutes", "recent_window_minutes"):
@@ -662,9 +667,14 @@ def _resume_components(candidate: RecommendationCandidate, context: Recommendati
     state = _activity_state(activity)
     ids = () if activity is None else activity.evidence_ids
     recent = None if activity is None else activity.recent_window_minutes
+    recent_state = (
+        "unknown"
+        if activity is None
+        else _freshness_component_state(activity.recent_freshness)
+    )
     lifetime = None if activity is None else activity.lifetime_minutes
     last = None if activity is None else activity.last_played_at
-    recent_points = RESUME_RECENT_WINDOW if state == "applied" and recent is not None and recent > 0 else (0 if state == "applied" and recent is not None else None)
+    recent_points = RESUME_RECENT_WINDOW if recent_state == "applied" and recent is not None and recent > 0 else (0 if recent_state == "applied" and recent is not None else None)
     sustained_points = RESUME_SUSTAINED_PLAY if state == "applied" and lifetime is not None and lifetime >= 120 else (0 if state == "applied" and lifetime is not None else None)
     last_points: int | None = None
     if state == "applied" and last is not None and last <= context.now:
@@ -678,7 +688,7 @@ def _resume_components(candidate: RecommendationCandidate, context: Recommendati
     if astate == "applied":
         apoints = RESUME_ACHIEVEMENT_PROGRESS if ratio is not None and 0 < ratio < 10_000 else 0
     return [
-        _component("recent_sustained_play", recent, ids, recent_points, _metric_state(state, recent), "behavioral", "recent_window_is_not_a_session_log"),
+        _component("recent_sustained_play", recent, ids, recent_points, _metric_state(recent_state, recent), "behavioral", "recent_window_is_not_a_session_log"),
         _component("lifetime_play_momentum", lifetime, ids, sustained_points, _metric_state(state, lifetime), "behavioral", "playtime_does_not_imply_preference"),
         _component("last_played_recency", None if last is None else last.isoformat(), ids, last_points, "unknown" if state == "applied" and (last is None or last > context.now) else state, "behavioral"),
         _component("achievement_progress_weak", ratio, aids, apoints, astate, "achievement", "achievement_ratio_is_weak_evidence_not_completion"),
@@ -719,11 +729,16 @@ def _preference_behavior_components(candidate: RecommendationCandidate, context:
     state = _activity_state(activity)
     ids = () if activity is None else activity.evidence_ids
     recent = None if activity is None else activity.recent_window_minutes
+    recent_state = (
+        "unknown"
+        if activity is None
+        else _freshness_component_state(activity.recent_freshness)
+    )
     lifetime = None if activity is None else activity.lifetime_minutes
-    recent_points = PREFERENCE_RECENT_BEHAVIOR if state == "applied" and recent is not None and recent > 0 else (0 if state == "applied" and recent is not None else None)
+    recent_points = PREFERENCE_RECENT_BEHAVIOR if recent_state == "applied" and recent is not None and recent > 0 else (0 if recent_state == "applied" and recent is not None else None)
     lifetime_points = PREFERENCE_SUSTAINED_BEHAVIOR if state == "applied" and lifetime is not None and lifetime >= 120 else (0 if state == "applied" and lifetime is not None else None)
     return [
-        _component("recent_play_behavior", recent, ids, recent_points, _metric_state(state, recent), "behavioral", "behavior_does_not_prove_preference"),
+        _component("recent_play_behavior", recent, ids, recent_points, _metric_state(recent_state, recent), "behavioral", "behavior_does_not_prove_preference"),
         _component("lifetime_play_behavior", lifetime, ids, lifetime_points, _metric_state(state, lifetime), "behavioral", "behavior_does_not_prove_preference"),
     ]
 
@@ -732,6 +747,14 @@ def _metric_state(state: ComponentState, value: object | None) -> ComponentState
     if state == "applied" and value is None:
         return "unknown"
     return state
+
+
+def _freshness_component_state(freshness: Freshness | None) -> ComponentState:
+    if freshness in {None, "unknown"}:
+        return "unknown"
+    if freshness == "expired":
+        return "expired"
+    return "stale" if freshness == "stale" else "applied"
 
 
 def _safe_sum(values: tuple[int, ...]) -> int:

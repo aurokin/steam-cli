@@ -621,7 +621,7 @@ class RecommendationSnapshot:
     achievement_latest: SyncRun | None
     feedback: tuple[ExplicitFeedback, ...]
     rules: tuple[PreferenceRule, ...]
-    classifications: tuple[tuple[int, str, int], ...]
+    catalog: CatalogSnapshot
 
 
 def _timestamp(value: str | datetime) -> str:
@@ -4681,20 +4681,16 @@ class Storage:
             )
             feedback = self.list_explicit_feedback(account_id)
             rules = self.list_preference_rules(account_id)
-            classifications = tuple(
-                (int(row["appid"]), str(row["classification"]), int(row["evidence_id"]))
-                for row in self._connection.execute(
-                    """SELECT appid, classification, evidence_id
-                       FROM catalog_subject_current
-                       WHERE account_id = ? AND machine_id = ? ORDER BY appid""",
-                    (account_id, machine_id),
-                )
+            catalog = self._read_catalog_snapshot(
+                {game.appid for game in owned.games},
+                account_id=account_id,
+                machine_id=machine_id,
             )
             self._connection.commit()
             return RecommendationSnapshot(
                 owned, installed, activity_items, activity_latest,
                 activity_latest_complete, achievement_items, achievement_latest,
-                feedback, rules, classifications,
+                feedback, rules, catalog,
             )
         except BaseException:
             try:

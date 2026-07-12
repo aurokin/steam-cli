@@ -224,6 +224,76 @@ def test_failed_last_attempt_and_stale_evidence_remain_distinct(tmp_path, capsys
     assert "achievements_unevaluated" in unknown["unknowns"]
 
 
+def test_recent_window_stops_scoring_after_one_hour(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    populated(tmp_path)
+    monkeypatch.setattr(
+        cli, "_utc_now", lambda: datetime(2026, 7, 12, 6, tzinfo=timezone.utc)
+    )
+    result = invoke(
+        tmp_path, capsys, "recommendations", "query", "--account", "primary",
+        "--recipe", "resume/0.1", "--unknown", "include",
+    )[1]
+    game = next(item for item in result["data"]["results"] if item["appid"] == 10)
+    recent = next(component for component in game["components"] if component["rule_id"] == "recent_sustained_play")
+    assert recent["state"] == "stale" and recent["points"] is None
+    lifetime = next(component for component in game["components"] if component["rule_id"] == "lifetime_play_momentum")
+    assert lifetime["state"] == "applied"
+
+
+def test_stale_catalog_cannot_pass_game_gate(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    populated(tmp_path)
+    monkeypatch.setattr(
+        cli, "_utc_now", lambda: datetime(2026, 7, 13, 5, 2, tzinfo=timezone.utc)
+    )
+    result = invoke(
+        tmp_path, capsys, "recommendations", "query", "--account", "primary",
+        "--recipe", "preference-fit/0.1", "--unknown", "include",
+    )[1]
+    game = next(item for item in result["data"]["results"] if item["appid"] == 10)
+    gate = next(gate for gate in game["gates"] if gate["name"] == "game")
+    assert gate["original"] == "unknown"
+    assert "catalog.classification" in result["completeness"]["stale_capabilities"]
+    assert "owned.visible.read" in result["completeness"]["stale_capabilities"]
+
+
+def test_fresh_running_refresh_is_informational_but_failed_catalog_is_stale(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    account_id = populated(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.begin_sync(
+            provider="steam_web_api", capability="owned.visible.read",
+            account_id=account_id, started_at="2026-07-12T04:59:00Z",
+        )
+        storage.begin_activity_sync(
+            account_id=account_id, disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+            started_at="2026-07-12T04:59:00Z",
+        )
+        storage.begin_sync(
+            provider="local_steam", capability="installed", machine_id="local",
+            started_at="2026-07-12T04:59:00Z",
+        )
+        catalog = storage.begin_catalog_sync(
+            provider="steam_store_web_api", account_id=account_id, machine_id="local",
+            demanded_appids=[10, 20, 30], started_at="2026-07-12T04:59:00Z",
+        )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    running = invoke(
+        tmp_path, capsys, "recommendations", "query", "--account", "primary",
+        "--recipe", "resume/0.1", "--require", "installed=true", "--unknown", "include",
+    )[1]
+    assert not {"owned.visible.read", "activity.read", "installed.read", "catalog.application.read"} & set(running["completeness"]["stale_capabilities"])
+    assert "SYNC_IN_PROGRESS" in {item["code"] for item in running["completeness"]["warnings"]}
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.finish_catalog_sync(
+            catalog.id, status="failed", completed_at="2026-07-12T05:01:00Z",
+            error_code="PROVIDER_UNAVAILABLE",
+        )
+    failed = invoke(
+        tmp_path, capsys, "recommendations", "query", "--account", "primary",
+        "--recipe", "resume/0.1", "--unknown", "include",
+    )[1]
+    assert "catalog.application.read" in failed["completeness"]["stale_capabilities"]
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
