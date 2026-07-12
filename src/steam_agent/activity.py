@@ -259,10 +259,17 @@ def sync_achievements(
                 )
         except (SteamActivityApiError, ActivitySyncError) as exc:
             error_code, _ = _provider_error(exc)
+            # A schema request is part of the per-game acquisition. Do not
+            # misrepresent a provider failure as a successful player result
+            # paired with unsupported schema evidence.
+            state = "failed"
+            write_schema = False
             if isinstance(exc, ActivitySyncError):
                 fatal = ActivitySyncError(error_code, retryable=exc.retryable)
         except BaseException:
             error_code = "INTERNAL_ERROR"
+            state = "failed"
+            write_schema = False
             fatal = ActivitySyncError(error_code, retryable=False)
         storage.record_achievement_result(
             run.id, account_id=account_id, appid=appid, state=state,

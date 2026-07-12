@@ -1238,7 +1238,9 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
                     "empty": False,
                 },
             )
-        snapshot = storage.read_recommendation_snapshot(account.id, args.machine)
+        snapshot = storage.read_recommendation_snapshot(
+            account.id, args.machine, now=generated_at
+        )
     if snapshot.owned.latest_complete is None:
         return _emit_success(
             args,

@@ -178,6 +178,88 @@ def test_provider_wide_failure_stops_fanout_and_marks_remaining_unevaluated(conf
     assert [item["state"] for item in items] == ["failed", "unevaluated", "unevaluated"]
 
 
+@pytest.mark.parametrize(
+    ("provider_error", "stored_error"),
+    [
+        (SteamActivityApiError("RATE_LIMITED", retryable=True), "PROVIDER_RATE_LIMITED"),
+        (SteamActivityApiError("PROVIDER_UNAVAILABLE", retryable=True), "PROVIDER_UNAVAILABLE"),
+    ],
+)
+def test_schema_provider_wide_failure_is_not_reported_as_ready_and_stops_fanout(
+    configured: tuple[Storage, int],
+    provider_error: SteamActivityApiError,
+    stored_error: str,
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(
+        10, "ready", (PlayerAchievement("A", True, 1),)
+    )
+    client.schema[10] = provider_error
+
+    result = sync_achievements(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        scope="owned",
+        explicit_appids=(10, 20, 30),
+        max_items=3,
+        client=client,
+        clock=lambda: NOW,
+    )
+
+    assert result.state_counts == {"failed": 1, "unevaluated": 2}
+    rows = storage._connection.execute(
+        "SELECT state, evaluated, error_code FROM achievement_sync_demand ORDER BY appid"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("failed", 1, stored_error),
+        ("unevaluated", 0, stored_error),
+        ("unevaluated", 0, stored_error),
+    ]
+    assert client.schema_calls == [10]
+    assert storage._connection.execute(
+        "SELECT COUNT(*) FROM achievement_player_current WHERE account_id=?",
+        (account_id,),
+    ).fetchone()[0] == 0
+
+
+def test_schema_invalid_response_is_a_per_game_failure_not_unsupported_schema(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(
+        10, "ready", (PlayerAchievement("A", True, 1),)
+    )
+    client.schema[10] = SteamActivityApiError(
+        "PROVIDER_RESPONSE_INVALID", retryable=False
+    )
+
+    result = sync_achievements(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        scope="owned",
+        explicit_appids=(10,),
+        client=client,
+        clock=lambda: NOW,
+    )
+
+    assert result.state_counts == {"failed": 1}
+    item = query_achievements(storage, account_id=account_id, clock=lambda: NOW)[
+        "items"
+    ][0]
+    assert item["state"] == "failed"
+    assert item["error_code"] == "PROVIDER_RESPONSE_INVALID"
+    assert item["achievements"] == []
+    assert storage._connection.execute(
+        "SELECT COUNT(*) FROM achievement_schema_status WHERE appid=10"
+    ).fetchone()[0] == 0
+
+
 def test_activity_query_hard_deletes_expired_provider_rows(configured: tuple[Storage, int]) -> None:
     storage, account_id = configured
     client = FakeClient()

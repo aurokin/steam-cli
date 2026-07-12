@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -155,6 +155,36 @@ def test_full_cache_only_tracer_is_deterministic_and_truthful(tmp_path, capsys, 
     encoded = json.dumps(result)
     assert "76561198000000000" not in encoded and str(tmp_path) not in encoded
     assert "/private" not in encoded
+
+
+def test_recommendation_only_read_hard_deletes_expired_behavioral_evidence(
+    tmp_path,
+) -> None:
+    account_id = populated(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        snapshot = storage.read_recommendation_snapshot(
+            account_id, "local", now=NOW + timedelta(days=8)
+        )
+
+        assert snapshot.activity_items == ()
+        assert snapshot.activity_latest is None
+        assert snapshot.activity_latest_complete is None
+        assert snapshot.achievement_items == ()
+        assert snapshot.achievement_latest is None
+        for table in (
+            "activity_observations",
+            "activity_current",
+            "achievement_sync_demand",
+            "achievement_player_observations",
+            "achievement_player_current",
+        ):
+            assert storage._connection.execute(
+                f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed test table names
+            ).fetchone()[0] == 0
+        assert storage._connection.execute(
+            """SELECT COUNT(*) FROM sync_runs
+               WHERE capability IN ('activity.read', 'achievements.read')"""
+        ).fetchone()[0] == 0
 
 
 def test_feedback_components_keep_field_specific_event_lineage(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:

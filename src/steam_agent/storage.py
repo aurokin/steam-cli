@@ -4619,15 +4619,22 @@ class Storage:
             raise
 
     def read_recommendation_snapshot(
-        self, account_id: int, machine_id: str
+        self,
+        account_id: int,
+        machine_id: str,
+        *,
+        now: str | datetime,
     ) -> RecommendationSnapshot:
-        """Read all M4 ranking inputs atomically, without pruning or refresh."""
+        """Read all M4 ranking inputs atomically after enforcing retention."""
 
         if self._connection.in_transaction:
             raise StorageError("cannot start a read snapshot inside a transaction")
-        self._connection.execute("BEGIN")
+        self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_steam_account(account_id)
+            timestamp = _timestamp(now)
+            self._prune_activity(account_id, timestamp)
+            self._prune_achievements(account_id, timestamp)
             owned = self._read_owned_snapshot(account_id)
             installed = InstalledSnapshot(
                 games=tuple(self.list_installed(machine_id)),
