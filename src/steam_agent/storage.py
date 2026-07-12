@@ -18,12 +18,14 @@ from typing import Any, Literal, Mapping
 import uuid
 from urllib.parse import parse_qs, urlsplit
 
+from steam_agent.groups import MemberRef
 from steam_agent.local_accounts import validate_steam_id64
 
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
 TerminalSyncStatus = Literal["complete", "partial", "failed"]
 MAX_DECLARED_APP_DEMAND = 10_000
+GROUP_PROFILE_DISCLOSURE_VERSION = "2026-07-12.m6"
 _DECLARED_APP_MAX_DEMAND = MAX_DECLARED_APP_DEMAND
 _DECLARED_APP_READ_CHUNK = 500
 STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID("d95b6568-2886-5d15-aa84-1986e4ac511e")
@@ -87,6 +89,52 @@ class Account:
     source_kind: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class GroupProfile:
+    id: int | None
+    ref: MemberRef
+    disclosure_version: str | None
+    backups_acknowledged: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GroupOwnershipAssertion:
+    profile: MemberRef
+    appid: int
+    state: Literal["owned", "not_owned", "unknown"]
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GroupFamilyAssertion:
+    recipient: MemberRef
+    source: MemberRef
+    appid: int
+    state: Literal["available", "unavailable", "unknown"]
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GroupAppAssertion:
+    profile: MemberRef
+    appid: int
+    fact: str
+    state: Literal["known", "present", "absent", "unknown"]
+    value: int | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GroupDataDeletion:
+    profile_removed: bool
+    ownership_removed: int
+    family_removed: int
+    assertions_removed: int
+    consent_removed: bool
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1256,13 @@ class Storage:
 
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            synthetic_collision = self._connection.execute(
+                "SELECT 1 FROM group_profiles "
+                "WHERE kind = 'synthetic' AND alias = ? COLLATE NOCASE",
+                (normalized_alias,),
+            ).fetchone()
+            if synthetic_collision is not None:
+                raise AccountConflict("account alias conflicts with a synthetic profile")
             alias_row = self._connection.execute(
                 "SELECT * FROM accounts WHERE alias = ? COLLATE NOCASE",
                 (normalized_alias,),
@@ -1292,6 +1347,498 @@ class Storage:
                 (normalized_alias,),
             )
         return cursor.rowcount > 0
+
+    def create_synthetic_group_profile(
+        self,
+        alias: str,
+        *,
+        disclosure_version: str,
+        backups_acknowledged: bool,
+        created_at: str | datetime,
+    ) -> GroupProfile:
+        """Create one local-only participant under the current disclosure."""
+
+        ref = MemberRef("synthetic", _account_alias(alias))
+        _validate_group_disclosure(disclosure_version, backups_acknowledged)
+        timestamp = _timestamp(created_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if self._connection.execute(
+                "SELECT 1 FROM accounts WHERE alias = ? COLLATE NOCASE", (ref.key,)
+            ).fetchone() is not None:
+                raise AccountConflict(
+                    "synthetic profile alias conflicts with a configured account"
+                )
+            row = self._connection.execute(
+                "SELECT id FROM group_profiles "
+                "WHERE kind = 'synthetic' AND alias = ? COLLATE NOCASE",
+                (ref.key,),
+            ).fetchone()
+            if row is None:
+                cursor = self._connection.execute(
+                    """INSERT INTO group_profiles(
+                           kind, account_id, alias, created_at, updated_at
+                       ) VALUES ('synthetic', NULL, ?, ?, ?)""",
+                    (ref.key, timestamp, timestamp),
+                )
+                profile_id = int(cursor.lastrowid)
+                self._connection.execute(
+                    """INSERT INTO group_profile_consents(
+                           profile_id, disclosure_version,
+                           backups_acknowledged, accepted_at
+                       ) VALUES (?, ?, 1, ?)""",
+                    (profile_id, disclosure_version, timestamp),
+                )
+            else:
+                profile_id = int(row[0])
+                self._require_group_profile_consent(profile_id)
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        result = self.get_group_profile(ref)
+        assert result is not None
+        return result
+
+    def acknowledge_group_profile_storage(
+        self,
+        ref: MemberRef,
+        *,
+        disclosure_version: str,
+        backups_acknowledged: bool,
+        accepted_at: str | datetime,
+    ) -> GroupProfile:
+        """Acknowledge durable M6 facts for one already-known participant."""
+
+        _validate_group_disclosure(disclosure_version, backups_acknowledged)
+        timestamp = _timestamp(accepted_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            profile_id = self._ensure_group_profile(ref, timestamp)
+            self._connection.execute(
+                """INSERT INTO group_profile_consents(
+                       profile_id, disclosure_version,
+                       backups_acknowledged, accepted_at
+                   ) VALUES (?, ?, 1, ?)
+                   ON CONFLICT(profile_id) DO UPDATE SET
+                       disclosure_version=excluded.disclosure_version,
+                       backups_acknowledged=1,
+                       accepted_at=excluded.accepted_at""",
+                (profile_id, disclosure_version, timestamp),
+            )
+            self._connection.execute(
+                "UPDATE group_profiles SET updated_at = ? WHERE id = ?",
+                (timestamp, profile_id),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        result = self.get_group_profile(ref)
+        assert result is not None
+        return result
+
+    def get_group_profile(self, ref: MemberRef) -> GroupProfile | None:
+        """Resolve a typed ref without returning provider identity fields."""
+
+        if not isinstance(ref, MemberRef):
+            raise ValueError("group profile reference is invalid")
+        row = self._group_profile_row(ref)
+        if row is not None:
+            return _group_profile(row)
+        if ref.kind == "synthetic":
+            return None
+        account = self._connection.execute(
+            "SELECT created_at, updated_at FROM accounts "
+            "WHERE alias = ? COLLATE NOCASE",
+            (ref.key,),
+        ).fetchone()
+        if account is None:
+            return None
+        return GroupProfile(
+            None,
+            ref,
+            None,
+            False,
+            str(account["created_at"]),
+            str(account["updated_at"]),
+        )
+
+    def list_synthetic_group_profiles(self) -> tuple[GroupProfile, ...]:
+        rows = self._connection.execute(
+            """SELECT gp.id, gp.kind, gp.alias AS resolved_alias,
+                      c.disclosure_version, c.backups_acknowledged,
+                      gp.created_at, gp.updated_at
+               FROM group_profiles gp
+               LEFT JOIN group_profile_consents c ON c.profile_id = gp.id
+               WHERE gp.kind = 'synthetic'
+               ORDER BY gp.alias COLLATE NOCASE, gp.id"""
+        )
+        return tuple(_group_profile(row) for row in rows)
+
+    def get_synthetic_group_profile(self, alias: str) -> GroupProfile | None:
+        return self.get_group_profile(MemberRef("synthetic", _account_alias(alias)))
+
+    def delete_synthetic_group_profile(self, alias: str) -> GroupDataDeletion:
+        ref = MemberRef("synthetic", _account_alias(alias))
+        return self._delete_group_profile(ref)
+
+    def clear_account_group_data(self, alias: str) -> GroupDataDeletion:
+        ref = MemberRef("account", _account_alias(alias))
+        return self._delete_group_profile(ref)
+
+    def set_group_ownership(
+        self,
+        ref: MemberRef,
+        *,
+        appid: int,
+        state: str,
+        updated_at: str | datetime,
+    ) -> GroupOwnershipAssertion:
+        if ref.kind != "synthetic":
+            raise ValueError("configured-account ownership comes from Steam evidence")
+        if state not in {"owned", "not_owned", "unknown"}:
+            raise ValueError("group ownership state is invalid")
+        timestamp = _timestamp(updated_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            profile_id = self._require_group_profile(ref)
+            self._require_group_profile_consent(profile_id)
+            self._ensure_steam_application_identity(appid, observed_at=timestamp)
+            self._connection.execute(
+                """INSERT INTO group_ownership_current(
+                       profile_id, appid, state, updated_at
+                   ) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(profile_id, appid) DO UPDATE SET
+                       state=excluded.state, updated_at=excluded.updated_at""",
+                (profile_id, appid, state, timestamp),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return GroupOwnershipAssertion(ref, appid, state, timestamp)  # type: ignore[arg-type]
+
+    def clear_group_ownership(self, ref: MemberRef, *, appid: int) -> bool:
+        steam_application_stable_id(appid)
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return False
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM group_ownership_current "
+                "WHERE profile_id = ? AND appid = ?",
+                (profile.id, appid),
+            )
+        return cursor.rowcount > 0
+
+    def read_group_ownership(
+        self, ref: MemberRef, *, appid: int | None = None
+    ) -> tuple[GroupOwnershipAssertion, ...]:
+        if appid is not None:
+            steam_application_stable_id(appid)
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return ()
+        where = " AND appid = ?" if appid is not None else ""
+        values: tuple[object, ...] = (
+            (profile.id, appid) if appid is not None else (profile.id,)
+        )
+        rows = self._connection.execute(
+            "SELECT appid, state, updated_at FROM group_ownership_current "
+            f"WHERE profile_id = ?{where} ORDER BY appid",
+            values,
+        )
+        return tuple(
+            GroupOwnershipAssertion(ref, int(row[0]), row[1], row[2])
+            for row in rows
+        )
+
+    def set_group_family(
+        self,
+        recipient: MemberRef,
+        *,
+        source: MemberRef,
+        appid: int,
+        state: str,
+        updated_at: str | datetime,
+    ) -> GroupFamilyAssertion:
+        if recipient == source:
+            raise ValueError("family source must be distinct from its recipient")
+        if state not in {"available", "unavailable", "unknown"}:
+            raise ValueError("group family state is invalid")
+        timestamp = _timestamp(updated_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            recipient_id = self._ensure_group_profile(recipient, timestamp)
+            self._require_group_profile_consent(recipient_id)
+            source_id = self._ensure_group_profile(source, timestamp)
+            self._ensure_steam_application_identity(appid, observed_at=timestamp)
+            self._connection.execute(
+                """INSERT INTO group_family_current(
+                       recipient_profile_id, source_profile_id, appid,
+                       state, updated_at
+                   ) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(recipient_profile_id, source_profile_id, appid)
+                   DO UPDATE SET state=excluded.state,
+                                 updated_at=excluded.updated_at""",
+                (recipient_id, source_id, appid, state, timestamp),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return GroupFamilyAssertion(recipient, source, appid, state, timestamp)  # type: ignore[arg-type]
+
+    def clear_group_family(
+        self, recipient: MemberRef, *, source: MemberRef, appid: int
+    ) -> bool:
+        steam_application_stable_id(appid)
+        recipient_profile = self.get_group_profile(recipient)
+        source_profile = self.get_group_profile(source)
+        if (
+            recipient_profile is None
+            or recipient_profile.id is None
+            or source_profile is None
+            or source_profile.id is None
+        ):
+            return False
+        with self._connection:
+            cursor = self._connection.execute(
+                """DELETE FROM group_family_current
+                   WHERE recipient_profile_id = ? AND source_profile_id = ?
+                     AND appid = ?""",
+                (recipient_profile.id, source_profile.id, appid),
+            )
+        return cursor.rowcount > 0
+
+    def read_group_family(
+        self,
+        recipient: MemberRef,
+        *,
+        appid: int | None = None,
+    ) -> tuple[GroupFamilyAssertion, ...]:
+        if appid is not None:
+            steam_application_stable_id(appid)
+        profile = self.get_group_profile(recipient)
+        if profile is None or profile.id is None:
+            return ()
+        suffix = " AND f.appid = ?" if appid is not None else ""
+        values: tuple[object, ...] = (
+            (profile.id, appid) if appid is not None else (profile.id,)
+        )
+        rows = self._connection.execute(
+            """SELECT f.appid, f.state, f.updated_at, source.kind,
+                      COALESCE(source.alias, a.alias) AS source_alias
+               FROM group_family_current f
+               JOIN group_profiles source ON source.id = f.source_profile_id
+               LEFT JOIN accounts a ON a.id = source.account_id
+               WHERE f.recipient_profile_id = ?"""
+            f"{suffix} ORDER BY f.appid, source.kind, source_alias COLLATE NOCASE",
+            values,
+        )
+        return tuple(
+            GroupFamilyAssertion(
+                recipient,
+                MemberRef(row["kind"], row["source_alias"]),
+                int(row["appid"]),
+                row["state"],
+                row["updated_at"],
+            )
+            for row in rows
+        )
+
+    def set_group_app_assertion(
+        self,
+        ref: MemberRef,
+        *,
+        appid: int,
+        fact: str,
+        value: int | str,
+        updated_at: str | datetime,
+    ) -> GroupAppAssertion:
+        fact_kind, slug, state, integer = _group_app_fact(fact, value)
+        timestamp = _timestamp(updated_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            profile_id = self._ensure_group_profile(ref, timestamp)
+            self._require_group_profile_consent(profile_id)
+            self._ensure_steam_application_identity(appid, observed_at=timestamp)
+            if fact_kind in {"players_min", "players_max"} and state == "known":
+                other_kind = (
+                    "players_max" if fact_kind == "players_min" else "players_min"
+                )
+                other = self._connection.execute(
+                    """SELECT value_integer FROM group_app_assertion_current
+                       WHERE profile_id = ? AND appid = ? AND fact_kind = ?
+                         AND slug = '' AND state = 'known'""",
+                    (profile_id, appid, other_kind),
+                ).fetchone()
+                if other is not None:
+                    other_value = int(other[0])
+                    inverted = (
+                        fact_kind == "players_min" and integer > other_value
+                    ) or (fact_kind == "players_max" and integer < other_value)
+                    if inverted:
+                        raise ValueError("player-limit assertions are inverted")
+            self._connection.execute(
+                """INSERT INTO group_app_assertion_current(
+                       profile_id, appid, fact_kind, slug, state,
+                       value_integer, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(profile_id, appid, fact_kind, slug) DO UPDATE SET
+                       state=excluded.state,
+                       value_integer=excluded.value_integer,
+                       updated_at=excluded.updated_at""",
+                (profile_id, appid, fact_kind, slug, state, integer, timestamp),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return GroupAppAssertion(ref, appid, _group_fact_name(fact_kind, slug), state, integer, timestamp)  # type: ignore[arg-type]
+
+    def clear_group_app_assertion(
+        self, ref: MemberRef, *, appid: int, fact: str
+    ) -> bool:
+        steam_application_stable_id(appid)
+        fact_kind, slug = _group_fact_key(fact)
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return False
+        with self._connection:
+            cursor = self._connection.execute(
+                """DELETE FROM group_app_assertion_current
+                   WHERE profile_id = ? AND appid = ?
+                     AND fact_kind = ? AND slug = ?""",
+                (profile.id, appid, fact_kind, slug),
+            )
+        return cursor.rowcount > 0
+
+    def read_group_app_assertions(
+        self, ref: MemberRef, *, appid: int | None = None
+    ) -> tuple[GroupAppAssertion, ...]:
+        if appid is not None:
+            steam_application_stable_id(appid)
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return ()
+        suffix = " AND appid = ?" if appid is not None else ""
+        values: tuple[object, ...] = (
+            (profile.id, appid) if appid is not None else (profile.id,)
+        )
+        rows = self._connection.execute(
+            """SELECT appid, fact_kind, slug, state, value_integer, updated_at
+               FROM group_app_assertion_current WHERE profile_id = ?"""
+            f"{suffix} ORDER BY appid, fact_kind, slug",
+            values,
+        )
+        return tuple(
+            GroupAppAssertion(
+                ref,
+                int(row["appid"]),
+                _group_fact_name(row["fact_kind"], row["slug"]),
+                row["state"],
+                row["value_integer"],
+                row["updated_at"],
+            )
+            for row in rows
+        )
+
+    def _group_profile_row(self, ref: MemberRef) -> sqlite3.Row | None:
+        column = "a.alias" if ref.kind == "account" else "gp.alias"
+        return self._connection.execute(
+            """SELECT gp.id, gp.kind, COALESCE(gp.alias, a.alias) AS resolved_alias,
+                      c.disclosure_version, c.backups_acknowledged,
+                      gp.created_at, gp.updated_at
+               FROM group_profiles gp
+               LEFT JOIN accounts a ON a.id = gp.account_id
+               LEFT JOIN group_profile_consents c ON c.profile_id = gp.id
+               WHERE gp.kind = ? AND """
+            f"{column} = ? COLLATE NOCASE",
+            (ref.kind, ref.key),
+        ).fetchone()
+
+    def _ensure_group_profile(self, ref: MemberRef, timestamp: str) -> int:
+        existing = self._group_profile_row(ref)
+        if existing is not None:
+            return int(existing["id"])
+        if ref.kind == "synthetic":
+            raise ValueError("synthetic group profile is not configured")
+        account = self._connection.execute(
+            "SELECT id FROM accounts WHERE alias = ? COLLATE NOCASE", (ref.key,)
+        ).fetchone()
+        if account is None:
+            raise ValueError("configured account group profile is unavailable")
+        cursor = self._connection.execute(
+            """INSERT INTO group_profiles(
+                   kind, account_id, alias, created_at, updated_at
+               ) VALUES ('account', ?, NULL, ?, ?)""",
+            (int(account["id"]), timestamp, timestamp),
+        )
+        return int(cursor.lastrowid)
+
+    def _require_group_profile(self, ref: MemberRef) -> int:
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            raise ValueError("group profile is unavailable")
+        return profile.id
+
+    def _require_group_profile_consent(self, profile_id: int) -> None:
+        row = self._connection.execute(
+            """SELECT disclosure_version, backups_acknowledged
+               FROM group_profile_consents WHERE profile_id = ?""",
+            (profile_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["disclosure_version"] != GROUP_PROFILE_DISCLOSURE_VERSION
+            or not bool(row["backups_acknowledged"])
+        ):
+            raise StorageError("current synthetic/group storage disclosure is required")
+
+    def _delete_group_profile(self, ref: MemberRef) -> GroupDataDeletion:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._group_profile_row(ref)
+            if row is None:
+                self._connection.commit()
+                return GroupDataDeletion(False, 0, 0, 0, False)
+            profile_id = int(row["id"])
+            ownership = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM group_ownership_current WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()[0]
+            )
+            family = int(
+                self._connection.execute(
+                    """SELECT COUNT(*) FROM group_family_current
+                       WHERE recipient_profile_id = ? OR source_profile_id = ?""",
+                    (profile_id, profile_id),
+                ).fetchone()[0]
+            )
+            assertions = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM group_app_assertion_current WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()[0]
+            )
+            consent = self._connection.execute(
+                "SELECT 1 FROM group_profile_consents WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone() is not None
+            cursor = self._connection.execute(
+                "DELETE FROM group_profiles WHERE id = ? AND kind = ?",
+                (profile_id, ref.kind),
+            )
+            self._connection.commit()
+            return GroupDataDeletion(
+                cursor.rowcount > 0, ownership, family, assertions, consent
+            )
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
 
     def set_explicit_feedback_field(
         self,
@@ -7183,8 +7730,24 @@ class Storage:
                     SELECT appid FROM achievement_sync_demand WHERE account_id = ?
                     UNION
                     SELECT appid FROM review_sync_demand WHERE account_id = ?
+                    UNION
+                    SELECT o.appid FROM group_ownership_current o
+                    JOIN group_profiles gp ON gp.id = o.profile_id
+                    WHERE gp.account_id = ?
+                    UNION
+                    SELECT f.appid FROM group_family_current f
+                    JOIN group_profiles gp ON gp.id = f.recipient_profile_id
+                    WHERE gp.account_id = ?
+                    UNION
+                    SELECT f.appid FROM group_family_current f
+                    JOIN group_profiles gp ON gp.id = f.source_profile_id
+                    WHERE gp.account_id = ?
+                    UNION
+                    SELECT x.appid FROM group_app_assertion_current x
+                    JOIN group_profiles gp ON gp.id = x.profile_id
+                    WHERE gp.account_id = ?
                     """,
-                    (account_id, account_id, account_id, account_id, account_id, account_id, account_id),
+                    (account_id,) * 11,
                 )
             )
             (
@@ -7506,8 +8069,24 @@ class Storage:
                         UNION
                         SELECT appid FROM achievement_sync_demand
                         WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT o.appid FROM group_ownership_current o
+                        JOIN group_profiles gp ON gp.id = o.profile_id
+                        WHERE gp.account_id IN ({id_placeholders})
+                        UNION
+                        SELECT f.appid FROM group_family_current f
+                        JOIN group_profiles gp ON gp.id = f.recipient_profile_id
+                        WHERE gp.account_id IN ({id_placeholders})
+                        UNION
+                        SELECT f.appid FROM group_family_current f
+                        JOIN group_profiles gp ON gp.id = f.source_profile_id
+                        WHERE gp.account_id IN ({id_placeholders})
+                        UNION
+                        SELECT x.appid FROM group_app_assertion_current x
+                        JOIN group_profiles gp ON gp.id = x.profile_id
+                        WHERE gp.account_id IN ({id_placeholders})
                         """,
-                        (*account_ids, *account_ids, *account_ids, *account_ids, *account_ids, *account_ids),
+                        account_ids * 10,
                     )
                 )
 
@@ -8589,6 +9168,18 @@ class Storage:
                   WHERE explicit_trait_current.appid = steam_apps.appid
               )
               AND NOT EXISTS (
+                  SELECT 1 FROM group_ownership_current
+                  WHERE group_ownership_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM group_family_current
+                  WHERE group_family_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM group_app_assertion_current
+                  WHERE group_app_assertion_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
                   SELECT 1 FROM activity_observations
                   WHERE activity_observations.appid = steam_apps.appid
               )
@@ -8906,6 +9497,12 @@ __all__ = [
     "ExplicitFeedback",
     "ExplicitTrait",
     "FeedbackChange",
+    "GROUP_PROFILE_DISCLOSURE_VERSION",
+    "GroupAppAssertion",
+    "GroupDataDeletion",
+    "GroupFamilyAssertion",
+    "GroupOwnershipAssertion",
+    "GroupProfile",
     "InstalledGame",
     "InstalledObservation",
     "InstalledSnapshot",
@@ -8954,6 +9551,65 @@ def _sync_run(row: sqlite3.Row) -> SyncRun:
     values = dict(row)
     values["promoted"] = bool(values["promoted"])
     return SyncRun(**values)
+
+
+def _group_profile(row: sqlite3.Row) -> GroupProfile:
+    return GroupProfile(
+        int(row["id"]),
+        MemberRef(row["kind"], row["resolved_alias"]),
+        row["disclosure_version"],
+        bool(row["backups_acknowledged"]),
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _validate_group_disclosure(version: str, backups_acknowledged: bool) -> None:
+    if version != GROUP_PROFILE_DISCLOSURE_VERSION:
+        raise ValueError("synthetic/group disclosure version is not current")
+    if backups_acknowledged is not True:
+        raise ValueError("synthetic/group storage requires backup acknowledgment")
+
+
+def _group_fact_key(fact: str) -> tuple[str, str]:
+    if fact == "players:min":
+        return "players_min", ""
+    if fact == "players:max":
+        return "players_max", ""
+    for prefix, kind in (("trait:", "trait"), ("policy:", "policy")):
+        if isinstance(fact, str) and fact.startswith(prefix):
+            slug = fact[len(prefix) :]
+            _user_trait(slug)
+            return kind, slug
+    raise ValueError("group app fact is invalid")
+
+
+def _group_app_fact(
+    fact: str, value: int | str
+) -> tuple[str, str, str, int | None]:
+    kind, slug = _group_fact_key(fact)
+    if kind in {"players_min", "players_max"}:
+        if value == "unknown":
+            return kind, slug, "unknown", None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= (1 << 32) - 1
+        ):
+            raise ValueError("player-limit assertion is invalid")
+        return kind, slug, "known", value
+    if value not in {"present", "absent", "unknown"}:
+        raise ValueError("trait/policy assertion state is invalid")
+    return kind, slug, str(value), None
+
+
+def _group_fact_name(kind: str, slug: str) -> str:
+    return {
+        "players_min": "players:min",
+        "players_max": "players:max",
+        "trait": f"trait:{slug}",
+        "policy": f"policy:{slug}",
+    }[kind]
 
 
 def _account_alias(value: str) -> str:
