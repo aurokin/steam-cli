@@ -591,6 +591,8 @@ class SafeMinimumEvaluator:
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
         system_observed_at: datetime | None,
+        system_snapshot_id: str | int | None,
+        system_promoted_run_id: str | int | None,
         system_profile_freshness: str,
         storage_available_freshness: str,
         generated_at: datetime,
@@ -600,6 +602,8 @@ class SafeMinimumEvaluator:
             system_profile,
             declared_observed_at,
             system_observed_at,
+            system_snapshot_id,
+            system_promoted_run_id,
             system_profile_freshness,
             storage_available_freshness,
             generated_at,
@@ -763,6 +767,71 @@ def test_default_evaluator_has_compatible_path_when_opaque_models_are_absent() -
     item = result(snapshot=declared(10, payload=payload))
     assert item.compatibility == "compatible"
     assert next(g for g in item.gates if g.name == "meets_minimum").effective == "pass"
+
+
+def test_derived_minimum_lineage_binds_exact_promoted_system_evidence() -> None:
+    payload = {
+        **facts(10),
+        "requirements": [
+            {
+                "platform": "windows",
+                "state": "declared",
+                "minimum": (
+                    "Memory: 8 GiB RAM\nStorage: 10 GiB available space\n"
+                    "Architecture: x86_64"
+                ),
+                "recommended": None,
+            }
+        ],
+    }
+    base = system()
+    first = SystemSnapshot(
+        base.target_key,
+        base.profile,
+        base.observed_at,
+        "PRIVATE-SNAPSHOT-ONE",
+        base.observed_at,
+        "complete",
+        101,
+        "PRIVATE-PROMOTED-ONE",
+    )
+    second = SystemSnapshot(
+        base.target_key,
+        base.profile,
+        base.observed_at,
+        "PRIVATE-SNAPSHOT-TWO",
+        base.observed_at,
+        "complete",
+        202,
+        "PRIVATE-PROMOTED-TWO",
+    )
+
+    first_item = result(snapshot=declared(10, payload=payload), system_snapshot=first)
+    second_item = result(snapshot=declared(10, payload=payload), system_snapshot=second)
+    first_ids = {
+        evidence_id
+        for gate in first_item.gates
+        if gate.name in {"architecture", "meets_minimum"}
+        for evidence_id in gate.original_evidence_ids
+    }
+    second_ids = {
+        evidence_id
+        for gate in second_item.gates
+        if gate.name in {"architecture", "meets_minimum"}
+        for evidence_id in gate.original_evidence_ids
+    }
+
+    assert first_ids
+    assert second_ids
+    assert first_ids.isdisjoint(second_ids)
+    rendered = json.dumps((asdict(first_item), asdict(second_item)), default=str)
+    for opaque_id in (
+        "PRIVATE-SNAPSHOT-ONE",
+        "PRIVATE-SNAPSHOT-TWO",
+        "PRIVATE-PROMOTED-ONE",
+        "PRIVATE-PROMOTED-TWO",
+    ):
+        assert opaque_id not in rendered
 
 
 def test_real_system_storage_role_is_used_but_not_a_compatibility_failure_for_installed_app() -> None:

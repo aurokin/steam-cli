@@ -188,6 +188,8 @@ class MinimumEvaluator(Protocol):
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
         system_observed_at: datetime | None,
+        system_snapshot_id: str | int | None,
+        system_promoted_run_id: str | int | None,
         system_profile_freshness: Freshness,
         storage_available_freshness: Freshness,
         generated_at: datetime,
@@ -206,6 +208,8 @@ class ConservativeMinimumEvaluator:
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
         system_observed_at: datetime | None,
+        system_snapshot_id: str | int | None,
+        system_promoted_run_id: str | int | None,
         system_profile_freshness: Freshness,
         storage_available_freshness: Freshness,
         generated_at: datetime,
@@ -231,6 +235,8 @@ class ConservativeMinimumEvaluator:
             observed,
             _worst_freshness(declared_freshness, system_profile_freshness),
             "minimum-architecture",
+            system_snapshot_id,
+            system_promoted_run_id,
         )
         # A current free-space failure is useful only for fifteen minutes when
         # it is decisive.  If a non-storage component independently fails, the
@@ -261,6 +267,8 @@ class ConservativeMinimumEvaluator:
             observed,
             minimum_freshness,
             "minimum-overall",
+            system_snapshot_id,
+            system_promoted_run_id,
         )
         without_storage = _comparison_evidence(
             without_storage_state,
@@ -269,6 +277,8 @@ class ConservativeMinimumEvaluator:
             observed,
             _worst_freshness(declared_freshness, system_profile_freshness),
             "minimum-overall-without-storage",
+            system_snapshot_id,
+            system_promoted_run_id,
         )
         return MinimumEvaluation(architecture, minimum, without_storage)
 
@@ -419,6 +429,10 @@ def _candidate(
             system_profile=None if system is None else system.profile,
             declared_observed_at=declared_at,
             system_observed_at=None if system is None else system.observed_at,
+            system_snapshot_id=None if system is None else system.snapshot_id,
+            system_promoted_run_id=(
+                None if system is None else system.promoted_sync_run_id
+            ),
             system_profile_freshness=_system_freshness(
                 system, generated_at, SYSTEM_FRESH
             ),
@@ -883,8 +897,20 @@ def _comparison_evidence(
     observed_at: datetime,
     freshness: Freshness,
     kind: str,
+    system_snapshot_id: str | int | None,
+    system_promoted_run_id: str | int | None,
 ) -> PrimitiveEvidence:
-    evidence_id = _lineage(kind, appid, observed_at, state, reason)
+    # Opaque source identities bind this derivation to the exact promoted
+    # system evidence.  They are hashed into lineage and never serialized.
+    evidence_id = _lineage(
+        kind,
+        appid,
+        observed_at,
+        state,
+        reason,
+        system_snapshot_id,
+        system_promoted_run_id,
+    )
     if state == "unknown":
         return PrimitiveEvidence(
             "unknown",
