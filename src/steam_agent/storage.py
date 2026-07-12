@@ -2886,10 +2886,11 @@ class Storage:
                         """SELECT 1 FROM declared_app_sync_demand d
                            JOIN sync_runs r ON r.id=d.sync_run_id
                            WHERE d.appid=? AND d.country=? AND d.language=?
-                             AND d.evaluated=1 AND d.observed_at>=?
+                             AND d.evaluated=1
+                             AND d.observed_at>=? AND d.observed_at<=?
                              AND d.state='not_found'
                            ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
-                        (appid, country, language, negative_cutoff),
+                        (appid, country, language, negative_cutoff, timestamp),
                     ).fetchone()
                     if current is not None:
                         skip_codes[appid] = "FRESH_LAST_GOOD"
@@ -3228,12 +3229,18 @@ class Storage:
                      completed_at=?, error_code=?, error_detail=NULL WHERE id=?""",
                 (status, promoted, evaluated, timestamp, error_code, sync_run_id),
             )
+            finished_row = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id=?", (sync_run_id,)
+            ).fetchone()
+            if finished_row is None:
+                raise InvalidSyncTransition("declared-app sync disappeared")
+            finished = _sync_run(finished_row)
             self._prune_declared_apps(timestamp)
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()
             raise
-        return self.get_sync_run(sync_run_id)
+        return finished
 
     def read_declared_app_snapshot(
         self,
@@ -3480,11 +3487,7 @@ class Storage:
         )
         self._connection.execute(
             """DELETE FROM sync_runs
-               WHERE capability='compatibility.declared.read' AND started_at < ?
-                 AND NOT EXISTS (
-                   SELECT 1 FROM declared_app_current c
-                   WHERE c.promoted_sync_run_id=sync_runs.id
-                 )""",
+               WHERE capability='compatibility.declared.read' AND started_at < ?""",
             (cutoff,),
         )
 

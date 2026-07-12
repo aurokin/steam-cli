@@ -355,6 +355,27 @@ def test_success_false_is_bounded_negative_cache(
     assert storage.finish_declared_app_sync(cached.id, completed_at=T2).status == "complete"
 
 
+def test_future_not_found_observation_is_not_used_by_earlier_sync_clock(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    future, _, _ = begin(storage, account_id, [570], at=T0)
+    storage.record_declared_app_result(
+        future.id,
+        account_id=account_id,
+        appid=570,
+        state="not_found",
+        observed_at=T2,
+    )
+    storage.finish_declared_app_sync(future.id, completed_at=T2)
+
+    earlier, candidates, targeted = begin(storage, account_id, [570], at=T1)
+
+    assert candidates == (570,)
+    assert targeted == (570,)
+    assert demand_rows(storage, earlier.id)[0]["error_code"] is None
+
+
 def test_not_found_refresh_preserves_last_good_as_partial_stale_evidence(
     configured: tuple[Storage, int],
 ) -> None:
@@ -624,6 +645,63 @@ def test_opening_storage_prunes_expired_declared_private_lineage(
         ).fetchone()[0] == 0
         assert reopened._connection.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM declared_app_sync_demand"
+        ).fetchone()[0] == 0
+
+
+def test_retention_prunes_old_private_run_while_preserving_fresh_public_fact(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "steam-agent.sqlite3"
+    started = "2026-06-01T00:00:00Z"
+    observed = "2026-07-20T00:00:00Z"
+    pruned_at = "2026-08-01T00:00:00Z"
+    with Storage(path) as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Gaming PC", "linux", "x86_64"),
+            observed_at=started,
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=started,
+        )
+        storage.record_compatibility_data_consent(
+            account_id=account.id,
+            disclosure_version="m5-v1",
+            accepted_at=started,
+            backups_acknowledged=True,
+        )
+        run, _, _ = begin(storage, account.id, [400], at=started)
+        storage.record_declared_app_result(
+            run.id,
+            account_id=account.id,
+            appid=400,
+            state="ready",
+            facts=payload(400),
+            observed_at=observed,
+        )
+        storage.finish_declared_app_sync(run.id, completed_at=observed)
+
+        storage._prune_declared_apps(pruned_at)  # noqa: SLF001
+
+        current = storage._connection.execute(  # noqa: SLF001
+            """SELECT observed_at,promoted_sync_run_id
+               FROM declared_app_current WHERE appid=400"""
+        ).fetchone()
+        assert dict(current) == {
+            "observed_at": observed,
+            "promoted_sync_run_id": None,
+        }
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM sync_runs WHERE id=?", (run.id,)
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_sync_demand WHERE sync_run_id=?",
+            (run.id,),
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_observations WHERE sync_run_id=?",
+            (run.id,),
         ).fetchone()[0] == 0
 
 
