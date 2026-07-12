@@ -33,7 +33,7 @@ def test_all_common_question_scenarios_validate_and_use_synthetic_canaries() -> 
         assert scenario_id not in seen_ids
         seen_ids.add(scenario_id)
         assert path.name.startswith(f"{scenario_id}-")
-        assert scenario["status"] == ("active" if scenario["milestone"] == "M3" else "proposed")
+        assert scenario["status"] == "active"
 
         canaries = tuple(scenario["privacy_canaries"].values())
         assert all(value.startswith("EVAL_CANARY_") for value in canaries)

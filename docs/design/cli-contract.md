@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: M1, M2, and M3 contracts implemented and accepted
+Status: M1, M2, and M3 accepted; M4 recommendation contract active
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -376,6 +376,27 @@ not leave a permanent in-progress result.
   unavailable completeness state, rather than a nonzero exit, when no default
   Steam installation is found.
 
+## Implemented M4 recommendation query
+
+```text
+steam-agent recommendations query --account ALIAS [--machine local] [--scope owned] --recipe resume/0.1|finishability/0.1|preference-fit/0.1 [--time-minutes N] [--require installed=true|false] [--require user:<slug>=true|false] [--unknown include|exclude] [--override appid:N:<constraint>=pass|fail|unknown] [--explain] [--format json|table]
+```
+
+The only accepted candidate scope is `owned`, which is also the default. The
+command reads visible-owned last-good candidates, the selected machine's
+installed last-good projection, catalog classification, activity,
+subject-consistent achievement summaries, and explicit feedback and rules in
+one SQLite transaction. It performs no refresh, credential resolution, or
+write. Known non-games fail the `game` gate; an unobserved classification is
+`unknown` and follows the explicit unknown policy.
+
+Requirements and overrides are bounded, exact-match expressions. Duplicate or
+malformed expressions are rejected. Every result retains original and
+effective gate states, component inputs and points, evidence lineage, factors,
+tradeoffs, unknowns, freshness, confidence, and completeness under schema
+`recommendations/0.1`. Missing titles are allowed; SteamID64, internal account
+IDs, secrets, and local filesystem paths are not returned.
+
 ## Exploratory future command shape
 
 A composable vocabulary scales better than one command per natural-language
@@ -390,7 +411,6 @@ steam-agent compatibility assess <appid...> --system <profile>
 steam-agent group query --members <profiles...> --ownership all
 steam-agent achievements query --state near-complete
 steam-agent profile show|set|infer
-steam-agent feedback rate|avoid|finish|abandon|snooze
 steam-agent evidence show <evidence-id>
 ```
 

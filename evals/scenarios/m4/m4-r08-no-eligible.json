@@ -1,11 +1,11 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m4-r08", "status": "proposed", "milestone": "M4",
+  "schema_version": "steam-agent-eval/0.1", "id": "m4-r08", "status": "active", "milestone": "M4",
   "question_family": "no eligible recommendation", "tags": ["empty", "hard-constraint", "truthfulness"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Every candidate fails at least one explicit installed, snooze, or feature gate.", "facts": [{"subject": "synthetic:appid:1801", "state": "uninstalled"}, {"subject": "synthetic:appid:1802", "state": "active_snooze"}, {"subject": "synthetic:appid:1803", "state": "required_feature_fail"}]},
   "conversation": {"user": ["What can I play now under all these constraints?"], "paraphrase": "Return nothing if no game actually qualifies."},
   "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "installed=true", "--require", "user:controller=true"]}], "prohibited": ["sync", "relax constraints", "invent candidate"]},
-  "deterministic_oracle": {"recipe_or_contract": "M4 eligibility proposed", "assertions": [
-    {"path": "$.eligible", "operator": "equals", "expected": []}, {"path": "$.excluded[*].appid", "operator": "ordered_equals", "expected": [1801, 1802, 1803]}, {"path": "$.completeness", "operator": "equals", "expected": "complete"}
+  "deterministic_oracle": {"recipe_or_contract": "recommendations/0.1 eligibility", "assertions": [
+    {"path": "$.data.eligible", "operator": "equals", "expected": []}, {"path": "$.data.excluded[*].appid", "operator": "ordered_equals", "expected": [1801, 1802, 1803]}, {"path": "$.completeness.status", "operator": "equals", "expected": "complete"}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "truthful-empty", "weight": 10, "requirement": "Return no recommendation rather than relaxing a hard gate.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "useful-empty", "weight": 3, "requirement": "Explain why none qualify without silently changing the request."}]},

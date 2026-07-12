@@ -73,6 +73,7 @@ def candidate(
     return RecommendationCandidate(
         appid, f"Game {appid}", owned, installed, act, achievements,
         feedback() if fb is None else fb,
+        is_game=True,
     )
 
 

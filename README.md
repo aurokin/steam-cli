@@ -245,6 +245,25 @@ and typed missing/unsynchronized states. See the
 [M3 execution plan](docs/design/m3-execution.md) for the accepted evidence and
 scope boundary.
 
+## M4 next-to-play recommendations
+
+M4 recommendation queries are cache-only and deterministic:
+
+```text
+uv run steam-agent recommendations query --account primary --recipe resume/0.1
+uv run steam-agent recommendations query --account primary --recipe finishability/0.1 --time-minutes 360 --unknown include
+uv run steam-agent recommendations query --account primary --recipe preference-fit/0.1 --require installed=true --explain --format table
+```
+
+The candidate scope is the visible-owned last-good projection. A query reads
+owned, installed, catalog classification, activity, achievement summary, and
+explicit feedback/rules in one transaction without network access or secret
+resolution. Hard gates remain pass, fail, or unknown; temporary overrides show
+both original and effective state and are never persisted. Known non-games are
+excluded, while missing classification remains explicit. Results use the
+versioned `recommendations/0.1` schema and preserve score components, factors,
+tradeoffs, lineage, freshness, confidence, and completeness.
+
 The current working direction is:
 
 ```text

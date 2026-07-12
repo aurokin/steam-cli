@@ -5,8 +5,8 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 
 - `schema/scenario-0.1.json` defines the scenario format.
 - `scenarios/m3/` covers accepted deal-question behavior.
-- `scenarios/m4/` proposes recommendation questions for promotion as M4
-  command and recipe contracts are accepted.
+- `scenarios/m4/` contains active deterministic recommendation questions for
+  the accepted `recommendations/0.1` command and recipe contracts.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git.
 

@@ -155,7 +155,7 @@ class AchievementEvidence:
             if self.unlocked is None or self.total is None:
                 raise ValueError("ready achievements require unlocked and total")
             _int(self.unlocked, name="unlocked", maximum=MAX_APPID)
-            _int(self.total, name="total", minimum=1, maximum=MAX_APPID)
+            _int(self.total, name="total", minimum=0, maximum=MAX_APPID)
             if self.unlocked > self.total:
                 raise ValueError("unlocked cannot exceed total")
             if self.observed_at is None:
@@ -168,7 +168,7 @@ class AchievementEvidence:
     def ratio_bps(self) -> int | None:
         if self.state != "ready" or self.unlocked is None or self.total is None:
             return None
-        return self.unlocked * 10_000 // self.total
+        return None if self.total == 0 else self.unlocked * 10_000 // self.total
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +194,11 @@ class ExplicitFeedback:
     remaining_minutes: int | None = None
     traits: tuple[TraitAssertion, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    rating_evidence_ids: tuple[str, ...] = ()
+    play_state_evidence_ids: tuple[str, ...] = ()
+    snooze_evidence_ids: tuple[str, ...] = ()
+    minimum_session_evidence_ids: tuple[str, ...] = ()
+    remaining_evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.rating not in {None, "liked", "disliked", "neutral"}:
@@ -215,6 +220,11 @@ class ExplicitFeedback:
             raise ValueError("traits must be unique")
         object.__setattr__(self, "traits", tuple(sorted(self.traits, key=lambda item: item.trait)))
         object.__setattr__(self, "evidence_ids", _ids(self.evidence_ids))
+        for name in (
+            "rating_evidence_ids", "play_state_evidence_ids", "snooze_evidence_ids",
+            "minimum_session_evidence_ids", "remaining_evidence_ids",
+        ):
+            object.__setattr__(self, name, _ids(getattr(self, name)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +260,8 @@ class RecommendationCandidate:
     identity_evidence_ids: tuple[str, ...] = ()
     owned_evidence_ids: tuple[str, ...] = ()
     installed_evidence_ids: tuple[str, ...] = ()
+    is_game: bool | None = None
+    classification_evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _int(self.appid, name="appid", minimum=1, maximum=MAX_APPID)
@@ -260,6 +272,8 @@ class RecommendationCandidate:
             raise ValueError("owned must be true, false, or unknown")
         if self.installed is not None and not isinstance(self.installed, bool):
             raise ValueError("installed must be true, false, or unknown")
+        if self.is_game is not None and not isinstance(self.is_game, bool):
+            raise ValueError("is_game must be true, false, or unknown")
         if self.activity is not None and not isinstance(self.activity, ActivityEvidence):
             raise ValueError("activity must be ActivityEvidence or unknown")
         if self.achievements is not None and not isinstance(self.achievements, AchievementEvidence):
@@ -269,6 +283,7 @@ class RecommendationCandidate:
         object.__setattr__(self, "identity_evidence_ids", _ids(self.identity_evidence_ids))
         object.__setattr__(self, "owned_evidence_ids", _ids(self.owned_evidence_ids))
         object.__setattr__(self, "installed_evidence_ids", _ids(self.installed_evidence_ids))
+        object.__setattr__(self, "classification_evidence_ids", _ids(self.classification_evidence_ids))
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,9 +526,11 @@ def _gate(name: str, original: GateState, evidence_ids: tuple[str, ...], candida
 
 def _gates(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], context: RecommendationContext) -> tuple[GateResult, ...]:
     feedback_ids = candidate.feedback.evidence_ids
+    snooze_ids = candidate.feedback.snooze_evidence_ids or feedback_ids
     raw: list[tuple[str, GateState, tuple[str, ...]]] = [
         ("owned", _bool_gate(candidate.owned, True), candidate.owned_evidence_ids),
-        ("snoozed", "fail" if candidate.feedback.snoozed_until is not None and candidate.feedback.snoozed_until > context.now else "pass", feedback_ids),
+        ("game", _bool_gate(candidate.is_game, True), candidate.classification_evidence_ids),
+        ("snoozed", "fail" if candidate.feedback.snoozed_until is not None and candidate.feedback.snoozed_until > context.now else "pass", snooze_ids),
     ]
     if context.time_minutes is not None:
         minimum_session = candidate.feedback.minimum_session_minutes
@@ -522,7 +539,7 @@ def _gates(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], c
             "unknown" if minimum_session is None else (
                 "pass" if minimum_session <= context.time_minutes else "fail"
             ),
-            feedback_ids,
+            candidate.feedback.minimum_session_evidence_ids or feedback_ids,
         ))
     trait_map = {item.trait: item for item in candidate.feedback.traits}
     for requirement in context.requirements:
@@ -543,10 +560,10 @@ def _gates(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], c
     if context.recipe in {RESUME_RECIPE, FINISHABILITY_RECIPE}:
         # This gate means "not explicitly marked finished".  An unset local
         # state is therefore a pass, not an inference that play is unfinished.
-        raw.append(("not_finished", "fail" if candidate.feedback.play_state == "finished" else "pass", feedback_ids))
+        raw.append(("not_finished", "fail" if candidate.feedback.play_state == "finished" else "pass", candidate.feedback.play_state_evidence_ids or feedback_ids))
     if context.recipe == FINISHABILITY_RECIPE and context.time_minutes is not None:
         remaining = candidate.feedback.remaining_minutes
-        raw.append(("remaining_within_time", "unknown" if remaining is None else ("pass" if remaining <= context.time_minutes else "fail"), feedback_ids))
+        raw.append(("remaining_within_time", "unknown" if remaining is None else ("pass" if remaining <= context.time_minutes else "fail"), candidate.feedback.remaining_evidence_ids or feedback_ids))
     names = [name for name, _, _ in raw]
     override_names = {item.constraint for item in context.overrides if item.appid == candidate.appid}
     if not override_names.issubset(names):
@@ -582,14 +599,14 @@ def _components(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ..
     rating_points = {"liked": PREFERENCE_LIKED, "disliked": PREFERENCE_DISLIKED, "neutral": 0}
     items.append(_component(
         "explicit_like" if feedback.rating == "liked" else "explicit_dislike" if feedback.rating == "disliked" else "explicit_rating",
-        feedback.rating, feedback.evidence_ids,
+        feedback.rating, feedback.rating_evidence_ids or feedback.evidence_ids,
         None if feedback.rating is None else rating_points[feedback.rating],
         "unknown" if feedback.rating is None else "applied", "explicit_user",
     ))
     play_points = {"finished": PREFERENCE_FINISHED, "user_abandoned": PREFERENCE_ABANDONED, "active": 0}
     items.append(_component(
         "user_abandoned" if feedback.play_state == "user_abandoned" else "explicit_finished" if feedback.play_state == "finished" else "explicit_play_state",
-        feedback.play_state, feedback.evidence_ids,
+        feedback.play_state, feedback.play_state_evidence_ids or feedback.evidence_ids,
         None if feedback.play_state is None else play_points[feedback.play_state],
         "unknown" if feedback.play_state is None else "applied", "explicit_user",
     ))
@@ -628,6 +645,8 @@ def _activity_state(activity: ActivityEvidence | None) -> ComponentState:
 
 def _achievement_component_state(achievement: AchievementEvidence | None) -> ComponentState:
     if achievement is None or achievement.state != "ready":
+        return "unknown"
+    if achievement.total == 0:
         return "unknown"
     if achievement.freshness == "fresh":
         return "applied"
@@ -690,7 +709,7 @@ def _finish_components(candidate: RecommendationCandidate, context: Recommendati
     if astate == "applied":
         apoints = 0 if ratio is None else ratio * FINISH_ACHIEVEMENT_PROGRESS // 10_000
     return [
-        _component("explicit_remaining_estimate", remaining, candidate.feedback.evidence_ids, points, "unknown" if remaining is None else "applied", "explicit_user"),
+        _component("explicit_remaining_estimate", remaining, candidate.feedback.remaining_evidence_ids or candidate.feedback.evidence_ids, points, "unknown" if remaining is None else "applied", "explicit_user"),
         _component("achievement_progress_weak", ratio, () if achievement is None else achievement.evidence_ids, apoints, astate, "achievement", "achievement_ratio_is_weak_evidence_not_completion"),
     ]
 

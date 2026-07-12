@@ -175,6 +175,18 @@ def smoke(wheel: Path) -> None:
             for option in ("--scope", "--appid", "--max-items", "--acknowledge-local-storage")
         ):
             raise RuntimeError("installed help does not expose M4 activity contracts")
+        recommendations_help = _run(
+            [str(executable), "recommendations", "query", "--help"]
+        )
+        if not all(
+            option in recommendations_help.stdout
+            for option in (
+                "--account", "--machine", "--scope", "--recipe",
+                "--time-minutes", "--require", "--unknown", "--override",
+                "--explain", "--format",
+            )
+        ):
+            raise RuntimeError("installed help does not expose recommendation contracts")
 
         data_dir = root / "data"
         query = [
@@ -195,6 +207,22 @@ def smoke(wheel: Path) -> None:
             or first.get("data", {}).get("empty") is not False
         ):
             raise RuntimeError("fresh-profile wishlist truth state is invalid")
+        recommendation = json.loads(
+            _run(
+                [
+                    str(executable), "--data-dir", str(data_dir),
+                    "recommendations", "query", "--account", "primary",
+                    "--recipe", "resume/0.1",
+                ]
+            ).stdout
+        )
+        if (
+            recommendation.get("completeness", {}).get("status") != "unavailable"
+            or recommendation.get("completeness", {}).get("missing_capabilities")
+            != ["account.identity"]
+            or recommendation.get("data", {}).get("empty") is not False
+        ):
+            raise RuntimeError("fresh-profile recommendation truth state is invalid")
 
         database = data_dir / "steam-agent.sqlite3"
         before = _versions(database)

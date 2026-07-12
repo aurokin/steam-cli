@@ -35,8 +35,8 @@ prompts, live-account runs, and judge calibration remain opt-in follow-up work.
    implement a judge or depend on a model API.
 
 The scenario corpus under [`evals/`](../../evals/) represents these layers
-explicitly. M3 cases are active descriptions of accepted behavior. M4 cases are
-proposed until their command and recipe contracts exist.
+explicitly. M3 and M4 cases are active descriptions of their accepted CLI and
+deterministic recipe behavior.
 
 ## Metrics
 

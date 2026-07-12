@@ -88,6 +88,8 @@ from steam_agent.activity import (
     sync_activity,
     sync_achievements,
 )
+from steam_agent.recommendations import ConstraintOverride, Requirement
+from steam_agent.recommendation_query import build_recommendation_query
 from steam_agent.steam_activity_api import SteamActivityApiClient
 
 
@@ -290,6 +292,32 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("official", "keyshop", "unknown"),
         default="official",
     )
+
+    recommendations = commands.add_parser(
+        "recommendations", help="Query deterministic cached play recommendations."
+    )
+    recommendation_commands = recommendations.add_subparsers(
+        dest="recommendations_command", required=True
+    )
+    recommendation_query = recommendation_commands.add_parser(
+        "query", help="Rank visible-owned games from one cached evidence snapshot."
+    )
+    _add_leaf_format(recommendation_query)
+    recommendation_query.add_argument("--account", required=True)
+    recommendation_query.add_argument("--machine", default="local")
+    recommendation_query.add_argument("--scope", choices=("owned",), default="owned")
+    recommendation_query.add_argument(
+        "--recipe",
+        choices=("resume/0.1", "finishability/0.1", "preference-fit/0.1"),
+        required=True,
+    )
+    recommendation_query.add_argument("--time-minutes", type=int)
+    recommendation_query.add_argument("--require", action="append", default=[])
+    recommendation_query.add_argument(
+        "--unknown", choices=("include", "exclude"), default="exclude"
+    )
+    recommendation_query.add_argument("--override", action="append", default=[])
+    recommendation_query.add_argument("--explain", action="store_true")
 
     activity = commands.add_parser("activity", help="Query cached activity evidence.")
     activity_commands = activity.add_subparsers(dest="activity_command", required=True)
@@ -783,6 +811,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
+    if args.command == "recommendations":
+        return _dispatch_recommendations_query(args, database_path)
     if args.command in {"activity", "achievements"}:
         return _dispatch_activity(args, database_path)
     if args.command == "accounts":
@@ -1101,6 +1131,225 @@ def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
         context=result["context"],  # type: ignore[arg-type]
         completeness_value=result["completeness"],  # type: ignore[arg-type]
         data=result["data"],  # type: ignore[arg-type]
+    )
+
+
+_RECOMMEND_REQUIREMENT = re.compile(
+    r"(installed|user:[a-z0-9](?:[a-z0-9._-]{0,57}[a-z0-9])?)=(true|false)\Z"
+)
+_RECOMMEND_OVERRIDE = re.compile(
+    r"appid:([1-9][0-9]{0,9}):([a-z][a-z0-9:._-]{0,126})=(pass|fail|unknown)\Z"
+)
+_MAX_RECOMMEND_FILTERS = 32
+
+
+def _recommendation_filters(
+    args: argparse.Namespace,
+) -> tuple[tuple[Requirement, ...], tuple[ConstraintOverride, ...]]:
+    if args.time_minutes is not None and not 0 <= args.time_minutes <= (1 << 32) - 1:
+        raise ValueError("time-minutes is out of range")
+    if len(args.require) > _MAX_RECOMMEND_FILTERS or len(args.override) > _MAX_RECOMMEND_FILTERS:
+        raise ValueError("too many recommendation filters")
+    requirements: list[Requirement] = []
+    for expression in args.require:
+        if len(expression) > 128 or (match := _RECOMMEND_REQUIREMENT.fullmatch(expression)) is None:
+            raise ValueError("requirement expression is invalid")
+        requirements.append(Requirement(match.group(1), match.group(2) == "true"))
+    overrides: list[ConstraintOverride] = []
+    for expression in args.override:
+        if len(expression) > 160 or (match := _RECOMMEND_OVERRIDE.fullmatch(expression)) is None:
+            raise ValueError("override expression is invalid")
+        appid = int(match.group(1))
+        if appid > (1 << 32) - 1:
+            raise ValueError("override AppID is out of range")
+        overrides.append(ConstraintOverride(appid, match.group(2), match.group(3)))
+    if len({item.name for item in requirements}) != len(requirements):
+        raise ValueError("duplicate requirements are invalid")
+    if len({(item.appid, item.constraint) for item in overrides}) != len(overrides):
+        raise ValueError("duplicate overrides are invalid")
+    return tuple(requirements), tuple(overrides)
+
+
+def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Path) -> int:
+    generated_at = _utc_now().astimezone(timezone.utc).replace(microsecond=0)
+    if (
+        not isinstance(args.machine, str)
+        or not 1 <= len(args.machine) <= 256
+        or any(ord(character) < 32 for character in args.machine)
+    ):
+        return _emit_error(
+            args,
+            command="recommendations.query",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The recommendation query arguments are invalid.",
+            exit_code=2,
+        )
+    try:
+        requirements, overrides = _recommendation_filters(args)
+    except ValueError:
+        return _emit_error(
+            args,
+            command="recommendations.query",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The recommendation query arguments are invalid.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            return _emit_error(
+                args,
+                command="recommendations.query",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
+        if account is None:
+            return _emit_success(
+                args,
+                command="recommendations.query",
+                generated_at=generated_at,
+                context={
+                    "account_alias": args.account,
+                    "machine_id": args.machine,
+                    "scopes": ["owned"],
+                    "recipe": args.recipe,
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["account.identity"],
+                    warnings=[WarningRecord(ErrorCode.ACCOUNT_NOT_CONFIGURED, "The requested account alias is not configured.")],
+                ),
+                data={
+                    "schema": "recommendations/0.1",
+                    "recipe_version": args.recipe,
+                    "results": [],
+                    "eligible": [],
+                    "conditional": [],
+                    "excluded": [],
+                    "counts": {"eligible": 0, "conditional": 0, "excluded": 0, "total": 0},
+                    "empty": False,
+                },
+            )
+        snapshot = storage.read_recommendation_snapshot(account.id, args.machine)
+    if snapshot.owned.latest_complete is None:
+        return _emit_success(
+            args,
+            command="recommendations.query",
+            generated_at=generated_at,
+            context={
+                "account_alias": account.alias,
+                "machine_id": args.machine,
+                "scopes": ["owned"],
+                "recipe": args.recipe,
+                "identifiers_included": False,
+            },
+            completeness_value=completeness(
+                CompletenessStatus.UNAVAILABLE,
+                missing_capabilities=["owned.visible.read"],
+                warnings=[WarningRecord(ErrorCode.NOT_SYNCED, "Visible-owned games have not been synchronized.")],
+            ),
+            data={
+                "schema": "recommendations/0.1",
+                "recipe_version": args.recipe,
+                "results": [],
+                "eligible": [],
+                "conditional": [],
+                "excluded": [],
+                "counts": {"eligible": 0, "conditional": 0, "excluded": 0, "total": 0},
+                "empty": False,
+            },
+        )
+    try:
+        ranking = build_recommendation_query(
+            snapshot,
+            recipe=args.recipe,
+            now=generated_at,
+            time_minutes=args.time_minutes,
+            requirements=requirements,
+            unknown_policy=args.unknown,
+            overrides=overrides,
+            explain=args.explain,
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command="recommendations.query",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="A recommendation constraint or override is invalid for this candidate set.",
+            exit_code=2,
+        )
+    missing: set[str] = set()
+    stale: set[str] = set()
+    warnings: list[WarningRecord] = []
+    if any(item[1] == "not_observed" for item in snapshot.classifications) or len(snapshot.classifications) < len(snapshot.owned.games):
+        missing.add("catalog.classification")
+    if any(item.name == "installed" for item in requirements) and snapshot.installed.latest_complete is None:
+        missing.add("installed.read")
+    if args.recipe in {"resume/0.1", "preference-fit/0.1"} and snapshot.activity_latest_complete is None:
+        missing.add("activity.read")
+    if args.recipe in {"resume/0.1", "finishability/0.1"} and snapshot.achievement_latest is None:
+        missing.add("achievements.read")
+    if snapshot.owned.latest is not None and snapshot.owned.latest.status != "complete":
+        stale.add("owned.visible.read")
+        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "Recommendations use the last-good visible-owned snapshot."))
+    if snapshot.activity_latest is not None and snapshot.activity_latest.status != "complete":
+        stale.add("activity.read")
+        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "Behavioral factors use the last-good activity snapshot."))
+    if snapshot.installed.latest is not None and snapshot.installed.latest.status != "complete" and any(item.name == "installed" for item in requirements):
+        stale.add("installed.read")
+        warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "The installed constraint uses the last-good machine snapshot."))
+    components = [
+        component
+        for item in ranking["results"]
+        for component in item["components"]
+    ]
+    if any(
+        component["evidence_kind"] == "behavioral"
+        and component["state"] in {"stale", "expired"}
+        for component in components
+    ):
+        stale.add("activity.read")
+    if any(
+        component["evidence_kind"] == "achievement"
+        and component["state"] in {"stale", "expired"}
+        for component in components
+    ):
+        stale.add("achievements.read")
+    status = CompletenessStatus.COMPLETE
+    if ranking["completeness"] == "partial" or missing or stale:
+        status = CompletenessStatus.PARTIAL
+    ranking["empty"] = len(snapshot.owned.games) == 0
+    ranking["snapshots"] = {
+        "owned_last_attempt_status": snapshot.owned.latest.status if snapshot.owned.latest else None,
+        "owned_last_successful_sync_at": snapshot.owned.latest_complete.completed_at,
+        "installed_last_attempt_status": snapshot.installed.latest.status if snapshot.installed.latest else None,
+        "activity_last_attempt_status": snapshot.activity_latest.status if snapshot.activity_latest else None,
+        "achievements_last_attempt_status": snapshot.achievement_latest.status if snapshot.achievement_latest else None,
+    }
+    return _emit_success(
+        args,
+        command="recommendations.query",
+        generated_at=generated_at,
+        context={
+            "account_alias": account.alias,
+            "machine_id": args.machine,
+            "scopes": ["owned"],
+            "recipe": args.recipe,
+            "unknown_policy": args.unknown,
+            "time_minutes": args.time_minutes,
+            "identifiers_included": False,
+            "cache_only": True,
+        },
+        completeness_value=completeness(
+            status,
+            missing_capabilities=sorted(missing),
+            stale_capabilities=sorted(stale),
+            warnings=warnings,
+        ),
+        data=ranking,
     )
 
 
@@ -3939,6 +4188,7 @@ def _command_name(args: argparse.Namespace) -> str:
         "rule_command",
         "activity_command",
         "achievements_command",
+        "recommendations_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -4137,6 +4387,24 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "recommendations.query":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for capability in query_completeness["missing_capabilities"]:
+            _print_table_fields("MISSING_CAPABILITY", capability)
+        for capability in query_completeness["stale_capabilities"]:
+            _print_table_fields("STALE_CAPABILITY", capability)
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields("APPID", "NAME", "ELIGIBILITY", "SCORE", "CONFIDENCE", "UNKNOWNS")
+        for item in envelope["data"]["results"]:
+            _print_table_fields(
+                item["appid"], item["name"], item["eligibility"], item["score"],
+                item["confidence"], ",".join(item["unknowns"]),
+            )
+            if envelope["data"].get("context", {}).get("explain"):
+                _print_table_fields("FACTORS", item["appid"], ",".join(item["positive_factors"]), ",".join(item["negative_factors"]), ",".join(item["tradeoffs"]))
+        return
     if command == "activity.query":
         _print_table_fields("COMPLETENESS", envelope["completeness"]["status"])
         for warning in envelope["completeness"]["warnings"]:

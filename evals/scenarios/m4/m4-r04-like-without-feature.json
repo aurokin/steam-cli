@@ -1,13 +1,13 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m4-r04", "status": "proposed", "milestone": "M4",
+  "schema_version": "steam-agent-eval/0.1", "id": "m4-r04", "status": "active", "milestone": "M4",
   "question_family": "preference with avoidance", "tags": ["explicit-feedback", "feature-rule", "hard-constraint"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Direct positive feedback and an explicit user-namespaced crafting avoidance conflict across candidates.", "facts": [
     {"subject": "synthetic:appid:1401", "state": "high_direct_fit_user:crafting_true"}, {"subject": "synthetic:appid:1402", "state": "moderate_direct_fit_user:crafting_false"}, {"subject": "synthetic:appid:1403", "state": "fit_unknown_user:crafting_unknown"}
   ]},
   "conversation": {"user": ["What should I play that fits my likes but has no crafting?"], "paraphrase": "Respect my no-crafting rule even if another game scores higher."},
   "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "user:crafting=false", "--unknown", "include"]}], "prohibited": ["sync", "semantic tag inference", "feedback mutation"]},
-  "deterministic_oracle": {"recipe_or_contract": "preference-fit/0.1 proposed", "assertions": [
-    {"path": "$.eligible[0].appid", "operator": "equals", "expected": 1402}, {"path": "$.excluded[0].appid", "operator": "equals", "expected": 1401}, {"path": "$.conditional[0].appid", "operator": "equals", "expected": 1403}
+  "deterministic_oracle": {"recipe_or_contract": "preference-fit/0.1", "assertions": [
+    {"path": "$.data.eligible[0].appid", "operator": "equals", "expected": 1402}, {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1401}, {"path": "$.data.conditional[0].appid", "operator": "equals", "expected": 1403}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "avoidance-gate", "weight": 10, "requirement": "Apply explicit feature avoidance before preference score.", "hard_fail": true}, {"id": "no-semantic-inference", "weight": 5, "requirement": "Do not infer unsupported cross-game similarity or traits.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "tradeoff", "weight": 3, "requirement": "Explain the fit-versus-avoidance tradeoff clearly."}]},

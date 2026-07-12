@@ -418,6 +418,7 @@ class ExplicitFeedback:
     updated_at: str | None
     last_event_id: int | None
     traits: tuple[ExplicitTrait, ...]
+    field_event_ids: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -605,6 +606,22 @@ class LibrarySnapshot:
     installed: InstalledSnapshot
     stable_game_ids_by_appid: tuple[tuple[int, str], ...]
     catalog: CatalogSnapshot
+
+
+@dataclass(frozen=True)
+class RecommendationSnapshot:
+    """M4 candidate evidence captured in one read-only SQLite snapshot."""
+
+    owned: OwnedSnapshot
+    installed: InstalledSnapshot
+    activity_items: tuple[Mapping[str, Any], ...]
+    activity_latest: SyncRun | None
+    activity_latest_complete: SyncRun | None
+    achievement_items: tuple[Mapping[str, Any], ...]
+    achievement_latest: SyncRun | None
+    feedback: tuple[ExplicitFeedback, ...]
+    rules: tuple[PreferenceRule, ...]
+    classifications: tuple[tuple[int, str, int], ...]
 
 
 def _timestamp(value: str | datetime) -> str:
@@ -1250,6 +1267,20 @@ class Storage:
                 )
             )
             values = {} if current is None else dict(current)
+            field_event_ids = tuple(
+                (str(item["event_kind"]), int(item["id"]))
+                for item in self._connection.execute(
+                    """SELECT event_kind, MAX(id) AS id
+                       FROM explicit_feedback_events
+                       WHERE account_id = ? AND appid = ? AND trait IS NULL
+                         AND event_kind IN (
+                           'rating', 'play_state', 'snooze',
+                           'minimum_session_minutes', 'remaining_minutes'
+                         )
+                       GROUP BY event_kind ORDER BY event_kind""",
+                    (account_id, current_appid),
+                )
+            )
             output.append(
                 ExplicitFeedback(
                     account_id=account_id,
@@ -1263,6 +1294,7 @@ class Storage:
                     updated_at=values.get("updated_at"),
                     last_event_id=values.get("last_event_id"),
                     traits=traits,
+                    field_event_ids=field_event_ids,
                 )
             )
         return tuple(output)
@@ -4586,6 +4618,91 @@ class Storage:
                 pass
             raise
 
+    def read_recommendation_snapshot(
+        self, account_id: int, machine_id: str
+    ) -> RecommendationSnapshot:
+        """Read all M4 ranking inputs atomically, without pruning or refresh."""
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            self._require_steam_account(account_id)
+            owned = self._read_owned_snapshot(account_id)
+            installed = InstalledSnapshot(
+                games=tuple(self.list_installed(machine_id)),
+                latest=self.latest_sync(capability="installed", machine_id=machine_id),
+                latest_complete=self.latest_sync(
+                    capability="installed", machine_id=machine_id, status="complete"
+                ),
+            )
+            activity_items = tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    """SELECT c.*, a.name FROM activity_current c
+                       JOIN steam_apps a USING(appid)
+                       WHERE c.account_id = ? ORDER BY c.appid""",
+                    (account_id,),
+                )
+            )
+            activity_latest = self.latest_account_sync(
+                capability="activity.read", account_id=account_id
+            )
+            activity_latest_complete = self.latest_account_sync(
+                capability="activity.read", account_id=account_id, status="complete"
+            )
+            achievement_latest = self.latest_account_sync(
+                capability="achievements.read", account_id=account_id
+            )
+            achievement_items = tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    """SELECT d.sync_run_id, d.appid, d.targeted, d.evaluated,
+                              d.state, d.error_code, d.observed_at,
+                              SUM(CASE WHEN p.achieved = 1 THEN 1 ELSE 0 END) AS unlocked,
+                              COUNT(p.api_name) AS total
+                       FROM achievement_sync_demand d
+                       JOIN sync_runs r ON r.id = d.sync_run_id
+                       LEFT JOIN achievement_player_current p
+                         ON p.account_id = d.account_id AND p.appid = d.appid
+                        AND p.promoted_sync_run_id = d.sync_run_id
+                       WHERE d.account_id = ?
+                         AND d.sync_run_id = (
+                           SELECT d2.sync_run_id FROM achievement_sync_demand d2
+                           JOIN sync_runs r2 ON r2.id = d2.sync_run_id
+                           WHERE d2.account_id = d.account_id AND d2.appid = d.appid
+                           ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
+                         )
+                       GROUP BY d.sync_run_id, d.appid, d.targeted, d.evaluated,
+                                d.state, d.error_code, d.observed_at
+                       ORDER BY d.appid""",
+                    (account_id,),
+                )
+            )
+            feedback = self.list_explicit_feedback(account_id)
+            rules = self.list_preference_rules(account_id)
+            classifications = tuple(
+                (int(row["appid"]), str(row["classification"]), int(row["evidence_id"]))
+                for row in self._connection.execute(
+                    """SELECT appid, classification, evidence_id
+                       FROM catalog_subject_current
+                       WHERE account_id = ? AND machine_id = ? ORDER BY appid""",
+                    (account_id, machine_id),
+                )
+            )
+            self._connection.commit()
+            return RecommendationSnapshot(
+                owned, installed, activity_items, activity_latest,
+                activity_latest_complete, achievement_items, achievement_latest,
+                feedback, rules, classifications,
+            )
+        except BaseException:
+            try:
+                self._rollback_or_reopen()
+            except BaseException:
+                pass
+            raise
+
     def delete_steam_account_data(self, account_id: int) -> AccountDataDeletion:
         """Delete one target account while preserving data-profile credentials."""
 
@@ -6370,6 +6487,7 @@ __all__ = [
     "OwnedSnapshotProvenance",
     "ProviderProbeRecord",
     "PreferenceRule",
+    "RecommendationSnapshot",
     "SteamApp",
     "Storage",
     "StorageError",

@@ -28,6 +28,15 @@ also depends on the accepted M3 wishlist and deal boundary. M3 user testing is
 not an M4 prerequisite. The common-question evaluation track in AUR-652 is
 cross-milestone and non-blocking.
 
+AUR-637 is implemented through `recommendations query` and
+`recommendations/0.1`. Its normal-CI tracer constructs a temporary SQLite
+profile, freezes the clock, repeats the query byte-for-byte, changes direct
+feedback, exercises known non-game and unknown classification gates, failed
+last-attempt plus stale last-good evidence, no-eligible and deletion outcomes,
+JSON/table views, strict expressions, and fresh installed-wheel behavior. The
+R01-R10 deterministic eval scenarios are active; natural-language judging
+remains opt-in.
+
 M4 does not add compatibility assessment, group recommendations, broad store
 discovery, full price-event history, Steam actions, or natural-language model
 inference inside the CLI.
