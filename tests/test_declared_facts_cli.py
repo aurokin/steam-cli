@@ -418,6 +418,92 @@ def test_stale_owned_last_good_makes_sync_partial(
     )
 
 
+@pytest.mark.parametrize("superseded", [False, True])
+def test_empty_owned_last_good_retains_stale_or_superseded_completeness(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    superseded: bool,
+) -> None:
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=NOW,
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-visible-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+        complete = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at="2026-07-10T00:00:00Z" if not superseded else NOW,
+        )
+        storage.complete_owned_snapshot(
+            complete.id,
+            (),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=0,
+            expanded_reported_count=0,
+            completed_at=(
+                "2026-07-10T00:00:01Z" if not superseded else NOW
+            ),
+        )
+        if superseded:
+            failed = storage.begin_sync(
+                provider="steam_web_api",
+                capability="owned.visible.read",
+                account_id=account.id,
+                started_at="2026-07-12T12:00:01Z",
+            )
+            storage.finish_owned_sync(
+                failed.id,
+                status="failed",
+                completed_at="2026-07-12T12:00:02Z",
+                error_code="PROVIDER_UNAVAILABLE",
+            )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    code, result, error = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "compatibility",
+        "--scope",
+        "library",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+    )
+
+    assert code == 0
+    assert error == ""
+    assert result["data"]["items"] == []
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["stale_capabilities"] == [
+        "owned.visible.read"
+    ]
+    assert result["completeness"]["warnings"] == [
+        {
+            "code": "STALE_LAST_GOOD",
+            "message": (
+                "Compatibility demand came from a stale or superseded "
+                "last-good visible-owned snapshot."
+            ),
+        }
+    ]
+
+
 def test_keyboard_interrupt_finishes_typed_recoverable_run(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:

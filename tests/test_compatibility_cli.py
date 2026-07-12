@@ -411,6 +411,40 @@ def test_assess_opens_existing_cache_read_only_and_does_not_create_missing_store
     assert not (missing_dir / "steam-agent.sqlite3").exists()
 
 
+def test_assess_outdated_readonly_schema_returns_actionable_typed_error(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        storage._connection.execute(  # noqa: SLF001
+            "DELETE FROM schema_migrations WHERE version = 22"
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 1
+    assert stderr == ""
+    assert value["error"]["code"] == "DATABASE_ERROR"
+    assert "migration" in value["error"]["remediation"]
+    assert "Traceback" not in json.dumps(value)
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -483,6 +517,17 @@ def test_assess_default_json_and_table_remain_compact_and_safe(
     assert code == 0
     assert captured.err == ""
     assert "APPID\tCOMPATIBILITY\tPLAYABLE_NOW\tCOMPLETENESS\tUNKNOWNS" in captured.out
+    reference_lines = [
+        line for line in captured.out.splitlines() if line.startswith("REFERENCE\t")
+    ]
+    assert len(reference_lines) == 4
+    assert {line.split("\t")[2] for line in reference_lines} == {
+        "steam",
+        "steamdb",
+        "protondb",
+        "pcgamingwiki",
+    }
+    assert all("\tmanual_only\tfalse\thttps://" in line for line in reference_lines)
     assert "76561198999999999" not in captured.out
 
 

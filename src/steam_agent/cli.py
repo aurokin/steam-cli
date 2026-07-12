@@ -1486,6 +1486,24 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 exit_code=2,
             )
         if not demanded_appids:
+            empty_status = (
+                CompletenessStatus.PARTIAL
+                if owned_dependency_stale
+                else CompletenessStatus.COMPLETE
+            )
+            empty_warnings = (
+                [
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message=(
+                            "Compatibility demand came from a stale or superseded "
+                            "last-good visible-owned snapshot."
+                        ),
+                    )
+                ]
+                if owned_dependency_stale
+                else []
+            )
             return _emit_success(
                 args,
                 command=command,
@@ -1497,7 +1515,13 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     "scope": "library",
                     "identifiers_included": False,
                 },
-                completeness_value=completeness(CompletenessStatus.COMPLETE),
+                completeness_value=completeness(
+                    empty_status,
+                    stale_capabilities=(
+                        ["owned.visible.read"] if owned_dependency_stale else []
+                    ),
+                    warnings=empty_warnings,
+                ),
                 data={
                     "sync_run_id": None,
                     "sync_status": "complete",
@@ -1828,6 +1852,21 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             target=target,
             requirements=requirements,
             overrides=overrides,
+        )
+    except (sqlite3.DatabaseError, StorageError):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.DATABASE_ERROR,
+            message=(
+                "The local data store is unavailable for a cache-only "
+                "compatibility assessment."
+            ),
+            remediation=(
+                "Run a writable steam-agent command with the current version "
+                "to apply required database migrations and checkpoint pending "
+                "writes, then retry the assessment."
+            ),
         )
     except ValueError:
         return _emit_error(
@@ -5828,6 +5867,17 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
                         gate["original_freshness"],
                         gate["override_name"],
                     )
+        for subject in envelope["data"]["references"]:
+            for reference in subject["items"]:
+                _print_table_fields(
+                    "REFERENCE",
+                    subject["appid"],
+                    reference["provider"],
+                    reference["purpose"],
+                    reference["access_mode"],
+                    reference["automation_supported"],
+                    reference["url"],
+                )
         return
     if command == "system.query":
         query_completeness = envelope["completeness"]
