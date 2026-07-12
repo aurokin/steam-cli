@@ -543,3 +543,31 @@ def test_readonly_storage_never_migrates_or_accepts_writes(tmp_path: Path) -> No
 def test_readonly_storage_requires_an_existing_file(tmp_path: Path) -> None:
     with pytest.raises(StorageError, match="does not exist"):
         Storage(tmp_path / "missing.sqlite3", readonly=True)
+
+
+def test_readonly_storage_requires_current_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "steam-agent.sqlite3"
+    with Storage(database_path):
+        pass
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version=22")
+
+    with pytest.raises(StorageError, match="migration is required"):
+        Storage(database_path, readonly=True)
+
+
+def test_readonly_storage_rejects_uncheckpointed_wal(tmp_path: Path) -> None:
+    database_path = tmp_path / "steam-agent.sqlite3"
+    with Storage(database_path) as writer:
+        assert writer._connection.execute(  # noqa: SLF001 - boundary setup
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0] == "wal"
+        writer._connection.execute(  # noqa: SLF001 - keep live WAL content
+            "INSERT INTO machines(id,name,platform,created_at,updated_at) "
+            "VALUES ('wal-machine','WAL','linux',?,?)",
+            (T0, T0),
+        )
+        writer._connection.commit()  # noqa: SLF001
+
+        with pytest.raises(StorageError, match="uncheckpointed WAL"):
+            Storage(database_path, readonly=True)

@@ -928,7 +928,13 @@ class Storage:
                 raise StorageError("database path must not be a symbolic link")
             if not self.path.is_file():
                 raise StorageError("read-only database does not exist")
+            wal_path = Path(f"{self.path}-wal")
+            if wal_path.exists() and wal_path.stat().st_size:
+                raise StorageError(
+                    "read-only database has an uncheckpointed WAL; writable maintenance is required"
+                )
             self._connection = self._open_connection()
+            self._require_current_schema()
             return
         if self.path != Path(":memory:"):
             if self.path.is_symlink():
@@ -968,6 +974,30 @@ class Storage:
             connection.execute("PRAGMA secure_delete = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
+
+    def _require_current_schema(self) -> None:
+        """Reject query-only opens that cannot safely apply required migrations."""
+
+        migrations_dir = Path(__file__).with_name("migrations")
+        expected = max(
+            int(path.name.split("_", 1)[0])
+            for path in migrations_dir.glob("[0-9][0-9][0-9]_*.sql")
+        )
+        try:
+            row = self._connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()
+        except sqlite3.DatabaseError as error:
+            self._connection.close()
+            raise StorageError(
+                "database schema migration is required before read-only access"
+            ) from error
+        actual = None if row is None else row[0]
+        if actual != expected:
+            self._connection.close()
+            raise StorageError(
+                "database schema migration is required before read-only access"
+            )
 
     def _rollback_transaction(self) -> None:
         """Rollback hook kept separate so failure recovery can be fault tested."""
@@ -2801,9 +2831,6 @@ class Storage:
             candidates: list[int] = []
             skip_codes: dict[int, str] = {}
             for appid in demanded:
-                if cooldown_until is not None:
-                    skip_codes[appid] = "PROVIDER_COOLDOWN"
-                    continue
                 active = self._connection.execute(
                     """SELECT 1 FROM declared_app_sync_demand d
                        JOIN sync_runs r ON r.id=d.sync_run_id
@@ -2837,6 +2864,13 @@ class Storage:
                     if negative is not None:
                         skip_codes[appid] = "NOT_FOUND_CACHE"
                         continue
+                # A provider-wide cooldown prevents new requests, but it does
+                # not invalidate a subject's still-fresh terminal cache.  Keep
+                # those more specific outcomes visible before falling back to
+                # the global provider state.
+                if cooldown_until is not None:
+                    skip_codes[appid] = "PROVIDER_COOLDOWN"
+                    continue
                 candidates.append(appid)
             targeted = tuple(candidates[:max_items])
             target_set = set(targeted)
