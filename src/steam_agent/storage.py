@@ -2889,7 +2889,18 @@ class Storage:
                 cooldown_until = None
             candidates: list[int] = []
             skip_codes: dict[int, str] = {}
+            wall_clock = _timestamp(datetime.now(timezone.utc))
             for appid in demanded:
+                # A clock-skewed future projection is unusable to readers and
+                # would otherwise prevent a valid corrective observation from
+                # winning the monotonic promotion check.
+                self._connection.execute(
+                    """DELETE FROM declared_app_current
+                       WHERE appid=? AND country=? AND language=?
+                         AND provider='steam_store'
+                         AND observed_at>? AND observed_at>?""",
+                    (appid, country, language, timestamp, wall_clock),
+                )
                 active = self._connection.execute(
                     """SELECT 1 FROM declared_app_sync_demand d
                        JOIN sync_runs r ON r.id=d.sync_run_id

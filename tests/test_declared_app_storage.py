@@ -583,7 +583,7 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
 ) -> None:
     storage, account_id = configured
     first, _, _ = begin(storage, account_id, [400], at=T0)
-    future = "2026-07-11T12:01:00Z"
+    future = "2100-07-11T12:01:00Z"
     storage.record_declared_app_result(
         first.id,
         account_id=account_id,
@@ -598,7 +598,23 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
 
     assert candidates == (400,)
     assert targeted == (400,)
+    storage.record_declared_app_result(
+        second.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=T2,
+    )
     storage.finish_declared_app_sync(second.id, completed_at=T2)
+    current = storage._connection.execute(  # noqa: SLF001
+        """SELECT observed_at,promoted_sync_run_id FROM declared_app_current
+           WHERE appid=400 AND country='US' AND language='english'"""
+    ).fetchone()
+    assert dict(current) == {
+        "observed_at": T2,
+        "promoted_sync_run_id": second.id,
+    }
 
 
 def test_expired_declared_rows_are_not_exposed_by_cache_reads(
