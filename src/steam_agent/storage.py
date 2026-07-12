@@ -647,6 +647,91 @@ class WishlistRecommendationSnapshot:
     review_demand: tuple[Mapping[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class SystemProfileProjection:
+    """Last-good normalized system profile and its immutable lineage."""
+
+    schema_id: str
+    profile: Mapping[str, Any]
+    observed_at: str
+    promoted_sync_run_id: int
+    evidence_id: int
+
+
+@dataclass(frozen=True)
+class SystemProfileSnapshot:
+    current: SystemProfileProjection | None
+    latest: SyncRun | None
+    latest_complete: SyncRun | None
+
+
+@dataclass(frozen=True)
+class DeclaredAppProjection:
+    appid: int
+    country: str
+    language: str
+    schema_id: str
+    facts: Mapping[str, Any]
+    provider: str
+    support_level: str
+    source_locator: str
+    human_reference_url: str
+    observed_at: str
+    promoted_sync_run_id: int | None
+
+
+@dataclass(frozen=True)
+class DeclaredAppDemand:
+    appid: int
+    ordinal: int | None
+    targeted: bool
+    evaluated: bool
+    state: str
+    error_code: str | None
+    retry_at: str | None
+    observed_at: str | None
+    sync_run_id: int | None
+    sync_status: str | None
+    started_at: str | None
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
+class DeclaredAppSubject:
+    appid: int
+    current: DeclaredAppProjection | None
+    latest_demand: DeclaredAppDemand
+
+
+@dataclass(frozen=True)
+class DeclaredAppSnapshot:
+    subjects: tuple[DeclaredAppSubject, ...]
+    latest: SyncRun | None
+
+
+@dataclass(frozen=True)
+class CompatibilityRequestedApp:
+    appid: int
+    stable_game_id: str
+
+
+@dataclass(frozen=True)
+class CompatibilitySnapshot:
+    """Every storage input for one M5 assessment from one SQLite snapshot."""
+
+    account_id: int
+    machine_id: str
+    machine: Machine
+    country: str
+    language: str
+    as_of: str
+    requested: tuple[CompatibilityRequestedApp, ...]
+    system_profile: SystemProfileSnapshot
+    declared_apps: DeclaredAppSnapshot
+    owned: OwnedSnapshot
+    installed: InstalledSnapshot
+
+
 def _timestamp(value: str | datetime) -> str:
     if isinstance(value, str):
         candidate = value
@@ -2439,33 +2524,62 @@ class Storage:
         return self.get_sync_run(sync_run_id)
 
     def read_system_profile_snapshot(self, machine_id: str) -> Mapping[str, Any]:
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
         self._connection.execute("BEGIN")
         try:
-            row = self._connection.execute(
-                """SELECT schema_id,profile_json,observed_at,promoted_sync_run_id
-                   FROM system_profile_current WHERE machine_id=?""",
-                (machine_id,),
-            ).fetchone()
-            latest = self.latest_sync(
-                capability="system_profile.read", machine_id=machine_id
-            )
-            latest_complete = self.latest_sync(
-                capability="system_profile.read", machine_id=machine_id, status="complete"
-            )
+            snapshot = self._read_system_profile_snapshot(machine_id)
+            current = snapshot.current
             result = {
-                "profile": None if row is None else json.loads(row["profile_json"]),
-                "observed_at": None if row is None else row["observed_at"],
+                "profile": None if current is None else current.profile,
+                "schema_id": None if current is None else current.schema_id,
+                "observed_at": None if current is None else current.observed_at,
                 "promoted_sync_run_id": (
-                    None if row is None else int(row["promoted_sync_run_id"])
+                    None if current is None else current.promoted_sync_run_id
                 ),
-                "latest": latest,
-                "latest_complete": latest_complete,
+                "evidence_id": None if current is None else current.evidence_id,
+                "latest": snapshot.latest,
+                "latest_complete": snapshot.latest_complete,
             }
             self._connection.commit()
             return result
         except BaseException:
             self._rollback_or_reopen()
             raise
+
+    def _read_system_profile_snapshot(
+        self, machine_id: str
+    ) -> SystemProfileSnapshot:
+        """Read and validate a system profile in the caller's transaction."""
+
+        from steam_agent.system_profile import validate_system_profile
+
+        row = self._connection.execute(
+            """SELECT schema_id,profile_json,observed_at,promoted_sync_run_id,
+                      evidence_id
+               FROM system_profile_current WHERE machine_id=?""",
+            (machine_id,),
+        ).fetchone()
+        current = None
+        if row is not None:
+            current = SystemProfileProjection(
+                schema_id=str(row["schema_id"]),
+                profile=validate_system_profile(json.loads(row["profile_json"])),
+                observed_at=str(row["observed_at"]),
+                promoted_sync_run_id=int(row["promoted_sync_run_id"]),
+                evidence_id=int(row["evidence_id"]),
+            )
+        return SystemProfileSnapshot(
+            current=current,
+            latest=self.latest_sync(
+                capability="system_profile.read", machine_id=machine_id
+            ),
+            latest_complete=self.latest_sync(
+                capability="system_profile.read",
+                machine_id=machine_id,
+                status="complete",
+            ),
+        )
 
     def delete_system_profile_data(self, machine_id: str) -> Mapping[str, int]:
         """Delete only system-profile facts; preserve machine and M1 installs."""
@@ -3026,6 +3140,34 @@ class Storage:
     ) -> Mapping[str, Any]:
         """Read global current facts with account/machine demand lineage."""
 
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        self._connection.execute("BEGIN")
+        try:
+            snapshot = self._read_declared_app_snapshot(
+                account_id=account_id,
+                machine_id=machine_id,
+                country=country,
+                language=language,
+                appids=appids,
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def _read_declared_app_snapshot(
+        self,
+        *,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        appids: list[int] | tuple[int, ...],
+    ) -> Mapping[str, Any]:
+        """Read declared facts using the caller's active transaction."""
+
         from steam_agent.steam_declared_facts import (
             SteamDeclaredFactsRequestContext,
             validate_declared_facts_payload,
@@ -3130,6 +3272,77 @@ class Storage:
             "latest": None if latest is None else _sync_run(latest),
             "latest_demand": demand,
         }
+
+    def _read_typed_declared_app_snapshot(
+        self,
+        *,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        appids: tuple[int, ...],
+    ) -> DeclaredAppSnapshot:
+        raw = self._read_declared_app_snapshot(
+            account_id=account_id,
+            machine_id=machine_id,
+            country=country,
+            language=language,
+            appids=appids,
+        )
+        subjects: list[DeclaredAppSubject] = []
+        for item, demand in zip(
+            raw["items"], raw["latest_demand"], strict=True
+        ):
+            current = None
+            if item["facts"] is not None:
+                current = DeclaredAppProjection(
+                    appid=int(item["appid"]),
+                    country=str(item["country"]),
+                    language=str(item["language"]),
+                    schema_id=str(item["schema_id"]),
+                    facts=item["facts"],
+                    provider=str(item["provider"]),
+                    support_level=str(item["support_level"]),
+                    source_locator=str(item["source_locator"]),
+                    human_reference_url=str(item["human_reference_url"]),
+                    observed_at=str(item["observed_at"]),
+                    promoted_sync_run_id=(
+                        None
+                        if item["promoted_sync_run_id"] is None
+                        else int(item["promoted_sync_run_id"])
+                    ),
+                )
+            typed_demand = DeclaredAppDemand(
+                appid=int(demand["appid"]),
+                ordinal=(
+                    None if demand["ordinal"] is None else int(demand["ordinal"])
+                ),
+                targeted=bool(demand["targeted"]),
+                evaluated=bool(demand["evaluated"]),
+                state=str(demand["state"]),
+                error_code=demand["error_code"],
+                retry_at=demand["retry_at"],
+                observed_at=demand["observed_at"],
+                sync_run_id=(
+                    None
+                    if demand["sync_run_id"] is None
+                    else int(demand["sync_run_id"])
+                ),
+                sync_status=demand["sync_status"],
+                started_at=demand["started_at"],
+                completed_at=demand["completed_at"],
+            )
+            subjects.append(
+                DeclaredAppSubject(
+                    appid=int(item["appid"]),
+                    current=current,
+                    latest_demand=typed_demand,
+                )
+            )
+        return DeclaredAppSnapshot(
+            subjects=tuple(subjects),
+            latest=raw["latest"],
+        )
 
     def _prune_declared_apps(self, now: str) -> None:
         cutoff = _timestamp(
@@ -6442,6 +6655,71 @@ class Storage:
                 pass
             raise
 
+    def read_compatibility_snapshot(
+        self,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        appids: list[int] | tuple[int, ...],
+        now: str | datetime,
+    ) -> CompatibilitySnapshot:
+        """Read every M5 compatibility input in one read-only transaction.
+
+        Requested identities derive directly from AppIDs, so absent subjects
+        remain explicit without mutating ``steam_apps``.
+        """
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        selected = _catalog_appids(appids)
+        if not selected:
+            raise ValueError("compatibility snapshot requires explicit appids")
+        if len(selected) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("compatibility demand exceeds the bounded maximum")
+        as_of = _timestamp(now)
+        self._connection.execute("BEGIN")
+        try:
+            self._require_steam_account(account_id)
+            machine = self.get_machine(machine_id)
+            if machine is None:
+                raise ValueError("compatibility machine is not configured")
+            system_profile = self._read_system_profile_snapshot(machine_id)
+            declared_apps = self._read_typed_declared_app_snapshot(
+                account_id=account_id,
+                machine_id=machine_id,
+                country=country,
+                language=language,
+                appids=selected,
+            )
+            owned = self._read_owned_snapshot(account_id)
+            installed = self._read_installed_snapshot(machine_id)
+            requested = tuple(
+                CompatibilityRequestedApp(
+                    appid=appid,
+                    stable_game_id=steam_application_stable_id(appid),
+                )
+                for appid in selected
+            )
+            snapshot = CompatibilitySnapshot(
+                account_id=account_id,
+                machine_id=machine_id,
+                machine=machine,
+                country=country,
+                language=language,
+                as_of=as_of,
+                requested=requested,
+                system_profile=system_profile,
+                declared_apps=declared_apps,
+                owned=owned,
+                installed=installed,
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
     def read_recommendation_snapshot(
         self,
         account_id: int,
@@ -7127,11 +7405,7 @@ class Storage:
             raise StorageError("cannot start a read snapshot inside a transaction")
         self._connection.execute("BEGIN")
         try:
-            games = tuple(self.list_installed(machine_id))
-            latest = self.latest_sync(capability="installed", machine_id=machine_id)
-            latest_complete = self.latest_sync(
-                capability="installed", machine_id=machine_id, status="complete"
-            )
+            snapshot = self._read_installed_snapshot(machine_id)
             self._connection.commit()
         except BaseException:
             try:
@@ -7139,10 +7413,17 @@ class Storage:
             except BaseException:
                 pass
             raise
+        return snapshot
+
+    def _read_installed_snapshot(self, machine_id: str) -> InstalledSnapshot:
+        """Read installed state using the caller's active transaction."""
+
         return InstalledSnapshot(
-            games=games,
-            latest=latest,
-            latest_complete=latest_complete,
+            games=tuple(self.list_installed(machine_id)),
+            latest=self.latest_sync(capability="installed", machine_id=machine_id),
+            latest_complete=self.latest_sync(
+                capability="installed", machine_id=machine_id, status="complete"
+            ),
         )
 
     def get_app(self, appid: int) -> SteamApp | None:
@@ -8340,7 +8621,13 @@ __all__ = [
     "CatalogSourceProvenance",
     "CatalogStreamInput",
     "CatalogStreamProvenance",
+    "CompatibilityRequestedApp",
+    "CompatibilitySnapshot",
     "CredentialReferenceRecord",
+    "DeclaredAppDemand",
+    "DeclaredAppProjection",
+    "DeclaredAppSnapshot",
+    "DeclaredAppSubject",
     "EvidenceInput",
     "ExplicitFeedback",
     "ExplicitTrait",
@@ -8363,6 +8650,8 @@ __all__ = [
     "Storage",
     "StorageError",
     "SyncRun",
+    "SystemProfileProjection",
+    "SystemProfileSnapshot",
     "UnknownSyncRun",
     "WishlistGame",
     "WishlistObservation",
