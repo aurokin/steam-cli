@@ -213,6 +213,81 @@ def test_typed_adapter_maps_system_owned_installed_and_omits_them_for_deck(
     assert "system_profile.read" in deck.completeness.missing_capabilities
 
 
+def test_typed_adapter_preserves_all_run_lineage_for_same_second_attempts(
+    tmp_path: Path,
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    declared_subject = snapshot.declared_apps.subjects[0]
+    declared_demand = replace(
+        declared_subject.latest_demand,
+        state="failed",
+        sync_run_id=8,
+        sync_status="failed",
+    )
+    system_latest = snapshot.system_profile.latest
+    installed_latest = snapshot.installed.latest
+    owned_latest = snapshot.owned.latest
+    assert system_latest is not None
+    assert installed_latest is not None
+    assert owned_latest is not None
+    snapshot = replace(
+        snapshot,
+        system_profile=replace(
+            snapshot.system_profile,
+            latest=replace(system_latest, id=10, status="partial", promoted=False),
+        ),
+        declared_apps=replace(
+            snapshot.declared_apps,
+            subjects=(replace(declared_subject, latest_demand=declared_demand),),
+        ),
+        installed=replace(
+            snapshot.installed,
+            latest=replace(
+                installed_latest,
+                id=installed_latest.id + 100,
+                status="partial",
+                promoted=False,
+            ),
+        ),
+        owned=replace(
+            snapshot.owned,
+            latest=replace(
+                owned_latest,
+                id=owned_latest.id + 100,
+                status="failed",
+                promoted=False,
+            ),
+        ),
+    )
+
+    query = assess_compatibility_snapshot(
+        snapshot,
+        target=CompatibilityTarget("machine", "local", "linux"),
+    )
+    gates = {gate.name: gate for gate in query.assessment.results[0].gates}
+    assert gates["declared_native_build"].original_freshness == "stale"
+    assert gates["effective_execution_support"].original_freshness == "stale"
+    assert gates["readiness:installed"].original_freshness == "stale"
+    assert gates["readiness:visible_owned"].original_freshness == "stale"
+
+
+def test_typed_adapter_accepts_established_uppercase_machine_alias(
+    tmp_path: Path,
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    snapshot = replace(
+        snapshot,
+        machine_id="Desk-A",
+        machine=replace(snapshot.machine, id="Desk-A"),
+    )
+    query = assess_compatibility_snapshot(
+        snapshot,
+        target=CompatibilityTarget("machine", "Desk-A", "linux"),
+    )
+    assert query.assessment.target.key == "Desk-A"
+    assert "declared_native_build" not in query.assessment.results[0].conflicts
+
+
 def test_assess_is_cache_only_exact_and_does_not_persist_overrides(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

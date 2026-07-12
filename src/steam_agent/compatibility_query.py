@@ -94,6 +94,8 @@ class LocalObservation:
     snapshot_id: str | int | None = None
     latest_attempt_at: datetime | None = None
     latest_attempt_status: AttemptStatus | None = None
+    promoted_sync_run_id: str | int | None = None
+    latest_attempt_id: str | int | None = None
 
     def __post_init__(self) -> None:
         if self.presence not in {"present", "absent", "unknown"}:
@@ -116,6 +118,11 @@ class LocalObservation:
             raise ValueError("latest attempt time and status must be supplied together")
         if self.latest_attempt_status not in {None, "complete", "partial", "failed", "running"}:
             raise ValueError("latest attempt status is invalid")
+        for name in ("promoted_sync_run_id", "latest_attempt_id"):
+            if getattr(self, name) is not None and not isinstance(
+                getattr(self, name), (str, int)
+            ):
+                raise ValueError(f"{name} is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +136,7 @@ class SystemSnapshot:
     latest_attempt_at: datetime | None = None
     latest_attempt_status: AttemptStatus | None = None
     latest_attempt_id: str | int | None = None
+    promoted_sync_run_id: str | int | None = None
 
     def __post_init__(self) -> None:
         # CompatibilityTarget owns the canonical key grammar.
@@ -153,6 +161,10 @@ class SystemSnapshot:
             self.latest_attempt_id, (str, int)
         ):
             raise ValueError("latest system attempt ID is invalid")
+        if self.promoted_sync_run_id is not None and not isinstance(
+            self.promoted_sync_run_id, (str, int)
+        ):
+            raise ValueError("promoted system run ID is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,16 +232,24 @@ class ConservativeMinimumEvaluator:
             _worst_freshness(declared_freshness, system_profile_freshness),
             "minimum-architecture",
         )
-        # A current free-space failure is useful only for fifteen minutes.
-        # Memory/architecture failures use the slower system-profile policy.
-        minimum_freshness = _worst_freshness(
-            declared_freshness,
-            (
+        # A current free-space failure is useful only for fifteen minutes when
+        # it is decisive.  If a non-storage component independently fails, the
+        # slower system-profile evidence remains sufficient for that failure.
+        without_storage_state, without_storage_reason = _minimum_overall(
+            comparison, ignore_storage=True
+        )
+        decisive_freshness = (
+            system_profile_freshness
+            if without_storage_state == "fail"
+            else (
                 system_profile_freshness
                 if comparison.storage.state != "fail"
                 else storage_available_freshness
-            ),
-            system_profile_freshness,
+            )
+        )
+        minimum_freshness = _worst_freshness(
+            declared_freshness,
+            decisive_freshness,
         )
         minimum_state, minimum_reason = _minimum_overall(
             comparison, ignore_storage=False
@@ -241,9 +261,6 @@ class ConservativeMinimumEvaluator:
             observed,
             minimum_freshness,
             "minimum-overall",
-        )
-        without_storage_state, without_storage_reason = _minimum_overall(
-            comparison, ignore_storage=True
         )
         without_storage = _comparison_evidence(
             without_storage_state,
@@ -592,6 +609,7 @@ def _effective_execution(
                 _lineage(
                     "system-target", appid, system.observed_at,
                     target.key, system.snapshot_id,
+                    system.promoted_sync_run_id, system.latest_attempt_id,
                 ),
             )
         )
@@ -732,7 +750,8 @@ def _local_evidence(
     if value.observed_at is None:
         return unknown("local_membership_not_observed")
     evidence_id = _lineage(
-        value.source, appid, value.observed_at, value.snapshot_id
+        value.source, appid, value.observed_at, value.snapshot_id,
+        value.promoted_sync_run_id, value.latest_attempt_id,
     )
     if value.presence == "unknown":
         return _attributed_unknown(
@@ -960,11 +979,12 @@ def _system_freshness(
     if age is None:
         return "unknown"
     freshness: Freshness = "fresh" if age <= policy else "expired"
-    if (
-        freshness == "fresh"
-        and system.latest_attempt_at is not None
-        and system.latest_attempt_at > system.observed_at
-        and system.latest_attempt_status != "complete"
+    if freshness == "fresh" and _incomplete_attempt_supersedes(
+        observed_at=system.observed_at,
+        promoted_run_id=system.promoted_sync_run_id,
+        latest_attempt_at=system.latest_attempt_at,
+        latest_attempt_id=system.latest_attempt_id,
+        latest_attempt_status=system.latest_attempt_status,
     ):
         return "stale"
     return freshness
@@ -1079,13 +1099,40 @@ def _local_freshness(
         if age <= (INSTALLED_FRESH if installed_kind else OWNED_FRESH)
         else "stale"
     )
-    if (
-        value.latest_attempt_at is not None
-        and value.latest_attempt_at > value.observed_at
-        and value.latest_attempt_status != "complete"
+    if _incomplete_attempt_supersedes(
+        observed_at=value.observed_at,
+        promoted_run_id=value.promoted_sync_run_id,
+        latest_attempt_at=value.latest_attempt_at,
+        latest_attempt_id=value.latest_attempt_id,
+        latest_attempt_status=value.latest_attempt_status,
     ):
         return "stale"
     return freshness
+
+
+def _incomplete_attempt_supersedes(
+    *,
+    observed_at: datetime,
+    promoted_run_id: str | int | None,
+    latest_attempt_at: datetime | None,
+    latest_attempt_id: str | int | None,
+    latest_attempt_status: AttemptStatus | None,
+) -> bool:
+    """Conservatively order an incomplete attempt against a last-good row."""
+
+    if latest_attempt_at is None or latest_attempt_status in {None, "complete"}:
+        return False
+    if latest_attempt_at > observed_at:
+        return True
+    if latest_attempt_at < observed_at:
+        return False
+    if latest_attempt_id == promoted_run_id and latest_attempt_id is not None:
+        return False
+    if isinstance(latest_attempt_id, int) and not isinstance(latest_attempt_id, bool):
+        if isinstance(promoted_run_id, int) and not isinstance(promoted_run_id, bool):
+            return latest_attempt_id > promoted_run_id
+    # Equal timestamps with missing or non-orderable lineage are ambiguous.
+    return True
 
 
 def _declared_maps(

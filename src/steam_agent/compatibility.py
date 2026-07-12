@@ -33,6 +33,7 @@ Platform = Literal["windows", "macos", "linux", "steamos"]
 FeatureKind = Literal["accessibility", "input", "language"]
 
 _SLUG = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?\Z")
+_MACHINE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _GATE = re.compile(r"[a-z0-9](?:[a-z0-9._:-]{0,126}[a-z0-9])?\Z")
 _ARCHITECTURES = {"x86", "x86_64", "arm64"}
 
@@ -78,8 +79,9 @@ class CompatibilityTarget:
     def __post_init__(self) -> None:
         if self.kind not in {"machine", "valve_deck"}:
             raise ValueError("target kind is invalid")
-        if not isinstance(self.key, str) or _SLUG.fullmatch(self.key) is None:
-            raise ValueError("target key must be a bounded slug")
+        key_pattern = _MACHINE_KEY if self.kind == "machine" else _SLUG
+        if not isinstance(self.key, str) or key_pattern.fullmatch(self.key) is None:
+            raise ValueError("target key is invalid")
         if self.platform not in {"windows", "macos", "linux", "steamos"}:
             raise ValueError("target platform is invalid")
         if self.kind == "valve_deck" and self.platform != "steamos":

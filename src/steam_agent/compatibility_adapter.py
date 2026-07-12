@@ -39,6 +39,7 @@ def assess_compatibility_snapshot(
                 "appid": subject.appid,
                 "facts": subject.current.facts,
                 "observed_at": subject.current.observed_at,
+                "promoted_sync_run_id": subject.current.promoted_sync_run_id,
             }
             for subject in snapshot.declared_apps.subjects
             if subject.current is not None
@@ -121,6 +122,9 @@ def _system(
         latest_attempt_at=_run_time(latest),
         latest_attempt_status=None if latest is None else latest.status,
         latest_attempt_id=None if latest is None else latest.id,
+        promoted_sync_run_id=(
+            None if current is None else current.promoted_sync_run_id
+        ),
     )
 
 
@@ -143,6 +147,8 @@ def _installed_observations(
                 item.evidence_id,
                 _run_time(source.latest),
                 None if source.latest is None else source.latest.status,
+                item.promoted_sync_run_id,
+                None if source.latest is None else source.latest.id,
             )
         elif latest_complete is not None:
             result[appid] = LocalObservation(
@@ -152,6 +158,8 @@ def _installed_observations(
                 latest_complete.id,
                 _run_time(source.latest),
                 None if source.latest is None else source.latest.status,
+                latest_complete.id,
+                None if source.latest is None else source.latest.id,
             )
     return result or None
 
@@ -175,6 +183,8 @@ def _owned_observations(
                 item.evidence_id,
                 _run_time(source.latest),
                 None if source.latest is None else source.latest.status,
+                item.promoted_sync_run_id,
+                None if source.latest is None else source.latest.id,
             )
         elif latest_complete is not None:
             # The builder deliberately turns visible-owned absence into unknown,
@@ -186,6 +196,8 @@ def _owned_observations(
                 latest_complete.id,
                 _run_time(source.latest),
                 None if source.latest is None else source.latest.status,
+                latest_complete.id,
+                None if source.latest is None else source.latest.id,
             )
     return result or None
 

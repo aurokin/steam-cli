@@ -433,6 +433,40 @@ def test_newer_failed_system_attempt_marks_promoted_current_stale() -> None:
     assert gate.original_freshness == "stale"
 
 
+@pytest.mark.parametrize(
+    ("promoted_run_id", "latest_run_id", "expected_freshness"),
+    [(10, 11, "stale"), (10, 9, "fresh"), (None, None, "stale")],
+)
+def test_equal_timestamp_failed_system_attempt_uses_run_lineage_tiebreaker(
+    promoted_run_id: int | None,
+    latest_run_id: int | None,
+    expected_freshness: str,
+) -> None:
+    base = system()
+    candidate = SystemSnapshot(
+        base.target_key,
+        base.profile,
+        base.observed_at,
+        base.snapshot_id,
+        latest_attempt_at=NOW,
+        latest_attempt_status="partial",
+        latest_attempt_id=latest_run_id,
+        promoted_sync_run_id=promoted_run_id,
+    )
+    item = result(system_snapshot=candidate)
+    gate = next(g for g in item.gates if g.name == "effective_execution_support")
+    assert gate.original_freshness == expected_freshness
+
+
+def test_established_uppercase_machine_alias_retains_exact_target_identity() -> None:
+    target = CompatibilityTarget("machine", "Desk-A", "windows")
+    item = result(target=target, system_snapshot=system(target_key="Desk-A"))
+    gate = next(g for g in item.gates if g.name == "effective_execution_support")
+    assert item.target == target
+    assert gate.original == "pass"
+    assert gate.original_conflict is False
+
+
 def test_newer_failed_declared_demand_marks_retained_current_stale() -> None:
     item = result(
         snapshot=declared(
@@ -665,6 +699,50 @@ def test_default_bounded_parser_can_detect_a_decisive_memory_failure() -> None:
     assert minimum.effective == "fail"
     assert item.compatibility == "incompatible"
     assert "Opaque" not in json.dumps(asdict(item), default=str)
+
+
+def test_non_storage_failure_keeps_system_freshness_when_storage_also_fails() -> None:
+    base = system(observed_at=NOW - timedelta(hours=1))
+    payload = {
+        **facts(10),
+        "requirements": [
+            {
+                "platform": "windows",
+                "state": "declared",
+                "minimum": "Memory: 32 GiB RAM\nStorage: 100 GiB available space",
+                "recommended": None,
+            }
+        ],
+    }
+    item = result(snapshot=declared(10, payload=payload), system_snapshot=base)
+    minimum = next(g for g in item.gates if g.name == "meets_minimum")
+    assert minimum.original == "fail"
+    assert minimum.original_freshness == "fresh"
+    assert minimum.effective == "fail"
+
+
+@pytest.mark.parametrize(
+    ("promoted_run_id", "latest_run_id", "expected_freshness"),
+    [(10, 11, "stale"), (10, 9, "fresh"), (None, None, "stale")],
+)
+def test_equal_timestamp_failed_local_attempt_uses_run_lineage_tiebreaker(
+    promoted_run_id: int | None,
+    latest_run_id: int | None,
+    expected_freshness: str,
+) -> None:
+    observation = LocalObservation(
+        "present",
+        NOW,
+        "installed_projection",
+        "snapshot-7",
+        NOW,
+        "partial",
+        promoted_run_id,
+        latest_run_id,
+    )
+    item = result(installed={10: observation})
+    gate = next(g for g in item.gates if g.name == "readiness:installed")
+    assert gate.original_freshness == expected_freshness
 
 
 def test_default_evaluator_has_compatible_path_when_opaque_models_are_absent() -> None:
