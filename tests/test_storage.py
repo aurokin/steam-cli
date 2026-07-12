@@ -598,3 +598,23 @@ def test_readonly_storage_rejects_clean_persistent_wal_without_sidecars(
         assert readonly._connection.execute(  # noqa: SLF001
             "PRAGMA journal_mode"
         ).fetchone()[0] == "delete"
+
+
+def test_one_writable_open_normalizes_clean_wal_with_empty_sidecars(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "steam-agent.sqlite3"
+    with Storage(database_path) as storage:
+        assert storage._connection.execute(  # noqa: SLF001 - boundary setup
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0] == "wal"
+    Path(f"{database_path}-wal").touch()
+    Path(f"{database_path}-shm").touch()
+
+    with Storage(database_path):
+        pass
+
+    with Storage(database_path, readonly=True) as readonly:
+        assert readonly._connection.execute(  # noqa: SLF001
+            "PRAGMA journal_mode"
+        ).fetchone()[0] == "delete"

@@ -950,6 +950,11 @@ class Storage:
                     "read-only database uses WAL journal mode; writable maintenance is required"
                 )
             self._connection = self._open_connection()
+            if _database_uses_wal(self.path) or Path(f"{self.path}-wal").exists():
+                self._connection.close()
+                raise StorageError(
+                    "database entered WAL mode during read-only open; retry after writable maintenance"
+                )
             self._require_current_schema()
             return
         if self.path != Path(":memory:"):
@@ -976,6 +981,7 @@ class Storage:
         if self.path != Path(":memory:") and os.name != "nt":
             self.path.chmod(0o600)
         self.migrate()
+        self._finish_wal_maintenance()
 
     def _open_connection(self) -> sqlite3.Connection:
         if self.readonly:
@@ -1031,6 +1037,26 @@ class Storage:
             raise StorageError(
                 "database schema migration is required before read-only access"
             )
+
+    def _finish_wal_maintenance(self) -> None:
+        """Best-effort checkpoint/normalization after an uncontended write open."""
+
+        try:
+            mode = str(
+                self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+            if mode != "wal":
+                return
+            checkpoint = self._connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint is None or int(checkpoint[0]) != 0:
+                return
+            self._connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+        except sqlite3.DatabaseError:
+            # A concurrent reader/writer can keep WAL live. The next writable
+            # process retries; query-only access remains rejected meanwhile.
+            return
 
     def _rollback_transaction(self) -> None:
         """Rollback hook kept separate so failure recovery can be fault tested."""
