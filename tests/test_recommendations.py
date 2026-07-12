@@ -283,6 +283,9 @@ def test_datetime_requires_timezone_and_future_last_played_is_bounded() -> None:
     future = activity(days_ago=-10)
     result = rank_recommendations((candidate(1, act=future),), context=context("resume/0.1"))
     assert result.results[0].score is not None
+    recency = next(item for item in result.results[0].components if item.rule_id == "last_played_recency")
+    assert recency.state == "unknown"
+    assert recency.points is None
 
 
 def test_invalid_enums_rules_duplicates_and_override_targets_are_rejected() -> None:
@@ -331,3 +334,33 @@ def test_session_and_remaining_estimates_only_come_from_explicit_feedback() -> N
     component = next(item for item in result.results[0].components if item.rule_id == "explicit_remaining_estimate")
     assert component.evidence_kind == "explicit_user"
     assert component.input == 90
+
+
+def test_nullable_fresh_activity_metrics_remain_unknown_not_zero() -> None:
+    evidence = ActivityEvidence("fresh", NOW, evidence_ids=("activity:z",))
+    query = context("resume/0.1", unknown_policy="include")
+    result = rank_recommendations((candidate(1, act=evidence),), context=query)
+    assert result.context == query
+    metrics = [
+        item
+        for item in result.results[0].components
+        if item.evidence_kind == "behavioral"
+    ]
+    assert metrics and all(item.state == "unknown" and item.points is None for item in metrics)
+
+
+def test_identity_and_gate_evidence_lineage_is_preserved() -> None:
+    game = replace(
+        candidate(1),
+        identity_evidence_ids=("catalog:1",),
+        owned_evidence_ids=("owned:1",),
+        installed_evidence_ids=("installed:1",),
+    )
+    result = rank_recommendations(
+        (game,),
+        context=context(requirements=(Requirement("installed", True),)),
+    )
+    item = result.results[0]
+    assert item.identity_evidence_ids == ("catalog:1",)
+    assert next(gate for gate in item.gates if gate.name == "owned").evidence_ids == ("owned:1",)
+    assert next(gate for gate in item.gates if gate.name == "installed").evidence_ids == ("installed:1",)

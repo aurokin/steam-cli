@@ -114,8 +114,8 @@ class ActivityEvidence:
                 _int(value, name=name, maximum=MAX_MINUTES)
         if self.last_played_at is not None:
             object.__setattr__(self, "last_played_at", _timestamp(self.last_played_at, name="last_played_at"))
-        if self.freshness == "fresh" and self.observed_at is None:
-            raise ValueError("fresh activity requires observed_at")
+        if self.freshness != "unknown" and self.observed_at is None:
+            raise ValueError("known activity freshness requires observed_at")
         object.__setattr__(self, "evidence_ids", _ids(self.evidence_ids))
 
 
@@ -144,8 +144,8 @@ class AchievementEvidence:
             raise ValueError("achievement freshness is invalid")
         if self.observed_at is not None:
             object.__setattr__(self, "observed_at", _timestamp(self.observed_at, name="observed_at"))
-        if self.freshness == "fresh" and self.observed_at is None:
-            raise ValueError("fresh achievements require observed_at")
+        if self.freshness != "unknown" and self.observed_at is None:
+            raise ValueError("known achievement freshness requires observed_at")
         if self.state == "ready":
             if self.unlocked is None or self.total is None:
                 raise ValueError("ready achievements require unlocked and total")
@@ -247,7 +247,7 @@ class RecommendationCandidate:
     def __post_init__(self) -> None:
         _int(self.appid, name="appid", minimum=1, maximum=MAX_APPID)
         if self.name is not None:
-            if not isinstance(self.name, str) or not self.name or len(self.name) > MAX_TEXT or any(ord(c) < 32 for c in self.name):
+            if not isinstance(self.name, str) or not self.name or len(self.name) > MAX_TEXT or any(not c.isprintable() for c in self.name):
                 raise ValueError("name must be a bounded printable string")
         if self.owned is not None and not isinstance(self.owned, bool):
             raise ValueError("owned must be true, false, or unknown")
@@ -340,6 +340,7 @@ class ScoreComponent:
 class RankedRecommendation:
     appid: int
     name: str | None
+    identity_evidence_ids: tuple[str, ...]
     eligibility: Eligibility
     score: int | None
     gates: tuple[GateResult, ...]
@@ -358,6 +359,7 @@ class RankedRecommendation:
 class RecommendationRanking:
     schema: Literal["recommendations/0.1"]
     recipe_version: RecipeId
+    context: RecommendationContext
     unknown_policy: UnknownPolicy
     results: tuple[RankedRecommendation, ...]
     eligible: tuple[RankedRecommendation, ...]
@@ -398,7 +400,7 @@ def rank_recommendations(
     all_results = visible + excluded
     complete = "complete" if all(item.completeness == "complete" for item in all_results) else "partial"
     return RecommendationRanking(
-        "recommendations/0.1", context.recipe, context.unknown_policy,
+        "recommendations/0.1", context.recipe, context, context.unknown_policy,
         all_results, eligible, conditional, excluded,
         (("eligible", len(eligible)), ("conditional", len(conditional)), ("excluded", len(excluded)), ("total", len(all_results))),
         complete,
@@ -463,7 +465,8 @@ def _rank(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], co
         "unknown"
     )
     return RankedRecommendation(
-        candidate.appid, candidate.name, eligibility, score, gates, components,
+        candidate.appid, candidate.name, candidate.identity_evidence_ids,
+        eligibility, score, gates, components,
         positive, negative, reasons, tradeoffs, unknowns, freshness, confidence, completeness,
     )
 
@@ -584,8 +587,8 @@ def _resume_components(candidate: RecommendationCandidate, context: Recommendati
     recent_points = RESUME_RECENT_WINDOW if state == "applied" and recent is not None and recent > 0 else (0 if state == "applied" and recent is not None else None)
     sustained_points = RESUME_SUSTAINED_PLAY if state == "applied" and lifetime is not None and lifetime >= 120 else (0 if state == "applied" and lifetime is not None else None)
     last_points: int | None = None
-    if state == "applied" and last is not None:
-        age_days = max(0, (context.now - last).days)
+    if state == "applied" and last is not None and last <= context.now:
+        age_days = (context.now - last).days
         last_points = RESUME_LAST_PLAYED_7D if age_days <= 7 else RESUME_LAST_PLAYED_30D if age_days <= 30 else RESUME_LAST_PLAYED_90D if age_days <= 90 else 0
     achievement = candidate.achievements
     astate: ComponentState = "unknown"
@@ -597,9 +600,9 @@ def _resume_components(candidate: RecommendationCandidate, context: Recommendati
         if astate == "applied":
             apoints = RESUME_ACHIEVEMENT_PROGRESS if ratio is not None and 0 < ratio < 10_000 else 0
     return [
-        _component("recent_sustained_play", recent, ids, recent_points, state if recent_points is None else "applied", "behavioral", "recent_window_is_not_a_session_log"),
-        _component("lifetime_play_momentum", lifetime, ids, sustained_points, state if sustained_points is None else "applied", "behavioral", "playtime_does_not_imply_preference"),
-        _component("last_played_recency", None if last is None else last.isoformat(), ids, last_points, state if last_points is None else "applied", "behavioral"),
+        _component("recent_sustained_play", recent, ids, recent_points, _metric_state(state, recent), "behavioral", "recent_window_is_not_a_session_log"),
+        _component("lifetime_play_momentum", lifetime, ids, sustained_points, _metric_state(state, lifetime), "behavioral", "playtime_does_not_imply_preference"),
+        _component("last_played_recency", None if last is None else last.isoformat(), ids, last_points, "unknown" if state == "applied" and (last is None or last > context.now) else state, "behavioral"),
         _component("achievement_progress_weak", ratio, aids, apoints, astate, "achievement", "achievement_ratio_is_weak_evidence_not_completion"),
     ]
 
@@ -644,9 +647,15 @@ def _preference_behavior_components(candidate: RecommendationCandidate, context:
     recent_points = PREFERENCE_RECENT_BEHAVIOR if state == "applied" and recent is not None and recent > 0 else (0 if state == "applied" and recent is not None else None)
     lifetime_points = PREFERENCE_SUSTAINED_BEHAVIOR if state == "applied" and lifetime is not None and lifetime >= 120 else (0 if state == "applied" and lifetime is not None else None)
     return [
-        _component("recent_play_behavior", recent, ids, recent_points, state if recent_points is None else "applied", "behavioral", "behavior_does_not_prove_preference"),
-        _component("lifetime_play_behavior", lifetime, ids, lifetime_points, state if lifetime_points is None else "applied", "behavioral", "behavior_does_not_prove_preference"),
+        _component("recent_play_behavior", recent, ids, recent_points, _metric_state(state, recent), "behavioral", "behavior_does_not_prove_preference"),
+        _component("lifetime_play_behavior", lifetime, ids, lifetime_points, _metric_state(state, lifetime), "behavioral", "behavior_does_not_prove_preference"),
     ]
+
+
+def _metric_state(state: ComponentState, value: object | None) -> ComponentState:
+    if state == "applied" and value is None:
+        return "unknown"
+    return state
 
 
 def _safe_sum(values: tuple[int, ...]) -> int:
