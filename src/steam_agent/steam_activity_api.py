@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.client
 import json
-from typing import Literal, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol
 from urllib.parse import urlencode
 
 from steam_agent.credentials import SecretValue
@@ -151,6 +151,7 @@ class SteamActivityApiClient:
         steamid: str,
         api_key: SecretValue,
         recent_count: int = MAX_RECENT_COUNT,
+        request_gate: Callable[[], None] = lambda: None,
     ) -> ActivityAcquisition:
         """Acquire owned activity and Steam's recent-play window as one unit."""
 
@@ -163,9 +164,11 @@ class SteamActivityApiClient:
             "include_played_free_games": True,
         }
         recent_input = {"steamid": steamid, "count": recent_count}
+        request_gate()
         owned = _owned_activity(
             self._request_service(OWNED_GAMES_PATH, owned_input, api_key)
         )
+        request_gate()
         recent = _recent_activity(
             self._request_service(RECENT_GAMES_PATH, recent_input, api_key),
             requested_count=recent_count,

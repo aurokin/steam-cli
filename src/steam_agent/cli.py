@@ -80,6 +80,15 @@ from steam_agent.cheapshark import CheapSharkClient, CheapSharkError
 from steam_agent.price_library import PriceSyncError, sync_wishlist_prices
 from steam_agent.deal_query import build_deal_query_from_snapshot
 from steam_agent.feedback import FeedbackService
+from steam_agent.activity import (
+    ACTIVITY_DISCLOSURE_VERSION,
+    ActivitySyncError,
+    query_activity,
+    query_achievements,
+    sync_activity,
+    sync_achievements,
+)
+from steam_agent.steam_activity_api import SteamActivityApiClient
 
 
 EXIT_OK = 0
@@ -238,6 +247,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider", choices=("auto", "gg-deals", "cheapshark"), default="auto"
     )
     prices_sync.add_argument("--max-items", type=int)
+    activity_sync = sync_commands.add_parser(
+        "activity", help="Synchronize normalized owned and recent activity."
+    )
+    _add_leaf_format(activity_sync)
+    activity_sync.add_argument("--account", default="primary")
+    activity_sync.add_argument("--acknowledge-local-storage", action="store_true")
+    achievements_sync = sync_commands.add_parser(
+        "achievements", help="Synchronize bounded achievement evidence."
+    )
+    _add_leaf_format(achievements_sync)
+    achievements_sync.add_argument("--account", default="primary")
+    achievements_sync.add_argument(
+        "--scope", choices=("recent", "installed", "owned"), default="recent"
+    )
+    achievements_sync.add_argument("--appid", type=int, action="append", default=[])
+    achievements_sync.add_argument("--max-items", type=int, default=20)
+    achievements_sync.add_argument("--acknowledge-local-storage", action="store_true")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -264,6 +290,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("official", "keyshop", "unknown"),
         default="official",
     )
+
+    activity = commands.add_parser("activity", help="Query cached activity evidence.")
+    activity_commands = activity.add_subparsers(dest="activity_command", required=True)
+    activity_query = activity_commands.add_parser("query", help="Query cached activity.")
+    _add_leaf_format(activity_query)
+    activity_query.add_argument("--account", default="primary")
+    activity_query.add_argument("--appid", type=int)
+
+    achievements = commands.add_parser(
+        "achievements", help="Query cached achievement evidence."
+    )
+    achievement_commands = achievements.add_subparsers(
+        dest="achievements_command", required=True
+    )
+    achievement_query = achievement_commands.add_parser(
+        "query", help="Query cached achievement summaries."
+    )
+    _add_leaf_format(achievement_query)
+    achievement_query.add_argument("--account", default="primary")
+    achievement_query.add_argument("--appid", type=int)
 
     feedback = commands.add_parser("feedback", help="Manage explicit local game feedback.")
     feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
@@ -567,6 +613,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_wishlist(args, database_path)
     if args.command == "sync" and args.sync_command == "prices":
         return _dispatch_sync_prices(args, database_path)
+    if args.command == "sync" and args.sync_command in {"activity", "achievements"}:
+        return _dispatch_activity(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -725,6 +773,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
+    if args.command in {"activity", "achievements"}:
+        return _dispatch_activity(args, database_path)
     if args.command == "accounts":
         return _dispatch_accounts(args, database_path)
     if args.command == "auth":
@@ -734,6 +784,190 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
     if args.command == "data":
         return _dispatch_data(args, database_path)
     raise AssertionError("argparse accepted an unhandled command")
+
+
+def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
+    command = _command_name(args)
+    if args.command in {"activity", "achievements"}:
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                account = None
+            if account is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            try:
+                result = (
+                    query_activity(storage, account_id=account.id, appid=args.appid)
+                    if args.command == "activity"
+                    else query_achievements(storage, account_id=account.id, appid=args.appid)
+                )
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The query arguments are invalid.",
+                    exit_code=2,
+                )
+        snapshot = result["snapshot"]
+        last_status = snapshot["last_attempt_status"]
+        query_completeness = completeness(
+            CompletenessStatus.UNAVAILABLE if last_status is None else CompletenessStatus.COMPLETE,
+            missing_capabilities=[] if last_status is not None else [f"{args.command}.read"],
+            warnings=(
+                []
+                if last_status is not None
+                else [WarningRecord(code=ErrorCode.NOT_SYNCED, message=f"{args.command.title()} have not been synchronized.")]
+            ),
+        )
+        return _emit_success(
+            args,
+            command=command,
+            context={"account_alias": account.alias, "identifiers_included": False},
+            completeness_value=query_completeness,
+            data=result,
+        )
+
+    with _credential_operation_lock(database_path):
+        credential_ref = _steam_credential_ref(database_path)
+        with Storage(database_path) as storage:
+            try:
+                account = storage.get_account(args.account)
+            except ValueError:
+                account = None
+            if account is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            consent = storage.get_activity_data_consent(account.id)
+            if consent is None or consent.disclosure_version != ACTIVITY_DISCLOSURE_VERSION:
+                if not args.acknowledge_local_storage:
+                    return _emit_error(
+                        args,
+                        command=command,
+                        code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                        message=(
+                            "Steam activity and bounded achievement evidence will be stored "
+                            "locally: AppIDs, normalized playtime and recent-window fields, "
+                            "last-played times, achievement state and public schema text, "
+                            "plus coarse attempt metadata. Recent play is not a session log, "
+                            "achievement percentage is not completion truth, and activity does "
+                            "not imply preference. Locked hidden achievement text is suppressed "
+                            "from normal output. The selected filesystem, replicas, snapshots, "
+                            "and user-controlled backups may retain copies after local deletion."
+                        ),
+                        remediation=(
+                            "Rerun with --acknowledge-local-storage to accept this "
+                            "versioned local-storage policy."
+                        ),
+                    )
+                storage.record_activity_data_consent(
+                    account_id=account.id,
+                    disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+                    accepted_at=_utc_now(),
+                    backups_acknowledged=True,
+                )
+            metadata = storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            if metadata is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.AUTH_REQUIRED,
+                    message="A Steam Web API user key has not been configured.",
+                )
+            resolved = _resolve_credential(metadata, credential_ref)
+            if resolved["state"] != "configured":
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=_credential_error_code(resolved["state"]),
+                    message="The Steam Web API credential is unavailable.",
+                )
+
+            def request_gate() -> None:
+                for attempt in range(2):
+                    if _reserve_provider_request(
+                        "steam-web-api", _utc_now(), _PROVIDER_MINIMUM_INTERVAL_SECONDS
+                    ):
+                        return
+                    if attempt == 0:
+                        time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                raise ActivitySyncError("REQUEST_THROTTLED", retryable=True)
+
+            try:
+                if args.sync_command == "activity":
+                    result = sync_activity(
+                        storage,
+                        account_id=account.id,
+                        steamid=account.provider_account_id,
+                        api_key=resolved["secret"],
+                        client=_steam_activity_client(),
+                        request_gate=request_gate,
+                        clock=_utc_now,
+                    )
+                    data = {
+                        "sync_run_id": result.run.id,
+                        "sync_status": result.run.status,
+                        "owned_count": result.owned_count,
+                        "recent_count": result.recent_count,
+                        "disclosure_version": ACTIVITY_DISCLOSURE_VERSION,
+                    }
+                else:
+                    result = sync_achievements(
+                        storage,
+                        account_id=account.id,
+                        steamid=account.provider_account_id,
+                        api_key=resolved["secret"],
+                        scope=args.scope,
+                        explicit_appids=tuple(args.appid),
+                        max_items=args.max_items,
+                        client=_steam_activity_client(),
+                        request_gate=request_gate,
+                        clock=_utc_now,
+                    )
+                    data = {
+                        "sync_run_id": result.run.id,
+                        "sync_status": result.run.status,
+                        "candidate_count": result.candidate_count,
+                        "targeted_count": result.targeted_count,
+                        "state_counts": result.state_counts,
+                        "disclosure_version": ACTIVITY_DISCLOSURE_VERSION,
+                    }
+            except ActivitySyncError as exc:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=exc.code,
+                    message="The Steam activity synchronization did not complete.",
+                    retryable=exc.retryable,
+                )
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The synchronization arguments are invalid.",
+                    exit_code=2,
+                )
+        return _emit_success(
+            args,
+            command=command,
+            context={"account_alias": account.alias, "identifiers_included": False},
+            data=data,
+        )
 
 
 def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
@@ -2356,6 +2590,11 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                             "feedback_traits_removed": 0,
                             "preference_rule_events_removed": 0,
                             "preference_rules_removed": 0,
+                            "activity_observations_removed": 0,
+                            "activity_current_removed": 0,
+                            "achievement_demand_removed": 0,
+                            "achievement_player_observations_removed": 0,
+                            "achievement_player_current_removed": 0,
                             "sync_runs_removed": 0,
                             "probes_removed": 0,
                             "consents_removed": 0,
@@ -2385,6 +2624,11 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                     "feedback_traits_removed": result.feedback_traits_removed,
                     "preference_rule_events_removed": result.preference_rule_events_removed,
                     "preference_rules_removed": result.preference_rules_removed,
+                    "activity_observations_removed": result.activity_observations_removed,
+                    "activity_current_removed": result.activity_current_removed,
+                    "achievement_demand_removed": result.achievement_demand_removed,
+                    "achievement_player_observations_removed": result.achievement_player_observations_removed,
+                    "achievement_player_current_removed": result.achievement_player_current_removed,
                     "sync_runs_removed": result.sync_runs_removed,
                     "probes_removed": result.probes_removed,
                     "consents_removed": result.consents_removed,
@@ -2613,6 +2857,11 @@ def _delete_all_steam_web_api_data(
             "feedback_traits_removed": deletion.feedback_traits_removed,
             "preference_rule_events_removed": deletion.preference_rule_events_removed,
             "preference_rules_removed": deletion.preference_rules_removed,
+            "activity_observations_removed": deletion.activity_observations_removed,
+            "activity_current_removed": deletion.activity_current_removed,
+            "achievement_demand_removed": deletion.achievement_demand_removed,
+            "achievement_player_observations_removed": deletion.achievement_player_observations_removed,
+            "achievement_player_current_removed": deletion.achievement_player_current_removed,
             "sync_runs_removed": deletion.sync_runs_removed,
             "probes_removed": deletion.probes_removed,
             "consents_removed": deletion.consents_removed,
@@ -3539,6 +3788,10 @@ def _steam_web_api_client() -> SteamWebApiClient:
     return SteamWebApiClient()
 
 
+def _steam_activity_client() -> SteamActivityApiClient:
+    return SteamActivityApiClient()
+
+
 def _steam_wishlist_client() -> SteamWishlistClient:
     return SteamWishlistClient()
 
@@ -3659,6 +3912,8 @@ def _command_name(args: argparse.Namespace) -> str:
         "feedback_command",
         "preferences_command",
         "rule_command",
+        "activity_command",
+        "achievements_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -3739,6 +3994,24 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "activity.query":
+        _print_table_fields("APPID", "NAME", "LIFETIME_MINUTES", "RECENT_MINUTES", "LAST_PLAYED_AT", "FRESHNESS")
+        for item in envelope["data"]["items"]:
+            _print_table_fields(
+                item["appid"], item["name"], item["playtime"]["lifetime_minutes"],
+                item["playtime"]["recent_window_minutes"], item["last_played_at"],
+                item["freshness"]["activity"],
+            )
+        return
+    if command == "achievements.query":
+        _print_table_fields("APPID", "NAME", "STATE", "TARGETED", "UNLOCKED", "TOTAL", "FRESHNESS")
+        for item in envelope["data"]["items"]:
+            _print_table_fields(
+                item["appid"], item["name"], item["state"], item["targeted"],
+                item["summary"]["unlocked"], item["summary"]["total"],
+                item["summary"]["freshness"],
+            )
+        return
     if command == "feedback.query":
         _print_table_fields(
             "APPID", "RATING", "PLAY_STATE", "SNOOZED_UNTIL",

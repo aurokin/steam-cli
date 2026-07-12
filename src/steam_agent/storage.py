@@ -546,6 +546,11 @@ class AccountDataDeletion:
     feedback_traits_removed: int = 0
     preference_rule_events_removed: int = 0
     preference_rules_removed: int = 0
+    activity_observations_removed: int = 0
+    activity_current_removed: int = 0
+    achievement_demand_removed: int = 0
+    achievement_player_observations_removed: int = 0
+    achievement_player_current_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -577,6 +582,11 @@ class AllSteamAccountDataDeletion:
     feedback_traits_removed: int = 0
     preference_rule_events_removed: int = 0
     preference_rules_removed: int = 0
+    activity_observations_removed: int = 0
+    activity_current_removed: int = 0
+    achievement_demand_removed: int = 0
+    achievement_player_observations_removed: int = 0
+    achievement_player_current_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -1821,6 +1831,436 @@ class Storage:
         values = dict(row)
         values["backups_acknowledged"] = bool(values["backups_acknowledged"])
         return AccountDataConsent(**values)
+
+    def record_activity_data_consent(
+        self,
+        *,
+        account_id: int,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> AccountDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            self._require_steam_account(account_id)
+            self._connection.execute(
+                """
+                INSERT INTO account_data_consents(
+                    account_id, consent_kind, disclosure_version,
+                    backups_acknowledged, accepted_at
+                ) VALUES (?, 'activity_persistence', ?, 1, ?)
+                ON CONFLICT(account_id, consent_kind) DO UPDATE SET
+                    disclosure_version = excluded.disclosure_version,
+                    backups_acknowledged = excluded.backups_acknowledged,
+                    accepted_at = excluded.accepted_at
+                """,
+                (account_id, disclosure_version, timestamp),
+            )
+        consent = self.get_activity_data_consent(account_id)
+        assert consent is not None
+        return consent
+
+    def get_activity_data_consent(self, account_id: int) -> AccountDataConsent | None:
+        row = self._connection.execute(
+            """SELECT * FROM account_data_consents
+               WHERE account_id = ? AND consent_kind = 'activity_persistence'""",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return AccountDataConsent(**values)
+
+    def complete_activity_snapshot(
+        self,
+        sync_run_id: int,
+        *,
+        account_id: int,
+        games: tuple[Mapping[str, Any], ...],
+        observed_at: str | datetime,
+        recent_observed_at: str | datetime,
+        completed_at: str | datetime,
+    ) -> SyncRun:
+        observed = _timestamp(observed_at)
+        recent_observed = _timestamp(recent_observed_at)
+        completed = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id = ?", (sync_run_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["capability"] != "activity.read"
+                or run["account_id"] != account_id
+                or run["status"] != "running"
+            ):
+                raise InvalidSyncTransition("activity sync run is not active")
+            self._require_steam_account(account_id)
+            seen: set[int] = set()
+            for game in games:
+                appid = int(game["appid"])
+                if appid in seen:
+                    raise ValueError("duplicate activity AppID")
+                seen.add(appid)
+                self._ensure_steam_application_identity(appid, observed_at=observed)
+                values = (
+                    sync_run_id,
+                    account_id,
+                    appid,
+                    game.get("playtime_forever_minutes"),
+                    game.get("playtime_2weeks_minutes"),
+                    game.get("playtime_windows_forever_minutes"),
+                    game.get("playtime_mac_forever_minutes"),
+                    game.get("playtime_linux_forever_minutes"),
+                    game.get("playtime_deck_forever_minutes"),
+                    game.get("playtime_disconnected_minutes"),
+                    game.get("last_played_unix"),
+                    game.get("recent_window_minutes"),
+                    observed,
+                    recent_observed if game.get("recent_window_minutes") is not None else None,
+                )
+                self._connection.execute(
+                    """INSERT INTO activity_observations VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+            self._connection.execute(
+                "DELETE FROM activity_current WHERE account_id = ?", (account_id,)
+            )
+            self._connection.execute(
+                """INSERT INTO activity_current
+                SELECT account_id, appid, sync_run_id,
+                       playtime_forever_minutes, playtime_2weeks_minutes,
+                       playtime_windows_forever_minutes, playtime_mac_forever_minutes,
+                       playtime_linux_forever_minutes, playtime_deck_forever_minutes,
+                       playtime_disconnected_minutes, last_played_unix,
+                       recent_window_minutes, observed_at, recent_observed_at
+                FROM activity_observations WHERE sync_run_id = ?""",
+                (sync_run_id,),
+            )
+            self._connection.execute(
+                """UPDATE sync_runs SET status = 'complete', promoted = 1,
+                   records_seen = ?, completed_at = ? WHERE id = ?""",
+                (len(games), completed, sync_run_id),
+            )
+            self._prune_activity(account_id, completed)
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def finish_activity_sync_failed(
+        self, sync_run_id: int, *, error_code: str, completed_at: str | datetime
+    ) -> SyncRun:
+        return self._finish_simple_sync(
+            sync_run_id, "activity.read", error_code=error_code, completed_at=completed_at
+        )
+
+    def read_activity_snapshot(
+        self, account_id: int, *, now: str | datetime | None = None
+    ) -> Mapping[str, Any]:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if now is not None:
+                self._prune_activity(account_id, _timestamp(now))
+            rows = tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    """SELECT c.*, a.name FROM activity_current c
+                       JOIN steam_apps a USING(appid)
+                       WHERE c.account_id = ? ORDER BY c.appid""",
+                    (account_id,),
+                )
+            )
+            latest_row = self._connection.execute(
+                """SELECT * FROM sync_runs WHERE account_id = ? AND capability = 'activity.read'
+                   ORDER BY started_at DESC, id DESC LIMIT 1""",
+                (account_id,),
+            ).fetchone()
+            good_row = self._connection.execute(
+                """SELECT * FROM sync_runs WHERE account_id = ? AND capability = 'activity.read'
+                   AND status = 'complete' AND promoted = 1
+                   ORDER BY completed_at DESC, id DESC LIMIT 1""",
+                (account_id,),
+            ).fetchone()
+            result = {
+                "items": rows,
+                "latest": None if latest_row is None else SyncRun(**dict(latest_row)),
+                "latest_complete": None if good_row is None else SyncRun(**dict(good_row)),
+            }
+            self._connection.commit()
+            return result
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def begin_achievement_sync(
+        self,
+        *,
+        account_id: int,
+        candidates: tuple[int, ...],
+        targeted: tuple[int, ...],
+        started_at: str | datetime,
+    ) -> SyncRun:
+        timestamp = _timestamp(started_at)
+        target_set = set(targeted)
+        if len(candidates) != len(set(candidates)) or not target_set <= set(candidates):
+            raise ValueError("achievement demand is invalid")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            cursor = self._connection.execute(
+                """INSERT INTO sync_runs(provider, capability, account_id, started_at, status)
+                   VALUES ('steam_web_api', 'achievements.read', ?, ?, 'running')""",
+                (account_id, timestamp),
+            )
+            run_id = int(cursor.lastrowid)
+            for ordinal, appid in enumerate(candidates):
+                self._ensure_steam_application_identity(appid, observed_at=timestamp)
+                is_targeted = appid in target_set
+                self._connection.execute(
+                    """INSERT INTO achievement_sync_demand
+                       (sync_run_id, account_id, appid, ordinal, targeted, state)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (run_id, account_id, appid, ordinal, is_targeted, "running" if is_targeted else "unevaluated"),
+                )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(run_id)
+
+    def record_achievement_result(
+        self,
+        sync_run_id: int,
+        *,
+        account_id: int,
+        appid: int,
+        state: str,
+        player: tuple[Mapping[str, Any], ...],
+        schema_state: str,
+        schema: tuple[Mapping[str, Any], ...],
+        observed_at: str | datetime,
+        error_code: str | None = None,
+        write_schema: bool = True,
+    ) -> None:
+        if state not in {"ready", "profile_not_public", "achievements_not_supported", "failed"}:
+            raise ValueError("achievement state is invalid")
+        timestamp = _timestamp(observed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            demand = self._connection.execute(
+                """SELECT * FROM achievement_sync_demand
+                   WHERE sync_run_id = ? AND account_id = ? AND appid = ? AND targeted = 1""",
+                (sync_run_id, account_id, appid),
+            ).fetchone()
+            if demand is None or demand["state"] != "running":
+                raise InvalidSyncTransition("achievement target is not running")
+            if state != "failed":
+                self._connection.execute(
+                    "DELETE FROM achievement_player_current WHERE account_id = ? AND appid = ?",
+                    (account_id, appid),
+                )
+                for item in player:
+                    values = (
+                        sync_run_id, account_id, appid, item["api_name"],
+                        bool(item["achieved"]), item.get("unlock_time_unix"), timestamp,
+                    )
+                    self._connection.execute(
+                        "INSERT INTO achievement_player_observations VALUES (?, ?, ?, ?, ?, ?, ?)", values,
+                    )
+                    self._connection.execute(
+                        "INSERT INTO achievement_player_current VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (account_id, appid, item["api_name"], bool(item["achieved"]), item.get("unlock_time_unix"), timestamp, sync_run_id),
+                    )
+                if write_schema:
+                    self._connection.execute(
+                        "DELETE FROM achievement_schema_current WHERE appid = ? AND language = 'english'",
+                        (appid,),
+                    )
+                    for item in schema:
+                        self._connection.execute(
+                            """INSERT INTO achievement_schema_current VALUES
+                               (?, 'english', ?, ?, ?, ?, ?, ?)""",
+                            (appid, item["api_name"], schema_state, item.get("display_name"), item.get("description"), bool(item["hidden"]), timestamp),
+                        )
+                    self._connection.execute(
+                        """INSERT INTO achievement_schema_status VALUES (?, 'english', ?, ?)
+                           ON CONFLICT(appid, language) DO UPDATE SET state=excluded.state, observed_at=excluded.observed_at""",
+                        (appid, schema_state, timestamp),
+                    )
+            self._connection.execute(
+                """UPDATE achievement_sync_demand SET evaluated = 1, state = ?,
+                   error_code = ?, observed_at = ? WHERE sync_run_id = ? AND appid = ?""",
+                (state, error_code, timestamp, sync_run_id, appid),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def read_cached_achievement_schema(
+        self, appid: int, *, now: str | datetime, language: str = "english"
+    ) -> Mapping[str, Any] | None:
+        evaluated = datetime.fromisoformat(_timestamp(now).replace("Z", "+00:00"))
+        status = self._connection.execute(
+            "SELECT state, observed_at FROM achievement_schema_status WHERE appid=? AND language=?",
+            (appid, language),
+        ).fetchone()
+        if status is None:
+            return None
+        observed = datetime.fromisoformat(str(status["observed_at"]).replace("Z", "+00:00"))
+        lifetime = timedelta(days=30 if status["state"] == "ready" else 7)
+        if evaluated - observed > lifetime:
+            return None
+        rows = tuple(
+            dict(row)
+            for row in self._connection.execute(
+                """SELECT api_name, display_name, description, hidden
+                   FROM achievement_schema_current
+                   WHERE appid=? AND language=? ORDER BY api_name""",
+                (appid, language),
+            )
+        )
+        return {"state": status["state"], "achievements": rows}
+
+    def finish_achievement_sync(
+        self, sync_run_id: int, *, completed_at: str | datetime
+    ) -> SyncRun:
+        completed = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id = ?", (sync_run_id,)
+            ).fetchone()
+            if run is None or run["capability"] != "achievements.read" or run["status"] != "running":
+                raise InvalidSyncTransition("achievement sync run is not active")
+            running = int(self._connection.execute(
+                "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id = ? AND state = 'running'", (sync_run_id,)
+            ).fetchone()[0])
+            if running:
+                self._connection.execute(
+                    """UPDATE achievement_sync_demand SET state='failed', evaluated=1,
+                       error_code='SYNC_INTERRUPTED', observed_at=?
+                       WHERE sync_run_id=? AND state='running'""", (completed, sync_run_id)
+                )
+            evaluated = int(self._connection.execute(
+                "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id=? AND evaluated=1", (sync_run_id,)
+            ).fetchone()[0])
+            self._connection.execute(
+                """UPDATE sync_runs SET status='complete', promoted=1, records_seen=?, completed_at=?
+                   WHERE id=?""", (evaluated, completed, sync_run_id)
+            )
+            self._prune_achievements(int(run["account_id"]), completed)
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def mark_remaining_achievements_unevaluated(
+        self,
+        sync_run_id: int,
+        *,
+        observed_at: str | datetime,
+        error_code: str,
+    ) -> int:
+        timestamp = _timestamp(observed_at)
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE achievement_sync_demand
+                   SET state='unevaluated', evaluated=0, error_code=?, observed_at=?
+                   WHERE sync_run_id=? AND targeted=1 AND state='running'""",
+                (error_code, timestamp, sync_run_id),
+            )
+        return cursor.rowcount
+
+    def read_achievement_snapshot(self, account_id: int, *, appid: int | None = None) -> Mapping[str, Any]:
+        filter_sql = "" if appid is None else " AND d.appid = ?"
+        latest = self._connection.execute(
+            """SELECT * FROM sync_runs WHERE account_id=? AND capability='achievements.read'
+               ORDER BY started_at DESC, id DESC LIMIT 1""", (account_id,)
+        ).fetchone()
+        if latest is None:
+            return {"items": (), "latest": None}
+        rows = tuple(dict(row) for row in self._connection.execute(
+            f"""SELECT d.*, a.name FROM achievement_sync_demand d
+                JOIN steam_apps a USING(appid)
+                JOIN sync_runs r ON r.id=d.sync_run_id
+                WHERE d.account_id=?{filter_sql}
+                  AND d.sync_run_id = (
+                    SELECT d2.sync_run_id FROM achievement_sync_demand d2
+                    JOIN sync_runs r2 ON r2.id=d2.sync_run_id
+                    WHERE d2.account_id=d.account_id AND d2.appid=d.appid
+                    ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
+                  )
+                ORDER BY d.appid""",
+            (account_id, *(() if appid is None else (appid,))),
+        ))
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            achievements = tuple(dict(item) for item in self._connection.execute(
+                """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
+                          s.display_name, s.description, COALESCE(s.hidden, 0) AS hidden
+                   FROM achievement_player_current p
+                   LEFT JOIN achievement_schema_current s ON s.appid=p.appid
+                     AND s.language='english' AND s.api_name=p.api_name
+                   WHERE p.account_id=? AND p.appid=? ORDER BY p.api_name""",
+                (account_id, row["appid"]),
+            ))
+            row["achievements"] = achievements
+            items.append(row)
+        return {"items": tuple(items), "latest": SyncRun(**dict(latest))}
+
+    def _finish_simple_sync(self, sync_run_id: int, capability: str, *, error_code: str, completed_at: str | datetime) -> SyncRun:
+        timestamp = _timestamp(completed_at)
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE sync_runs SET status='failed', completed_at=?, error_code=?, error_detail=NULL
+                   WHERE id=? AND capability=? AND status='running'""",
+                (timestamp, error_code, sync_run_id, capability),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidSyncTransition("sync run is not active")
+        return self.get_sync_run(sync_run_id)
+
+    def _prune_activity(self, account_id: int, now: str) -> None:
+        cutoff = _timestamp(datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7))
+        self._connection.execute(
+            "DELETE FROM sync_runs WHERE account_id=? AND capability='activity.read' AND started_at < ?",
+            (account_id, cutoff),
+        )
+        self._connection.execute(
+            "DELETE FROM activity_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
+        )
+
+    def _prune_achievements(self, account_id: int, now: str) -> None:
+        parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        cutoff = _timestamp(parsed - timedelta(days=7))
+        schema_cutoff = _timestamp(parsed - timedelta(days=30))
+        self._connection.execute(
+            "DELETE FROM sync_runs WHERE account_id=? AND capability='achievements.read' AND started_at < ?",
+            (account_id, cutoff),
+        )
+        self._connection.execute(
+            "DELETE FROM achievement_player_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
+        )
+        self._connection.execute(
+            "DELETE FROM achievement_schema_current WHERE observed_at < ?", (schema_cutoff,)
+        )
+        self._connection.execute(
+            "DELETE FROM achievement_schema_status WHERE state='ready' AND observed_at < ?", (schema_cutoff,)
+        )
+        self._connection.execute(
+            "DELETE FROM achievement_schema_status WHERE state='achievements_not_supported' AND observed_at < ?", (cutoff,)
+        )
 
     def complete_wishlist_snapshot(
         self,
@@ -4015,6 +4455,21 @@ class Storage:
                 "preference_rules": self._count_where(
                     "preference_rules_current", "account_id", account_id
                 ),
+                "activity_observations": self._count_where(
+                    "activity_observations", "account_id", account_id
+                ),
+                "activity_current": self._count_where(
+                    "activity_current", "account_id", account_id
+                ),
+                "achievement_demand": self._count_where(
+                    "achievement_sync_demand", "account_id", account_id
+                ),
+                "achievement_player_observations": self._count_where(
+                    "achievement_player_observations", "account_id", account_id
+                ),
+                "achievement_player_current": self._count_where(
+                    "achievement_player_current", "account_id", account_id
+                ),
                 "sync_runs": self._count_where("sync_runs", "account_id", account_id),
                 "consents": self._count_where(
                     "account_data_consents", "account_id", account_id
@@ -4051,8 +4506,12 @@ class Storage:
                     SELECT appid FROM price_sync_demand WHERE account_id = ?
                     UNION
                     SELECT appid FROM explicit_feedback_events WHERE account_id = ?
+                    UNION
+                    SELECT appid FROM activity_observations WHERE account_id = ?
+                    UNION
+                    SELECT appid FROM achievement_sync_demand WHERE account_id = ?
                     """,
-                    (account_id, account_id, account_id, account_id),
+                    (account_id, account_id, account_id, account_id, account_id, account_id),
                 )
             )
             (
@@ -4092,6 +4551,9 @@ class Storage:
                 )
                 evidence_removed = max(evidence_removed, evidence_cursor.rowcount)
             evidence_removed += catalog_evidence_removed
+            self._delete_orphan_achievement_schemas(
+                tuple(sorted({*appids, *catalog_appids}))
+            )
             orphan_apps_removed = self._delete_orphan_apps(
                 tuple(sorted({*appids, *catalog_appids}))
             )
@@ -4115,6 +4577,11 @@ class Storage:
                 feedback_traits_removed=counts["feedback_traits"],
                 preference_rule_events_removed=counts["preference_rule_events"],
                 preference_rules_removed=counts["preference_rules"],
+                activity_observations_removed=counts["activity_observations"],
+                activity_current_removed=counts["activity_current"],
+                achievement_demand_removed=counts["achievement_demand"],
+                achievement_player_observations_removed=counts["achievement_player_observations"],
+                achievement_player_current_removed=counts["achievement_player_current"],
             )
         except BaseException:
             try:
@@ -4171,6 +4638,11 @@ class Storage:
                 "feedback_traits": 0,
                 "preference_rule_events": 0,
                 "preference_rules": 0,
+                "activity_observations": 0,
+                "activity_current": 0,
+                "achievement_demand": 0,
+                "achievement_player_observations": 0,
+                "achievement_player_current": 0,
                 "sync_runs": 0,
                 "consents": 0,
                 "probes": 0,
@@ -4260,6 +4732,36 @@ class Storage:
                             f"WHERE account_id IN ({id_placeholders})", account_ids
                         ).fetchone()[0]
                     ),
+                    "activity_observations": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM activity_observations WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "activity_current": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM activity_current WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "achievement_demand": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM achievement_sync_demand WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "achievement_player_observations": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM achievement_player_observations WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
+                    "achievement_player_current": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM achievement_player_current WHERE account_id IN ({id_placeholders})",
+                            account_ids,
+                        ).fetchone()[0]
+                    ),
                     "sync_runs": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM sync_runs "
@@ -4314,8 +4816,14 @@ class Storage:
                         UNION
                         SELECT appid FROM explicit_feedback_events
                         WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT appid FROM activity_observations
+                        WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT appid FROM achievement_sync_demand
+                        WHERE account_id IN ({id_placeholders})
                         """,
-                        (*account_ids, *account_ids, *account_ids, *account_ids),
+                        (*account_ids, *account_ids, *account_ids, *account_ids, *account_ids, *account_ids),
                     )
                 )
 
@@ -4375,6 +4883,8 @@ class Storage:
             account_cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE provider = 'steam'"
             )
+            self._connection.execute("DELETE FROM achievement_schema_current")
+            self._connection.execute("DELETE FROM achievement_schema_status")
             catalog_runs_cursor = self._connection.execute(
                 "DELETE FROM sync_runs WHERE capability = 'catalog.application.read'"
             )
@@ -4419,6 +4929,11 @@ class Storage:
                 feedback_traits_removed=counts["feedback_traits"],
                 preference_rule_events_removed=counts["preference_rule_events"],
                 preference_rules_removed=counts["preference_rules"],
+                activity_observations_removed=counts["activity_observations"],
+                activity_current_removed=counts["activity_current"],
+                achievement_demand_removed=counts["achievement_demand"],
+                achievement_player_observations_removed=counts["achievement_player_observations"],
+                achievement_player_current_removed=counts["achievement_player_current"],
             )
         except BaseException:
             try:
@@ -4812,6 +5327,11 @@ class Storage:
             ("explicit_trait_current", "account_id"),
             ("preference_rule_events", "account_id"),
             ("preference_rules_current", "account_id"),
+            ("activity_observations", "account_id"),
+            ("activity_current", "account_id"),
+            ("achievement_sync_demand", "account_id"),
+            ("achievement_player_observations", "account_id"),
+            ("achievement_player_current", "account_id"),
             ("sync_runs", "account_id"),
             ("account_data_consents", "account_id"),
         }
@@ -5267,6 +5787,39 @@ class Storage:
         )
         return cursor.rowcount
 
+    def _delete_orphan_achievement_schemas(self, appids: tuple[int, ...]) -> int:
+        if not appids:
+            return 0
+        placeholders = ",".join("?" for _ in appids)
+        cursor = self._connection.execute(
+            f"""DELETE FROM achievement_schema_current
+                WHERE appid IN ({placeholders})
+                  AND NOT EXISTS (
+                    SELECT 1 FROM achievement_sync_demand d
+                    WHERE d.appid = achievement_schema_current.appid
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM achievement_player_current p
+                    WHERE p.appid = achievement_schema_current.appid
+                  )""",
+            appids,
+        )
+        self._connection.execute(
+            f"""DELETE FROM achievement_schema_status
+                WHERE appid IN ({placeholders})
+                  AND NOT EXISTS (
+                    SELECT 1 FROM achievement_schema_current s
+                    WHERE s.appid = achievement_schema_status.appid
+                      AND s.language = achievement_schema_status.language
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM achievement_sync_demand d
+                    WHERE d.appid = achievement_schema_status.appid
+                  )""",
+            appids,
+        )
+        return cursor.rowcount
+
     def _delete_orphan_apps(self, appids: tuple[int, ...]) -> int:
         if not appids:
             return 0
@@ -5338,6 +5891,26 @@ class Storage:
               AND NOT EXISTS (
                   SELECT 1 FROM explicit_trait_current
                   WHERE explicit_trait_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM activity_observations
+                  WHERE activity_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM activity_current
+                  WHERE activity_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM achievement_sync_demand
+                  WHERE achievement_sync_demand.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM achievement_player_current
+                  WHERE achievement_player_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM achievement_schema_status
+                  WHERE achievement_schema_status.appid = steam_apps.appid
               )
             """,
             appids,

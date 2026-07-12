@@ -157,6 +157,13 @@ def smoke(wheel: Path) -> None:
             )
         ):
             raise RuntimeError("installed help does not expose explicit estimates")
+        activity_help = _run([str(executable), "sync", "activity", "--help"])
+        achievements_help = _run([str(executable), "sync", "achievements", "--help"])
+        if "--acknowledge-local-storage" not in activity_help.stdout or not all(
+            option in achievements_help.stdout
+            for option in ("--scope", "--appid", "--max-items", "--acknowledge-local-storage")
+        ):
+            raise RuntimeError("installed help does not expose M4 activity contracts")
 
         data_dir = root / "data"
         query = [
@@ -187,6 +194,9 @@ def smoke(wheel: Path) -> None:
             or "targeted" not in _columns(database, "price_sync_demand")
             or "explicit_feedback_current" not in _tables(database)
             or "preference_rules_current" not in _tables(database)
+            or "activity_current" not in _tables(database)
+            or "achievement_sync_demand" not in _tables(database)
+            or "achievement_player_current" not in _tables(database)
         ):
             raise RuntimeError(
                 "installed wheel did not apply the complete source schema"
