@@ -138,13 +138,18 @@ from steam_agent.compatibility_adapter import (
 )
 from steam_agent.groups import (
     CopySourceRef,
+    FeatureSet,
     FamilyEdge,
+    GroupCandidate,
+    MemberPreference,
     MemberRef,
     OwnershipFact,
     PlayerLimits,
     PolicyFact,
     assess_copies,
     assess_eligibility,
+    rank_candidates,
+    score_preferences,
     summarize_ownership,
 )
 
@@ -496,6 +501,38 @@ def build_parser() -> argparse.ArgumentParser:
             )
             leaf.add_argument("--host")
             leaf.add_argument("--policy")
+    group_recommend = group_commands.add_parser(
+        "recommend", help="Rank a bounded cache-only group candidate set."
+    )
+    _add_leaf_format(group_recommend)
+    group_recommend.add_argument(
+        "--scope",
+        choices=("known", "library", "wishlist", "installed", "appids"),
+        required=True,
+    )
+    group_recommend.add_argument("--limit", type=int, required=True)
+    group_recommend.add_argument("--appid", action="append", type=int, default=[])
+    group_recommend.add_argument("--member", action="append", required=True)
+    group_recommend.add_argument("--copy-source", action="append", default=[])
+    group_recommend.add_argument("--context-account", required=True)
+    group_recommend.add_argument("--context-machine", required=True)
+    group_recommend.add_argument("--country", required=True)
+    group_recommend.add_argument("--language", required=True)
+    group_recommend.add_argument(
+        "--mode",
+        required=True,
+        choices=tuple(_GROUP_MODE_DECLARATION),
+    )
+    group_recommend.add_argument("--host")
+    group_recommend.add_argument("--policy")
+    group_recommend.add_argument(
+        "--objective",
+        choices=("no-purchase", "min-copies", "preference-fit"),
+        required=True,
+    )
+    group_recommend.add_argument("--like", action="append", default=[])
+    group_recommend.add_argument("--dislike", action="append", default=[])
+    group_recommend.add_argument("--exclude-trait")
 
     deals = commands.add_parser("deals", help="Query cached wishlist deal evidence.")
     deal_commands = deals.add_subparsers(dest="deals_command", required=True)
@@ -2368,7 +2405,215 @@ _GROUP_MODE_DECLARATION = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _GroupEvaluation:
+    summary: Any
+    copies: Any
+    eligibility: Any
+    features: FeatureSet
+    trait_exclusion: str
+
+
+def _group_feature_set(appid: int, payload: Mapping[str, Any] | None) -> FeatureSet:
+    if payload is None:
+        return FeatureSet(appid, known=False)
+    facts = declared_discovery_facts(payload)
+    if facts.category_state != "declared" or facts.genres.state != "declared":
+        return FeatureSet(appid, known=False)
+    return FeatureSet(
+        appid,
+        frozenset(item.id for item in facts.genres.items),
+        frozenset(facts.category_ids),
+    )
+
+
+def _group_ownership_by_app(
+    storage: Storage,
+    *,
+    refs: tuple[MemberRef, ...],
+    appids: tuple[int, ...],
+) -> dict[int, tuple[OwnershipFact, ...]]:
+    account_owned: dict[MemberRef, set[int]] = {}
+    for ref in refs:
+        if ref.kind != "account":
+            continue
+        account = storage.get_account(ref.key)
+        if account is None:
+            raise ValueError("selected account is not configured")
+        snapshot = storage.read_owned_snapshot(account.id)
+        account_owned[ref] = {
+            game.appid
+            for game in snapshot.games
+            if game.inclusion_basis == "visible_owned"
+        }
+    result: dict[int, tuple[OwnershipFact, ...]] = {}
+    for appid in appids:
+        facts: list[OwnershipFact] = []
+        for ref in refs:
+            source = CopySourceRef(ref.kind, ref.key)
+            if ref.kind == "account":
+                state = "owned" if appid in account_owned[ref] else "unknown"
+            else:
+                assertions = storage.read_group_ownership(ref, appid=appid)
+                state = assertions[0].state if assertions else "unknown"
+            facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
+        result[appid] = tuple(facts)
+    return result
+
+
+def _evaluate_group_app(
+    storage: Storage,
+    *,
+    appid: int,
+    members: tuple[MemberRef, ...],
+    extra_sources: tuple[CopySourceRef, ...],
+    ownership: tuple[OwnershipFact, ...],
+    payload: Mapping[str, Any] | None,
+    mode: str,
+    host: MemberRef | None,
+    policy: str | None,
+    exclude_trait: str | None,
+) -> _GroupEvaluation:
+    summary = summarize_ownership(members, ownership)
+    selected_sources = {
+        *(CopySourceRef.for_member(member) for member in members),
+        *extra_sources,
+    }
+    family: list[FamilyEdge] = []
+    for member in members:
+        for assertion in storage.read_group_family(member, appid=appid):
+            source = CopySourceRef(assertion.source.kind, assertion.source.key)
+            if source in selected_sources:
+                family.append(FamilyEdge(member, source, assertion.state))
+    copies = assess_copies(
+        members=members,
+        extra_sources=extra_sources,
+        ownership=ownership,
+        family=tuple(family),
+        mode=mode,  # type: ignore[arg-type]
+        host=host,
+    )
+    discovery = None if payload is None else declared_discovery_facts(payload)
+    expected_mode = _GROUP_MODE_DECLARATION[mode]
+    mode_state = (
+        "pass"
+        if discovery is not None
+        and expected_mode is not None
+        and expected_mode in discovery.multiplayer_modes
+        else "unknown"
+    )
+    player_values: dict[str, list[int]] = {"players:min": [], "players:max": []}
+    policy_facts: list[PolicyFact] = []
+    trait_states: list[str] = []
+    for member in members:
+        assertions = storage.read_group_app_assertions(member, appid=appid)
+        by_fact = {assertion.fact: assertion for assertion in assertions}
+        for assertion in assertions:
+            if (
+                assertion.fact in player_values
+                and assertion.state == "known"
+                and assertion.value is not None
+            ):
+                player_values[assertion.fact].append(assertion.value)
+        if policy is not None:
+            assertion = by_fact.get(f"policy:{policy}")
+            if assertion is not None:
+                state = {
+                    "present": "pass",
+                    "absent": "fail",
+                    "unknown": "unknown",
+                }[assertion.state]
+                policy_facts.append(PolicyFact(member, policy, state))  # type: ignore[arg-type]
+        if exclude_trait is not None:
+            assertion = by_fact.get(f"trait:{exclude_trait}")
+            trait_states.append("unknown" if assertion is None else assertion.state)
+    minimums = set(player_values["players:min"])
+    maximums = set(player_values["players:max"])
+    minimum = next(iter(minimums)) if len(minimums) == 1 else None
+    maximum = next(iter(maximums)) if len(maximums) == 1 else None
+    limits = PlayerLimits(
+        minimum,
+        maximum,
+        len(minimums) > 1
+        or len(maximums) > 1
+        or (
+            minimum is not None and maximum is not None and minimum > maximum
+        ),
+    )
+    eligibility = assess_eligibility(
+        members=members,
+        mode_state=mode_state,
+        player_limits=limits,
+        required_policy=policy,
+        policy_facts=tuple(policy_facts),
+    )
+    trait_exclusion = "pass"
+    if "present" in trait_states:
+        trait_exclusion = "fail"
+    elif "unknown" in trait_states:
+        trait_exclusion = "unknown"
+    return _GroupEvaluation(
+        summary,
+        copies,
+        eligibility,
+        _group_feature_set(appid, payload),
+        trait_exclusion,
+    )
+
+
+def _parse_member_seeds(
+    raw_values: Sequence[str], *, members: tuple[MemberRef, ...]
+) -> dict[MemberRef, tuple[int, ...]]:
+    parsed: dict[MemberRef, list[int]] = {member: [] for member in members}
+    for raw in raw_values:
+        if not isinstance(raw, str) or "=" not in raw:
+            raise ValueError("member-qualified preference seed is invalid")
+        raw_ref, raw_appid = raw.rsplit("=", 1)
+        member = _group_ref(raw_ref)
+        if member not in parsed or not raw_appid.isdecimal():
+            raise ValueError("member-qualified preference seed is invalid")
+        appid = int(raw_appid)
+        if not 1 <= appid <= (1 << 32) - 1:
+            raise ValueError("member-qualified preference seed is invalid")
+        parsed[member].append(appid)
+    return {
+        member: tuple(values)
+        for member, values in parsed.items()
+    }
+
+
+def _group_copies_json(
+    copies: Any,
+    *,
+    member_ordinals: Mapping[MemberRef, int],
+    source_ordinals: Mapping[CopySourceRef, int],
+) -> dict[str, Any]:
+    return {
+        "required": copies.required_copies,
+        "known_matching": copies.known_matching,
+        "possible_matching": copies.possible_matching,
+        "missing": asdict(copies.missing),
+        "guarantee": copies.guarantee,
+        "known_assignments": [
+            {
+                "member_ordinal": member_ordinals[member],
+                "source_ordinal": source_ordinals[source],
+            }
+            for member, source in copies.known_assignments
+        ],
+        "possible_assignments": [
+            {
+                "member_ordinal": member_ordinals[member],
+                "source_ordinal": source_ordinals[source],
+            }
+            for member, source in copies.possible_assignments
+        ],
+    }
+
+
 def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
+    if args.group_command == "recommend":
+        return _dispatch_group_recommend(args, database_path)
     command = f"group.{args.group_command}"
     try:
         appids = tuple(sorted(set(args.appid)))
@@ -2417,30 +2662,9 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
             for ref in refs:
                 if storage.get_group_profile(ref) is None:
                     raise ValueError("selected group profile is unavailable")
-            ownership_by_app: dict[int, tuple[OwnershipFact, ...]] = {}
-            account_owned: dict[MemberRef, set[int]] = {}
-            for ref in refs:
-                if ref.kind == "account":
-                    account = storage.get_account(ref.key)
-                    if account is None:
-                        raise ValueError("selected account is not configured")
-                    snapshot = storage.read_owned_snapshot(account.id)
-                    account_owned[ref] = {
-                        game.appid
-                        for game in snapshot.games
-                        if game.inclusion_basis == "visible_owned"
-                    }
-            for appid in appids:
-                facts: list[OwnershipFact] = []
-                for ref in refs:
-                    source = CopySourceRef(ref.kind, ref.key)
-                    if ref.kind == "account":
-                        state = "owned" if appid in account_owned[ref] else "unknown"
-                    else:
-                        assertions = storage.read_group_ownership(ref, appid=appid)
-                        state = assertions[0].state if assertions else "unknown"
-                    facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
-                ownership_by_app[appid] = tuple(facts)
+            ownership_by_app = _group_ownership_by_app(
+                storage, refs=refs, appids=appids
+            )
             declared = (
                 storage.read_declared_app_snapshot(
                     account_id=context_account.id,
@@ -2479,108 +2703,30 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                     },
                 }
                 if declared is not None:
-                    family: list[FamilyEdge] = []
-                    for member in members:
-                        for assertion in storage.read_group_family(member, appid=appid):
-                            source = CopySourceRef(
-                                assertion.source.kind, assertion.source.key
-                            )
-                            if source in source_ordinals:
-                                family.append(
-                                    FamilyEdge(member, source, assertion.state)
-                                )
-                    copies = assess_copies(
+                    raw = declared["items"][index]
+                    payload = raw.get("facts")
+                    evaluation = _evaluate_group_app(
+                        storage,
+                        appid=appid,
                         members=members,
                         extra_sources=extra_sources,
                         ownership=ownership_by_app[appid],
-                        family=tuple(family),
+                        payload=payload,
                         mode=args.mode,
                         host=host,
+                        policy=policy,
+                        exclude_trait=None,
                     )
-                    raw = declared["items"][index]
-                    payload = raw.get("facts")
-                    modes = (
-                        ()
-                        if payload is None
-                        else declared_discovery_facts(payload).multiplayer_modes
+                    row["copies"] = _group_copies_json(
+                        evaluation.copies,
+                        member_ordinals=member_ordinals,
+                        source_ordinals=source_ordinals,
                     )
-                    expected_mode = _GROUP_MODE_DECLARATION[args.mode]
-                    mode_state = (
-                        "pass"
-                        if expected_mode is not None and expected_mode in modes
-                        else "unknown"
-                    )
-                    player_values: dict[str, list[int]] = {
-                        "players:min": [],
-                        "players:max": [],
-                    }
-                    policy_facts: list[PolicyFact] = []
-                    for member in members:
-                        for assertion in storage.read_group_app_assertions(
-                            member, appid=appid
-                        ):
-                            if (
-                                assertion.fact in player_values
-                                and assertion.state == "known"
-                                and assertion.value is not None
-                            ):
-                                player_values[assertion.fact].append(assertion.value)
-                            if (
-                                policy is not None
-                                and assertion.fact == f"policy:{policy}"
-                            ):
-                                state = {
-                                    "present": "pass",
-                                    "absent": "fail",
-                                    "unknown": "unknown",
-                                }[assertion.state]
-                                policy_facts.append(PolicyFact(member, policy, state))  # type: ignore[arg-type]
-                    minimums = set(player_values["players:min"])
-                    maximums = set(player_values["players:max"])
-                    minimum = next(iter(minimums)) if len(minimums) == 1 else None
-                    maximum = next(iter(maximums)) if len(maximums) == 1 else None
-                    limits = PlayerLimits(
-                        minimum,
-                        maximum,
-                        len(minimums) > 1
-                        or len(maximums) > 1
-                        or (
-                            minimum is not None
-                            and maximum is not None
-                            and minimum > maximum
-                        ),
-                    )
-                    eligibility = assess_eligibility(
-                        members=members,
-                        mode_state=mode_state,
-                        player_limits=limits,
-                        required_policy=policy,
-                        policy_facts=tuple(policy_facts),
-                    )
-                    row["copies"] = {
-                        "required": copies.required_copies,
-                        "known_matching": copies.known_matching,
-                        "possible_matching": copies.possible_matching,
-                        "missing": asdict(copies.missing),
-                        "guarantee": copies.guarantee,
-                        "known_assignments": [
-                            {
-                                "member_ordinal": member_ordinals[member],
-                                "source_ordinal": source_ordinals[source],
-                            }
-                            for member, source in copies.known_assignments
-                        ],
-                        "possible_assignments": [
-                            {
-                                "member_ordinal": member_ordinals[member],
-                                "source_ordinal": source_ordinals[source],
-                            }
-                            for member, source in copies.possible_assignments
-                        ],
-                    }
                     row["eligibility"] = {
-                        "state": eligibility.state,
-                        "gates": [asdict(gate) for gate in eligibility.gates],
+                        "state": evaluation.eligibility.state,
+                        "gates": [
+                            asdict(gate) for gate in evaluation.eligibility.gates
+                        ],
                     }
                 rows.append(row)
         return _emit_success(
@@ -2600,6 +2746,273 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
     except (StorageError, TypeError, ValueError):
         return _group_invalid(
             args, command, "Cached group evidence is unavailable or invalid."
+        )
+
+
+def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> int:
+    command = "group.recommend"
+    try:
+        explicit = tuple(sorted(set(args.appid)))
+        if any(not 1 <= appid <= (1 << 32) - 1 for appid in explicit):
+            raise ValueError("invalid AppID")
+        if args.scope == "appids" and not explicit:
+            raise ValueError("appids scope requires explicit AppIDs")
+        if not 1 <= args.limit <= 10_000:
+            raise ValueError("invalid limit")
+        members = tuple(_group_ref(value) for value in args.member)
+        extra_sources = tuple(
+            CopySourceRef(ref.kind, ref.key)
+            for ref in (_group_ref(value) for value in args.copy_source)
+        )
+        summarize_ownership(members, ())
+        if len(extra_sources) != len(set(extra_sources)):
+            raise ValueError("copy sources must be unique")
+        host = None if args.host is None else _group_ref(args.host)
+        # Validate the exact topology even when the selected scope is empty.
+        assess_copies(
+            members=members,
+            extra_sources=extra_sources,
+            ownership=(),
+            mode=args.mode,
+            host=host,
+        )
+        country = args.country.upper()
+        SteamDeclaredFactsRequestContext(country, args.language)
+        for slug in (args.policy, args.exclude_trait):
+            if slug is not None and re.fullmatch(
+                r"user:[a-z0-9](?:[a-z0-9._-]{0,57}[a-z0-9])?", slug
+            ) is None:
+                raise ValueError("user assertion slug is invalid")
+        liked = _parse_member_seeds(args.like, members=members)
+        disliked = _parse_member_seeds(args.dislike, members=members)
+        if args.objective == "preference-fit":
+            if any(not liked[member] and not disliked[member] for member in members):
+                raise ValueError("every member needs a preference seed")
+        elif args.like or args.dislike:
+            raise ValueError("preference seeds require preference-fit")
+    except (TypeError, ValueError):
+        return _group_invalid(
+            args, command, "The bounded group recommendation arguments are invalid."
+        )
+
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            context_account = storage.get_account(args.context_account)
+            machine = storage.get_machine(args.context_machine)
+            if context_account is None or machine is None:
+                raise ValueError("group recommendation context is not configured")
+            refs = tuple(
+                dict.fromkeys(
+                    (
+                        *members,
+                        *(MemberRef(source.kind, source.key) for source in extra_sources),
+                    )
+                )
+            )
+            for ref in refs:
+                if storage.get_group_profile(ref) is None:
+                    raise ValueError("selected group profile is unavailable")
+            candidate_appids = _declared_scope_appids(
+                storage,
+                account_id=context_account.id,
+                machine_id=machine.id,
+                scope=args.scope,
+                explicit=explicit,
+            )
+            if len(candidate_appids) > 10_000:
+                raise ValueError("group candidate universe exceeds the bound")
+            seed_appids = tuple(
+                sorted(
+                    {
+                        appid
+                        for values in (*liked.values(), *disliked.values())
+                        for appid in values
+                    }
+                )
+            )
+            demanded = tuple(sorted({*candidate_appids, *seed_appids}))
+            if demanded:
+                declared = storage.read_declared_app_snapshot(
+                    account_id=context_account.id,
+                    machine_id=machine.id,
+                    country=country,
+                    language=args.language,
+                    appids=demanded,
+                )
+                payload_by_appid = {
+                    int(item["appid"]): item.get("facts")
+                    for item in declared["items"]
+                }
+            else:
+                payload_by_appid = {}
+            ownership_by_app = _group_ownership_by_app(
+                storage, refs=refs, appids=candidate_appids
+            )
+            evaluations = {
+                appid: _evaluate_group_app(
+                    storage,
+                    appid=appid,
+                    members=members,
+                    extra_sources=extra_sources,
+                    ownership=ownership_by_app[appid],
+                    payload=payload_by_appid.get(appid),
+                    mode=args.mode,
+                    host=host,
+                    policy=args.policy,
+                    exclude_trait=args.exclude_trait,
+                )
+                for appid in candidate_appids
+            }
+            member_preferences: tuple[MemberPreference, ...] = ()
+            if args.objective == "preference-fit":
+                member_preferences = tuple(
+                    MemberPreference(
+                        member,
+                        liked=tuple(
+                            _group_feature_set(appid, payload_by_appid.get(appid))
+                            for appid in liked[member]
+                        ),
+                        disliked=tuple(
+                            _group_feature_set(appid, payload_by_appid.get(appid))
+                            for appid in disliked[member]
+                        ),
+                    )
+                    for member in members
+                )
+            candidates: list[GroupCandidate] = []
+            explicit_trait_exclusions = 0
+            for appid in candidate_appids:
+                evaluation = evaluations[appid]
+                if evaluation.trait_exclusion == "fail":
+                    explicit_trait_exclusions += 1
+                    continue
+                preference = (
+                    score_preferences(
+                        evaluation.features, members, member_preferences
+                    )
+                    if args.objective == "preference-fit"
+                    else None
+                )
+                candidates.append(
+                    GroupCandidate(
+                        appid,
+                        evaluation.copies,
+                        evaluation.eligibility,
+                        preference,
+                    )
+                )
+            ranked = rank_candidates(tuple(candidates), objective=args.objective)
+            selected = ranked[: args.limit]
+
+        member_ordinals = {member: index for index, member in enumerate(members)}
+        source_refs = tuple(
+            dict.fromkeys(
+                (
+                    *(CopySourceRef.for_member(member) for member in members),
+                    *extra_sources,
+                )
+            )
+        )
+        source_ordinals = {source: index for index, source in enumerate(source_refs)}
+        results: list[dict[str, Any]] = []
+        for rank, candidate in enumerate(selected, start=1):
+            evaluation = evaluations[candidate.appid]
+            preference_data: dict[str, Any] | None = None
+            if candidate.preference is not None:
+                preference_data = {
+                    "state": (
+                        "unknown"
+                        if candidate.preference.least_member is None
+                        else "known"
+                    ),
+                    "members": [
+                        {
+                            "member_ordinal": member_ordinals[member],
+                            "score_bps": score,
+                        }
+                        for member, score in candidate.preference.per_member
+                    ],
+                    "least_member_score_bps": candidate.preference.least_member,
+                    "total_score_bps": candidate.preference.total,
+                }
+            results.append(
+                {
+                    "rank": rank,
+                    "appid": candidate.appid,
+                    "ownership": {
+                        "members": [
+                            {
+                                "member_ordinal": member_ordinals[member],
+                                "state": state,
+                            }
+                            for member, state in evaluation.summary.per_member
+                        ],
+                        "union": evaluation.summary.union,
+                        "intersection": evaluation.summary.intersection,
+                    },
+                    "copies": _group_copies_json(
+                        candidate.copies,
+                        member_ordinals=member_ordinals,
+                        source_ordinals=source_ordinals,
+                    ),
+                    "eligibility": {
+                        "state": candidate.eligibility.state,
+                        "gates": [asdict(gate) for gate in candidate.eligibility.gates],
+                    },
+                    "trait_exclusion": {
+                        "trait": args.exclude_trait,
+                        "state": evaluation.trait_exclusion,
+                    },
+                    "preference": preference_data,
+                }
+            )
+        missing_declared = sum(
+            payload_by_appid.get(appid) is None for appid in demanded
+        )
+        status = (
+            CompletenessStatus.COMPLETE
+            if missing_declared == 0
+            else (
+                CompletenessStatus.UNAVAILABLE
+                if demanded and missing_declared == len(demanded)
+                else CompletenessStatus.PARTIAL
+            )
+        )
+        return _emit_success(
+            args,
+            command=command,
+            context={
+                "account_context": True,
+                "machine_context": True,
+                "country": country,
+                "language": args.language,
+                "scope": args.scope,
+                "cache_only": True,
+                "network_used": False,
+                "member_count": len(members),
+                "copy_source_count": len(source_refs),
+            },
+            completeness_value=completeness(
+                status,
+                missing_capabilities=(
+                    ["discovery.declared.read"] if missing_declared else []
+                ),
+            ),
+            data={
+                "schema": "group-fit/0.1",
+                "objective": args.objective,
+                "candidate_count": len(candidate_appids),
+                "eligible_ranked_count": len(ranked),
+                "explicit_trait_exclusions": explicit_trait_exclusions,
+                "returned_count": len(results),
+                "truncated": len(ranked) > len(selected),
+                "limit": args.limit,
+                "results": results,
+            },
+        )
+    except (StorageError, TypeError, ValueError):
+        return _group_invalid(
+            args, command, "Cached group recommendation evidence is unavailable or invalid."
         )
 
 
