@@ -3439,6 +3439,25 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 "preference_rules_removed": (
                     0 if deletion is None else deletion.preference_rules_removed
                 ),
+                "activity_observations_removed": (
+                    0 if deletion is None else deletion.activity_observations_removed
+                ),
+                "activity_current_removed": (
+                    0 if deletion is None else deletion.activity_current_removed
+                ),
+                "achievement_demand_removed": (
+                    0 if deletion is None else deletion.achievement_demand_removed
+                ),
+                "achievement_player_observations_removed": (
+                    0
+                    if deletion is None
+                    else deletion.achievement_player_observations_removed
+                ),
+                "achievement_player_current_removed": (
+                    0
+                    if deletion is None
+                    else deletion.achievement_player_current_removed
+                ),
                 "sync_runs_removed": 0
                 if deletion is None
                 else deletion.sync_runs_removed,

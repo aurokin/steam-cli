@@ -181,11 +181,12 @@ def achievement_candidates(
     account_id: int,
     scope: Literal["recent", "installed", "owned"],
     explicit_appids: tuple[int, ...],
+    now: datetime | None = None,
 ) -> tuple[int, ...]:
     if explicit_appids:
         candidates = explicit_appids
     elif scope == "recent":
-        snapshot = storage.read_activity_snapshot(account_id)
+        snapshot = storage.read_activity_snapshot(account_id, now=now)
         candidates = tuple(
             int(row["appid"])
             for row in sorted(
@@ -221,14 +222,21 @@ def sync_achievements(
 ) -> AchievementSyncResult:
     if isinstance(max_items, bool) or not 1 <= max_items <= MAX_ACHIEVEMENT_ITEMS:
         raise ValueError(f"max_items must be between 1 and {MAX_ACHIEVEMENT_ITEMS}")
-    candidates = achievement_candidates(storage, account_id=account_id, scope=scope, explicit_appids=explicit_appids)
+    started_at = clock()
+    candidates = achievement_candidates(
+        storage,
+        account_id=account_id,
+        scope=scope,
+        explicit_appids=explicit_appids,
+        now=started_at,
+    )
     targeted = candidates[:max_items]
     api = client or SteamActivityApiClient()
     run = storage.begin_achievement_sync(
         account_id=account_id,
         candidates=candidates,
         targeted=targeted,
-        started_at=clock(),
+        started_at=started_at,
         disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
     )
     counts: dict[str, int] = {}
@@ -336,11 +344,27 @@ def query_achievements(
         state = row["state"]
         if age is not None and age > HARD_RETENTION and state not in {"unevaluated", "running"}:
             state = "expired"
+        player_observed_at = next(
+            (
+                achievement["observed_at"]
+                for achievement in row["achievements"]
+                if achievement["observed_at"] is not None
+            ),
+            None,
+        )
+        player_age = (
+            None
+            if player_observed_at is None
+            else now - _parse(str(player_observed_at))
+        )
+        last_good_freshness = _evidence_freshness(
+            player_age, fresh_for=ACHIEVEMENT_FRESH, retained_for=HARD_RETENTION
+        )
         last_good_summary = {
             "unlocked": unlocked,
             "total": len(visible),
             "newest_unlock_at": None if newest is None else datetime.fromtimestamp(newest, timezone.utc).isoformat().replace("+00:00", "Z"),
-            "freshness": freshness,
+            "freshness": last_good_freshness,
         } if visible else None
         items.append({
             "appid": row["appid"],
@@ -352,7 +376,13 @@ def query_achievements(
             "summary": {
                 "unlocked": unlocked if state == "ready" else None,
                 "total": len(visible) if state == "ready" else None,
-                "newest_unlock_at": None if newest is None else datetime.fromtimestamp(newest, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "newest_unlock_at": (
+                    None
+                    if state != "ready" or newest is None
+                    else datetime.fromtimestamp(newest, timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
                 "freshness": freshness,
             },
             "last_good_summary": last_good_summary if state != "ready" else None,

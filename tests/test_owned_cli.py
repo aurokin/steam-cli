@@ -251,6 +251,11 @@ def test_accounts_remove_routes_through_account_data_cleanup(
 
     assert code == 0
     assert removed["data"]["removed"] is True  # type: ignore[index]
+    assert removed["data"]["activity_observations_removed"] == 0  # type: ignore[index]
+    assert removed["data"]["activity_current_removed"] == 0  # type: ignore[index]
+    assert removed["data"]["achievement_demand_removed"] == 0  # type: ignore[index]
+    assert removed["data"]["achievement_player_observations_removed"] == 0  # type: ignore[index]
+    assert removed["data"]["achievement_player_current_removed"] == 0  # type: ignore[index]
     assert credential_store.contains(ref)
     with Storage(database) as storage:
         assert (

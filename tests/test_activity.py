@@ -137,11 +137,14 @@ def test_achievement_failure_is_per_app_and_preserves_previous_current(configure
     client.schema[10] = GameAchievementSchema(10, "ready", "english", (AchievementDefinition("A", "A", None, False),))
     sync_achievements(storage, account_id=account_id, steamid="76561198000000001", api_key=SecretValue("s"), scope="owned", explicit_appids=(10,), client=client, clock=lambda: NOW)
     client.player[10] = SteamActivityApiError("PROVIDER_UNAVAILABLE", retryable=True)
-    result = sync_achievements(storage, account_id=account_id, steamid="76561198000000001", api_key=SecretValue("s"), scope="owned", explicit_appids=(10,), client=client, clock=lambda: NOW)
+    result = sync_achievements(storage, account_id=account_id, steamid="76561198000000001", api_key=SecretValue("s"), scope="owned", explicit_appids=(10,), client=client, clock=lambda: NOW + timedelta(days=2))
     assert result.state_counts == {"failed": 1}
-    item = query_achievements(storage, account_id=account_id, clock=lambda: NOW)["items"][0]
+    item = query_achievements(storage, account_id=account_id, clock=lambda: NOW + timedelta(days=2))["items"][0]
     assert item["state"] == "failed"
     assert item["achievements"] == []
+    assert item["summary"]["newest_unlock_at"] is None
+    assert item["last_good_summary"]["newest_unlock_at"] == "1970-01-01T00:00:01Z"
+    assert item["last_good_summary"]["freshness"] == "stale"
     with storage._connection as connection:
         assert connection.execute("SELECT COUNT(*) FROM achievement_player_current WHERE account_id=?", (account_id,)).fetchone()[0] == 1
 
@@ -421,6 +424,14 @@ def test_achievement_query_hard_deletes_expired_account_evidence(
 ) -> None:
     storage, account_id = configured
     client = FakeClient()
+    sync_activity(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        client=client,
+        clock=lambda: NOW,
+    )
     client.player[10] = PlayerAchievements(
         10, "ready", (PlayerAchievement("A", True, 1),)
     )
@@ -453,6 +464,40 @@ def test_achievement_query_hard_deletes_expired_account_evidence(
     assert storage._connection.execute(
         "SELECT COUNT(*) FROM achievement_schema_current"
     ).fetchone()[0] == 1
+    assert storage._connection.execute(
+        "SELECT COUNT(*) FROM activity_current"
+    ).fetchone()[0] == 0
+
+
+def test_recent_achievement_sync_prunes_expired_activity_before_demand(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    sync_activity(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        client=client,
+        clock=lambda: NOW,
+    )
+
+    result = sync_achievements(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        scope="recent",
+        client=client,
+        clock=lambda: NOW + timedelta(days=8),
+    )
+
+    assert result.candidate_count == 0
+    assert result.targeted_count == 0
+    assert storage._connection.execute(
+        "SELECT COUNT(*) FROM activity_current"
+    ).fetchone()[0] == 0
 
 
 def test_late_older_activity_completion_cannot_replace_newer_projection(

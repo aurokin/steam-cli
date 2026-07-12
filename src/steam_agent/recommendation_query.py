@@ -134,21 +134,27 @@ def build_recommendation_query(
         achievement_row = achievements.get(owned.appid)
         achievement_value = None
         if achievement_row is not None:
-            state = _achievement_state(achievement_row)
+            player_observed_at = achievement_row.get("player_observed_at")
+            player_sync_run_id = achievement_row.get("player_sync_run_id")
+            has_last_good = player_observed_at is not None
+            state = "ready" if has_last_good else _achievement_state(achievement_row)
+            evidence_observed_at = (
+                player_observed_at if has_last_good else achievement_row["observed_at"]
+            )
             achievement_value = AchievementEvidence(
                 state=state,
                 freshness=_freshness(
-                    achievement_row["observed_at"], now, ACHIEVEMENT_FRESH
+                    evidence_observed_at, now, ACHIEVEMENT_FRESH
                 ),
                 observed_at=(
                     None
-                    if achievement_row["observed_at"] is None
-                    else _parse(achievement_row["observed_at"])
+                    if evidence_observed_at is None
+                    else _parse(evidence_observed_at)
                 ),
-                unlocked=int(achievement_row["unlocked"]) if state == "ready" else None,
-                total=int(achievement_row["total"]) if state == "ready" else None,
+                unlocked=int(achievement_row["unlocked"] or 0) if state == "ready" else None,
+                total=int(achievement_row["total"] or 0) if state == "ready" else None,
                 evidence_ids=(
-                    f"achievement:{achievement_row['sync_run_id']}:{owned.appid}",
+                    f"achievement:{player_sync_run_id or achievement_row['sync_run_id']}:{owned.appid}",
                 ),
             )
         stored_feedback = feedback.get(owned.appid)

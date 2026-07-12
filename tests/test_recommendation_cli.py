@@ -187,6 +187,98 @@ def test_recommendation_only_read_hard_deletes_expired_behavioral_evidence(
         ).fetchone()[0] == 0
 
 
+def test_recommendation_snapshot_preserves_last_good_achievement_aggregate(
+    tmp_path,
+) -> None:
+    account_id = populated(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        failed = storage.begin_achievement_sync(
+            account_id=account_id,
+            candidates=(10,),
+            targeted=(10,),
+            started_at="2026-07-12T04:02:00Z",
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.record_achievement_result(
+            failed.id,
+            account_id=account_id,
+            appid=10,
+            state="failed",
+            player=(),
+            schema_state="achievements_not_supported",
+            schema=(),
+            observed_at="2026-07-12T04:02:00Z",
+            error_code="PROVIDER_UNAVAILABLE",
+            write_schema=False,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.finish_achievement_sync(
+            failed.id, completed_at="2026-07-12T04:03:00Z"
+        )
+
+        snapshot = storage.read_recommendation_snapshot(
+            account_id, "local", now=NOW
+        )
+
+    row = next(item for item in snapshot.achievement_items if item["appid"] == 10)
+    assert row["state"] == "failed"
+    assert row["unlocked"] == 1
+    assert row["total"] == 2
+    assert row["player_sync_run_id"] != row["sync_run_id"]
+    assert row["player_observed_at"] == T0
+
+
+def test_recommendation_query_accepts_ready_zero_achievement_aggregate(
+    tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account_id = populated(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        run = storage.begin_achievement_sync(
+            account_id=account_id,
+            candidates=(30,),
+            targeted=(30,),
+            started_at="2026-07-12T04:02:00Z",
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.record_achievement_result(
+            run.id,
+            account_id=account_id,
+            appid=30,
+            state="ready",
+            player=(),
+            schema_state="achievements_not_supported",
+            schema=(),
+            observed_at="2026-07-12T04:02:00Z",
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+        storage.finish_achievement_sync(run.id, completed_at="2026-07-12T04:03:00Z")
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    code, result, stderr = invoke(
+        tmp_path,
+        capsys,
+        "recommendations",
+        "query",
+        "--account",
+        "primary",
+        "--recipe",
+        "finishability/0.1",
+        "--unknown",
+        "include",
+    )
+
+    assert code == 0 and stderr == ""
+    assert any(item["appid"] == 30 for item in result["data"]["results"])
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        snapshot = storage.read_recommendation_snapshot(
+            account_id, "local", now=NOW
+        )
+    row = next(item for item in snapshot.achievement_items if item["appid"] == 30)
+    assert row["state"] == "ready"
+    assert row["unlocked"] == 0
+    assert row["total"] == 0
+
+
 def test_feedback_components_keep_field_specific_event_lineage(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
     account_id = populated(tmp_path)
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)

@@ -2013,7 +2013,7 @@ class Storage:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_activity_consent(account_id, disclosure_version)
-            self._prune_activity(account_id, timestamp)
+            self._prune_behavioral(account_id, timestamp)
             cursor = self._connection.execute(
                 """INSERT INTO sync_runs(
                        provider, capability, account_id, started_at, status
@@ -2109,7 +2109,7 @@ class Storage:
                    records_seen = ?, completed_at = ? WHERE id = ?""",
                 (promoted, len(games), completed, sync_run_id),
             )
-            self._prune_activity(account_id, completed)
+            self._prune_behavioral(account_id, completed)
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()
@@ -2124,7 +2124,7 @@ class Storage:
         )
         assert run.account_id is not None
         with self._connection:
-            self._prune_activity(run.account_id, _timestamp(completed_at))
+            self._prune_behavioral(run.account_id, _timestamp(completed_at))
         return run
 
     def read_activity_snapshot(
@@ -2133,7 +2133,7 @@ class Storage:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             if now is not None:
-                self._prune_activity(account_id, _timestamp(now))
+                self._prune_behavioral(account_id, _timestamp(now))
             rows = tuple(
                 dict(row)
                 for row in self._connection.execute(
@@ -2181,7 +2181,7 @@ class Storage:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_activity_consent(account_id, disclosure_version)
-            self._prune_achievements(account_id, timestamp)
+            self._prune_behavioral(account_id, timestamp)
             cursor = self._connection.execute(
                 """INSERT INTO sync_runs(provider, capability, account_id, started_at, status)
                    VALUES ('steam_web_api', 'achievements.read', ?, ?, 'running')""",
@@ -2346,7 +2346,7 @@ class Storage:
                 """UPDATE sync_runs SET status='complete', promoted=1, records_seen=?, completed_at=?
                    WHERE id=?""", (evaluated, completed, sync_run_id)
             )
-            self._prune_achievements(int(run["account_id"]), completed)
+            self._prune_behavioral(int(run["account_id"]), completed)
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()
@@ -2377,44 +2377,398 @@ class Storage:
         appid: int | None = None,
         now: str | datetime | None = None,
     ) -> Mapping[str, Any]:
-        if now is not None:
-            with self._connection:
-                self._prune_achievements(account_id, _timestamp(now))
-        filter_sql = "" if appid is None else " AND d.appid = ?"
-        latest = self._connection.execute(
-            """SELECT * FROM sync_runs WHERE account_id=? AND capability='achievements.read'
-               ORDER BY started_at DESC, id DESC LIMIT 1""", (account_id,)
-        ).fetchone()
-        if latest is None:
-            return {"items": (), "latest": None}
-        rows = tuple(dict(row) for row in self._connection.execute(
-            f"""SELECT d.*, a.name FROM achievement_sync_demand d
-                JOIN steam_apps a USING(appid)
-                JOIN sync_runs r ON r.id=d.sync_run_id
-                WHERE d.account_id=?{filter_sql}
-                  AND d.sync_run_id = (
-                    SELECT d2.sync_run_id FROM achievement_sync_demand d2
-                    JOIN sync_runs r2 ON r2.id=d2.sync_run_id
-                    WHERE d2.account_id=d.account_id AND d2.appid=d.appid
-                    ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
-                  )
-                ORDER BY d.appid""",
-            (account_id, *(() if appid is None else (appid,))),
-        ))
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            achievements = tuple(dict(item) for item in self._connection.execute(
-                """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
-                          s.display_name, s.description, COALESCE(s.hidden, 0) AS hidden
-                   FROM achievement_player_current p
-                   LEFT JOIN achievement_schema_current s ON s.appid=p.appid
-                     AND s.language='english' AND s.api_name=p.api_name
-                   WHERE p.account_id=? AND p.appid=? ORDER BY p.api_name""",
-                (account_id, row["appid"]),
-            ))
-            row["achievements"] = achievements
-            items.append(row)
-        return {"items": tuple(items), "latest": SyncRun(**dict(latest))}
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if now is not None:
+                self._prune_behavioral(account_id, _timestamp(now))
+            filter_sql = "" if appid is None else " AND d.appid = ?"
+            latest = self._connection.execute(
+                """SELECT * FROM sync_runs WHERE account_id=? AND capability='achievements.read'
+                   ORDER BY started_at DESC, id DESC LIMIT 1""", (account_id,)
+            ).fetchone()
+            if latest is None:
+                result: Mapping[str, Any] = {"items": (), "latest": None}
+            else:
+                rows = tuple(dict(row) for row in self._connection.execute(
+                    f"""SELECT d.*, a.name FROM achievement_sync_demand d
+                        JOIN steam_apps a USING(appid)
+                        JOIN sync_runs r ON r.id=d.sync_run_id
+                        WHERE d.account_id=?{filter_sql}
+                          AND d.sync_run_id = (
+                            SELECT d2.sync_run_id FROM achievement_sync_demand d2
+                            JOIN sync_runs r2 ON r2.id=d2.sync_run_id
+                            WHERE d2.account_id=d.account_id AND d2.appid=d.appid
+                            ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
+                          )
+                        ORDER BY d.appid""",
+                    (account_id, *(() if appid is None else (appid,))),
+                ))
+                items: list[dict[str, Any]] = []
+                for row in rows:
+                    achievements = tuple(dict(item) for item in self._connection.execute(
+                        """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
+                                  s.display_name, s.description, COALESCE(s.hidden, 0) AS hidden
+                           FROM achievement_player_current p
+                           LEFT JOIN achievement_schema_current s ON s.appid=p.appid
+                             AND s.language='english' AND s.api_name=p.api_name
+                           WHERE p.account_id=? AND p.appid=? ORDER BY p.api_name""",
+                        (account_id, row["appid"]),
+                    ))
+                    row["achievements"] = achievements
+                    items.append(row)
+                result = {"items": tuple(items), "latest": SyncRun(**dict(latest))}
+            self._connection.commit()
+            return result
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def review_sync_candidates(
+        self,
+        account_id: int,
+        *,
+        now: str | datetime,
+        skip_fresh_terminal: bool,
+    ) -> tuple[int, ...]:
+        """Return the deterministic wishlist order eligible for review sync."""
+
+        timestamp = _timestamp(now)
+        fresh_cutoff = _timestamp(
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            - timedelta(hours=24)
+        )
+        self._require_steam_account(account_id)
+        rows = self._connection.execute(
+            """SELECT w.appid
+               FROM wishlist_current AS w
+               WHERE w.account_id = ?
+                 AND (? = 0 OR NOT EXISTS (
+                   SELECT 1 FROM review_sync_demand AS d
+                   JOIN sync_runs AS r ON r.id = d.sync_run_id
+                   WHERE d.account_id = w.account_id AND d.appid = w.appid
+                     AND d.evaluated = 1 AND d.state IN ('ready', 'failed')
+                     AND d.observed_at >= ?
+                 ))
+               ORDER BY w.priority, w.date_added, w.appid""",
+            (account_id, int(skip_fresh_terminal), fresh_cutoff),
+        )
+        return tuple(int(row[0]) for row in rows)
+
+    def begin_review_sync(
+        self,
+        *,
+        account_id: int,
+        candidates: tuple[int, ...],
+        targeted: tuple[int, ...],
+        started_at: str | datetime,
+        disclosure_version: str,
+    ) -> SyncRun:
+        timestamp = _timestamp(started_at)
+        if (
+            len(candidates) != len(set(candidates))
+            or len(targeted) != len(set(targeted))
+            or not set(targeted) <= set(candidates)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= (1 << 32) - 1
+                for value in candidates
+            )
+        ):
+            raise ValueError("review demand is invalid")
+        target_set = set(targeted)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            consent = self._connection.execute(
+                """SELECT disclosure_version FROM account_data_consents
+                   WHERE account_id=? AND consent_kind='wishlist_persistence'""",
+                (account_id,),
+            ).fetchone()
+            if consent is None:
+                raise InvalidSyncTransition("wishlist persistence consent is required")
+            review_consent = self._connection.execute(
+                """SELECT disclosure_version FROM account_data_consents
+                   WHERE account_id=? AND consent_kind='review_persistence'""",
+                (account_id,),
+            ).fetchone()
+            if (
+                review_consent is None
+                or review_consent["disclosure_version"] != disclosure_version
+            ):
+                raise InvalidSyncTransition("current review persistence consent is required")
+            self._prune_reviews(timestamp)
+            cursor = self._connection.execute(
+                """INSERT INTO sync_runs(provider, capability, account_id, started_at, status)
+                   VALUES ('steam_store', 'reviews.aggregate.read', ?, ?, 'running')""",
+                (account_id, timestamp),
+            )
+            run_id = int(cursor.lastrowid)
+            for ordinal, appid in enumerate(candidates):
+                self._ensure_steam_application_identity(appid, observed_at=timestamp)
+                targeted_value = appid in target_set
+                self._connection.execute(
+                    """INSERT INTO review_sync_demand
+                       (sync_run_id, account_id, appid, ordinal, targeted, state)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        account_id,
+                        appid,
+                        ordinal,
+                        targeted_value,
+                        "running" if targeted_value else "unevaluated",
+                    ),
+                )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(run_id)
+
+    def record_review_result(
+        self,
+        sync_run_id: int,
+        *,
+        account_id: int,
+        appid: int,
+        state: str,
+        observed_at: str | datetime,
+        summary: Mapping[str, Any] | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        if state not in {"ready", "failed"} or (state == "ready") != (summary is not None):
+            raise ValueError("review result is invalid")
+        timestamp = _timestamp(observed_at)
+        if summary is not None:
+            _validate_review_summary(appid, summary)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            demand = self._connection.execute(
+                """SELECT d.*, r.started_at FROM review_sync_demand d
+                   JOIN sync_runs r ON r.id=d.sync_run_id
+                   WHERE d.sync_run_id=? AND d.account_id=? AND d.appid=?
+                     AND d.targeted=1""",
+                (sync_run_id, account_id, appid),
+            ).fetchone()
+            if demand is None or demand["state"] != "running":
+                raise InvalidSyncTransition("review target is not running")
+            if summary is not None:
+                values = (
+                    sync_run_id,
+                    appid,
+                    summary["review_score"],
+                    summary["total_positive"],
+                    summary["total_negative"],
+                    summary["total_reviews"],
+                    summary["request_filter"],
+                    summary["language"],
+                    summary["day_range"],
+                    summary["review_type"],
+                    summary["purchase_type"],
+                    summary["num_per_page"],
+                    int(bool(summary["off_topic_activity_filtered"])),
+                    summary["source_locator"],
+                    summary["human_reference_url"],
+                    timestamp,
+                )
+                self._connection.execute(
+                    "INSERT INTO review_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    values,
+                )
+                current = self._connection.execute(
+                    """SELECT c.observed_at, r.started_at, c.promoted_sync_run_id
+                       FROM review_current c LEFT JOIN sync_runs r ON r.id=c.promoted_sync_run_id
+                       WHERE c.appid=?""",
+                    (appid,),
+                ).fetchone()
+                promote = current is None or (
+                    timestamp >= str(current["observed_at"])
+                    and (
+                        current["started_at"] is None
+                        or (str(demand["started_at"]), sync_run_id)
+                        > (
+                            str(current["started_at"]),
+                            int(current["promoted_sync_run_id"]),
+                        )
+                    )
+                )
+                if promote:
+                    self._connection.execute(
+                        """INSERT INTO review_current VALUES
+                           (?, 'steam_store', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(appid) DO UPDATE SET
+                             provider=excluded.provider,
+                             review_score=excluded.review_score,
+                             total_positive=excluded.total_positive,
+                             total_negative=excluded.total_negative,
+                             total_reviews=excluded.total_reviews,
+                             request_filter=excluded.request_filter,
+                             language=excluded.language,
+                             day_range=excluded.day_range,
+                             review_type=excluded.review_type,
+                             purchase_type=excluded.purchase_type,
+                             num_per_page=excluded.num_per_page,
+                             off_topic_activity_filtered=excluded.off_topic_activity_filtered,
+                             source_locator=excluded.source_locator,
+                             human_reference_url=excluded.human_reference_url,
+                             observed_at=excluded.observed_at,
+                             promoted_sync_run_id=excluded.promoted_sync_run_id""",
+                        (
+                            appid,
+                            summary["review_score"],
+                            summary["total_positive"],
+                            summary["total_negative"],
+                            summary["total_reviews"],
+                            summary["request_filter"],
+                            summary["language"],
+                            summary["day_range"],
+                            summary["review_type"],
+                            summary["purchase_type"],
+                            summary["num_per_page"],
+                            int(bool(summary["off_topic_activity_filtered"])),
+                            summary["source_locator"],
+                            summary["human_reference_url"],
+                            timestamp,
+                            sync_run_id,
+                        ),
+                    )
+            self._connection.execute(
+                """UPDATE review_sync_demand SET evaluated=1, state=?, error_code=?, observed_at=?
+                   WHERE sync_run_id=? AND appid=?""",
+                (state, error_code, timestamp, sync_run_id, appid),
+            )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def mark_remaining_reviews_unevaluated(
+        self, sync_run_id: int, *, observed_at: str | datetime, error_code: str
+    ) -> int:
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE review_sync_demand SET state='unevaluated', evaluated=0,
+                   error_code=?, observed_at=? WHERE sync_run_id=? AND state='running'""",
+                (error_code, _timestamp(observed_at), sync_run_id),
+            )
+        return cursor.rowcount
+
+    def finish_review_sync(
+        self, sync_run_id: int, *, completed_at: str | datetime
+    ) -> SyncRun:
+        timestamp = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id=?", (sync_run_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["capability"] != "reviews.aggregate.read"
+                or run["status"] != "running"
+            ):
+                raise InvalidSyncTransition("review sync run is not active")
+            self._connection.execute(
+                """UPDATE review_sync_demand SET state='unevaluated', evaluated=0,
+                   error_code='SYNC_INTERRUPTED', observed_at=?
+                   WHERE sync_run_id=? AND state='running'""",
+                (timestamp, sync_run_id),
+            )
+            evaluated = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM review_sync_demand WHERE sync_run_id=? AND evaluated=1",
+                    (sync_run_id,),
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """UPDATE sync_runs SET status='complete', promoted=1, records_seen=?, completed_at=?
+                   WHERE id=?""",
+                (evaluated, timestamp, sync_run_id),
+            )
+            self._prune_reviews(timestamp)
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def _prune_reviews(self, now: str) -> None:
+        cutoff = _timestamp(
+            datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)
+        )
+        self._connection.execute(
+            "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read' AND started_at < ?",
+            (cutoff,),
+        )
+        self._connection.execute(
+            "DELETE FROM review_current WHERE observed_at < ?", (cutoff,)
+        )
+        self._connection.execute(
+            """DELETE FROM review_current WHERE NOT EXISTS (
+                 SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
+               )"""
+        )
+
+    def delete_review_data(self, *, account_id: int | None = None) -> Mapping[str, int]:
+        """Delete public-review acquisition data for one account or the provider."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if account_id is not None:
+                self._require_steam_account(account_id)
+            where = "" if account_id is None else " AND account_id=?"
+            parameters: tuple[object, ...] = () if account_id is None else (account_id,)
+            observations = int(
+                self._connection.execute(
+                    f"""SELECT COUNT(*) FROM review_observations WHERE sync_run_id IN (
+                           SELECT id FROM sync_runs
+                           WHERE capability='reviews.aggregate.read'{where}
+                         )""",
+                    parameters,
+                ).fetchone()[0]
+            )
+            demand = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM review_sync_demand"
+                    + ("" if account_id is None else " WHERE account_id=?"),
+                    parameters,
+                ).fetchone()[0]
+            )
+            runs = self._connection.execute(
+                "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read'" + where,
+                parameters,
+            ).rowcount
+            consent_where = (
+                "consent_kind='review_persistence'"
+                if account_id is None
+                else "consent_kind='review_persistence' AND account_id=?"
+            )
+            self._connection.execute(
+                "DELETE FROM account_data_consents WHERE " + consent_where,
+                parameters,
+            )
+            if account_id is None:
+                current = self._connection.execute("DELETE FROM review_current").rowcount
+                self._connection.execute(
+                    "DELETE FROM provider_request_limits WHERE provider='steam-store-reviews'"
+                )
+            else:
+                current = self._connection.execute(
+                    """DELETE FROM review_current WHERE NOT EXISTS (
+                         SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
+                       )"""
+                ).rowcount
+            self._connection.commit()
+            return {
+                "observations_removed": observations,
+                "demand_removed": demand,
+                "current_removed": current,
+                "sync_runs_removed": runs,
+            }
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
 
     def _finish_simple_sync(self, sync_run_id: int, capability: str, *, error_code: str, completed_at: str | datetime) -> SyncRun:
         timestamp = _timestamp(completed_at)
@@ -2437,6 +2791,10 @@ class Storage:
         self._connection.execute(
             "DELETE FROM activity_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
         )
+
+    def _prune_behavioral(self, account_id: int, now: str) -> None:
+        self._prune_activity(account_id, now)
+        self._prune_achievements(account_id, now)
 
     def _prune_achievements(self, account_id: int, now: str) -> None:
         parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
@@ -4667,13 +5025,14 @@ class Storage:
                 for row in self._connection.execute(
                     """SELECT d.sync_run_id, d.appid, d.targeted, d.evaluated,
                               d.state, d.error_code, d.observed_at,
-                              SUM(CASE WHEN p.achieved = 1 THEN 1 ELSE 0 END) AS unlocked,
+                              MAX(p.observed_at) AS player_observed_at,
+                              MAX(p.promoted_sync_run_id) AS player_sync_run_id,
+                              COALESCE(SUM(CASE WHEN p.achieved = 1 THEN 1 ELSE 0 END), 0) AS unlocked,
                               COUNT(p.api_name) AS total
                        FROM achievement_sync_demand d
                        JOIN sync_runs r ON r.id = d.sync_run_id
                        LEFT JOIN achievement_player_current p
                          ON p.account_id = d.account_id AND p.appid = d.appid
-                        AND p.promoted_sync_run_id = d.sync_run_id
                        WHERE d.account_id = ?
                          AND d.sync_run_id = (
                            SELECT d2.sync_run_id FROM achievement_sync_demand d2
