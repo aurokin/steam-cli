@@ -1796,6 +1796,8 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
 
     command = "compatibility.assess"
     now = _utc_now()
+    # Validate the caller-controlled contract before touching cached evidence so
+    # request mistakes remain distinct from malformed persisted projections.
     try:
         supplied_appids = tuple(args.appids)
         if (
@@ -1820,13 +1822,27 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             _compatibility_override(item, requested=set(appids), applied_at=now)
             for item in args.override
         )
-        if not database_path.is_file() and not database_path.is_symlink():
-            return _emit_error(
-                args,
-                command=command,
-                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
-                message="The requested account alias is not configured.",
-            )
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The compatibility assessment arguments are invalid.",
+            remediation=(
+                "Use valid AppIDs, an explicit configured account/target, country, "
+                "language, and documented requirement/override expressions."
+            ),
+            exit_code=2,
+        )
+
+    if not database_path.is_file() and not database_path.is_symlink():
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+            message="The requested account alias is not configured.",
+        )
+    try:
         with Storage(database_path, readonly=True) as storage:
             account = storage.get_account(args.account)
             if account is None:
@@ -1836,9 +1852,22 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
                     code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
                     message="The requested account alias is not configured.",
                 )
-            target, machine_id = _compatibility_target(
-                storage, args.target, args.context_machine
-            )
+            try:
+                target, machine_id = _compatibility_target(
+                    storage, args.target, args.context_machine
+                )
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The compatibility assessment target is invalid.",
+                    remediation=(
+                        "Use a configured machine target, or provide an explicit "
+                        "configured evidence context for a Steam Deck target."
+                    ),
+                    exit_code=2,
+                )
             snapshot = storage.read_compatibility_snapshot(
                 account.id,
                 machine_id,
@@ -1872,13 +1901,12 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         return _emit_error(
             args,
             command=command,
-            code=ErrorCode.INVALID_ARGUMENT,
-            message="The compatibility assessment arguments or cached context are invalid.",
+            code=ErrorCode.DATABASE_ERROR,
+            message="Cached compatibility evidence is malformed or inconsistent.",
             remediation=(
-                "Use valid AppIDs, an explicit configured account/target, country, "
-                "language, and documented requirement/override expressions."
+                "Resync the system profile and declared compatibility facts with "
+                "the current steam-agent version, then retry the assessment."
             ),
-            exit_code=2,
         )
 
     # The process envelope reports completeness for the active M5 query

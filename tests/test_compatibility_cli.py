@@ -445,6 +445,78 @@ def test_assess_outdated_readonly_schema_returns_actionable_typed_error(
     assert "Traceback" not in json.dumps(value)
 
 
+def test_assess_corrupt_cached_timestamp_returns_database_error_with_resync(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    current = snapshot.system_profile.current
+    assert current is not None
+    corrupt = replace(
+        snapshot,
+        system_profile=replace(
+            snapshot.system_profile,
+            current=replace(current, observed_at="not-a-timestamp"),
+        ),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        Storage,
+        "read_compatibility_snapshot",
+        lambda *_args, **_kwargs: corrupt,
+    )
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 1
+    assert stderr == ""
+    assert value["error"]["code"] == "DATABASE_ERROR"
+    assert "Resync" in value["error"]["remediation"]
+    assert "Traceback" not in json.dumps(value)
+
+
+def test_assess_malformed_request_is_not_misclassified_as_corrupt_cache(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--require",
+        "missing-colon",
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+    assert "Resync" not in value["error"]["remediation"]
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
