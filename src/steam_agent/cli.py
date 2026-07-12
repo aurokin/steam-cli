@@ -55,6 +55,7 @@ from steam_agent.contracts import (
     success_envelope,
 )
 from steam_agent.storage import (
+    GROUP_PROFILE_DISCLOSURE_VERSION,
     MAX_DECLARED_APP_DEMAND,
     AccountConflict,
     Storage,
@@ -134,6 +135,17 @@ from steam_agent.compatibility import (
 from steam_agent.compatibility_adapter import (
     assess_compatibility_snapshot,
     compatibility_query_data,
+)
+from steam_agent.groups import (
+    CopySourceRef,
+    FamilyEdge,
+    MemberRef,
+    OwnershipFact,
+    PlayerLimits,
+    PolicyFact,
+    assess_copies,
+    assess_eligibility,
+    summarize_ownership,
 )
 
 
@@ -388,6 +400,102 @@ def build_parser() -> argparse.ArgumentParser:
     discovery_query.add_argument("--country", required=True)
     discovery_query.add_argument("--language", required=True)
     discovery_query.add_argument("--require-mode")
+
+    profiles = commands.add_parser(
+        "profiles", help="Manage local-only group participant profiles."
+    )
+    profile_commands = profiles.add_subparsers(dest="profiles_command", required=True)
+    for name in ("create", "get", "delete", "clear-account"):
+        leaf = profile_commands.add_parser(name)
+        _add_leaf_format(leaf)
+        leaf.add_argument("profile")
+        if name == "create":
+            leaf.add_argument("--acknowledge-group-storage", action="store_true")
+            leaf.add_argument("--acknowledge-backups", action="store_true")
+        if name in {"delete", "clear-account"}:
+            leaf.add_argument("--yes", action="store_true")
+    profile_list = profile_commands.add_parser("list")
+    _add_leaf_format(profile_list)
+
+    ownership = commands.add_parser(
+        "ownership", help="Manage synthetic ownership assertions."
+    )
+    ownership_commands = ownership.add_subparsers(
+        dest="ownership_command", required=True
+    )
+    ownership_set = ownership_commands.add_parser("set")
+    _add_leaf_format(ownership_set)
+    ownership_set.add_argument("profile")
+    ownership_set.add_argument("appid", type=int)
+    ownership_set.add_argument("state", choices=("owned", "not_owned", "unknown"))
+    ownership_clear = ownership_commands.add_parser("clear")
+    _add_leaf_format(ownership_clear)
+    ownership_clear.add_argument("profile")
+    ownership_clear.add_argument("appid", type=int)
+    ownership_clear.add_argument("--yes", action="store_true")
+
+    family = commands.add_parser(
+        "family", help="Manage explicit family access assertions."
+    )
+    family_commands = family.add_subparsers(dest="family_command", required=True)
+    family_set = family_commands.add_parser("set")
+    _add_leaf_format(family_set)
+    family_set.add_argument("recipient")
+    family_set.add_argument("appid", type=int)
+    family_set.add_argument("state", choices=("available", "unavailable", "unknown"))
+    family_set.add_argument("--source", required=True)
+    family_clear = family_commands.add_parser("clear")
+    _add_leaf_format(family_clear)
+    family_clear.add_argument("recipient")
+    family_clear.add_argument("appid", type=int)
+    family_clear.add_argument("--source", required=True)
+    family_clear.add_argument("--yes", action="store_true")
+
+    fact = commands.add_parser("fact", help="Manage member-qualified group assertions.")
+    fact_commands = fact.add_subparsers(dest="fact_command", required=True)
+    fact_set = fact_commands.add_parser("set")
+    _add_leaf_format(fact_set)
+    fact_set.add_argument("profile")
+    fact_set.add_argument("appid", type=int)
+    fact_set.add_argument("fact")
+    fact_set.add_argument("value")
+    fact_clear = fact_commands.add_parser("clear")
+    _add_leaf_format(fact_clear)
+    fact_clear.add_argument("profile")
+    fact_clear.add_argument("appid", type=int)
+    fact_clear.add_argument("fact")
+    fact_clear.add_argument("--yes", action="store_true")
+
+    group = commands.add_parser(
+        "group", help="Assess cached multi-person game evidence."
+    )
+    group_commands = group.add_subparsers(dest="group_command", required=True)
+    for name in ("ownership", "eligibility"):
+        leaf = group_commands.add_parser(name)
+        _add_leaf_format(leaf)
+        leaf.add_argument("appid", nargs="+", type=int)
+        leaf.add_argument("--member", action="append", required=True)
+        leaf.add_argument("--copy-source", action="append", default=[])
+        leaf.add_argument("--account", required=True)
+        leaf.add_argument("--machine", required=True)
+        leaf.add_argument("--country", required=True)
+        leaf.add_argument("--language", required=True)
+        if name == "eligibility":
+            leaf.add_argument(
+                "--mode",
+                required=True,
+                choices=(
+                    "online_coop",
+                    "online_pvp",
+                    "lan_coop",
+                    "lan_pvp",
+                    "shared_split_coop",
+                    "shared_split_pvp",
+                    "remote_play_together",
+                ),
+            )
+            leaf.add_argument("--host")
+            leaf.add_argument("--policy")
 
     deals = commands.add_parser("deals", help="Query cached wishlist deal evidence.")
     deal_commands = deals.add_subparsers(dest="deals_command", required=True)
@@ -1014,6 +1122,10 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_compatibility(args, database_path)
     if args.command == "discovery":
         return _dispatch_discovery(args, database_path)
+    if args.command in {"profiles", "ownership", "family", "fact"}:
+        return _dispatch_group_profiles(args, database_path)
+    if args.command == "group":
+        return _dispatch_group(args, database_path)
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
     if args.command == "recommendations" and args.recommendations_command == "wishlist":
@@ -2041,6 +2153,446 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             "schema_id": "discovery-query/0.1",
         },
     )
+
+
+def _group_ref(raw: str) -> MemberRef:
+    if not isinstance(raw, str) or raw.count(":") != 1:
+        raise ValueError("group profile reference is invalid")
+    kind, alias = raw.split(":", 1)
+    return MemberRef(kind, alias)  # type: ignore[arg-type]
+
+
+def _group_invalid(args: argparse.Namespace, command: str, message: str) -> int:
+    return _emit_error(
+        args,
+        command=command,
+        code=ErrorCode.INVALID_ARGUMENT,
+        message=message,
+        exit_code=2,
+    )
+
+
+def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> int:
+    command = f"{args.command}.{getattr(args, f'{args.command}_command')}"
+    operation = getattr(args, f"{args.command}_command")
+    raw_ref = getattr(args, "profile", getattr(args, "recipient", None))
+    try:
+        ref = None if raw_ref is None else _group_ref(raw_ref)
+        appid = getattr(args, "appid", None)
+        if appid is not None and not 1 <= appid <= (1 << 32) - 1:
+            raise ValueError("AppID is invalid")
+        if operation in {"delete", "clear-account", "clear"} and not args.yes:
+            raise ValueError("destructive group changes require --yes")
+    except (TypeError, ValueError):
+        return _group_invalid(args, command, "The group profile arguments are invalid.")
+    try:
+        with Storage(database_path) as storage:
+            if args.command == "profiles":
+                if operation == "create":
+                    assert ref is not None
+                    if not (
+                        args.acknowledge_group_storage and args.acknowledge_backups
+                    ):
+                        raise ValueError("current group disclosure is required")
+                    if ref.kind == "synthetic":
+                        profile = storage.create_synthetic_group_profile(
+                            ref.key,
+                            disclosure_version=GROUP_PROFILE_DISCLOSURE_VERSION,
+                            backups_acknowledged=True,
+                            created_at=_utc_now(),
+                        )
+                    else:
+                        profile = storage.acknowledge_group_profile_storage(
+                            ref,
+                            disclosure_version=GROUP_PROFILE_DISCLOSURE_VERSION,
+                            backups_acknowledged=True,
+                            accepted_at=_utc_now(),
+                        )
+                    return _emit_success(
+                        args,
+                        command=command,
+                        data={
+                            "profile": {
+                                "ordinal": 0,
+                                "kind": profile.ref.kind,
+                                "storage_acknowledged": profile.backups_acknowledged,
+                            },
+                            "disclosure_version": GROUP_PROFILE_DISCLOSURE_VERSION,
+                        },
+                    )
+                if operation == "get":
+                    assert ref is not None
+                    profile = storage.get_group_profile(ref)
+                    if profile is None:
+                        raise ValueError("group profile is unavailable")
+                    return _emit_success(
+                        args,
+                        command=command,
+                        data={
+                            "profile": {
+                                "ordinal": 0,
+                                "kind": profile.ref.kind,
+                                "storage_acknowledged": profile.backups_acknowledged,
+                            }
+                        },
+                    )
+                if operation == "list":
+                    profiles = [
+                        storage.get_group_profile(MemberRef("account", account.alias))
+                        for account in storage.list_accounts()
+                    ]
+                    profiles.extend(storage.list_synthetic_group_profiles())
+                    return _emit_success(
+                        args,
+                        command=command,
+                        data={
+                            "profiles": [
+                                {
+                                    "ordinal": ordinal,
+                                    "kind": profile.ref.kind,
+                                    "storage_acknowledged": profile.backups_acknowledged,
+                                }
+                                for ordinal, profile in enumerate(profiles)
+                                if profile is not None
+                            ]
+                        },
+                    )
+                assert ref is not None
+                if operation == "delete":
+                    if ref.kind != "synthetic":
+                        raise ValueError("delete is only for synthetic profiles")
+                    deletion = storage.delete_synthetic_group_profile(ref.key)
+                else:
+                    if ref.kind != "account":
+                        raise ValueError("clear-account requires an account profile")
+                    deletion = storage.clear_account_group_data(ref.key)
+                return _emit_success(
+                    args,
+                    command=command,
+                    data={"profile_ordinal": 0, "deleted": asdict(deletion)},
+                )
+            assert ref is not None and appid is not None
+            if args.command == "ownership":
+                if operation == "set":
+                    result = storage.set_group_ownership(
+                        ref, appid=appid, state=args.state, updated_at=_utc_now()
+                    )
+                    data = {
+                        "profile_ordinal": 0,
+                        "appid": result.appid,
+                        "state": result.state,
+                    }
+                else:
+                    data = {
+                        "profile_ordinal": 0,
+                        "appid": appid,
+                        "cleared": storage.clear_group_ownership(ref, appid=appid),
+                    }
+            elif args.command == "family":
+                source = _group_ref(args.source)
+                if operation == "set":
+                    result = storage.set_group_family(
+                        ref,
+                        source=source,
+                        appid=appid,
+                        state=args.state,
+                        updated_at=_utc_now(),
+                    )
+                    data = {
+                        "recipient_ordinal": 0,
+                        "source_ordinal": 1,
+                        "appid": result.appid,
+                        "state": result.state,
+                    }
+                else:
+                    data = {
+                        "recipient_ordinal": 0,
+                        "source_ordinal": 1,
+                        "appid": appid,
+                        "cleared": storage.clear_group_family(
+                            ref, source=source, appid=appid
+                        ),
+                    }
+            else:
+                if operation == "set":
+                    value: int | str = args.value
+                    if (
+                        args.fact in {"players:min", "players:max"}
+                        and args.value != "unknown"
+                    ):
+                        value = int(args.value)
+                    result = storage.set_group_app_assertion(
+                        ref,
+                        appid=appid,
+                        fact=args.fact,
+                        value=value,
+                        updated_at=_utc_now(),
+                    )
+                    data = {
+                        "profile_ordinal": 0,
+                        "appid": result.appid,
+                        "fact": result.fact,
+                        "state": result.state,
+                        "value": result.value,
+                    }
+                else:
+                    data = {
+                        "profile_ordinal": 0,
+                        "appid": appid,
+                        "fact": args.fact,
+                        "cleared": storage.clear_group_app_assertion(
+                            ref, appid=appid, fact=args.fact
+                        ),
+                    }
+            return _emit_success(args, command=command, data=data)
+    except (AccountConflict, StorageError, TypeError, ValueError):
+        return _group_invalid(args, command, "The group profile operation is invalid.")
+
+
+_GROUP_MODE_DECLARATION = {
+    "online_coop": "online_co_op",
+    "online_pvp": "online_pvp",
+    "lan_coop": "lan_co_op",
+    "lan_pvp": None,
+    "shared_split_coop": "shared_split_screen_co_op",
+    "shared_split_pvp": "shared_split_screen_pvp",
+    "remote_play_together": "remote_play_together",
+}
+
+
+def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
+    command = f"group.{args.group_command}"
+    try:
+        appids = tuple(sorted(set(args.appid)))
+        if (
+            not appids
+            or len(appids) > 10_000
+            or any(not 1 <= appid <= (1 << 32) - 1 for appid in appids)
+        ):
+            raise ValueError("AppIDs are invalid")
+        members = tuple(_group_ref(value) for value in args.member)
+        extra_sources = tuple(
+            CopySourceRef(ref.kind, ref.key)
+            for ref in (_group_ref(value) for value in args.copy_source)
+        )
+        # The pure engine owns cardinality, uniqueness, and exact topology checks.
+        summarize_ownership(members, ())
+        if len(extra_sources) != len(set(extra_sources)):
+            raise ValueError("copy sources must be unique")
+        country = args.country.upper()
+        SteamDeclaredFactsRequestContext(country, args.language)
+        host = None if getattr(args, "host", None) is None else _group_ref(args.host)
+        policy = getattr(args, "policy", None)
+        if policy is not None and not policy.startswith("user:"):
+            raise ValueError("policy must be a user slug")
+    except (TypeError, ValueError):
+        return _group_invalid(
+            args, command, "The bounded group query arguments are invalid."
+        )
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            context_account = storage.get_account(args.account)
+            machine = storage.get_machine(args.machine)
+            if context_account is None or machine is None:
+                raise ValueError("group query context is not configured")
+            refs = tuple(
+                dict.fromkeys(
+                    (
+                        *members,
+                        *(
+                            MemberRef(source.kind, source.key)
+                            for source in extra_sources
+                        ),
+                    )
+                )
+            )
+            for ref in refs:
+                if storage.get_group_profile(ref) is None:
+                    raise ValueError("selected group profile is unavailable")
+            ownership_by_app: dict[int, tuple[OwnershipFact, ...]] = {}
+            account_owned: dict[MemberRef, set[int]] = {}
+            for ref in refs:
+                if ref.kind == "account":
+                    account = storage.get_account(ref.key)
+                    if account is None:
+                        raise ValueError("selected account is not configured")
+                    snapshot = storage.read_owned_snapshot(account.id)
+                    account_owned[ref] = {
+                        game.appid
+                        for game in snapshot.games
+                        if game.inclusion_basis == "visible_owned"
+                    }
+            for appid in appids:
+                facts: list[OwnershipFact] = []
+                for ref in refs:
+                    source = CopySourceRef(ref.kind, ref.key)
+                    if ref.kind == "account":
+                        state = "owned" if appid in account_owned[ref] else "unknown"
+                    else:
+                        assertions = storage.read_group_ownership(ref, appid=appid)
+                        state = assertions[0].state if assertions else "unknown"
+                    facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
+                ownership_by_app[appid] = tuple(facts)
+            declared = (
+                storage.read_declared_app_snapshot(
+                    account_id=context_account.id,
+                    machine_id=machine.id,
+                    country=country,
+                    language=args.language,
+                    appids=appids,
+                )
+                if args.group_command == "eligibility"
+                else None
+            )
+            rows = []
+            member_ordinals = {member: index for index, member in enumerate(members)}
+            source_refs = tuple(
+                dict.fromkeys(
+                    (
+                        *(CopySourceRef.for_member(member) for member in members),
+                        *extra_sources,
+                    )
+                )
+            )
+            source_ordinals = {
+                source: index for index, source in enumerate(source_refs)
+            }
+            for index, appid in enumerate(appids):
+                summary = summarize_ownership(members, ownership_by_app[appid])
+                row: dict[str, Any] = {
+                    "appid": appid,
+                    "ownership": {
+                        "members": [
+                            {"member_ordinal": member_ordinals[member], "state": state}
+                            for member, state in summary.per_member
+                        ],
+                        "union": summary.union,
+                        "intersection": summary.intersection,
+                    },
+                }
+                if declared is not None:
+                    family: list[FamilyEdge] = []
+                    for member in members:
+                        for assertion in storage.read_group_family(member, appid=appid):
+                            source = CopySourceRef(
+                                assertion.source.kind, assertion.source.key
+                            )
+                            if source in source_ordinals:
+                                family.append(
+                                    FamilyEdge(member, source, assertion.state)
+                                )
+                    copies = assess_copies(
+                        members=members,
+                        extra_sources=extra_sources,
+                        ownership=ownership_by_app[appid],
+                        family=tuple(family),
+                        mode=args.mode,
+                        host=host,
+                    )
+                    raw = declared["items"][index]
+                    payload = raw.get("facts")
+                    modes = (
+                        ()
+                        if payload is None
+                        else declared_discovery_facts(payload).multiplayer_modes
+                    )
+                    expected_mode = _GROUP_MODE_DECLARATION[args.mode]
+                    mode_state = (
+                        "pass"
+                        if expected_mode is not None and expected_mode in modes
+                        else "unknown"
+                    )
+                    player_values: dict[str, list[int]] = {
+                        "players:min": [],
+                        "players:max": [],
+                    }
+                    policy_facts: list[PolicyFact] = []
+                    for member in members:
+                        for assertion in storage.read_group_app_assertions(
+                            member, appid=appid
+                        ):
+                            if (
+                                assertion.fact in player_values
+                                and assertion.state == "known"
+                                and assertion.value is not None
+                            ):
+                                player_values[assertion.fact].append(assertion.value)
+                            if (
+                                policy is not None
+                                and assertion.fact == f"policy:{policy}"
+                            ):
+                                state = {
+                                    "present": "pass",
+                                    "absent": "fail",
+                                    "unknown": "unknown",
+                                }[assertion.state]
+                                policy_facts.append(PolicyFact(member, policy, state))  # type: ignore[arg-type]
+                    minimums = set(player_values["players:min"])
+                    maximums = set(player_values["players:max"])
+                    minimum = next(iter(minimums)) if len(minimums) == 1 else None
+                    maximum = next(iter(maximums)) if len(maximums) == 1 else None
+                    limits = PlayerLimits(
+                        minimum,
+                        maximum,
+                        len(minimums) > 1
+                        or len(maximums) > 1
+                        or (
+                            minimum is not None
+                            and maximum is not None
+                            and minimum > maximum
+                        ),
+                    )
+                    eligibility = assess_eligibility(
+                        members=members,
+                        mode_state=mode_state,
+                        player_limits=limits,
+                        required_policy=policy,
+                        policy_facts=tuple(policy_facts),
+                    )
+                    row["copies"] = {
+                        "required": copies.required_copies,
+                        "known_matching": copies.known_matching,
+                        "possible_matching": copies.possible_matching,
+                        "missing": asdict(copies.missing),
+                        "guarantee": copies.guarantee,
+                        "known_assignments": [
+                            {
+                                "member_ordinal": member_ordinals[member],
+                                "source_ordinal": source_ordinals[source],
+                            }
+                            for member, source in copies.known_assignments
+                        ],
+                        "possible_assignments": [
+                            {
+                                "member_ordinal": member_ordinals[member],
+                                "source_ordinal": source_ordinals[source],
+                            }
+                            for member, source in copies.possible_assignments
+                        ],
+                    }
+                    row["eligibility"] = {
+                        "state": eligibility.state,
+                        "gates": [asdict(gate) for gate in eligibility.gates],
+                    }
+                rows.append(row)
+        return _emit_success(
+            args,
+            command=command,
+            context={
+                "account_context": True,
+                "machine_context": True,
+                "country": country,
+                "language": args.language,
+                "cache_only": True,
+                "member_count": len(members),
+                "copy_source_count": len(source_refs),
+            },
+            data={"schema": "group-eligibility/0.1", "results": rows},
+        )
+    except (StorageError, TypeError, ValueError):
+        return _group_invalid(
+            args, command, "Cached group evidence is unavailable or invalid."
+        )
 
 
 def _declared_sync_source_gaps(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:

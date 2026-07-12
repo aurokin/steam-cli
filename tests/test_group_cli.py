@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+import steam_agent.cli as cli
+from steam_agent.storage import Machine, OwnedObservation, Storage
+
+
+NOW = datetime(2026, 7, 12, 18, tzinfo=timezone.utc)
+
+
+def invoke(tmp_path: Path, capsys: object, *arguments: str):
+    code = cli.main(["--data-dir", str(tmp_path), *arguments])
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    return code, json.loads(captured.out), captured.err
+
+
+def configure(tmp_path: Path, *, with_owned: bool = False) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("local", "Machine", "linux", "x86_64"), observed_at=NOW
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198999999999",
+            configured_at=NOW,
+        )
+        storage.record_compatibility_data_consent(
+            account_id=account.id,
+            disclosure_version="m5-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-visible-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+        if with_owned:
+            run = storage.begin_sync(
+                provider="steam_web_api",
+                capability="owned.visible.read",
+                account_id=account.id,
+                started_at=NOW,
+            )
+            storage.complete_owned_snapshot(
+                run.id,
+                (OwnedObservation(400, 0, "visible_owned", NOW, "Private title"),),
+                base_retrieved_at=NOW,
+                expanded_retrieved_at=NOW,
+                base_reported_count=1,
+                expanded_reported_count=1,
+                completed_at=NOW,
+            )
+
+
+def create_profile(tmp_path: Path, capsys: object, ref: str) -> None:
+    code, _, _ = invoke(
+        tmp_path,
+        capsys,
+        "profiles",
+        "create",
+        ref,
+        "--acknowledge-group-storage",
+        "--acknowledge-backups",
+    )
+    assert code == 0
+
+
+def declared_payload(appid: int) -> dict[str, object]:
+    return {
+        "schema_id": "declared-app-facts/0.2",
+        "appid": appid,
+        "context": {"country": "US", "language": "english"},
+        "platforms": {
+            "state": "declared",
+            "windows": True,
+            "macos": False,
+            "linux": True,
+        },
+        "requirements": [
+            {
+                "platform": name,
+                "state": "undeclared",
+                "minimum": None,
+                "recommended": None,
+            }
+            for name in ("linux", "macos", "windows")
+        ],
+        "languages": {"state": "undeclared", "items": [], "unrecognized_count": 0},
+        "categories": {
+            "state": "declared",
+            "known_slugs": ["online_co_op"],
+            "unknown_ids": [],
+            "source": "steam_store_appdetails",
+            "numeric_ids": [38],
+        },
+        "genres": {
+            "state": "undeclared",
+            "source": "steam_store_appdetails",
+            "items": [],
+        },
+        "coming_soon": {"state": "absent", "localized_date_display": "Available"},
+        "controller_support": None,
+        "external_account_notice": {"state": "unknown", "text": None},
+        "drm_notice": {"state": "unknown", "text": None},
+        "source": {
+            "provider": "steam_store",
+            "support_level": "provisional",
+            "source_locator": "steam_store_appdetails",
+            "human_reference_url": f"https://store.steampowered.com/app/{appid}/?cc=US&l=english",
+            "access_mode": "manual_only",
+            "automation_supported": False,
+        },
+    }
+
+
+def seed_declared(tmp_path: Path, appid: int) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        run, _, _ = storage.begin_declared_app_sync(
+            account_id=account.id,
+            machine_id="local",
+            demanded_appids=[appid],
+            country="US",
+            language="english",
+            max_items=10,
+            skip_fresh_terminal=True,
+            started_at=NOW,
+            disclosure_version="m5-v1",
+        )
+        storage.record_declared_app_result(
+            run.id,
+            account_id=account.id,
+            appid=appid,
+            state="ready",
+            observed_at=NOW,
+            facts=declared_payload(appid),
+        )
+        storage.finish_declared_app_sync(run.id, completed_at=NOW)
+
+
+def test_profile_mutations_require_disclosure_and_destructive_confirmation(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    code, value, _ = invoke(tmp_path, capsys, "profiles", "create", "synthetic:Guest")
+    assert code == 2
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    code, value, _ = invoke(tmp_path, capsys, "profiles", "get", "synthetic:Guest")
+    assert code == 0
+    assert value["data"]["profile"] == {
+        "ordinal": 0,
+        "kind": "synthetic",
+        "storage_acknowledged": True,
+    }
+    assert "guest" not in json.dumps(value).casefold()
+
+    code, value, _ = invoke(tmp_path, capsys, "profiles", "delete", "synthetic:Guest")
+    assert code == 2
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+    code, value, _ = invoke(
+        tmp_path, capsys, "profiles", "delete", "synthetic:Guest", "--yes"
+    )
+    assert code == 0
+    assert value["data"]["deleted"]["profile_removed"] is True
+
+
+def test_group_ownership_uses_visible_positive_and_synthetic_assertions_only(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    code, _, _ = invoke(
+        tmp_path, capsys, "ownership", "set", "synthetic:Guest", "400", "owned"
+    )
+    assert code == 0
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "ownership",
+        "400",
+        "401",
+        "--member",
+        "account:primary",
+        "--member",
+        "synthetic:Guest",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0 and stderr == ""
+    results = value["data"]["results"]
+    assert results[0]["ownership"]["union"] == "owned"
+    assert results[0]["ownership"]["intersection"] == "owned"
+    assert results[1]["ownership"]["union"] == "unknown"
+    rendered = json.dumps(value).casefold()
+    assert "primary" not in rendered
+    assert "guest" not in rendered
+    assert "765611" not in rendered
+    assert "steam_web_api" not in rendered
+
+
+def test_group_eligibility_combines_mode_copies_players_and_policy(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Alpha")
+    create_profile(tmp_path, capsys, "synthetic:Beta")
+    for ref in ("synthetic:Alpha", "synthetic:Beta"):
+        assert invoke(tmp_path, capsys, "ownership", "set", ref, "400", "owned")[0] == 0
+        assert (
+            invoke(tmp_path, capsys, "fact", "set", ref, "400", "players:max", "4")[0]
+            == 0
+        )
+        assert (
+            invoke(
+                tmp_path, capsys, "fact", "set", ref, "400", "policy:user:ok", "present"
+            )[0]
+            == 0
+        )
+    seed_declared(tmp_path, 400)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "eligibility",
+        "400",
+        "--member",
+        "synthetic:Alpha",
+        "--member",
+        "synthetic:Beta",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+        "--policy",
+        "user:ok",
+    )
+    assert code == 0 and stderr == ""
+    result = value["data"]["results"][0]
+    assert result["copies"]["guarantee"] == "guaranteed"
+    assert result["eligibility"]["state"] == "pass"
+    assert [gate["state"] for gate in result["eligibility"]["gates"]] == [
+        "pass",
+        "pass",
+        "pass",
+    ]
+    rendered = json.dumps(value).casefold()
+    assert "alpha" not in rendered and "beta" not in rendered
