@@ -182,6 +182,8 @@ class FeedbackService:
             raise ValueError("preference rule kind is invalid")
         if strength not in {"soft", "hard"}:
             raise ValueError("preference rule strength is invalid")
+        if kind == "prefer" and strength == "hard":
+            raise ValueError("hard prefer is ambiguous; use a hard requirement")
         if isinstance(weight, bool) or not 0 <= weight <= 100:
             raise ValueError("preference rule weight is invalid")
         return self.storage.set_preference_rule(

@@ -211,6 +211,23 @@ def test_preference_rules_are_sorted_idempotent_and_removable(tmp_path) -> None:
         ).fetchone()[0] == 2
 
 
+def test_hard_prefer_is_rejected_before_it_can_break_queries(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = account(storage)
+        service = FeedbackService(storage, clock=lambda: NOW)
+
+        with pytest.raises(ValueError, match="hard prefer"):
+            service.set_rule(
+                account_id,
+                trait="user:relaxing",
+                kind="prefer",
+                strength="hard",
+                weight=100,
+            )
+
+        assert storage.list_preference_rules(account_id) == ()
+
+
 def test_account_isolation_deletion_counts_and_price_deletion_preserves_feedback(
     tmp_path,
 ) -> None:
