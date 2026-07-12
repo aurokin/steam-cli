@@ -27,6 +27,8 @@ FROM achievement_sync_demand AS demand
 JOIN sync_runs AS runs ON runs.id = demand.sync_run_id
 WHERE demand.state = 'ready'
   AND demand.observed_at IS NOT NULL
+  AND runs.status = 'complete'
+  AND runs.promoted = 1
   AND NOT EXISTS (
     SELECT 1
     FROM achievement_sync_demand AS newer_demand
@@ -34,6 +36,8 @@ WHERE demand.state = 'ready'
     WHERE newer_demand.account_id = demand.account_id
       AND newer_demand.appid = demand.appid
       AND newer_demand.state = 'ready'
+      AND newer_runs.status = 'complete'
+      AND newer_runs.promoted = 1
       AND (
         newer_runs.started_at > runs.started_at OR
         (newer_runs.started_at = runs.started_at AND newer_runs.id > runs.id)

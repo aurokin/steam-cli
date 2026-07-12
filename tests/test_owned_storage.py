@@ -106,6 +106,23 @@ def test_v18_upgrade_backfills_empty_ready_achievement_projection(
                ) VALUES (?, ?, 10, 0, 1, 1, 'ready', ?)""",
             (run_id, account_id, T0),
         )
+        unpromoted_run_id = int(
+            connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, completed_at,
+                       status, promoted, records_seen, error_code
+                   ) VALUES ('steam_web_api', 'achievements.read', ?, ?, ?,
+                             'failed', 0, 1, 'SYNC_INTERRUPTED')""",
+                (account_id, T2, T3),
+            ).lastrowid
+        )
+        connection.execute(
+            """INSERT INTO achievement_sync_demand(
+                   sync_run_id, account_id, appid, ordinal, targeted, evaluated,
+                   state, observed_at
+               ) VALUES (?, ?, 10, 0, 1, 1, 'ready', ?)""",
+            (unpromoted_run_id, account_id, T2),
+        )
         connection.commit()
 
     with Storage(path) as storage:
