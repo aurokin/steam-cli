@@ -21,6 +21,7 @@ from steam_agent.compatibility import (
     FeatureEvidence,
     FeatureRequirement,
     Freshness,
+    GateOverride,
     PrimitiveEvidence,
     RuntimeRisk,
     assess_compatibility,
@@ -301,6 +302,7 @@ def reconstruct_compatibility(
     installed: Mapping[int, LocalObservation] | None = None,
     owned: Mapping[int, LocalObservation] | None = None,
     requirements: tuple[FeatureRequirement, ...] = (),
+    overrides: tuple[GateOverride, ...] = (),
     minimum_evaluator: MinimumEvaluator | None = None,
 ) -> CompatibilityQueryResult:
     """Join frozen normalized inputs while retaining every requested AppID."""
@@ -328,7 +330,11 @@ def reconstruct_compatibility(
         for appid in requested
     )
     assessment = assess_compatibility(
-        requested, candidates, target=target, requirements=requirements
+        requested,
+        candidates,
+        target=target,
+        requirements=requirements,
+        overrides=overrides,
     )
     references = tuple((appid, manual_references(appid)) for appid in requested)
     completeness = _reconstruction_completeness(

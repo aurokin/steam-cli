@@ -116,6 +116,15 @@ from steam_agent.steam_declared_facts import (
     SteamDeclaredFactsError,
     declared_facts_payload,
 )
+from steam_agent.compatibility import (
+    CompatibilityTarget,
+    FeatureRequirement,
+    GateOverride as CompatibilityGateOverride,
+)
+from steam_agent.compatibility_adapter import (
+    assess_compatibility_snapshot,
+    compatibility_query_data,
+)
 
 
 EXIT_OK = 0
@@ -415,6 +424,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_leaf_format(system_query)
     system_query.add_argument("--machine", default="local")
+
+    compatibility = commands.add_parser(
+        "compatibility", help="Assess cached compatibility evidence."
+    )
+    compatibility_commands = compatibility.add_subparsers(
+        dest="compatibility_command", required=True
+    )
+    compatibility_assess = compatibility_commands.add_parser(
+        "assess", help="Assess explicit AppIDs against one explicit target."
+    )
+    _add_leaf_format(compatibility_assess)
+    compatibility_assess.add_argument("appids", metavar="APPID", nargs="+", type=int)
+    compatibility_assess.add_argument("--account", required=True)
+    compatibility_assess.add_argument("--target", required=True)
+    compatibility_assess.add_argument("--country", required=True)
+    compatibility_assess.add_argument("--language", required=True)
+    compatibility_assess.add_argument("--require", action="append", default=[])
+    compatibility_assess.add_argument("--override", action="append", default=[])
+    compatibility_assess.add_argument("--explain", action="store_true")
 
     feedback = commands.add_parser("feedback", help="Manage explicit local game feedback.")
     feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
@@ -904,6 +932,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.command == "system":
         return _dispatch_system(args, database_path)
+    if args.command == "compatibility":
+        return _dispatch_compatibility(args, database_path)
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
     if args.command == "recommendations" and args.recommendations_command == "wishlist":
@@ -1660,6 +1690,177 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             "support_level": "provisional",
             "disclosure_version": DECLARED_FACTS_DISCLOSURE_VERSION,
         },
+    )
+
+
+def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> int:
+    """Assess one atomic cache snapshot without provider or client access."""
+
+    command = "compatibility.assess"
+    now = _utc_now()
+    try:
+        supplied_appids = tuple(args.appids)
+        if (
+            not supplied_appids
+            or any(
+                isinstance(appid, bool)
+                or not isinstance(appid, int)
+                or not 1 <= appid <= (1 << 32) - 1
+                for appid in supplied_appids
+            )
+        ):
+            raise ValueError("AppIDs must be positive uint32 values")
+        appids = tuple(sorted(set(supplied_appids)))
+        if len(appids) > 10_000:
+            raise ValueError("compatibility query exceeds the bounded AppID maximum")
+        if re.fullmatch(r"[A-Z]{2}", args.country) is None:
+            raise ValueError("country must be an uppercase ISO-style code")
+        if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", args.language) is None:
+            raise ValueError("language is invalid")
+        requirements = tuple(_compatibility_requirement(item) for item in args.require)
+        overrides = tuple(
+            _compatibility_override(item, requested=set(appids), applied_at=now)
+            for item in args.override
+        )
+        with Storage(database_path) as storage:
+            account = storage.get_account(args.account)
+            if account is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            target, machine_id = _compatibility_target(storage, args.target)
+            snapshot = storage.read_compatibility_snapshot(
+                account.id,
+                machine_id,
+                args.country,
+                args.language,
+                appids,
+                now,
+            )
+        query = assess_compatibility_snapshot(
+            snapshot,
+            target=target,
+            requirements=requirements,
+            overrides=overrides,
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The compatibility assessment arguments or cached context are invalid.",
+            remediation=(
+                "Use valid AppIDs, an explicit configured account/target, country, "
+                "language, and documented requirement/override expressions."
+            ),
+            exit_code=2,
+        )
+
+    missing = query.completeness.missing_capabilities
+    stale = query.completeness.stale_capabilities
+    warnings_out: list[WarningRecord] = []
+    if missing:
+        warnings_out.append(
+            WarningRecord(
+                code=ErrorCode.NOT_SYNCED,
+                message="Some compatibility or ready-now evidence is unavailable.",
+            )
+        )
+    if stale:
+        warnings_out.append(
+            WarningRecord(
+                code=ErrorCode.STALE_LAST_GOOD,
+                message="Some compatibility evidence is stale or superseded.",
+            )
+        )
+    completeness_value = completeness(
+        CompletenessStatus.PARTIAL if (missing or stale) else CompletenessStatus.COMPLETE,
+        missing_capabilities=missing,
+        stale_capabilities=stale,
+        warnings=warnings_out,
+    )
+    return _emit_success(
+        args,
+        command=command,
+        generated_at=query.generated_at,
+        context={
+            "account_alias": args.account,
+            "target": args.target,
+            "country": args.country,
+            "language": args.language,
+            "cache_only": True,
+            "requirements": [f"{item.kind}:{item.name}" for item in requirements],
+            "overrides_ephemeral": bool(overrides),
+        },
+        completeness_value=completeness_value,
+        data=compatibility_query_data(query, explain=args.explain),
+    )
+
+
+def _compatibility_target(
+    storage: Storage, raw: str
+) -> tuple[CompatibilityTarget, str]:
+    if raw == "valve:steam-deck":
+        # Declared-fact demand is currently synchronized in the local context;
+        # no local profile or installed state is applied to the Deck target.
+        if storage.get_machine("local") is None:
+            raise ValueError("local compatibility context is not configured")
+        return CompatibilityTarget("valve_deck", "steam-deck", "steamos"), "local"
+    if not raw.startswith("machine:"):
+        raise ValueError("target is invalid")
+    machine_id = raw.removeprefix("machine:")
+    machine = storage.get_machine(machine_id)
+    if machine is None:
+        raise ValueError("compatibility machine is not configured")
+    platform_name = {
+        "darwin": "macos",
+        "mac": "macos",
+        "macos": "macos",
+        "win32": "windows",
+        "windows": "windows",
+        "linux": "linux",
+    }.get(machine.platform.casefold())
+    if platform_name is None:
+        raise ValueError("machine platform is unsupported")
+    return (
+        CompatibilityTarget("machine", machine_id, platform_name),  # type: ignore[arg-type]
+        machine_id,
+    )
+
+
+def _compatibility_requirement(raw: str) -> FeatureRequirement:
+    if not isinstance(raw, str) or raw.count(":") != 1:
+        raise ValueError("compatibility requirement is invalid")
+    kind, name = raw.split(":", 1)
+    return FeatureRequirement(kind, name)  # type: ignore[arg-type]
+
+
+def _compatibility_override(
+    raw: str, *, requested: set[int], applied_at: datetime
+) -> CompatibilityGateOverride:
+    if not isinstance(raw, str):
+        raise ValueError("compatibility override is invalid")
+    pieces = raw.split(":", 2)
+    if len(pieces) != 3 or "=" not in pieces[2]:
+        raise ValueError("compatibility override is invalid")
+    appid_text, name, gate_state = pieces
+    gate, state = gate_state.rsplit("=", 1)
+    if not appid_text.isascii() or not appid_text.isdecimal():
+        raise ValueError("compatibility override AppID is invalid")
+    appid = int(appid_text)
+    if appid not in requested:
+        raise ValueError("compatibility override AppID was not requested")
+    lineage = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return CompatibilityGateOverride(
+        name=name,
+        appid=appid,
+        gate=gate,
+        effective=state,  # type: ignore[arg-type]
+        evidence_ids=(f"query-override:{lineage}",),
+        applied_at=applied_at,
     )
 
 
@@ -5286,6 +5487,7 @@ def _command_name(args: argparse.Namespace) -> str:
         "achievements_command",
         "system_command",
         "recommendations_command",
+        "compatibility_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -5484,6 +5686,38 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "compatibility.assess":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for capability in query_completeness["missing_capabilities"]:
+            _print_table_fields("MISSING_CAPABILITY", capability)
+        for capability in query_completeness["stale_capabilities"]:
+            _print_table_fields("STALE_CAPABILITY", capability)
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields(
+            "APPID", "COMPATIBILITY", "PLAYABLE_NOW", "COMPLETENESS", "UNKNOWNS"
+        )
+        for item in envelope["data"]["results"]:
+            _print_table_fields(
+                item["appid"],
+                item["compatibility"],
+                item["playable_now"],
+                item["completeness"],
+                ",".join(item["unknowns"]),
+            )
+            if envelope["data"]["explain"]:
+                for gate in item["gates"]:
+                    _print_table_fields(
+                        "GATE",
+                        item["appid"],
+                        gate["name"],
+                        gate["original"],
+                        gate["effective"],
+                        gate["original_freshness"],
+                        gate["override_name"],
+                    )
+        return
     if command == "system.query":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])

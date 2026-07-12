@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+import pytest
+
+import steam_agent.cli as cli
+from steam_agent.compatibility import CompatibilityTarget
+from steam_agent.compatibility_adapter import assess_compatibility_snapshot
+from steam_agent.storage import (
+    DeclaredAppDemand,
+    DeclaredAppProjection,
+    DeclaredAppSnapshot,
+    DeclaredAppSubject,
+    EvidenceInput,
+    InstalledObservation,
+    Machine,
+    OwnedObservation,
+    Storage,
+    SystemProfileProjection,
+    SystemProfileSnapshot,
+)
+
+
+NOW = datetime(2026, 7, 12, 18, tzinfo=timezone.utc)
+
+
+def invoke(tmp_path: Path, capsys: object, *arguments: str):
+    code = cli.main(["--data-dir", str(tmp_path), *arguments])
+    captured = capsys.readouterr()  # type: ignore[attr-defined]
+    return code, json.loads(captured.out), captured.err
+
+
+def configure(tmp_path: Path) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("local", "Private workstation", "linux", "x86_64"),
+            observed_at=NOW,
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198999999999",
+            configured_at=NOW,
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-visible-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+
+
+def populated_snapshot(tmp_path: Path):
+    configure(tmp_path)
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        owned_run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            owned_run.id,
+            (OwnedObservation(400, 0, "visible_owned", NOW, "Private title"),),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=1,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+        installed_run = storage.begin_sync(
+            provider="local_steam",
+            capability="installed",
+            machine_id="local",
+            started_at=NOW,
+        )
+        storage.record_installed_observation(
+            installed_run.id,
+            InstalledObservation(
+                400,
+                "/private/library",
+                "private-install-dir",
+                NOW,
+                "Private title",
+            ),
+            EvidenceInput(
+                "local_steam",
+                "installed",
+                "local_file",
+                "appmanifest_400.acf",
+                NOW,
+                "core",
+                {"private": "must-not-escape"},
+            ),
+        )
+        storage.finish_installed_sync(
+            installed_run.id, status="complete", completed_at=NOW
+        )
+        snapshot = storage.read_compatibility_snapshot(
+            account.id, "local", "US", "english", [400], NOW
+        )
+
+    assert snapshot.installed.latest_complete is not None
+    system_run = replace(
+        snapshot.installed.latest_complete,
+        capability="system.profile.read",
+        provider="local_system",
+    )
+    profile = {
+        "schema_id": "system-profile/0.1",
+        "os": {"family": {"state": "known", "value": "linux"}},
+        "cpu": {"architecture": {"state": "known", "value": "x86_64"}},
+        "memory": {"total_bytes": {"state": "known", "value": 16 << 30}},
+        "storage": {
+            "state": "known",
+            "value": [{"available_bytes": 50 << 30}],
+        },
+        "graphics": {"state": "known", "value": {"models": ["PRIVATE GPU"]}},
+    }
+    facts = {
+        "schema_id": "declared-app-facts/0.1",
+        "appid": 400,
+        "context": {"country": "US", "language": "english"},
+        "platforms": {
+            "state": "declared",
+            "windows": False,
+            "macos": False,
+            "linux": True,
+        },
+        "requirements": [],
+        "languages": {"state": "declared", "items": [], "unrecognized_count": 0},
+        "categories": {"state": "declared", "known_slugs": [], "unknown_ids": []},
+        "controller_support": None,
+        "external_account_notice": {"state": "undeclared", "text": None},
+        "drm_notice": {"state": "undeclared", "text": None},
+        "source": {"support_level": "provisional"},
+    }
+    current = DeclaredAppProjection(
+        400,
+        "US",
+        "english",
+        "declared-app-facts/0.1",
+        facts,
+        "steam_store",
+        "provisional",
+        "steam_store_appdetails",
+        "https://store.steampowered.com/app/400/",
+        "2026-07-12T18:00:00Z",
+        7,
+    )
+    demand = DeclaredAppDemand(
+        400,
+        0,
+        True,
+        True,
+        "ready",
+        None,
+        None,
+        "2026-07-12T18:00:00Z",
+        7,
+        "complete",
+        "2026-07-12T18:00:00Z",
+        "2026-07-12T18:00:00Z",
+    )
+    return replace(
+        snapshot,
+        system_profile=SystemProfileSnapshot(
+            SystemProfileProjection(
+                "system-profile/0.1", profile, "2026-07-12T18:00:00Z", 9, 11
+            ),
+            system_run,
+            system_run,
+        ),
+        declared_apps=DeclaredAppSnapshot(
+            (DeclaredAppSubject(400, current, demand),), system_run
+        ),
+    )
+
+
+def forbid(*_: object, **__: object):
+    raise AssertionError("cache-only assessment crossed an external boundary")
+
+
+def test_typed_adapter_maps_system_owned_installed_and_omits_them_for_deck(
+    tmp_path: Path,
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    machine = assess_compatibility_snapshot(
+        snapshot,
+        target=CompatibilityTarget("machine", "local", "linux"),
+    )
+    gates = {gate.name: gate for gate in machine.assessment.results[0].gates}
+    assert gates["effective_execution_support"].original == "pass"
+    assert gates["readiness:installed"].original == "pass"
+    assert gates["readiness:visible_owned"].original == "pass"
+    assert machine.completeness.missing_capabilities == ("operations.ready.read",)
+
+    deck = assess_compatibility_snapshot(
+        snapshot,
+        target=CompatibilityTarget("valve_deck", "steam-deck", "steamos"),
+    )
+    deck_gates = {gate.name: gate for gate in deck.assessment.results[0].gates}
+    assert deck_gates["readiness:installed"].original == "unknown"
+    assert deck_gates["readiness:visible_owned"].original == "pass"
+    assert deck_gates["exact_target_review"].effective == "unknown"
+    assert "system_profile.read" in deck.completeness.missing_capabilities
+
+
+def test_assess_is_cache_only_exact_and_does_not_persist_overrides(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        before = tuple(storage._connection.iterdump())  # noqa: SLF001
+
+    monkeypatch.setattr(cli, "_declared_facts_client", forbid)
+    monkeypatch.setattr(cli, "_steam_web_api_client", forbid)
+    monkeypatch.setattr(cli, "_system_profile_collector", forbid)
+    monkeypatch.setattr(cli, "_credential_store", forbid)
+    monkeypatch.setattr(cli, "discover_steam_root", forbid)
+    monkeypatch.setattr(cli.time, "sleep", forbid)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--require",
+        "language:english",
+        "--override",
+        "400:manual-check:effective_execution_support=pass",
+        "--explain",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert value["command"] == "compatibility.assess"
+    assert value["generated_at"] == "2026-07-12T18:00:00Z"
+    assert value["context"] == {
+        "account_alias": "primary",
+        "cache_only": True,
+        "country": "US",
+        "language": "english",
+        "overrides_ephemeral": True,
+        "requirements": ["language:english"],
+        "target": "machine:local",
+    }
+    assert value["data"]["requested_appids"] == [400]
+    assert value["data"]["source_completeness"] == {
+        "missing_capabilities": [
+            "account.visible_owned.read",
+            "compatibility.declared.read",
+            "library.installed.read",
+            "operations.ready.read",
+            "system_profile.read",
+        ],
+        "stale_capabilities": [],
+    }
+    item = value["data"]["results"][0]
+    override_gate = next(
+        gate for gate in item["gates"] if gate["name"] == "effective_execution_support"
+    )
+    assert override_gate["original"] == "unknown"
+    assert override_gate["effective"] == "pass"
+    assert override_gate["override_name"] == "manual-check"
+    references = value["data"]["references"][0]["items"]
+    assert {item["provider"] for item in references} == {
+        "steam",
+        "steamdb",
+        "protondb",
+        "pcgamingwiki",
+    }
+    assert all(
+        item["access_mode"] == "manual_only"
+        and item["automation_supported"] is False
+        for item in references
+    )
+    encoded = json.dumps(value)
+    assert "76561198999999999" not in encoded
+    assert "Private workstation" not in encoded
+    assert "/Users/" not in encoded
+
+    with Storage(path) as storage:
+        after = tuple(storage._connection.iterdump())  # noqa: SLF001
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("0", "--target", "machine:local"),
+        ("4294967296", "--target", "machine:local"),
+        ("400", "--target", "machine:missing"),
+        ("400", "--target", "valve:steamdeck"),
+        ("400", "--target", "machine:local", "--require", "english"),
+        (
+            "400",
+            "--target",
+            "machine:local",
+            "--override",
+            "401:manual:effective_execution_support=pass",
+        ),
+    ],
+)
+def test_assess_rejects_invalid_bounded_contract(
+    tmp_path: Path, capsys: object, arguments: tuple[str, ...]
+) -> None:
+    configure(tmp_path)
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        *arguments,
+        "--account",
+        "primary",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_assess_default_json_and_table_remain_compact_and_safe(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    common = (
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "valve:steam-deck",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    code, value, stderr = invoke(tmp_path, capsys, *common)
+    assert code == 0
+    assert stderr == ""
+    assert value["data"]["target"] == {
+        "key": "steam-deck",
+        "kind": "valve_deck",
+        "platform": "steamos",
+    }
+    assert "gates" not in value["data"]["results"][0]
+    assert value["data"]["explain"] is False
+
+    code = cli.main(["--data-dir", str(tmp_path), *common, "--format", "table"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+    assert "APPID\tCOMPATIBILITY\tPLAYABLE_NOW\tCOMPLETENESS\tUNKNOWNS" in captured.out
+    assert "76561198999999999" not in captured.out
+
+
+def test_assess_missing_account_is_typed_without_identity_disclosure(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "missing",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 1
+    assert stderr == ""
+    assert value["error"]["code"] == "ACCOUNT_NOT_CONFIGURED"
+    assert "76561198999999999" not in json.dumps(value)
+
+
+@pytest.mark.parametrize(
+    ("country", "language"),
+    (("us", "english"), ("USA", "english"), ("US", "English"), ("US", "en glish")),
+)
+def test_assess_rejects_noncanonical_locale_context(
+    tmp_path: Path, capsys: object, country: str, language: str
+) -> None:
+    configure(tmp_path)
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        country,
+        "--language",
+        language,
+    )
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
