@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,9 +15,86 @@ from steam_agent.steam_reviews import (
     SteamReviewSummary,
 )
 from steam_agent.storage import Storage, WishlistObservation
+from steam_agent.wishlist_recommendation_query import _deal
 
 
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
+
+
+def deal_item(
+    *,
+    bucket: str = "unknown",
+    grade: str = "unknown",
+    attempts: list[dict[str, object]],
+    facts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "appid": 10,
+        "deal": {
+            "bucket": bucket,
+            "evidence_grade": grade,
+            "current_offer": None,
+            "historical_low": None,
+            "attempted_providers": attempts,
+        },
+        "evidence": {"offers": facts or [], "historical_lows": []},
+        "references": [
+            {"url": "https://gg.deals/steam/app/10/"},
+            {"url": "https://steamdb.info/app/10/"},
+        ],
+    }
+
+
+def test_m3_ladder_not_found_and_retained_evidence_are_not_collapsed() -> None:
+    partial = deal_item(
+        attempts=[
+            {"provider": "gg-deals", "status": "not_found"},
+            {"provider": "cheapshark", "status": "unavailable"},
+        ]
+    )
+    assert _deal(partial, "US", "official", {}) is None  # type: ignore[arg-type]
+
+    terminal = deal_item(
+        attempts=[
+            {"provider": "gg-deals", "status": "not_found"},
+            {"provider": "cheapshark", "status": "not_found"},
+        ]
+    )
+    subject = SimpleNamespace(
+        outcome="not_found", observed_at="2026-07-11T12:00:00Z"
+    )
+    not_found = _deal(  # type: ignore[arg-type]
+        terminal, "US", "official", {(10, "cheapshark"): subject}
+    )
+    assert not_found is not None and not_found.state == "not_found"
+    assert not_found.provider == "cheapshark"
+
+    retained = [
+        {
+            "evidence_id": 7,
+            "provider": "gg-deals",
+            "fresh": False,
+            "observed_at": "2026-07-10T00:00:00Z",
+        }
+    ]
+    stale = _deal(  # type: ignore[arg-type]
+        deal_item(attempts=[], facts=retained), "US", "official", {}
+    )
+    assert stale is not None and stale.state == "unknown"
+    assert stale.freshness == "stale" and stale.evidence_ids == ("price:7",)
+    noncomparable = _deal(  # type: ignore[arg-type]
+        deal_item(
+            bucket="noncomparable",
+            grade="degraded",
+            attempts=[],
+            facts=[{**retained[0], "fresh": True}],
+        ),
+        "US",
+        "official",
+        {},
+    )
+    assert noncomparable is not None and noncomparable.bucket == "noncomparable"
+    assert noncomparable.evidence_grade == "degraded"
 
 
 class Client:

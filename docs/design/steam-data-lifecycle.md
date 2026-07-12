@@ -204,9 +204,10 @@ The first persistent review sync requires the versioned M4 review disclosure.
 Current aggregate summaries are fresh for 24 hours and usable as stale,
 explicitly labeled optional evidence until their seven-day hard expiry.
 Account-scoped demand, observations, attempts, and consent expire or are
-deleted with the account. A shared public current aggregate may survive one
-account deletion only while another retained wishlist still references that
-AppID; orphan pruning removes it otherwise. Coarse provider cooldown state
+deleted with the account. During account-scoped provider deletion, a shared
+public current aggregate survives only when another account has its own ready
+observation to rehome; otherwise it is removed even if the deleting account's
+wishlist remains. Orphan pruning removes unreferenced rows. Coarse provider cooldown state
 prevents restart loops from bypassing `Retry-After`.
 
 Retained review fields are the exact AppID, Valve aggregate score and

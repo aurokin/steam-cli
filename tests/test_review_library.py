@@ -251,3 +251,39 @@ def test_provider_deletion_removes_review_cache_consent_and_cooldown(tmp_path) -
         assert storage._connection.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM provider_request_limits WHERE provider='steam-store-reviews'"
         ).fetchone()[0] == 0
+
+
+def test_account_provider_deletion_removes_sole_review_but_rehomes_shared(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        first = setup_wishlist(storage, 1)
+        sync_wishlist_reviews(
+            storage, account_id=first, max_items=1, client=Client(), clock=Clock()
+        )
+        deleted = storage.delete_review_data(account_id=first)
+        assert deleted["current_removed"] == 1
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM review_current"
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM wishlist_current WHERE account_id=?", (first,)
+        ).fetchone()[0] == 1
+
+    with Storage(tmp_path / "shared.sqlite3") as storage:
+        first = setup_wishlist(storage, 1)
+        second = setup_wishlist(storage, 1, alias="secondary")
+        sync_wishlist_reviews(
+            storage, account_id=first, max_items=1, client=Client(), clock=Clock()
+        )
+        sync_wishlist_reviews(
+            storage,
+            account_id=second,
+            max_items=1,
+            client=Client(),
+            clock=Clock(NOW + timedelta(minutes=1)),
+        )
+        storage.delete_review_data(account_id=second)
+        row = storage._connection.execute(  # noqa: SLF001
+            """SELECT r.account_id FROM review_current c
+               JOIN sync_runs r ON r.id=c.promoted_sync_run_id"""
+        ).fetchone()
+        assert row[0] == first

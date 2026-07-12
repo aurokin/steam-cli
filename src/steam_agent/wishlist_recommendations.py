@@ -360,13 +360,21 @@ class DealDimension:
             self.observed_at is None or self.freshness == "unknown"
         ):
             raise ValueError("not_found requires attributed observation freshness")
-        if self.state == "unknown" and (
-            self.provider not in {None, "manual-reference"}
-            or self.observed_at is not None
-            or self.freshness != "unknown"
-            or self.evidence_grade != "unknown"
-        ):
-            raise ValueError("unknown deal evidence carries contradictory claims")
+        if self.state == "unknown":
+            unattributed_unknown = (
+                self.provider in {None, "manual-reference"}
+                and self.observed_at is None
+                and self.freshness == "unknown"
+                and self.evidence_grade == "unknown"
+            )
+            attributed_stale = (
+                self.provider in {"gg-deals", "cheapshark"}
+                and self.observed_at is not None
+                and self.freshness in {"stale", "expired"}
+                and self.evidence_grade == "unknown"
+            )
+            if not unattributed_unknown and not attributed_stale:
+                raise ValueError("unknown deal evidence carries contradictory claims")
         if (
             not isinstance(self.references, tuple)
             or len(self.references) > MAX_EVIDENCE_IDS
@@ -924,8 +932,16 @@ def _deal(
             tuple(mismatches),
         )
     if value.state == "ready" and value.bucket == "noncomparable":
+        noncomparable_state = (
+            value.freshness
+            if value.freshness in {"stale", "expired"}
+            else "noncomparable"
+        )
+        tradeoffs = ["requested_comparison_dimensions_are_not_fully_supported"]
+        if noncomparable_state in {"stale", "expired"}:
+            tradeoffs.append(f"deal_evidence_{noncomparable_state}")
         return DealValueDimension(
-            "noncomparable",
+            noncomparable_state,  # type: ignore[arg-type]
             "noncomparable",
             "degraded",
             value.provider,
@@ -934,7 +950,7 @@ def _deal(
             value.freshness,
             value.references,
             value.evidence_ids,
-            ("requested_comparison_dimensions_are_not_fully_supported",),
+            tuple(tradeoffs),
         )
     if value.state == "not_found":
         return DealValueDimension(
@@ -950,8 +966,13 @@ def _deal(
             ("provider_reported_not_found; price_is_unknown_not_free",),
         )
     if value.state == "unknown":
+        state = (
+            value.freshness
+            if value.freshness in {"stale", "expired"}
+            else "unknown"
+        )
         return DealValueDimension(
-            "unknown",
+            state,  # type: ignore[arg-type]
             "unknown",
             "unknown",
             value.provider,
@@ -960,7 +981,13 @@ def _deal(
             value.freshness,
             value.references,
             value.evidence_ids,
-            ("deal_evidence_unknown",),
+            (
+                (
+                    f"deal_evidence_{state}"
+                    if state in {"stale", "expired"}
+                    else "deal_evidence_unknown"
+                ),
+            ),
         )
     if value.freshness == "unknown":
         return DealValueDimension(

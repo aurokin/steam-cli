@@ -233,10 +233,58 @@ def _deal(
         )
     )
     attempts = deal["attempted_providers"]
-    not_found = next(
-        (attempt for attempt in attempts if attempt["status"] == "not_found"), None
+    retained_facts = [
+        fact
+        for kind in ("offers", "historical_lows")
+        for fact in item["evidence"][kind]
+    ]
+    ingest_attempts = {
+        attempt["provider"]: attempt
+        for attempt in attempts
+        if attempt["provider"] in {"gg-deals", "cheapshark"}
+    }
+    ladder_not_found = all(
+        ingest_attempts.get(provider, {}).get("status") == "not_found"
+        for provider in ("gg-deals", "cheapshark")
     )
+    not_found = ingest_attempts.get("cheapshark") if ladder_not_found else None
     if selected is None:
+        if retained_facts and deal["bucket"] == "noncomparable":
+            fact = retained_facts[0]
+            return DealDimension(
+                "deal-evidence/0.1",
+                "ready",
+                "noncomparable",
+                "degraded",
+                fact["provider"],
+                store_class,
+                country,
+                "USD",
+                "fresh" if fact["fresh"] else "stale",
+                observed_at=datetime.fromisoformat(
+                    fact["observed_at"].replace("Z", "+00:00")
+                ),
+                references=references,
+                evidence_ids=evidence_ids,
+            )
+        if retained_facts and any(not fact["fresh"] for fact in retained_facts):
+            fact = next(fact for fact in retained_facts if not fact["fresh"])
+            return DealDimension(
+                "deal-evidence/0.1",
+                "unknown",
+                "unknown",
+                "unknown",
+                fact["provider"],
+                store_class,
+                country,
+                "USD",
+                "stale",
+                observed_at=datetime.fromisoformat(
+                    fact["observed_at"].replace("Z", "+00:00")
+                ),
+                references=references,
+                evidence_ids=evidence_ids,
+            )
         if not_found is None:
             return None
         subject = subjects.get((int(item["appid"]), not_found["provider"]))
