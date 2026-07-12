@@ -918,8 +918,18 @@ def _validate_review_summary(appid: int, value: Mapping[str, Any]) -> None:
 class Storage:
     """Owns a SQLite connection and exposes scanner-oriented transactions."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, readonly: bool = False) -> None:
         self.path = Path(path)
+        self.readonly = readonly
+        if readonly:
+            if self.path == Path(":memory:"):
+                raise StorageError("in-memory storage cannot be opened read-only")
+            if self.path.is_symlink():
+                raise StorageError("database path must not be a symbolic link")
+            if not self.path.is_file():
+                raise StorageError("read-only database does not exist")
+            self._connection = self._open_connection()
+            return
         if self.path != Path(":memory:"):
             if self.path.is_symlink():
                 raise StorageError("database path must not be a symbolic link")
@@ -938,7 +948,12 @@ class Storage:
         self.migrate()
 
     def _open_connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.path))
+        if self.readonly:
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True
+            )
+        else:
+            connection = sqlite3.connect(str(self.path))
         connection.row_factory = sqlite3.Row
         connection.create_function(
             "steam_application_uuid_v5",
@@ -947,7 +962,10 @@ class Storage:
             deterministic=True,
         )
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA secure_delete = ON")
+        if self.readonly:
+            connection.execute("PRAGMA query_only = ON")
+        else:
+            connection.execute("PRAGMA secure_delete = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 

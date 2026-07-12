@@ -17,6 +17,7 @@ from steam_agent.storage import (
     InvalidSyncTransition,
     Machine,
     Storage,
+    StorageError,
 )
 
 
@@ -518,3 +519,27 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
                 (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,), (20,), (21,),
                 (22,)
         ]
+
+
+def test_readonly_storage_never_migrates_or_accepts_writes(tmp_path: Path) -> None:
+    database_path = tmp_path / "steam-agent.sqlite3"
+    with Storage(database_path) as writable:
+        writable.upsert_machine(
+            Machine("desktop", "Gaming PC", "linux", "x86_64"),
+            observed_at=T0,
+        )
+    before = database_path.read_bytes()
+
+    with Storage(database_path, readonly=True) as readonly:
+        assert readonly.get_machine("desktop") is not None
+        with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+            readonly._connection.execute(  # noqa: SLF001 - process boundary proof
+                "DELETE FROM machines"
+            )
+
+    assert database_path.read_bytes() == before
+
+
+def test_readonly_storage_requires_an_existing_file(tmp_path: Path) -> None:
+    with pytest.raises(StorageError, match="does not exist"):
+        Storage(tmp_path / "missing.sqlite3", readonly=True)
