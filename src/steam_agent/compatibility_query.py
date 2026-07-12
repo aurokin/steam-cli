@@ -511,6 +511,7 @@ def _declared(
     if not isinstance(facts, Mapping):
         return None, None, "unknown", True
     conflict = facts.get("appid") != appid
+    facts = compatibility_declared_facts(facts)
     observed = _parse_time(item.get("observed_at"))
     freshness = (
         "unknown" if observed is None else _declared_freshness(observed, now)
@@ -567,6 +568,54 @@ def _declared(
             if freshness == "fresh":
                 freshness = "stale"
     return facts, observed, freshness, conflict
+
+
+def compatibility_declared_facts(facts: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Project either declared-facts schema onto the exact M5 allowlist.
+
+    Discovery-only category IDs, multiplayer mappings, genres, release timing,
+    and their schema-version metadata cannot influence M5 gates or lineage.
+    Requirement text and every other M5 input remain bound exactly.
+    """
+
+    projected = {
+        key: facts.get(key)
+        for key in (
+            "appid",
+            "context",
+            "platforms",
+            "requirements",
+            "languages",
+            "controller_support",
+            "external_account_notice",
+            "drm_notice",
+        )
+    }
+    categories = facts.get("categories")
+    if isinstance(categories, Mapping):
+        raw_slugs = categories.get("known_slugs")
+        slugs = (
+            tuple(
+                sorted(
+                    {
+                        value
+                        for value in raw_slugs
+                        if isinstance(value, str)
+                        and value
+                        in (INPUT_FEATURE_SLUGS | ACCESSIBILITY_FEATURE_SLUGS)
+                    }
+                )
+            )
+            if isinstance(raw_slugs, (list, tuple))
+            else ()
+        )
+        projected["categories"] = {
+            "state": categories.get("state"),
+            "known_slugs": slugs,
+        }
+    else:
+        projected["categories"] = None
+    return projected
 
 
 def _native(
@@ -970,7 +1019,7 @@ def _declared_projection_identity(
         return supplied
     canonical = json.dumps(
         {
-            "facts": facts,
+            "facts": compatibility_declared_facts(facts),
             "promoted_sync_run_id": (
                 None if item is None else item.get("promoted_sync_run_id")
             ),

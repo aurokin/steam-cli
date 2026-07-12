@@ -552,7 +552,7 @@ def test_assess_outdated_readonly_schema_returns_actionable_typed_error(
     path = tmp_path / "steam-agent.sqlite3"
     with Storage(path) as storage:
         storage._connection.execute(  # noqa: SLF001
-            "DELETE FROM schema_migrations WHERE version = 22"
+            "DELETE FROM schema_migrations WHERE version = 23"
         )
         storage._connection.commit()  # noqa: SLF001
 

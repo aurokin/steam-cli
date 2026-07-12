@@ -261,6 +261,46 @@ def test_positive_features_and_full_audio_are_exposed_without_negative_inference
     assert all(feature.support.state == "pass" for feature in (*item.accessibility, *item.input, *item.language))
 
 
+def test_declared_facts_0_1_and_0_2_are_identical_to_m5() -> None:
+    legacy_facts = facts(
+        10,
+        categories=("full_controller_support", "adjustable_text_size"),
+        languages=({"code": "english", "full_audio": True},),
+        controller="full",
+    )
+    legacy_categories = legacy_facts["categories"]
+    assert isinstance(legacy_categories, dict)
+    legacy_categories["unknown_ids"] = [1]
+    expanded_facts = {
+        **legacy_facts,
+        "schema_id": "declared-app-facts/0.2",
+        "categories": {
+            **legacy_categories,
+            "known_slugs": [
+                *legacy_categories["known_slugs"],
+                "multi_player",
+            ],
+            "unknown_ids": [],
+            "source": "steam_store_appdetails",
+            "numeric_ids": [1, 28, 64],
+        },
+        "genres": {
+            "state": "declared",
+            "source": "steam_store_appdetails",
+            "items": [{"id": 1, "localized_label": "Action"}],
+        },
+        "coming_soon": {
+            "state": "present",
+            "localized_date_display": "Coming soon",
+        },
+    }
+
+    legacy = result(snapshot=declared(10, payload=legacy_facts))
+    expanded = result(snapshot=declared(10, payload=expanded_facts))
+
+    assert expanded == legacy
+
+
 def test_input_category_classification_uses_an_explicit_allowlist() -> None:
     payload = facts(
         10,

@@ -18,6 +18,7 @@ from steam_agent.compatibility_query import (
     LocalObservation,
     SystemSnapshot,
     reconstruct_compatibility,
+    compatibility_declared_facts,
 )
 from steam_agent.contracts import format_timestamp
 from steam_agent.storage import CompatibilitySnapshot, SyncRun
@@ -220,7 +221,10 @@ def _declared_projection_identity(
     """Bind derived evidence to exact normalized content without exposing it."""
 
     canonical = json.dumps(
-        {"facts": facts, "promoted_sync_run_id": promoted_sync_run_id},
+        {
+            "facts": compatibility_declared_facts(facts),
+            "promoted_sync_run_id": promoted_sync_run_id,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,

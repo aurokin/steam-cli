@@ -492,10 +492,12 @@ def test_only_normalized_payload_is_persisted(
     assert set(decoded) == {
         "appid",
         "categories",
+        "coming_soon",
         "context",
         "controller_support",
         "drm_notice",
         "external_account_notice",
+        "genres",
         "languages",
         "platforms",
         "requirements",
