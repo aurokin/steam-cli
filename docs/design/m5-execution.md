@@ -1,6 +1,6 @@
 # M5 compatibility and ready-now execution plan
 
-Status: active 2026-07-12
+Status: accepted 2026-07-12
 
 ## Outcome and sequence
 
@@ -24,6 +24,11 @@ only after both foundations are stable.
 M5 does not add generic FPS prediction, benchmark inference, remote-machine
 inventory, broad discovery, group recommendation, Steam client mutation, or an
 action executor.
+
+Acceptance evidence: 1,284 repository tests, Ruff, packaged-wheel and bounded
+live primary-account smokes, an independent adversarial audit, and a final
+Diffwarden review with zero findings. Missing Deck review, performance, or M7
+operational evidence remains unknown.
 
 ## System-profile boundary
 
@@ -131,7 +136,7 @@ provider convergence, retry/cooldown/interruption, provisional schema changes,
 all gate states and overrides, input-order determinism, table safety, and
 installed-wheel behavior.
 
-Active synthetic M5 evals cover supported/failed OS, safe numeric RAM failure,
+Accepted synthetic M5 evals cover supported/failed OS, safe numeric RAM failure,
 unparsed CPU/GPU unknown, target-scoped Valve ratings, accessibility positive
 versus absent, stale/conflicting sources, playable-now unknown, not-installed
 failure, overrides, deletion, and privacy canaries. Every deterministic oracle

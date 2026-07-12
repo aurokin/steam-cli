@@ -28,7 +28,7 @@ supports them.
 | D020 | Explicit feedback, durable rules, and temporary constraint precedence | [Accepted for M4](0007-explicit-feedback-and-constraints.md) | Costly once agents write state | Mutation/clear/snooze, three-valued gate, override, isolation, and deletion tests |
 | D021 | Recommendation recipe and explanation semantics | [Accepted for M4](0008-versioned-recommendation-recipes.md) | Costly once rankings are consumed | Golden factors, hard-gate, overflow, tie, input-order, and eval scenarios |
 | D022 | Activity/achievement purpose and retention | [Accepted bounded M4 slice](0009-m4-activity-retention.md) | Costly for privacy | Disclosure, live privacy/no-stats evidence, LKG/expiry, bounded demand, and deletion tests |
-| D023 | System-profile identity, minimization, and retention | [Accepted for active M5](0010-m5-system-profile.md) | Costly for privacy and portability | Cross-platform fixtures, denylist canaries, consent, freshness, LKG, isolation, and deletion tests |
+| D023 | System-profile identity, minimization, and retention | [Accepted with M5](0010-m5-system-profile.md) | Costly for privacy and portability | Cross-platform fixtures, denylist canaries, consent, freshness, LKG, isolation, and deletion tests |
 | D024 | Compatibility evidence and precedence | [Accepted layered M5 boundary](0011-m5-layered-compatibility.md) | Costly once agents consume verdicts | Provisional shape fixtures, pure gate/eval oracles, target scoping, unknowns, overrides, and live redacted evidence |
 
 ## When to create an ADR

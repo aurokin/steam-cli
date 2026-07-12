@@ -1,6 +1,6 @@
 # ADR 0010: redacted observed system profiles for M5
 
-Status: accepted for active M5 on 2026-07-12
+Status: accepted with M5 on 2026-07-12
 
 ## Context
 

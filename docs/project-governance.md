@@ -6,7 +6,7 @@ documentation; product architecture remains in the design documents and ADRs.
 
 ## Current boundary
 
-M1 through M4 are accepted historical work. M5 and later milestones remain
+M1 through M5 are accepted historical work. M6 and later milestones remain
 roadmap hypotheses until the user explicitly selects one. Creating a milestone
 or issue does not approve an implementation, provider, credential flow, policy
 interpretation, or ADR.

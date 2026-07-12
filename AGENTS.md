@@ -11,10 +11,12 @@
 - M4 next-to-play and preference is accepted. Keep explicit feedback separate
   from behavioral inference, queries cache-only, hard gates three-valued, and
   recipes deterministic under `docs/design/m4-execution.md`.
-- M5 compatibility and ready-now is active. Preserve the redacted system-profile,
+- M5 compatibility and ready-now is accepted. Preserve the redacted system-profile,
   layered evidence, target scope, provisional-provider, and no-performance-promise
   boundaries in `docs/design/m5-execution.md`.
-- Keep artwork, group/discovery, and action capabilities in design until their
+- M6 discovery, household, and groups is active. Keep its candidate universe
+  bounded and profiles synthetic unless real-person data is explicitly approved.
+- Keep artwork and action capabilities in design until their
   Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.

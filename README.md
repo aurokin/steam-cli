@@ -24,10 +24,10 @@ provider-scoped deletion, and the cache-only attributed deal query are
 available. **M4 next-to-play and preference is implemented and accepted:**
 explicit feedback, bounded activity/achievement evidence, deterministic play
 recipes, public aggregate-review evidence, and wishlist-fit joins are
-available. **M5 compatibility and ready-now is implemented and undergoing
-acceptance:** redacted system profiles, provisional publisher declarations,
-and cache-only target assessments are available. Artwork, group discovery,
-and Steam actions remain proposed behind later activation checkpoints.
+available. **M5 compatibility and ready-now is implemented and accepted:**
+redacted system profiles, provisional publisher declarations, and cache-only
+target assessments are available. **M6 discovery, household, and groups is
+active.** Artwork and Steam actions remain behind later milestone boundaries.
 
 ## Install and develop
 
@@ -308,7 +308,7 @@ Temporary requirements and named gate overrides are request-local and are not
 persisted. M5 leaves `playable_now` unknown unless a known incompatibility or a
 fresh known-not-installed fact can safely fail it; client/update/launcher state
 belongs to the later actions milestone. See the
-[M5 execution plan](docs/design/m5-execution.md) for the active acceptance
+[M5 execution plan](docs/design/m5-execution.md) for the accepted evidence
 boundary.
 
 For Steam Deck, `--context-machine` selects declared-fact attempt lineage and
