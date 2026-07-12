@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: M1, M2, and M3 accepted; M4 recommendation contract active
+Status: M1, M2, M3, and M4 accepted
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -31,7 +31,7 @@ rejected without echoing their value.
 
 ## Implemented M2 capability-gate commands
 
-These commands are implemented while M2 live validation remains open:
+These commands are accepted under the M2 capability and credential boundary:
 
 ```text
 steam-agent accounts discover [--steam-root PATH] [--include-identifiers]

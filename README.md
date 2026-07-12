@@ -21,9 +21,10 @@ and bounded catalog queries, truthful freshness, and transactional deletion are
 available. **M3 wishlist and deal evidence is implemented and accepted:**
 provisional wishlist synchronization, bounded US price-summary synchronization,
 provider-scoped deletion, and the cache-only attributed deal query are
-available. **M4 next-to-play and preference is active:** explicit feedback,
-activity/achievement evidence, deterministic play recipes, and wishlist-fit
-joins are in acceptance work. Compatibility, artwork, group discovery, and
+available. **M4 next-to-play and preference is implemented and accepted:**
+explicit feedback, bounded activity/achievement evidence, deterministic play
+recipes, public aggregate-review evidence, and wishlist-fit joins are
+available. Compatibility, artwork, group discovery, and
 Steam actions remain proposed behind later activation checkpoints.
 
 ## Install and develop
@@ -247,12 +248,19 @@ scope boundary.
 
 ## M4 next-to-play recommendations
 
-M4 recommendation queries are cache-only and deterministic:
+M4 separates explicit mutation and provider synchronization from cache-only,
+deterministic recommendation queries:
 
 ```text
+uv run steam-agent feedback rate --account primary APPID --value liked
+uv run steam-agent preferences rule set --account primary --trait user:relaxing --kind prefer --strength soft --weight 80
+uv run steam-agent sync activity --account primary --acknowledge-local-storage
+uv run steam-agent sync achievements --account primary --scope recent --max-items 20 --acknowledge-local-storage
 uv run steam-agent recommendations query --account primary --recipe resume/0.1
 uv run steam-agent recommendations query --account primary --recipe finishability/0.1 --time-minutes 360 --unknown include
 uv run steam-agent recommendations query --account primary --recipe preference-fit/0.1 --require installed=true --explain --format table
+uv run steam-agent sync reviews --scope wishlist --account primary --max-items 20 --acknowledge-local-storage
+uv run steam-agent recommendations wishlist --account primary --country US --unknown include
 ```
 
 The candidate scope is the visible-owned last-good projection. A query reads
@@ -263,6 +271,13 @@ both original and effective state and are never persisted. Known non-games are
 excluded, while missing classification remains explicit. Results use the
 versioned `recommendations/0.1` schema and preserve score components, factors,
 tradeoffs, lineage, freshness, confidence, and completeness.
+
+Wishlist fit uses the immutable `wishlist-fit/0.1` recipe. Direct feedback,
+deal value, aggregate reviews, release, and compatibility remain separate
+dimensions. Steam aggregate reviews are report-only and retain no review text,
+reviewer data, cursor, or raw body. Without direct preference evidence, the
+query reports insufficient evidence instead of claiming a purchase
+recommendation.
 
 The current working direction is:
 
@@ -327,7 +342,7 @@ The design documents call out places where current research corrected it.
 
 ## Deliberately unresolved
 
-- Long-term storage schema and migration policy beyond the implemented M1 tables.
+- Long-term storage evolution beyond the implemented forward-only M1–M4 migrations.
 - Which approved provider may support a future full historical price-event
   graph; M3 retains only attributed low summaries.
 - Which Steam actions may be executed rather than planned/opened for a human.

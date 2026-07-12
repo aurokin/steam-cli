@@ -6,9 +6,10 @@ documentation; product architecture remains in the design documents and ADRs.
 
 ## Current boundary
 
-M1 is accepted historical work. Later milestones are roadmap hypotheses until
-the user explicitly selects one. Creating a milestone or issue does not approve
-an implementation, provider, credential flow, policy interpretation, or ADR.
+M1 through M4 are accepted historical work. M5 and later milestones remain
+roadmap hypotheses until the user explicitly selects one. Creating a milestone
+or issue does not approve an implementation, provider, credential flow, policy
+interpretation, or ADR.
 
 The completed M1 Linear project must not be repurposed for later scope. Future
 work belongs in the separate Steam CLI product-roadmap project.

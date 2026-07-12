@@ -8,7 +8,7 @@
 - M3 wishlist and deal evidence is accepted. Preserve its read-only boundary,
   explicit country/store context, cache-only query, attributed evidence,
   typed fallback states, and retention rules in `docs/design/m3-execution.md`.
-- M4 next-to-play and preference is active. Keep explicit feedback separate
+- M4 next-to-play and preference is accepted. Keep explicit feedback separate
   from behavioral inference, queries cache-only, hard gates three-valued, and
   recipes deterministic under `docs/design/m4-execution.md`.
 - Keep compatibility, artwork, group/discovery, and action capabilities in

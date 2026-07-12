@@ -22,6 +22,11 @@ typed-unavailable query, verifies the complete source migration set and database
 reopen, and checks that secret-like command-line input is rejected without being
 echoed.
 
+The normal suite also executes every deterministic assertion in the ten active
+M4 common-question scenarios under `evals/scenarios/m4`. Natural-language
+answer judging remains opt-in; deterministic evidence, gate, ordering, and
+truth-state oracles are part of CI.
+
 Live provider checks are intentionally not CI tests. Account contents, prices,
 provisional response shapes, credentials, and provider quotas are external and
 time-varying. Milestone acceptance records coarse live results separately and

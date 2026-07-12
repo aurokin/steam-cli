@@ -1,6 +1,6 @@
 # M4 next-to-play and preference execution plan
 
-Status: active 2026-07-11
+Status: accepted 2026-07-11
 
 ## Outcome and sequence
 
@@ -182,3 +182,34 @@ when represented truthfully.
 The cross-milestone eval strategy separately tests common user questions. M4
 acceptance requires deterministic recipe/oracle scenarios; natural-language
 model judges, real-user prompts, and M3 prose evaluation remain non-blocking.
+
+## Acceptance evidence
+
+M4 was accepted after all four Linear slices completed:
+
+- AUR-621: account-scoped explicit feedback, traits, estimates, snoozes, and
+  durable preference rules with auditable clearing and deletion;
+- AUR-630: bounded activity and optional achievement synchronization with
+  privacy/no-stats states, last-good projections, hard retention, and
+  clock/race handling;
+- AUR-637: cache-only `resume/0.1`, `finishability/0.1`, and
+  `preference-fit/0.1` recipes with three-valued gates and executable R01–R10
+  common-question oracles; and
+- AUR-642: bounded public aggregate-review synchronization and cache-only
+  `wishlist-fit/0.1`, preserving the accepted M3 deal ladder and keeping
+  preference, deal, review, release, and compatibility dimensions separate.
+
+The final deterministic gate passed 928 tests, Ruff, source and wheel builds,
+and installed-wheel smoke. Diffwarden's two-reviewer final passes returned zero
+findings for the achievement projection repair and the last wishlist-prefix
+truth-state fix after earlier findings were fixed with regressions.
+
+Redacted live acceptance on the primary account synchronized a bounded
+three-subject public-review slice from 238 wishlist candidates with all three
+targets ready. It retained no raw response, review text, or reviewer data. The
+final cache-only wishlist query returned 238 candidates, three with attributed
+review evidence and 235 with review evidence unknown. It correctly declined to
+claim a purchase recommendation without direct preference evidence and kept
+stale price evidence as a separate completeness warning. No personal titles,
+AppIDs, SteamID64 values, feedback, keys, or raw bodies were recorded as
+acceptance artifacts.

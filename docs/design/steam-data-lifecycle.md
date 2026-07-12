@@ -1,12 +1,14 @@
 # Steam account data lifecycle
 
-Status: accepted M2 and M3 policy boundary
+Status: accepted M2, M3, and M4 policy boundary
 
 This document governs Steam account data obtained through Valve's Web API. It
 does not change the accepted M1 local installed-library contract. It is the
 privacy and retention gate for AUR-620 and for the later persistent
-owned-library slice in AUR-627. The M3 sections extend the same boundary to the
-provisional wishlist, bounded price-summary demand, and cache-only deal query.
+owned-library slice in AUR-627. The M3 and M4 sections extend the same boundary
+to the provisional wishlist, bounded price-summary and public-review demand,
+activity and achievement evidence, and cache-only deal and recommendation
+queries.
 
 ## Terms basis
 
