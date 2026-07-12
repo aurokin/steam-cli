@@ -8,6 +8,7 @@ import pytest
 from steam_agent.recommendations import (
     MAX_APPID,
     MAX_INT64,
+    RECIPE_SCORING_TABLE,
     ActivityEvidence,
     AchievementEvidence,
     ConstraintOverride,
@@ -96,9 +97,9 @@ def test_r01_resume_orders_momentum_and_excludes_explicitly_finished() -> None:
 def test_r02_finishability_applies_time_gate_and_unknown_policy() -> None:
     result = rank_recommendations(
         (
-            candidate(1203, fb=feedback(remaining=None)),
-            candidate(1202, fb=feedback(remaining=600)),
-            candidate(1201, fb=feedback(remaining=240)),
+            candidate(1203, fb=ExplicitFeedback(play_state="active", minimum_session_minutes=0)),
+            candidate(1202, fb=ExplicitFeedback(play_state="active", minimum_session_minutes=0, remaining_minutes=600)),
+            candidate(1201, fb=ExplicitFeedback(play_state="active", minimum_session_minutes=0, remaining_minutes=240)),
         ),
         context=context("finishability/0.1", time_minutes=360, unknown_policy="include"),
     )
@@ -239,6 +240,23 @@ def test_profile_hard_require_and_avoid_are_three_valued() -> None:
     assert all(item.effective == "pass" for item in result.results[0].gates)
 
 
+def test_soft_require_rewards_present_penalizes_absent_and_preserves_unknown() -> None:
+    rule = ProfileRule("user:controller", "require", "soft", 40)
+    candidates = (
+        candidate(3, fb=feedback(traits=(TraitAssertion("user:controller", "unknown"),))),
+        candidate(2, fb=feedback(traits=(TraitAssertion("user:controller", "absent"),))),
+        candidate(1, fb=feedback(traits=(TraitAssertion("user:controller", "present"),))),
+    )
+    result = rank_recommendations(candidates, profile_rules=(rule,), context=context())
+    factors = {
+        item.appid: next(component for component in item.components if component.rule_id == "profile_rule:user:controller")
+        for item in result.results
+    }
+    assert (factors[1].points, factors[1].state) == (40, "applied")
+    assert (factors[2].points, factors[2].state) == (-40, "applied")
+    assert (factors[3].points, factors[3].state) == (None, "unknown")
+
+
 def test_achievement_ratio_is_weak_labeled_evidence_not_completion() -> None:
     achievement = AchievementEvidence("ready", "fresh", NOW, 9, 10, ("achievement:1",))
     result = rank_recommendations((candidate(1, act=activity(), achievements=achievement),), context=context("resume/0.1"))
@@ -263,6 +281,39 @@ def test_clock_change_only_affects_time_sensitive_snooze_and_recency() -> None:
     after = rank_recommendations((game,), context=RecommendationContext("resume/0.1", NOW + timedelta(days=2)))
     assert before.results[0].eligibility == "excluded"
     assert after.results[0].eligibility != "excluded"
+
+
+@pytest.mark.parametrize(
+    ("available", "minimum", "expected"),
+    ((30, 29, "pass"), (30, 30, "pass"), (30, 31, "fail"), (0, 0, "pass"), (0, 1, "fail"), (30, None, "unknown")),
+)
+@pytest.mark.parametrize("recipe", ("resume/0.1", "finishability/0.1", "preference-fit/0.1"))
+def test_minimum_session_time_gate_is_three_valued_across_recipes(
+    available: int,
+    minimum: int | None,
+    expected: str,
+    recipe: str,
+) -> None:
+    game = candidate(1, fb=ExplicitFeedback(play_state="active", minimum_session_minutes=minimum, remaining_minutes=0))
+    result = rank_recommendations(
+        (game,),
+        context=context(recipe, time_minutes=available, unknown_policy="include"),
+    )
+    gate = next(item for item in result.results[0].gates if item.name == "minimum_session_within_time")
+    assert (gate.original, gate.effective) == (expected, expected)
+
+
+def test_minimum_session_gate_can_be_explicitly_overridden() -> None:
+    game = candidate(1, fb=ExplicitFeedback(play_state="active", minimum_session_minutes=60))
+    result = rank_recommendations(
+        (game,),
+        context=context(
+            time_minutes=30,
+            overrides=(ConstraintOverride(1, "minimum_session_within_time", "pass"),),
+        ),
+    )
+    gate = next(item for item in result.results[0].gates if item.name == "minimum_session_within_time")
+    assert (gate.original, gate.effective, gate.overridden) == ("fail", "pass", True)
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, MAX_APPID + 1, "1"])
@@ -310,6 +361,37 @@ def test_evidence_and_collection_types_are_immutable_and_bounded() -> None:
         ExplicitFeedback(traits=[TraitAssertion("user:x", "present")])  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: ExplicitFeedback(traits=("not-a-trait",)),
+        lambda: RecommendationCandidate(1, None, True, True, activity="bad"),
+        lambda: RecommendationCandidate(1, None, True, True, achievements="bad"),
+        lambda: RecommendationCandidate(1, None, True, True, feedback="bad"),
+        lambda: RecommendationContext("resume/0.1", NOW, requirements=("bad",)),
+        lambda: RecommendationContext("resume/0.1", NOW, overrides=("bad",)),
+        lambda: rank_recommendations(("bad",), context=context()),
+        lambda: rank_recommendations((candidate(1),), profile_rules=("bad",), context=context()),
+        lambda: rank_recommendations((candidate(1),), context="bad"),
+    ),
+)
+def test_nested_recommendation_values_raise_value_error(factory: object) -> None:
+    with pytest.raises(ValueError):
+        factory()  # type: ignore[operator]
+
+
+def test_composite_evidence_lineage_is_bounded_before_ranking() -> None:
+    rule_ids = tuple(f"rule:{index}" for index in range(64))
+    assertion_ids = tuple(f"assertion:{index}" for index in range(64))
+    game = candidate(
+        1,
+        fb=feedback(traits=(TraitAssertion("user:x", "present", assertion_ids),)),
+    )
+    rule = ProfileRule("user:x", "prefer", "soft", 1, rule_ids)
+    with pytest.raises(ValueError, match="bounded tuple"):
+        rank_recommendations((game,), profile_rules=(rule,), context=context())
+
+
 def test_checked_int64_sum_accepts_boundaries_and_rejects_overflow() -> None:
     assert _safe_sum((MAX_INT64,)) == MAX_INT64
     assert _safe_sum((-MAX_INT64 - 1,)) == -MAX_INT64 - 1
@@ -326,6 +408,77 @@ def test_achievement_validation_distinguishes_unavailable_from_zero() -> None:
         AchievementEvidence("ready", "fresh", NOW, 11, 10)
     ready = AchievementEvidence("ready", "fresh", NOW, 0, 10)
     assert ready.ratio_bps == 0
+
+
+@pytest.mark.parametrize(
+    ("freshness", "component_state", "tradeoff"),
+    (
+        ("fresh", "applied", None),
+        ("stale", "stale", "stale_evidence_not_scored"),
+        ("expired", "expired", "expired_evidence_not_scored"),
+        ("unknown", "unknown", None),
+    ),
+)
+@pytest.mark.parametrize("recipe", ("resume/0.1", "finishability/0.1"))
+def test_ready_achievement_freshness_is_preserved(
+    freshness: str,
+    component_state: str,
+    tradeoff: str | None,
+    recipe: str,
+) -> None:
+    achievement = AchievementEvidence("ready", freshness, NOW, 1, 2)  # type: ignore[arg-type]
+    game = candidate(1, achievements=achievement, fb=feedback(remaining=60))
+    result = rank_recommendations((game,), context=context(recipe)).results[0]
+    component = next(item for item in result.components if item.rule_id == "achievement_progress_weak")
+    assert component.state == component_state
+    if tradeoff is not None:
+        assert tradeoff in result.tradeoffs
+    else:
+        assert "stale_evidence_not_scored" not in result.tradeoffs
+        assert "expired_evidence_not_scored" not in result.tradeoffs
+
+
+def test_equal_scores_with_different_components_tie_by_appid_only() -> None:
+    rule = ProfileRule("user:x", "prefer", "soft", 60)
+    disliked_offset = candidate(
+        2,
+        fb=feedback(rating="disliked", traits=(TraitAssertion("user:x", "present"),)),
+    )
+    neutral = candidate(
+        1,
+        fb=feedback(rating="neutral", traits=(TraitAssertion("user:x", "absent"),)),
+    )
+    forward = rank_recommendations((disliked_offset, neutral), profile_rules=(rule,), context=context())
+    reverse = rank_recommendations((neutral, disliked_offset), profile_rules=(rule,), context=context())
+    assert [(item.appid, item.score) for item in forward.results] == [(1, 0), (2, 0)]
+    assert forward == reverse
+
+
+def test_scoring_table_covers_emitted_component_ids_and_ranges() -> None:
+    rule = ProfileRule("user:x", "require", "soft", 40)
+    games = (
+        candidate(1, act=activity(), fb=feedback(rating="liked", traits=(TraitAssertion("user:x", "present"),))),
+        candidate(2, act=activity(), fb=feedback(rating="disliked", state="finished", traits=(TraitAssertion("user:x", "absent"),))),
+        candidate(3, act=activity(), fb=feedback(rating="neutral", state="user_abandoned", remaining=30)),
+    )
+    table = tuple(RECIPE_SCORING_TABLE)
+    for recipe in ("resume/0.1", "finishability/0.1", "preference-fit/0.1"):
+        ranking = rank_recommendations(games, profile_rules=(rule,), context=context(recipe))
+        for item in ranking.results:
+            for component in item.components:
+                if component.points is None:
+                    continue
+                matches = [
+                    row
+                    for row in table
+                    if row[0] in {"all", recipe}
+                    and (
+                        row[1] == component.rule_id
+                        or (row[1].endswith(":*") and component.rule_id.startswith(row[1][:-1]))
+                    )
+                ]
+                assert len(matches) == 1, component.rule_id
+                assert matches[0][2] <= component.points <= matches[0][3]
 
 
 def test_session_and_remaining_estimates_only_come_from_explicit_feedback() -> None:

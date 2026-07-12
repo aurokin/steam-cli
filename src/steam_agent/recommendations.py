@@ -32,7 +32,7 @@ GateState = Literal["pass", "fail", "unknown"]
 UnknownPolicy = Literal["include", "exclude"]
 Freshness = Literal["fresh", "stale", "expired", "unknown"]
 Eligibility = Literal["eligible", "conditional", "excluded"]
-ComponentState = Literal["applied", "not_applicable", "unknown", "stale"]
+ComponentState = Literal["applied", "not_applicable", "unknown", "stale", "expired"]
 
 TRAIT_RE = re.compile(r"user:[a-z0-9](?:[a-z0-9._-]{0,57}[a-z0-9])?\Z")
 REQUIREMENT_RE = re.compile(
@@ -56,11 +56,16 @@ FINISH_KNOWN_ESTIMATE = 60
 FINISH_ACHIEVEMENT_PROGRESS = 10
 
 # Machine-inspectable documentation for the accepted 0.1 arithmetic.  Each
-# tuple is (recipe or "all", rule_id, inclusive minimum, inclusive maximum).
+# tuple is (recipe or "all", emitted rule_id, inclusive minimum, inclusive
+# maximum).  A trailing ``:*`` identifies a bounded dynamic rule-ID family.
 RECIPE_SCORING_TABLE: tuple[tuple[str, str, int, int], ...] = (
-    ("all", "explicit_rating", PREFERENCE_DISLIKED, PREFERENCE_LIKED),
-    ("all", "explicit_play_state", PREFERENCE_ABANDONED, 0),
-    ("all", "soft_profile_rule", -MAX_RULE_WEIGHT, MAX_RULE_WEIGHT),
+    ("all", "explicit_like", PREFERENCE_LIKED, PREFERENCE_LIKED),
+    ("all", "explicit_dislike", PREFERENCE_DISLIKED, PREFERENCE_DISLIKED),
+    ("all", "explicit_rating", 0, 0),
+    ("all", "explicit_finished", PREFERENCE_FINISHED, PREFERENCE_FINISHED),
+    ("all", "user_abandoned", PREFERENCE_ABANDONED, PREFERENCE_ABANDONED),
+    ("all", "explicit_play_state", 0, 0),
+    ("all", "profile_rule:*", -MAX_RULE_WEIGHT, MAX_RULE_WEIGHT),
     (RESUME_RECIPE, "recent_sustained_play", 0, RESUME_RECENT_WINDOW),
     (RESUME_RECIPE, "last_played_recency", 0, RESUME_LAST_PLAYED_7D),
     (RESUME_RECIPE, "lifetime_play_momentum", 0, RESUME_SUSTAINED_PLAY),
@@ -203,6 +208,8 @@ class ExplicitFeedback:
                 _int(value, name=name, maximum=MAX_MINUTES)
         if not isinstance(self.traits, tuple):
             raise ValueError("traits must be a tuple")
+        if any(not isinstance(item, TraitAssertion) for item in self.traits):
+            raise ValueError("traits must contain TraitAssertion values")
         names = [item.trait for item in self.traits]
         if len(names) != len(set(names)):
             raise ValueError("traits must be unique")
@@ -253,6 +260,12 @@ class RecommendationCandidate:
             raise ValueError("owned must be true, false, or unknown")
         if self.installed is not None and not isinstance(self.installed, bool):
             raise ValueError("installed must be true, false, or unknown")
+        if self.activity is not None and not isinstance(self.activity, ActivityEvidence):
+            raise ValueError("activity must be ActivityEvidence or unknown")
+        if self.achievements is not None and not isinstance(self.achievements, AchievementEvidence):
+            raise ValueError("achievements must be AchievementEvidence or unknown")
+        if not isinstance(self.feedback, ExplicitFeedback):
+            raise ValueError("feedback must be ExplicitFeedback")
         object.__setattr__(self, "identity_evidence_ids", _ids(self.identity_evidence_ids))
         object.__setattr__(self, "owned_evidence_ids", _ids(self.owned_evidence_ids))
         object.__setattr__(self, "installed_evidence_ids", _ids(self.installed_evidence_ids))
@@ -306,6 +319,10 @@ class RecommendationContext:
             raise ValueError("explain must be boolean")
         if not isinstance(self.requirements, tuple) or not isinstance(self.overrides, tuple):
             raise ValueError("requirements and overrides must be tuples")
+        if any(not isinstance(item, Requirement) for item in self.requirements):
+            raise ValueError("requirements must contain Requirement values")
+        if any(not isinstance(item, ConstraintOverride) for item in self.overrides):
+            raise ValueError("overrides must contain ConstraintOverride values")
         names = [item.name for item in self.requirements]
         if len(names) != len(set(names)):
             raise ValueError("requirements must be unique")
@@ -377,8 +394,14 @@ def rank_recommendations(
 ) -> RecommendationRanking:
     """Apply gates, score eligible candidates, and return a stable ranking."""
 
+    if not isinstance(context, RecommendationContext):
+        raise ValueError("context must be RecommendationContext")
     if not isinstance(candidates, tuple) or not isinstance(profile_rules, tuple):
         raise ValueError("candidates and profile_rules must be tuples")
+    if any(not isinstance(item, RecommendationCandidate) for item in candidates):
+        raise ValueError("candidates must contain RecommendationCandidate values")
+    if any(not isinstance(item, ProfileRule) for item in profile_rules):
+        raise ValueError("profile_rules must contain ProfileRule values")
     if len(candidates) > MAX_CANDIDATES:
         raise ValueError("candidate set exceeds the supported bound")
     appids = [item.appid for item in candidates]
@@ -390,9 +413,18 @@ def rank_recommendations(
     candidate_ids = set(appids)
     if any(item.appid not in candidate_ids for item in context.overrides):
         raise ValueError("override AppID is not a candidate")
+    # Validate composite lineage before producing any ranked result.  Each
+    # source is bounded independently, but a rule plus assertion must also fit
+    # the public per-factor evidence bound.
+    for candidate in candidates:
+        assertions = {item.trait: item for item in candidate.feedback.traits}
+        for rule in profile_rules:
+            assertion = assertions.get(rule.trait)
+            if assertion is not None:
+                _merge_ids(rule.evidence_ids, assertion.evidence_ids)
 
     ranked = [_rank(item, tuple(sorted(profile_rules, key=lambda rule: rule.trait)), context) for item in candidates]
-    ranked.sort(key=lambda item: _sort_key(item, context.recipe))
+    ranked.sort(key=_sort_key)
     eligible = tuple(item for item in ranked if item.eligibility == "eligible")
     conditional = tuple(item for item in ranked if item.eligibility == "conditional")
     excluded = tuple(sorted((item for item in ranked if item.eligibility == "excluded"), key=lambda item: item.appid))
@@ -423,7 +455,7 @@ def _rank(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], co
     negative = tuple(item.rule_id for item in components if item.points is not None and item.points < 0)
     unknowns = tuple(sorted({
         *(gate.name for gate in gates if gate.effective == "unknown"),
-        *(item.rule_id for item in components if item.state in {"unknown", "stale"}),
+        *(item.rule_id for item in components if item.state in {"unknown", "stale", "expired"}),
         *(
             f"achievements_{candidate.achievements.state}"
             for _ in (0,)
@@ -440,6 +472,7 @@ def _rank(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], co
         *("temporary_constraint_override" for gate in gates if gate.overridden),
         *("achievement_ratio_is_weak_evidence_not_completion" for item in components if item.evidence_kind == "achievement" and item.state == "applied"),
         *("stale_evidence_not_scored" for item in components if item.state == "stale"),
+        *("expired_evidence_not_scored" for item in components if item.state == "expired"),
         *("behavior_does_not_prove_preference" for item in components if item.evidence_kind == "behavioral" and item.state == "applied"),
     }))
     known = sum(item.state in {"applied", "not_applicable"} for item in components)
@@ -482,6 +515,15 @@ def _gates(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], c
         ("owned", _bool_gate(candidate.owned, True), candidate.owned_evidence_ids),
         ("snoozed", "fail" if candidate.feedback.snoozed_until is not None and candidate.feedback.snoozed_until > context.now else "pass", feedback_ids),
     ]
+    if context.time_minutes is not None:
+        minimum_session = candidate.feedback.minimum_session_minutes
+        raw.append((
+            "minimum_session_within_time",
+            "unknown" if minimum_session is None else (
+                "pass" if minimum_session <= context.time_minutes else "fail"
+            ),
+            feedback_ids,
+        ))
     trait_map = {item.trait: item for item in candidate.feedback.traits}
     for requirement in context.requirements:
         if requirement.name == "installed":
@@ -530,7 +572,7 @@ def _component(rule_id: str, input_value: str | int | bool | None, ids: tuple[st
 
 
 def _merge_ids(*values: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(sorted({item for value in values for item in value}))
+    return _ids(tuple(sorted({item for value in values for item in value})))
 
 
 def _components(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ...], context: RecommendationContext) -> tuple[ScoreComponent, ...]:
@@ -560,7 +602,12 @@ def _components(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ..
             items.append(_component(f"profile_rule:{rule.trait}", None, rule.evidence_ids, None, "unknown", "explicit_user"))
             continue
         present = assertion.value == "present"
-        points = rule.weight if rule.kind == "prefer" and present else -rule.weight if rule.kind == "avoid" and present else 0
+        if rule.kind == "prefer":
+            points = rule.weight if present else 0
+        elif rule.kind == "avoid":
+            points = -rule.weight if present else 0
+        else:
+            points = rule.weight if present else -rule.weight
         items.append(_component(f"profile_rule:{rule.trait}", assertion.value, _merge_ids(rule.evidence_ids, assertion.evidence_ids), points, "applied", "explicit_user"))
     if context.recipe == RESUME_RECIPE:
         items.extend(_resume_components(candidate, context))
@@ -572,9 +619,23 @@ def _components(candidate: RecommendationCandidate, rules: tuple[ProfileRule, ..
 
 
 def _activity_state(activity: ActivityEvidence | None) -> ComponentState:
-    if activity is None or activity.freshness in {"unknown", "expired"}:
+    if activity is None or activity.freshness == "unknown":
         return "unknown"
+    if activity.freshness == "expired":
+        return "expired"
     return "stale" if activity.freshness == "stale" else "applied"
+
+
+def _achievement_component_state(achievement: AchievementEvidence | None) -> ComponentState:
+    if achievement is None or achievement.state != "ready":
+        return "unknown"
+    if achievement.freshness == "fresh":
+        return "applied"
+    if achievement.freshness == "stale":
+        return "stale"
+    if achievement.freshness == "expired":
+        return "expired"
+    return "unknown"
 
 
 def _resume_components(candidate: RecommendationCandidate, context: RecommendationContext) -> list[ScoreComponent]:
@@ -591,14 +652,12 @@ def _resume_components(candidate: RecommendationCandidate, context: Recommendati
         age_days = (context.now - last).days
         last_points = RESUME_LAST_PLAYED_7D if age_days <= 7 else RESUME_LAST_PLAYED_30D if age_days <= 30 else RESUME_LAST_PLAYED_90D if age_days <= 90 else 0
     achievement = candidate.achievements
-    astate: ComponentState = "unknown"
+    astate = _achievement_component_state(achievement)
     apoints = None
     ratio = None if achievement is None else achievement.ratio_bps
     aids = () if achievement is None else achievement.evidence_ids
-    if achievement is not None and achievement.state == "ready":
-        astate = "stale" if achievement.freshness != "fresh" else "applied"
-        if astate == "applied":
-            apoints = RESUME_ACHIEVEMENT_PROGRESS if ratio is not None and 0 < ratio < 10_000 else 0
+    if astate == "applied":
+        apoints = RESUME_ACHIEVEMENT_PROGRESS if ratio is not None and 0 < ratio < 10_000 else 0
     return [
         _component("recent_sustained_play", recent, ids, recent_points, _metric_state(state, recent), "behavioral", "recent_window_is_not_a_session_log"),
         _component("lifetime_play_momentum", lifetime, ids, sustained_points, _metric_state(state, lifetime), "behavioral", "playtime_does_not_imply_preference"),
@@ -626,12 +685,10 @@ def _finish_components(candidate: RecommendationCandidate, context: Recommendati
         points = max(1, FINISH_KNOWN_ESTIMATE - min(remaining // 60, FINISH_KNOWN_ESTIMATE - 1))
     achievement = candidate.achievements
     ratio = None if achievement is None else achievement.ratio_bps
-    astate: ComponentState = "unknown"
+    astate = _achievement_component_state(achievement)
     apoints = None
-    if achievement is not None and achievement.state == "ready":
-        astate = "stale" if achievement.freshness != "fresh" else "applied"
-        if astate == "applied":
-            apoints = 0 if ratio is None else ratio * FINISH_ACHIEVEMENT_PROGRESS // 10_000
+    if astate == "applied":
+        apoints = 0 if ratio is None else ratio * FINISH_ACHIEVEMENT_PROGRESS // 10_000
     return [
         _component("explicit_remaining_estimate", remaining, candidate.feedback.evidence_ids, points, "unknown" if remaining is None else "applied", "explicit_user"),
         _component("achievement_progress_weak", ratio, () if achievement is None else achievement.evidence_ids, apoints, astate, "achievement", "achievement_ratio_is_weak_evidence_not_completion"),
@@ -669,13 +726,6 @@ def _safe_sum(values: tuple[int, ...]) -> int:
     return total
 
 
-def _sort_key(item: RankedRecommendation, recipe: RecipeId) -> tuple[object, ...]:
+def _sort_key(item: RankedRecommendation) -> tuple[object, ...]:
     eligibility = {"eligible": 0, "conditional": 1, "excluded": 2}[item.eligibility]
-    components = {component.rule_id: component.points or 0 for component in item.components}
-    if recipe == RESUME_RECIPE:
-        recipe_tie = (-components.get("recent_sustained_play", 0), -components.get("last_played_recency", 0))
-    elif recipe == FINISHABILITY_RECIPE:
-        recipe_tie = (-components.get("explicit_remaining_estimate", 0), -components.get("achievement_progress_weak", 0))
-    else:
-        recipe_tie = (-components.get("explicit_like", 0), components.get("explicit_dislike", 0))
-    return (eligibility, -(item.score or 0), *recipe_tie, item.appid)
+    return (eligibility, -(item.score or 0), item.appid)
