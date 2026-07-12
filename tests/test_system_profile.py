@@ -276,6 +276,22 @@ def test_out_of_order_completion_cannot_replace_newer_profile(tmp_path: Path) ->
         assert storage.read_system_profile_snapshot("local")["profile"] == newer_profile
 
 
+def test_new_sync_recovers_abandoned_attempt(tmp_path: Path) -> None:
+    with configured(tmp_path) as storage:
+        abandoned = storage.begin_system_profile_sync(
+            machine_id="local", disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            started_at="2026-07-12T11:00:00Z",
+        )
+        current = storage.begin_system_profile_sync(
+            machine_id="local", disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            started_at=T0,
+        )
+        recovered = storage.get_sync_run(abandoned.id)
+        assert recovered.status == "failed"
+        assert recovered.error_code == "SYNC_ABANDONED"
+        assert storage.get_sync_run(current.id).status == "running"
+
+
 def test_profiles_are_isolated_and_delete_preserves_machine(tmp_path: Path) -> None:
     storage = configured(tmp_path, "one")
     try:

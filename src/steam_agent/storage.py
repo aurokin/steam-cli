@@ -2185,11 +2185,20 @@ class Storage:
             consent = self.get_system_profile_consent(machine_id)
             if consent is None or consent.disclosure_version != disclosure_version:
                 raise InvalidSyncTransition("current system-profile consent is required")
+            started = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            abandoned_cutoff = _timestamp(started - timedelta(minutes=15))
+            self._connection.execute(
+                """UPDATE sync_runs
+                   SET status='failed', completed_at=?, promoted=0,
+                       error_code='SYNC_ABANDONED', error_detail=NULL
+                   WHERE capability='system_profile.read' AND machine_id=?
+                     AND status='running' AND started_at < ?""",
+                (timestamp, machine_id, abandoned_cutoff),
+            )
             # History is diagnostic only and bounded to 30 days. Never delete the
             # promoted run because the current projection references it.
             cutoff = _timestamp(
-                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                - timedelta(days=30)
+                started - timedelta(days=30)
             )
             self._connection.execute(
                 """DELETE FROM sync_runs
