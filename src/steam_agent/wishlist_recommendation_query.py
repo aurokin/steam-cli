@@ -397,8 +397,11 @@ def _review_snapshot(
         age = now - observed
         stale_count += int(age > timedelta(hours=24))
         future_count += int(age < timedelta(0))
-    failed_or_unevaluated = sum(
-        states.get(state, 0) for state in ("failed", "unevaluated", "running")
+    targeted_incomplete = sum(
+        1
+        for row in snapshot.review_demand
+        if bool(row["targeted"])
+        and row["state"] in {"failed", "unevaluated", "running"}
     )
     return {
         "state": "not_synced" if not snapshot.review_attempts else "observed",
@@ -409,11 +412,12 @@ def _review_snapshot(
         "current_count": len(snapshot.reviews),
         "stale_current_count": stale_count,
         "future_current_count": future_count,
-        "refresh_incomplete": failed_or_unevaluated > 0,
+        "refresh_incomplete": targeted_incomplete > 0,
         "using_last_good_count": sum(
             1
             for row in snapshot.review_demand
-            if row["state"] in {"failed", "unevaluated", "running"}
+            if bool(row["targeted"])
+            and row["state"] in {"failed", "unevaluated", "running"}
             and any(item["appid"] == row["appid"] for item in snapshot.reviews)
         ),
         "optional_dimension": True,

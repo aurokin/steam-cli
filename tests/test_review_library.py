@@ -16,6 +16,7 @@ from steam_agent.steam_reviews import (
     SteamReviewSummary,
 )
 from steam_agent.storage import Storage, WishlistObservation
+from steam_agent.wishlist_recommendation_query import _review_snapshot
 
 
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
@@ -176,6 +177,12 @@ def test_explicit_limit_refreshes_prefix_and_preserves_full_demand(tmp_path) -> 
             (0, 0, "unevaluated"),
             (0, 0, "unevaluated"),
         ]
+        snapshot = storage.read_wishlist_recommendation_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        review_state = _review_snapshot(snapshot, NOW)
+        assert review_state["refresh_incomplete"] is False
+        assert review_state["subject_states"] == {"ready": 2, "unevaluated": 2}
 
 
 def test_multi_item_loop_paces_its_own_local_request_reservations(tmp_path) -> None:
