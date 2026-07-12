@@ -24,8 +24,10 @@ provider-scoped deletion, and the cache-only attributed deal query are
 available. **M4 next-to-play and preference is implemented and accepted:**
 explicit feedback, bounded activity/achievement evidence, deterministic play
 recipes, public aggregate-review evidence, and wishlist-fit joins are
-available. Compatibility, artwork, group discovery, and
-Steam actions remain proposed behind later activation checkpoints.
+available. **M5 compatibility and ready-now is implemented and undergoing
+acceptance:** redacted system profiles, provisional publisher declarations,
+and cache-only target assessments are available. Artwork, group discovery,
+and Steam actions remain proposed behind later activation checkpoints.
 
 ## Install and develop
 
@@ -278,6 +280,36 @@ dimensions. Steam aggregate reviews are report-only and retain no review text,
 reviewer data, cursor, or raw body. Without direct preference evidence, the
 query reports insufficient evidence instead of claiming a purchase
 recommendation.
+
+## M5 compatibility and ready-now
+
+M5 separates explicit local/provider synchronization from cache-only
+assessment for one exact machine or Valve Steam Deck target:
+
+```text
+uv run steam-agent sync system --machine local --acknowledge-local-storage
+uv run steam-agent system query --machine local
+uv run steam-agent sync compatibility --scope library --account primary --machine local --country US --language english --acknowledge-local-storage
+uv run steam-agent compatibility assess APPID --account primary --target machine:local --country US --language english
+uv run steam-agent compatibility assess APPID --account primary --target valve:steam-deck --country US --language english --explain
+```
+
+`sync compatibility` uses a narrow, disableable provisional Steam storefront
+adapter. It retains normalized publisher declarations and bounded sanitized
+requirements, never raw responses or HTML. `compatibility assess` reads one
+atomic local snapshot and does not access providers, credentials, the Steam
+client, or system collectors. Pass, fail, unknown, stale, and conflict remain
+distinct; no CPU/GPU performance or frame-rate claim is made. A declared
+`linux=false` is not treated as proof that Proton is unsupported.
+
+Steam, SteamDB, ProtonDB, and PCGamingWiki URLs in assessment results are typed
+manual-only references. The CLI returns them but never opens or reads them.
+Temporary requirements and named gate overrides are request-local and are not
+persisted. M5 leaves `playable_now` unknown unless a known incompatibility or a
+fresh known-not-installed fact can safely fail it; client/update/launcher state
+belongs to the later actions milestone. See the
+[M5 execution plan](docs/design/m5-execution.md) for the active acceptance
+boundary.
 
 The current working direction is:
 

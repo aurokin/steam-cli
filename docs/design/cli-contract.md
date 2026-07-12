@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: M1, M2, M3, and M4 accepted
+Status: M1, M2, M3, and M4 accepted; M5 implemented under acceptance
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -419,6 +419,52 @@ dimensions. Reviews are report-only; release and compatibility are explicitly
 unknown, and `purchase_recommendation_supported` is false when every preference
 dimension is unknown.
 
+## Implemented M5 compatibility commands
+
+M5 keeps collection and assessment as separate process boundaries:
+
+```text
+steam-agent sync system --machine MACHINE [--acknowledge-local-storage]
+steam-agent system query --machine MACHINE
+steam-agent sync compatibility --scope library --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
+steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck --country CC --language LANG [--require KIND:NAME] [--override APPID:NAME:GATE=pass|fail|unknown] [--explain] [--format json|table]
+```
+
+`sync system` is an explicit local observation and requires the current
+machine-scoped persistence disclosure. It stores only the redacted
+`system-profile/0.1` allowlist. `system query` is cache-only and does not run a
+collector.
+
+`sync compatibility` demands only AppIDs from the selected account's cached
+visible-owned projection. Its disableable Steam storefront adapter is
+provisional: it stores normalized publisher platform, controller, language,
+positive accessibility-category, DRM/account-notice, and bounded sanitized
+requirement declarations, but no raw response or HTML. Country and language
+are part of the evidence context. Partial or failed attempts do not erase a
+usable last-good declaration.
+
+`compatibility assess` reads declared, system, installed, and visible-owned
+inputs in one atomic cache snapshot. It performs no network request, secret
+resolution, Steam-client access, or system collection. Every requested AppID
+is returned under `compatibility/0.1`; primitive gates preserve pass, fail,
+unknown, freshness, conflict, support level, and evidence lineage. Publisher
+native-build evidence, effective execution support, exact-target review,
+minimum comparison, requested features, likely-good experience, and
+playable-now are separate claims. In particular, `linux=false` does not fail a
+possible Proton route, and M5 does not rank CPU/GPU names or predict frame rate.
+
+`--require` accepts an exact `accessibility`, `input`, or `language` feature.
+`--override` is a named, AppID-scoped, ephemeral gate decision; output retains
+both original and effective state, and no override is persisted. `--explain`
+adds gate details. Returned Steam, SteamDB, ProtonDB, and PCGamingWiki URLs are
+typed `manual_only` references with `automation_supported=false`; the command
+does not open or read them.
+
+M5 cannot prove a title playable now because update, process, launcher,
+network, and entitlement-session state are outside this milestone. A fresh
+known-not-installed observation or known incompatibility may fail
+`playable_now`; otherwise the operational result remains unknown.
+
 ## Exploratory future command shape
 
 A composable vocabulary scales better than one command per natural-language
@@ -429,7 +475,6 @@ steam-agent sync <owned|recent|wishlist|catalog|store|prices|achievements|system
 steam-agent games get <appid>
 steam-agent games query --scope <owned|wishlist|store|family|group>
 steam-agent games compare <appid...>
-steam-agent compatibility assess <appid...> --system <profile>
 steam-agent group query --members <profiles...> --ownership all
 steam-agent achievements query --state near-complete
 steam-agent profile show|set|infer
