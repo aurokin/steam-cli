@@ -1007,8 +1007,14 @@ def test_assess_rejects_noncanonical_locale_context(
             *(str(appid) for appid in range(1, 3_804)),
             *(value for index in range(256) for value in ("--require", f"language:l{index}")),
         ),
+        tuple(str(appid) for appid in range(1, 10_002)),
     ),
-    ids=("duplicate-requirement", "requirement-list-bound", "total-work-bound"),
+    ids=(
+        "duplicate-requirement",
+        "requirement-list-bound",
+        "total-work-bound",
+        "storage-demand-bound",
+    ),
 )
 def test_assess_rejects_requirement_work_bounds_before_storage(
     tmp_path: Path,

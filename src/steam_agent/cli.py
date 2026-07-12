@@ -54,7 +54,12 @@ from steam_agent.contracts import (
     error_envelope,
     success_envelope,
 )
-from steam_agent.storage import AccountConflict, Storage, StorageError
+from steam_agent.storage import (
+    MAX_DECLARED_APP_DEMAND,
+    AccountConflict,
+    Storage,
+    StorageError,
+)
 from steam_agent.local_accounts import (
     AmbiguousLocalAccounts,
     LocalAccountError,
@@ -1820,6 +1825,8 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         # requested subject.  Normalize that surface before applying the pure
         # engine request envelope.
         appids = tuple(sorted(set(supplied_appids)))
+        if len(appids) > MAX_DECLARED_APP_DEMAND:
+            raise ValueError("compatibility query exceeds the bounded AppID maximum")
         # Compatibility facts use the same closed request-context vocabulary
         # as their provider adapter.  Accepting an arbitrary language slug here
         # would create a cache key the sync boundary can never populate.

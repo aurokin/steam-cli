@@ -957,6 +957,15 @@ class _LanguageParser(_BoundedHTMLParser):
         if self.before_break:
             super().handle_starttag(tag, attrs)
 
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag.casefold() == "br":
+            self.before_break = False
+            return
+        if self.before_break:
+            super().handle_startendtag(tag, attrs)
+
     def handle_endtag(self, tag: str) -> None:
         if self.before_break:
             super().handle_endtag(tag)

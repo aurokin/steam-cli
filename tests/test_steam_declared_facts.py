@@ -426,6 +426,25 @@ def test_sanitizer_allows_real_self_closing_void_tags() -> None:
     assert sanitize_html("<img/><br/>Memory: 8 GB") == "Memory: 8 GB"
 
 
+def test_language_parser_stops_at_self_closing_break_before_footnote() -> None:
+    client, _ = client_for(
+        HttpResponse(
+            200,
+            valid_data(
+                supported_languages=(
+                    "English*<br/>*languages with full audio support"
+                )
+            ),
+            JSON_HEADERS,
+        )
+    )
+
+    result = client.fetch(400, country="US", language="english")
+
+    assert result.facts is not None
+    assert tuple(item.code for item in result.facts.languages.items) == ("english",)
+
+
 @pytest.mark.parametrize(
     "value",
     [

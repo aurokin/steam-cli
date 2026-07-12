@@ -23,7 +23,8 @@ from steam_agent.local_accounts import validate_steam_id64
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
 TerminalSyncStatus = Literal["complete", "partial", "failed"]
-_DECLARED_APP_MAX_DEMAND = 10_000
+MAX_DECLARED_APP_DEMAND = 10_000
+_DECLARED_APP_MAX_DEMAND = MAX_DECLARED_APP_DEMAND
 _DECLARED_APP_READ_CHUNK = 500
 STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID("d95b6568-2886-5d15-aa84-1986e4ac511e")
 
