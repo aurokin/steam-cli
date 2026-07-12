@@ -2893,7 +2893,40 @@ class Storage:
             for appid in demanded:
                 # A clock-skewed future projection is unusable to readers and
                 # would otherwise prevent a valid corrective observation from
-                # winning the monotonic promotion check.
+                # winning the monotonic promotion check. Quarantine its exact
+                # private lineage too: otherwise a future run can remain the
+                # apparent latest attempt after the public projection is gone.
+                future_lineage = tuple(
+                    int(row[0])
+                    for row in self._connection.execute(
+                        """SELECT DISTINCT d.sync_run_id
+                           FROM declared_app_current c
+                           JOIN declared_app_sync_demand d
+                             ON d.appid=c.appid AND d.country=c.country
+                            AND d.language=c.language
+                           LEFT JOIN declared_app_observations o
+                             ON o.sync_run_id=d.sync_run_id AND o.appid=d.appid
+                           WHERE c.appid=? AND c.country=? AND c.language=?
+                             AND c.provider='steam_store'
+                             AND c.observed_at>? AND c.observed_at>?
+                             AND (
+                               d.sync_run_id=c.promoted_sync_run_id
+                               OR (d.observed_at>? AND d.observed_at>?)
+                               OR (o.observed_at>? AND o.observed_at>?)
+                             )""",
+                        (
+                            appid,
+                            country,
+                            language,
+                            timestamp,
+                            wall_clock,
+                            timestamp,
+                            wall_clock,
+                            timestamp,
+                            wall_clock,
+                        ),
+                    )
+                )
                 self._connection.execute(
                     """DELETE FROM declared_app_current
                        WHERE appid=? AND country=? AND language=?
@@ -2901,6 +2934,23 @@ class Storage:
                          AND observed_at>? AND observed_at>?""",
                     (appid, country, language, timestamp, wall_clock),
                 )
+                for lineage_run_id in future_lineage:
+                    self._connection.execute(
+                        """DELETE FROM declared_app_sync_demand
+                           WHERE sync_run_id=? AND appid=? AND country=?
+                             AND language=?""",
+                        (lineage_run_id, appid, country, language),
+                    )
+                    self._connection.execute(
+                        """DELETE FROM sync_runs
+                           WHERE id=?
+                             AND capability='compatibility.declared.read'
+                             AND NOT EXISTS (
+                               SELECT 1 FROM declared_app_sync_demand d
+                               WHERE d.sync_run_id=sync_runs.id
+                             )""",
+                        (lineage_run_id,),
+                    )
                 active = self._connection.execute(
                     """SELECT 1 FROM declared_app_sync_demand d
                        JOIN sync_runs r ON r.id=d.sync_run_id
@@ -6831,6 +6881,8 @@ class Storage:
         language: str,
         appids: list[int] | tuple[int, ...],
         now: str | datetime,
+        *,
+        include_local_target_evidence: bool = True,
     ) -> CompatibilitySnapshot:
         """Read every M5 compatibility input in one read-only transaction.
 
@@ -6845,6 +6897,8 @@ class Storage:
             raise ValueError("compatibility snapshot requires explicit appids")
         if len(selected) > _DECLARED_APP_MAX_DEMAND:
             raise ValueError("compatibility demand exceeds the bounded maximum")
+        if not isinstance(include_local_target_evidence, bool):
+            raise ValueError("local target evidence selector is invalid")
         as_of = _timestamp(now)
         self._connection.execute("BEGIN")
         try:
@@ -6852,7 +6906,11 @@ class Storage:
             machine = self.get_machine(machine_id)
             if machine is None:
                 raise ValueError("compatibility machine is not configured")
-            system_profile = self._read_system_profile_snapshot(machine_id)
+            system_profile = (
+                self._read_system_profile_snapshot(machine_id)
+                if include_local_target_evidence
+                else SystemProfileSnapshot(None, None, None)
+            )
             declared_apps = self._read_typed_declared_app_snapshot(
                 account_id=account_id,
                 machine_id=machine_id,
@@ -6862,7 +6920,11 @@ class Storage:
                 as_of=as_of,
             )
             owned = self._read_owned_snapshot(account_id)
-            installed = self._read_installed_snapshot(machine_id)
+            installed = (
+                self._read_installed_snapshot(machine_id)
+                if include_local_target_evidence
+                else InstalledSnapshot((), None, None)
+            )
             requested = tuple(
                 CompatibilityRequestedApp(
                     appid=appid,

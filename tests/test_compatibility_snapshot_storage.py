@@ -20,6 +20,7 @@ from steam_agent.storage import (
     OwnedObservation,
     Storage,
     StorageError,
+    SystemProfileSnapshot,
     steam_application_stable_id,
 )
 from steam_agent.system_profile import fact, unknown
@@ -376,6 +377,18 @@ def test_snapshot_exposes_last_good_and_newest_failed_attempts_and_deletion(
             storage.read_compatibility_snapshot(
                 account_id, "one", "US", "english", [999], now=T2
             )
+        deck = storage.read_compatibility_snapshot(
+            account_id,
+            "one",
+            "US",
+            "english",
+            [999],
+            now=T2,
+            include_local_target_evidence=False,
+        )
+        assert deck.system_profile == SystemProfileSnapshot(None, None, None)
+        assert deck.installed.games == ()
+        assert deck.installed.latest is None
         storage._connection.execute(  # noqa: SLF001 - restore fixture for deletion
             "UPDATE system_profile_current SET profile_json=? WHERE machine_id='one'",
             (json.dumps(system_profile()),),
