@@ -21,15 +21,40 @@ ALPHA = MemberRef("synthetic", "alpha")
 BETA = MemberRef("synthetic", "beta")
 
 
+def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
+    class FakeStorage:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, ...]] = []
+
+        def read_declared_app_snapshot(self, **kwargs: object):
+            appids = kwargs["appids"]
+            assert isinstance(appids, tuple)
+            self.calls.append(appids)
+            return {"items": tuple({"appid": appid, "facts": None} for appid in appids)}
+
+    storage = FakeStorage()
+    candidates = tuple(range(1, 10_001))
+    result = cli._group_declared_payloads(  # noqa: SLF001
+        storage,  # type: ignore[arg-type]
+        account_id=1,
+        machine_id="local",
+        country="US",
+        language="english",
+        candidate_appids=candidates,
+        seed_appids=(1, 10_001),
+    )
+
+    assert [len(call) for call in storage.calls] == [10_000, 1]
+    assert len(result) == 10_001
+
+
 def invoke(tmp_path: Path, capsys: object, *arguments: str):
     code = cli.main(["--data-dir", str(tmp_path), *arguments])
     captured = capsys.readouterr()  # type: ignore[attr-defined]
     return code, json.loads(captured.out), captured.err
 
 
-def payload(
-    appid: int, *, genre: int, category: int = 38
-) -> dict[str, object]:
+def payload(appid: int, *, genre: int, category: int = 38) -> dict[str, object]:
     return {
         "schema_id": "declared-app-facts/0.2",
         "appid": appid,
@@ -158,9 +183,7 @@ def seed(tmp_path: Path, facts: dict[int, dict[str, object]]) -> None:
 def own(tmp_path: Path, ref: MemberRef, *appids: int) -> None:
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
         for appid in appids:
-            storage.set_group_ownership(
-                ref, appid=appid, state="owned", updated_at=NOW
-            )
+            storage.set_group_ownership(ref, appid=appid, state="owned", updated_at=NOW)
 
 
 def common(*, objective: str, appids: tuple[int, ...]) -> list[str]:
@@ -264,7 +287,9 @@ def test_missing_seed_features_sort_unknown_after_known_within_certainty(
     args.extend(("--like", "synthetic:Alpha=100", "--like", "synthetic:Beta=999"))
     code, value, _ = invoke(tmp_path, capsys, *args)
     assert code == 0
-    assert all(item["preference"]["state"] == "unknown" for item in value["data"]["results"])
+    assert all(
+        item["preference"]["state"] == "unknown" for item in value["data"]["results"]
+    )
     assert [item["appid"] for item in value["data"]["results"]] == [10, 20]
     assert value["completeness"]["status"] == "partial"
 

@@ -170,6 +170,15 @@ def test_profile_mutations_require_disclosure_and_destructive_confirmation(
     )
     assert code == 0
     assert value["data"]["deleted"]["profile_removed"] is True
+    assert value["completeness"]["warnings"] == [
+        {
+            "code": "BACKUP_RETENTION",
+            "message": (
+                "Local group data was removed, but replicas, snapshots, and "
+                "user-controlled backups may retain copies."
+            ),
+        }
+    ]
 
 
 def test_group_ownership_uses_visible_positive_and_synthetic_assertions_only(

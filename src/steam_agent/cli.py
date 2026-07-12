@@ -2314,6 +2314,18 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                 return _emit_success(
                     args,
                     command=command,
+                    completeness_value=completeness(
+                        CompletenessStatus.COMPLETE,
+                        warnings=[
+                            WarningRecord(
+                                code="BACKUP_RETENTION",
+                                message=(
+                                    "Local group data was removed, but replicas, "
+                                    "snapshots, and user-controlled backups may retain copies."
+                                ),
+                            )
+                        ],
+                    ),
                     data={"profile_ordinal": 0, "deleted": asdict(deletion)},
                 )
             assert ref is not None and appid is not None
@@ -2446,6 +2458,14 @@ def _group_ownership_by_app(
             for game in snapshot.games
             if game.inclusion_basis == "visible_owned"
         }
+    synthetic_states = {
+        ref: {
+            assertion.appid: assertion.state
+            for assertion in storage.read_group_ownership(ref)
+        }
+        for ref in refs
+        if ref.kind == "synthetic"
+    }
     result: dict[int, tuple[OwnershipFact, ...]] = {}
     for appid in appids:
         facts: list[OwnershipFact] = []
@@ -2454,15 +2474,13 @@ def _group_ownership_by_app(
             if ref.kind == "account":
                 state = "owned" if appid in account_owned[ref] else "unknown"
             else:
-                assertions = storage.read_group_ownership(ref, appid=appid)
-                state = assertions[0].state if assertions else "unknown"
+                state = synthetic_states[ref].get(appid, "unknown")
             facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
         result[appid] = tuple(facts)
     return result
 
 
 def _evaluate_group_app(
-    storage: Storage,
     *,
     appid: int,
     members: tuple[MemberRef, ...],
@@ -2473,6 +2491,8 @@ def _evaluate_group_app(
     host: MemberRef | None,
     policy: str | None,
     exclude_trait: str | None,
+    family_by_member: Mapping[MemberRef, tuple[Any, ...]],
+    assertions_by_member: Mapping[MemberRef, tuple[Any, ...]],
 ) -> _GroupEvaluation:
     summary = summarize_ownership(members, ownership)
     selected_sources = {
@@ -2481,7 +2501,9 @@ def _evaluate_group_app(
     }
     family: list[FamilyEdge] = []
     for member in members:
-        for assertion in storage.read_group_family(member, appid=appid):
+        for assertion in family_by_member[member]:
+            if assertion.appid != appid:
+                continue
             source = CopySourceRef(assertion.source.kind, assertion.source.key)
             if source in selected_sources:
                 family.append(FamilyEdge(member, source, assertion.state))
@@ -2506,7 +2528,11 @@ def _evaluate_group_app(
     policy_facts: list[PolicyFact] = []
     trait_states: list[str] = []
     for member in members:
-        assertions = storage.read_group_app_assertions(member, appid=appid)
+        assertions = tuple(
+            assertion
+            for assertion in assertions_by_member[member]
+            if assertion.appid == appid
+        )
         by_fact = {assertion.fact: assertion for assertion in assertions}
         for assertion in assertions:
             if (
@@ -2536,9 +2562,7 @@ def _evaluate_group_app(
         maximum,
         len(minimums) > 1
         or len(maximums) > 1
-        or (
-            minimum is not None and maximum is not None and minimum > maximum
-        ),
+        or (minimum is not None and maximum is not None and minimum > maximum),
     )
     eligibility = assess_eligibility(
         members=members,
@@ -2576,10 +2600,7 @@ def _parse_member_seeds(
         if not 1 <= appid <= (1 << 32) - 1:
             raise ValueError("member-qualified preference seed is invalid")
         parsed[member].append(appid)
-    return {
-        member: tuple(values)
-        for member, values in parsed.items()
-    }
+    return {member: tuple(values) for member, values in parsed.items()}
 
 
 def _group_copies_json(
@@ -2609,6 +2630,39 @@ def _group_copies_json(
             for member, source in copies.possible_assignments
         ],
     }
+
+
+def _group_declared_payloads(
+    storage: Storage,
+    *,
+    account_id: int,
+    machine_id: str,
+    country: str,
+    language: str,
+    candidate_appids: tuple[int, ...],
+    seed_appids: tuple[int, ...],
+) -> dict[int, Mapping[str, Any] | None]:
+    """Read independently bounded candidate and seed projections."""
+
+    payloads: dict[int, Mapping[str, Any] | None] = {}
+    candidate_set = set(candidate_appids)
+    for batch in (
+        candidate_appids,
+        tuple(appid for appid in seed_appids if appid not in candidate_set),
+    ):
+        if not batch:
+            continue
+        snapshot = storage.read_declared_app_snapshot(
+            account_id=account_id,
+            machine_id=machine_id,
+            country=country,
+            language=language,
+            appids=batch,
+        )
+        payloads.update(
+            {int(item["appid"]): item.get("facts") for item in snapshot["items"]}
+        )
+    return payloads
 
 
 def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
@@ -2676,6 +2730,19 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 if args.group_command == "eligibility"
                 else None
             )
+            family_by_member = (
+                {member: storage.read_group_family(member) for member in members}
+                if declared is not None
+                else {}
+            )
+            assertions_by_member = (
+                {
+                    member: storage.read_group_app_assertions(member)
+                    for member in members
+                }
+                if declared is not None
+                else {}
+            )
             rows = []
             member_ordinals = {member: index for index, member in enumerate(members)}
             source_refs = tuple(
@@ -2706,7 +2773,6 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                     raw = declared["items"][index]
                     payload = raw.get("facts")
                     evaluation = _evaluate_group_app(
-                        storage,
                         appid=appid,
                         members=members,
                         extra_sources=extra_sources,
@@ -2716,6 +2782,8 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                         host=host,
                         policy=policy,
                         exclude_trait=None,
+                        family_by_member=family_by_member,
+                        assertions_by_member=assertions_by_member,
                     )
                     row["copies"] = _group_copies_json(
                         evaluation.copies,
@@ -2779,9 +2847,11 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
         country = args.country.upper()
         SteamDeclaredFactsRequestContext(country, args.language)
         for slug in (args.policy, args.exclude_trait):
-            if slug is not None and re.fullmatch(
-                r"user:[a-z0-9](?:[a-z0-9._-]{0,57}[a-z0-9])?", slug
-            ) is None:
+            if (
+                slug is not None
+                and re.fullmatch(r"user:[a-z0-9](?:[a-z0-9._-]{0,57}[a-z0-9])?", slug)
+                is None
+            ):
                 raise ValueError("user assertion slug is invalid")
         liked = _parse_member_seeds(args.like, members=members)
         disliked = _parse_member_seeds(args.dislike, members=members)
@@ -2805,7 +2875,10 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 dict.fromkeys(
                     (
                         *members,
-                        *(MemberRef(source.kind, source.key) for source in extra_sources),
+                        *(
+                            MemberRef(source.kind, source.key)
+                            for source in extra_sources
+                        ),
                     )
                 )
             )
@@ -2831,26 +2904,26 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 )
             )
             demanded = tuple(sorted({*candidate_appids, *seed_appids}))
-            if demanded:
-                declared = storage.read_declared_app_snapshot(
-                    account_id=context_account.id,
-                    machine_id=machine.id,
-                    country=country,
-                    language=args.language,
-                    appids=demanded,
-                )
-                payload_by_appid = {
-                    int(item["appid"]): item.get("facts")
-                    for item in declared["items"]
-                }
-            else:
-                payload_by_appid = {}
+            payload_by_appid = _group_declared_payloads(
+                storage,
+                account_id=context_account.id,
+                machine_id=machine.id,
+                country=country,
+                language=args.language,
+                candidate_appids=candidate_appids,
+                seed_appids=seed_appids,
+            )
             ownership_by_app = _group_ownership_by_app(
                 storage, refs=refs, appids=candidate_appids
             )
+            family_by_member = {
+                member: storage.read_group_family(member) for member in members
+            }
+            assertions_by_member = {
+                member: storage.read_group_app_assertions(member) for member in members
+            }
             evaluations = {
                 appid: _evaluate_group_app(
-                    storage,
                     appid=appid,
                     members=members,
                     extra_sources=extra_sources,
@@ -2860,6 +2933,8 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                     host=host,
                     policy=args.policy,
                     exclude_trait=args.exclude_trait,
+                    family_by_member=family_by_member,
+                    assertions_by_member=assertions_by_member,
                 )
                 for appid in candidate_appids
             }
@@ -2887,9 +2962,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                     explicit_trait_exclusions += 1
                     continue
                 preference = (
-                    score_preferences(
-                        evaluation.features, members, member_preferences
-                    )
+                    score_preferences(evaluation.features, members, member_preferences)
                     if args.objective == "preference-fit"
                     else None
                 )
@@ -3012,7 +3085,9 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
         )
     except (StorageError, TypeError, ValueError):
         return _group_invalid(
-            args, command, "Cached group recommendation evidence is unavailable or invalid."
+            args,
+            command,
+            "Cached group recommendation evidence is unavailable or invalid.",
         )
 
 
