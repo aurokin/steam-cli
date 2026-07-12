@@ -24,7 +24,9 @@ MAX_TEXT = 256
 
 GateState = Literal["pass", "fail", "unknown"]
 Freshness = Literal["fresh", "stale", "expired", "unknown"]
-SupportLevel = Literal["official", "documented", "community", "local", "unknown"]
+SupportLevel = Literal[
+    "official", "documented", "provisional", "community", "local", "unknown"
+]
 CompatibilityState = Literal["compatible", "incompatible", "conditional", "unknown"]
 TargetKind = Literal["machine", "valve_deck"]
 Platform = Literal["windows", "macos", "linux", "steamos"]
@@ -101,7 +103,9 @@ class PrimitiveEvidence:
     def __post_init__(self) -> None:
         if self.state not in {"pass", "fail", "unknown"}:
             raise ValueError("evidence state is invalid")
-        if self.support_level not in {"official", "documented", "community", "local", "unknown"}:
+        if self.support_level not in {
+            "official", "documented", "provisional", "community", "local", "unknown",
+        }:
             raise ValueError("support level is invalid")
         if self.freshness not in {"fresh", "stale", "expired", "unknown"}:
             raise ValueError("freshness is invalid")
