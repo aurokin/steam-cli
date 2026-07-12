@@ -75,15 +75,9 @@ _UUID = re.compile(
 _EVIDENCE_REF = re.compile(r"[a-z0-9_-]{1,32}:[a-z0-9_.-]{1,64}\Z")
 _MAX_COMMAND_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT_SECONDS = 4.0
-_WINDOWS_POWERSHELL = (
-    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-)
-_WINDOWS_GPU_COMMAND = (
-    _WINDOWS_POWERSHELL,
-    "-NoProfile",
-    "-NonInteractive",
-    "-Command",
-    "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress",
+_WINDOWS_GPU_SCRIPT = (
+    "Get-CimInstance Win32_VideoController | Select-Object "
+    "Name,DriverVersion | ConvertTo-Json -Compress"
 )
 
 Clock = Callable[[], datetime]
@@ -150,6 +144,7 @@ def collect_system_profile(
     runner: Runner | None = None,
     disk_usage: DiskUsage | None = None,
     windows_native: Mapping[str, Any] | None = None,
+    windows_system_directory: str | None = None,
 ) -> CollectedSystemProfile:
     """Collect one normalized profile with injectable, bounded OS boundaries."""
 
@@ -166,6 +161,7 @@ def collect_system_profile(
         sections = _collect_windows(
             architecture, run,
             _windows_native_facts() if windows_native is None else windows_native,
+            windows_system_directory=windows_system_directory,
         )
     else:
         sections = _collect_common(system_name or "unknown", architecture)
@@ -292,7 +288,11 @@ def _collect_macos(architecture: str | None, runner: Runner) -> dict[str, Any]:
 
 
 def _collect_windows(
-    architecture: str | None, runner: Runner, native: Mapping[str, Any]
+    architecture: str | None,
+    runner: Runner,
+    native: Mapping[str, Any],
+    *,
+    windows_system_directory: str | None,
 ) -> dict[str, Any]:
     cpu = _base_cpu(architecture)
     cpu["model"] = _known_text(_string(native.get("cpu_model")), "windows:native-cpu")
@@ -305,10 +305,15 @@ def _collect_windows(
         cpu["features"] = fact("known", value=allowed, evidence_refs=("windows:native-cpu",))
     else:
         cpu["features"] = unknown("not_reported", "windows:native-cpu")
-    gpu_json = runner(
-        _WINDOWS_GPU_COMMAND,
-        _COMMAND_TIMEOUT_SECONDS,
-        _MAX_COMMAND_OUTPUT,
+    powershell = _trusted_windows_powershell(windows_system_directory)
+    gpu_json = (
+        None
+        if powershell is None
+        else runner(
+            _windows_gpu_command(powershell),
+            _COMMAND_TIMEOUT_SECONDS,
+            _MAX_COMMAND_OUTPUT,
+        )
     )
     adapters = _parse_windows_displays(gpu_json)
     total_memory = _positive_int(native.get("memory_total_bytes"))
@@ -587,12 +592,21 @@ def _bounded_run(argv: Sequence[str], timeout: float, output_limit: int) -> str 
     except OSError:
         return None
     assert process.stdout is not None
-    captured: list[bytes] = []
+    captured = bytearray()
     read_done = threading.Event()
+    overflow = threading.Event()
 
     def read_bounded() -> None:
         try:
-            captured.append(process.stdout.read(output_limit + 1))
+            while len(captured) <= output_limit:
+                remaining = output_limit + 1 - len(captured)
+                chunk = process.stdout.read(min(8192, remaining))
+                if not chunk:
+                    break
+                captured.extend(chunk)
+                if len(captured) > output_limit:
+                    overflow.set()
+                    break
         finally:
             read_done.set()
 
@@ -601,7 +615,7 @@ def _bounded_run(argv: Sequence[str], timeout: float, output_limit: int) -> str 
     deadline = time.monotonic() + timeout
     oversized = False
     while process.poll() is None and time.monotonic() < deadline:
-        if read_done.wait(0.01) and captured and len(captured[0]) > output_limit:
+        if overflow.wait(0.01):
             oversized = True
             break
     timed_out = process.poll() is None and time.monotonic() >= deadline
@@ -622,19 +636,22 @@ def _bounded_run(argv: Sequence[str], timeout: float, output_limit: int) -> str 
         pass
     if reader.is_alive() or oversized or timed_out or process.returncode != 0:
         return None
-    payload = captured[0] if captured else b""
-    if len(payload) > output_limit:
+    if len(captured) > output_limit:
         return None
-    return payload.decode("utf-8", errors="replace").strip() or None
+    return bytes(captured).decode("utf-8", errors="replace").strip() or None
 
 
-def _command_is_allowlisted(argv: tuple[str, ...]) -> bool:
+def _command_is_allowlisted(
+    argv: tuple[str, ...], *, trusted_windows_powershell: str | None = None
+) -> bool:
     if argv in {
         ("/usr/bin/sw_vers", "-productVersion"),
         ("/usr/bin/sw_vers", "-buildVersion"),
         ("/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"),
-        _WINDOWS_GPU_COMMAND,
     }:
+        return True
+    powershell = trusted_windows_powershell or _trusted_windows_powershell()
+    if powershell is not None and argv == _windows_gpu_command(powershell):
         return True
     return (
         len(argv) == 3
@@ -642,6 +659,48 @@ def _command_is_allowlisted(argv: tuple[str, ...]) -> bool:
         and argv[2] in {
             "machdep.cpu.brand_string", "hw.physicalcpu", "hw.logicalcpu", "hw.memsize"
         }
+    )
+
+
+def _windows_gpu_command(powershell: str) -> tuple[str, ...]:
+    return (
+        powershell,
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        _WINDOWS_GPU_SCRIPT,
+    )
+
+
+def _trusted_windows_powershell(
+    system_directory: str | None = None,
+) -> str | None:
+    """Resolve PowerShell beneath the native Windows system directory."""
+
+    directory = system_directory
+    if directory is None:
+        try:
+            import ctypes
+
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetSystemDirectoryW(  # type: ignore[attr-defined]
+                buffer, len(buffer)
+            )
+            if not 0 < length < len(buffer):
+                return None
+            directory = buffer.value
+        except (AttributeError, OSError):
+            return None
+    if (
+        not isinstance(directory, str)
+        or len(directory) > 1024
+        or re.fullmatch(r"[A-Za-z]:\\[^\x00]+", directory) is None
+        or any(part == ".." for part in directory.replace("/", "\\").split("\\"))
+    ):
+        return None
+    return (
+        directory.rstrip("\\/")
+        + r"\WindowsPowerShell\v1.0\powershell.exe"
     )
 
 
@@ -868,7 +927,7 @@ def _reject_private_material(value: Any, key: str = "") -> None:
         }
         if (
             len(value) > 512
-            or _PATH.search(value)
+            or _contains_private_path(value)
             or (ip_sensitive and _IP.search(value))
             or _MAC.search(value)
             or _UUID.search(value)
@@ -892,6 +951,20 @@ def canonical_architecture(value: str | None) -> str | None:
         "armv7": "armv7", "ppc64le": "ppc64le", "riscv64": "riscv64",
     }.get(normalized)
     return canonical
+
+
+def _contains_private_path(value: str) -> bool:
+    normalized = value.replace("/", "\\").casefold()
+    device_markers = (
+        "\\\\?\\",
+        "\\\\.\\",
+        "\\??\\",
+        "\\device\\",
+        "\\\\globalroot\\",
+    )
+    return _PATH.search(value) is not None or any(
+        marker in normalized for marker in device_markers
+    )
 
 
 def _known_text(value: Any, ref: str) -> dict[str, Any]:
@@ -922,7 +995,7 @@ def _string(value: Any) -> str | None:
 
 def _safe_text(value: Any) -> str | None:
     text = _string(value)
-    if text is None or len(text) > 256 or _PATH.search(text) or _IP.search(text) or _MAC.search(text) or _UUID.search(text):
+    if text is None or len(text) > 256 or _contains_private_path(text) or _IP.search(text) or _MAC.search(text) or _UUID.search(text):
         return None
     return text
 

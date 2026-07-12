@@ -1157,11 +1157,24 @@ def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
             )
 
         detected_machine = machine_for(machine_id)
+        normalized_detected_architecture = canonical_architecture(
+            detected_machine.architecture
+        )
+        if (
+            detected_machine.architecture is not None
+            and normalized_detected_architecture is None
+        ):
+            return _emit_error(
+                args,
+                command=command,
+                code="MACHINE_ARCHITECTURE_UNSUPPORTED",
+                message="The detected machine architecture is not supported by system-profile/0.1.",
+            )
         candidate = type(detected_machine)(
             detected_machine.id,
             detected_machine.name,
             detected_machine.platform,
-            canonical_architecture(detected_machine.architecture),
+            normalized_detected_architecture,
         )
         existing = storage.get_machine(machine_id)
         if existing is not None and not _machine_profile_identity_matches(

@@ -218,10 +218,11 @@ def test_windows_collector_never_requests_stable_device_identity() -> None:
             "physical_cores": 8, "logical_processors": 16,
             "memory_total_bytes": 32 * 1024**3,
         },
+        windows_system_directory=r"D:\Windows\System32",
         disk_usage=lambda _path: Usage(1000, 600, 400),
     )
     command = " ".join(calls[0]).casefold()
-    assert calls[0][0] == r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    assert calls[0][0] == r"D:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     assert all(word.casefold() not in command for word in (
         "PNPDeviceID", "DeviceID", "SystemName", "SerialNumber"
     ))
@@ -240,6 +241,26 @@ def test_command_allowlist_accepts_only_exact_fixed_argv() -> None:
     assert not allowed(("/usr/sbin/sysctl", "-n", "kern.hostname"))
     assert not allowed(("/usr/sbin/system_profiler", "SPHardwareDataType", "-json"))
     assert not allowed(("powershell.exe", "-NoProfile"))
+    powershell = system_profile_module._trusted_windows_powershell(  # noqa: SLF001
+        r"D:\Windows\System32"
+    )
+    assert powershell is not None
+    windows_command = system_profile_module._windows_gpu_command(powershell)  # noqa: SLF001
+    assert allowed(windows_command, trusted_windows_powershell=powershell)
+    assert not allowed(
+        (*windows_command[:-1], "Get-CimInstance Win32_ComputerSystem"),
+        trusted_windows_powershell=powershell,
+    )
+
+
+def test_windows_system_directory_is_native_absolute_and_not_environmental() -> None:
+    resolve = system_profile_module._trusted_windows_powershell  # noqa: SLF001
+    assert resolve(r"E:\WinRoot\System32") == (
+        r"E:\WinRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    assert resolve("relative\\System32") is None
+    assert resolve("/tmp/System32") is None
+    assert resolve(r"C:\Windows\..\Untrusted") is None
 
 
 def test_subprocess_reader_caps_output_without_communicate(
@@ -285,6 +306,54 @@ def test_subprocess_reader_caps_output_without_communicate(
     assert process.stdout.requested == 33
 
 
+def test_subprocess_reader_drains_multiple_short_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.stdout = self.Output(self)
+
+        class Output:
+            def __init__(self, process: Process) -> None:
+                self.process = process
+                self.chunks = [b"one", b"-", b"two", b""]
+                self.requests: list[int] = []
+
+            def read(self, size: int) -> bytes:
+                self.requests.append(size)
+                chunk = self.chunks.pop(0)
+                if not self.chunks:
+                    self.process.returncode = 0
+                return chunk
+
+            def close(self) -> None:
+                pass
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float) -> int:
+            assert timeout <= 0.5
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("fixed", timeout)
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(
+        system_profile_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    assert system_profile_module._bounded_run(  # noqa: SLF001
+        ("/usr/bin/sw_vers", "-productVersion"), 0.2, 64
+    ) == "one-two"
+    assert len(process.stdout.requests) == 4
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -306,6 +375,12 @@ def test_architecture_aliases_are_canonical(value: str, expected: str) -> None:
         r"share=(\\server\private\games)",
         "prefix,/tmp/private-file",
         "device=/dev/disk9",
+        r"device=\\?\C:\Users\alice\game.exe",
+        r"device=\\?\UNC\server\share\game.exe",
+        r"device=\\.\PhysicalDrive0",
+        r"device=\??\C:\private\game.exe",
+        r"device=\Device\HarddiskVolume1\private\game.exe",
+        r"device=\\GLOBALROOT\Device\HarddiskVolume1\game.exe",
     ],
 )
 def test_validator_rejects_embedded_and_punctuated_paths(canary: str) -> None:

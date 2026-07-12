@@ -158,6 +158,31 @@ def test_machine_alias_architecture_aliases_do_not_conflict(
     assert calls == [1]
 
 
+def test_unrecognized_detected_architecture_is_typed_and_never_overwrites_machine(
+    tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = setup(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "machine_for",
+        lambda alias: Machine(alias, alias, "linux", "vendor-private-arch"),
+    )
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("local", "Existing", "linux", "x86_64"), observed_at=NOW
+        )
+    code, result, _ = invoke(
+        tmp_path, capsys, "sync", "system", "--acknowledge-local-storage"
+    )
+    assert code == 1
+    assert result["error"]["code"] == "MACHINE_ARCHITECTURE_UNSUPPORTED"
+    assert calls == []
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        assert storage.get_machine("local") == Machine(
+            "local", "Existing", "linux", "x86_64"
+        )
+
+
 def test_machine_deletion_requires_confirmation_and_preserves_machine(
     tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
