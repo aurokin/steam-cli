@@ -18,6 +18,7 @@ MAX_APPID = (1 << 32) - 1
 MAX_BYTES = (1 << 63) - 1
 MAX_ITEMS = 100_000
 MAX_COMPONENTS = 256
+MAX_TOTAL_GATES = 1_000_000
 MAX_EVIDENCE_IDS = 64
 MAX_TEXT = 256
 
@@ -214,7 +215,9 @@ class TargetReview:
 @dataclass(frozen=True, slots=True)
 class CompatibilityCandidate:
     appid: int
-    native_os: PrimitiveEvidence
+    target: CompatibilityTarget
+    declared_native_build: PrimitiveEvidence
+    effective_execution_support: PrimitiveEvidence
     architecture: PrimitiveEvidence
     meets_minimum: PrimitiveEvidence
     exact_target_review: TargetReview | None
@@ -226,9 +229,11 @@ class CompatibilityCandidate:
 
     def __post_init__(self) -> None:
         _int(self.appid, name="appid", minimum=1, maximum=MAX_APPID)
+        if not isinstance(self.target, CompatibilityTarget):
+            raise ValueError("candidate target is invalid")
         for name in (
-            "native_os", "architecture", "meets_minimum", "likely_good_experience",
-            "installed", "owned",
+            "declared_native_build", "effective_execution_support", "architecture",
+            "meets_minimum", "likely_good_experience", "installed", "owned",
         ):
             if not isinstance(getattr(self, name), PrimitiveEvidence):
                 raise ValueError(f"{name} must be PrimitiveEvidence")
@@ -255,6 +260,7 @@ class GateOverride:
     gate: str
     effective: GateState
     evidence_ids: tuple[str, ...]
+    applied_at: datetime
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _SLUG.fullmatch(self.name) is None:
@@ -268,6 +274,7 @@ class GateOverride:
         if not ids:
             raise ValueError("override requires evidence lineage")
         object.__setattr__(self, "evidence_ids", ids)
+        object.__setattr__(self, "applied_at", _time(self.applied_at, name="override applied_at"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,16 +283,23 @@ class GateResult:
     original: GateState
     effective: GateState
     mandatory: bool
-    condition: str | None
-    source: str | None
-    support_level: SupportLevel
-    observed_at: datetime | None
-    freshness: Freshness
-    conflict: bool
-    unknown_reason: str | None
-    evidence_ids: tuple[str, ...]
+    original_condition: str | None
+    original_source: str | None
+    original_support_level: SupportLevel
+    original_observed_at: datetime | None
+    original_freshness: Freshness
+    original_conflict: bool
+    original_unknown_reason: str | None
+    original_evidence_ids: tuple[str, ...]
     override_name: str | None
     override_evidence_ids: tuple[str, ...]
+    effective_condition: str | None
+    effective_unknown_reason: str | None
+    effective_source: str | None
+    effective_support_level: SupportLevel
+    effective_observed_at: datetime | None
+    effective_freshness: Freshness
+    effective_evidence_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +308,7 @@ class CompatibilityAssessment:
     target: CompatibilityTarget
     compatibility: CompatibilityState
     playable_now: GateState
+    likely_good_experience_original: PrimitiveEvidence
     likely_good_experience: PrimitiveEvidence
     gates: tuple[GateResult, ...]
     runtime_risks: tuple[RuntimeRisk, ...]
@@ -351,6 +366,8 @@ def assess_compatibility(
     requested = set(requested_appids)
     if not set(candidate_ids).issubset(requested):
         raise ValueError("candidate AppIDs must be explicitly requested")
+    if any(item.target != target for item in candidates):
+        raise ValueError("candidate evidence target does not match the assessed target")
     req_keys = [(item.kind, item.name) for item in requirements]
     if len(req_keys) != len(set(req_keys)):
         raise ValueError("feature requirements must be unique")
@@ -360,25 +377,44 @@ def assess_compatibility(
     if any(item.appid not in requested for item in overrides):
         raise ValueError("override AppID was not requested")
 
-    by_appid = {item.appid: item for item in candidates}
-    results = tuple(
-        _assess(
-            by_appid.get(appid, _missing_candidate(appid)),
-            target,
-            tuple(sorted(requirements, key=lambda item: (item.kind, item.name))),
-            tuple(item for item in overrides if item.appid == appid),
-        )
-        for appid in sorted(requested)
+    total_gates = sum(
+        7 + len(item.runtime_risks) + len(item.features) + len(requirements)
+        for item in candidates
     )
+    total_gates += (len(requested) - len(candidates)) * (7 + len(requirements))
+    if total_gates > MAX_TOTAL_GATES:
+        raise ValueError("assessment output exceeds the supported total-work bound")
+
+    by_appid = {item.appid: item for item in candidates}
+    overrides_by_appid: dict[int, list[GateOverride]] = {}
+    for item in overrides:
+        overrides_by_appid.setdefault(item.appid, []).append(item)
+    ordered_results: list[CompatibilityAssessment] = []
+    for appid in sorted(requested):
+        item = by_appid.get(appid)
+        if item is None:
+            item = _missing_candidate(appid, target)
+        ordered_results.append(
+            _assess(
+                item,
+                target,
+                tuple(sorted(requirements, key=lambda value: (value.kind, value.name))),
+                tuple(overrides_by_appid.get(appid, ())),
+            )
+        )
+    results = tuple(ordered_results)
     completeness: Literal["complete", "partial"] = (
         "complete" if all(item.completeness == "complete" for item in results) else "partial"
     )
     return CompatibilityBatch(SCHEMA, target, tuple(sorted(requested)), results, completeness)
 
 
-def _missing_candidate(appid: int) -> CompatibilityCandidate:
+def _missing_candidate(appid: int, target: CompatibilityTarget) -> CompatibilityCandidate:
     missing = unknown("candidate_evidence_unavailable")
-    return CompatibilityCandidate(appid, missing, missing, missing, None, missing, missing, missing)
+    return CompatibilityCandidate(
+        appid, target, missing, missing, missing, missing, None,
+        missing, missing, missing,
+    )
 
 
 def _assess(
@@ -394,11 +430,16 @@ def _assess(
     mandatory_names = (
         {"exact_target_review"}
         if target.kind == "valve_deck"
-        else {"native_os", "architecture", "meets_minimum"}
+        else {"effective_execution_support", "architecture", "meets_minimum"}
     )
 
     raw: list[tuple[str, PrimitiveEvidence, bool]] = [
-        ("native_os", candidate.native_os, "native_os" in mandatory_names),
+        ("declared_native_build", candidate.declared_native_build, False),
+        (
+            "effective_execution_support",
+            candidate.effective_execution_support,
+            "effective_execution_support" in mandatory_names,
+        ),
         ("architecture", candidate.architecture, "architecture" in mandatory_names),
         ("meets_minimum", candidate.meets_minimum, "meets_minimum" in mandatory_names),
         (
@@ -406,6 +447,8 @@ def _assess(
             _exact_review_for_target(candidate.exact_target_review, target),
             "exact_target_review" in mandatory_names,
         ),
+        ("readiness:installed", candidate.installed, False),
+        ("readiness:visible_owned", candidate.owned, False),
     ]
     for risk in candidate.runtime_risks:
         if risk.presence == "present":
@@ -439,27 +482,31 @@ def _assess(
 
     mandatory = tuple(gate for gate in gates if gate.mandatory)
     decisive_fail = any(gate.effective == "fail" for gate in mandatory)
-    conditional = any(gate.effective == "pass" and gate.condition is not None for gate in mandatory)
+    conditional = any(
+        gate.effective == "pass" and gate.effective_condition is not None
+        for gate in mandatory
+    )
     required_unknown = any(gate.effective == "unknown" for gate in mandatory)
     if decisive_fail:
         state: CompatibilityState = "incompatible"
-    elif conditional:
-        state = "conditional"
     elif required_unknown:
         state = "unknown"
+    elif conditional:
+        state = "conditional"
     else:
         state = "compatible"
 
     # M5 does not possess M7 process, queue, entitlement-session, or launch
     # facts.  Even an installed, owned, compatible title is therefore not
     # promoted to "playable now".
-    if candidate.installed.state == "fail" or candidate.owned.state == "fail" or state == "incompatible":
+    installed_gate = next(gate for gate in gates if gate.name == "readiness:installed")
+    if installed_gate.effective == "fail" or state == "incompatible":
         playable: GateState = "fail"
     else:
         playable = "unknown"
 
     unknowns = tuple(sorted(gate.name for gate in gates if gate.effective == "unknown"))
-    conflicts = tuple(sorted(gate.name for gate in gates if gate.conflict))
+    conflicts = tuple(sorted(gate.name for gate in gates if gate.original_conflict))
     reasons = tuple(
         sorted(
             {
@@ -468,11 +515,14 @@ def _assess(
                 *("required_compatibility_evidence_unknown" for _ in (0,) if state == "unknown"),
                 *("all_mandatory_compatibility_gates_passed" for _ in (0,) if state == "compatible"),
                 *("playable_now_requires_m7_operational_facts" for _ in (0,) if playable == "unknown"),
-                *("known_not_installed" for _ in (0,) if candidate.installed.state == "fail"),
+                *("known_not_installed" for _ in (0,) if installed_gate.effective == "fail"),
             }
         )
     )
-    incomplete_freshness = any(gate.freshness in {"stale", "expired", "unknown"} for gate in mandatory)
+    incomplete_freshness = any(
+        gate.original_freshness in {"stale", "expired", "unknown"}
+        for gate in mandatory
+    )
     partial = (
         bool(unknowns or conflicts)
         or incomplete_freshness
@@ -483,6 +533,7 @@ def _assess(
     features = candidate.features
     return CompatibilityAssessment(
         candidate.appid, target, state, playable, candidate.likely_good_experience,
+        _effective_fact(candidate.likely_good_experience),
         gates, candidate.runtime_risks,
         tuple(item for item in features if item.kind == "accessibility"),
         tuple(item for item in features if item.kind == "input"),
@@ -492,18 +543,56 @@ def _assess(
 
 
 def _gate(name: str, evidence: PrimitiveEvidence, mandatory: bool, override: GateOverride | None) -> GateResult:
-    freshness_degraded = evidence.state != "unknown" and evidence.freshness == "expired"
+    freshness_degraded = evidence.state != "unknown" and (
+        evidence.freshness == "expired"
+        or (name.startswith("readiness:") and evidence.freshness == "stale")
+    )
     effective: GateState = "unknown" if freshness_degraded else evidence.state
+    effective_condition = evidence.condition
+    effective_unknown_reason = (
+        (
+            "evidence_expired"
+            if evidence.freshness == "expired"
+            else "evidence_stale_for_ready_now"
+        )
+        if freshness_degraded
+        else evidence.unknown_reason
+    )
+    effective_source = evidence.source
+    effective_support = evidence.support_level
+    effective_observed = evidence.observed_at
+    effective_freshness = evidence.freshness
+    effective_ids = evidence.evidence_ids
     if override is not None:
         effective = override.effective
+        effective_condition = None
+        effective_unknown_reason = (
+            "query_override_selected_unknown" if effective == "unknown" else None
+        )
+        effective_source = f"query_override:{override.name}"
+        effective_support = "local"
+        effective_observed = override.applied_at
+        effective_freshness = "fresh"
+        effective_ids = override.evidence_ids
     return GateResult(
         name, evidence.state, effective,
         mandatory, evidence.condition, evidence.source, evidence.support_level,
         evidence.observed_at, evidence.freshness, evidence.conflict,
-        "evidence_expired" if freshness_degraded else evidence.unknown_reason,
-        evidence.evidence_ids,
+        evidence.unknown_reason, evidence.evidence_ids,
         None if override is None else override.name,
         () if override is None else override.evidence_ids,
+        effective_condition, effective_unknown_reason, effective_source,
+        effective_support, effective_observed, effective_freshness, effective_ids,
+    )
+
+
+def _effective_fact(evidence: PrimitiveEvidence) -> PrimitiveEvidence:
+    if evidence.state == "unknown" or evidence.freshness != "expired":
+        return evidence
+    return PrimitiveEvidence(
+        "unknown", evidence.source, evidence.support_level, evidence.observed_at,
+        evidence.freshness, evidence.evidence_ids,
+        unknown_reason="evidence_expired",
     )
 
 
@@ -520,6 +609,7 @@ class MachineCapacity:
     ram_mib: int | None
     storage_mib: int | None
     architecture: str | None
+    supported_requirement_architectures: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("ram_mib", "storage_mib"):
@@ -528,6 +618,17 @@ class MachineCapacity:
                 _int(value, name=name, maximum=MAX_BYTES // (1024 * 1024))
         if self.architecture is not None and self.architecture not in _ARCHITECTURES:
             raise ValueError("machine architecture is unsupported")
+        if not isinstance(self.supported_requirement_architectures, tuple):
+            raise ValueError("supported architectures must be a tuple")
+        if any(item not in _ARCHITECTURES for item in self.supported_requirement_architectures):
+            raise ValueError("supported requirement architecture is invalid")
+        if len(self.supported_requirement_architectures) != len(set(self.supported_requirement_architectures)):
+            raise ValueError("supported requirement architectures must be unique")
+        object.__setattr__(
+            self,
+            "supported_requirement_architectures",
+            tuple(sorted(self.supported_requirement_architectures)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +638,8 @@ class MinimumRequirements:
     architecture: str | None
     cpu_text: str | None = None
     gpu_text: str | None = None
+    cpu_state: Literal["missing", "unparsed", "declared", "authoritative_none"] = "missing"
+    gpu_state: Literal["missing", "unparsed", "declared", "authoritative_none"] = "missing"
 
     def __post_init__(self) -> None:
         for name in ("ram_mib", "storage_mib"):
@@ -549,6 +652,15 @@ class MinimumRequirements:
             value = getattr(self, name)
             if value is not None:
                 _text(value, name=name)
+        for kind in ("cpu", "gpu"):
+            state = getattr(self, f"{kind}_state")
+            text = getattr(self, f"{kind}_text")
+            if state not in {"missing", "unparsed", "declared", "authoritative_none"}:
+                raise ValueError(f"{kind} requirement state is invalid")
+            if state == "declared" and text is None:
+                raise ValueError(f"declared {kind} requirement requires text")
+            if state in {"missing", "authoritative_none"} and text is not None:
+                raise ValueError(f"{state} {kind} requirement cannot carry text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,10 +683,15 @@ def compare_minimum_requirements(machine: MachineCapacity, requirement: MinimumR
     storage = _quantity_gate(machine.storage_mib, requirement.storage_mib)
     architecture: GateState = (
         "unknown" if machine.architecture is None or requirement.architecture is None
-        else "pass" if machine.architecture == requirement.architecture else "fail"
+        else "pass"
+        if (
+            machine.architecture == requirement.architecture
+            or requirement.architecture in machine.supported_requirement_architectures
+        )
+        else "unknown"
     )
-    cpu: GateState = "unknown" if requirement.cpu_text is not None else "pass"
-    gpu: GateState = "unknown" if requirement.gpu_text is not None else "pass"
+    cpu: GateState = "pass" if requirement.cpu_state == "authoritative_none" else "unknown"
+    gpu: GateState = "pass" if requirement.gpu_state == "authoritative_none" else "unknown"
     states = {"ram": ram, "storage": storage, "architecture": architecture, "cpu": cpu, "gpu": gpu}
     overall: GateState = "fail" if "fail" in states.values() else "unknown" if "unknown" in states.values() else "pass"
     return MinimumComparison(overall, ram, storage, architecture, cpu, gpu, tuple(name for name, state in states.items() if state == "unknown"))

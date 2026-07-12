@@ -79,22 +79,26 @@ MIT-licensed runtime-risk adapter; it is not required for the first M5 tracer.
 steam-agent sync system --machine MACHINE [--acknowledge-local-storage]
 steam-agent system query --machine MACHINE
 steam-agent sync compatibility --scope library --account ALIAS --machine MACHINE --country CC --language LANG [--max-items N] [--acknowledge-local-storage]
-steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck|valve:steam-machine|valve:steamos [--country CC] [--language LANG] [--require FIELD=VALUE] [--override appid:N:FIELD=pass|fail|unknown] [--explain]
+steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck [--country CC] [--language LANG] [--require FIELD=VALUE] [--override appid:N:FIELD=pass|fail|unknown] [--explain]
 ```
 
 Assessment is cache-only and returns every explicitly requested AppID. Every
 primitive gate is pass/fail/unknown; stale, inaccessible, and conflict remain
 orthogonal evidence states. Any decisive hard failure yields `incompatible`.
-A known manual/runtime condition yields `conditional`. Required unknowns yield
-`unknown`. `compatible` requires every mandatory gate to pass.
+Required unknowns yield `unknown`; otherwise a known manual/runtime condition
+yields `conditional`. `compatible` requires every mandatory gate to pass.
 
-Native OS support, architecture, meets-minimum, exact Valve target review,
-runtime risks, accessibility/input/language constraints,
+Publisher-declared native build, effective execution support, architecture,
+meets-minimum, exact Valve target review, runtime risks,
+accessibility/input/language constraints,
 `likely_good_experience`, and `playable_now` remain separate. Valve Verified,
 Playable, Unsupported, and Unknown map only to the exact reviewed target. M5
 normally leaves likely-good-experience unknown. Installed plus visible-owned is
 still not playable-now pass because M7 update/client/launcher/network state is
-not observed; known not-installed may fail playable-now for the selected target.
+not observed; known fresh not-installed may fail playable-now for the selected
+target. Visible-owned absence does not prove a missing entitlement. Publisher
+`linux=false` fails only the declared-native-build fact; effective Linux
+execution remains unknown unless a separately reviewed route supports it.
 
 Query constraints are ephemeral and potentially sensitive. They are not
 persisted. A named override preserves original/effective states and request
