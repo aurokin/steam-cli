@@ -1,0 +1,13 @@
+{
+  "schema_version": "steam-agent-eval/0.1", "id": "m4-r10", "status": "proposed", "milestone": "M4",
+  "question_family": "temporary recommendation override", "tags": ["override", "reproducibility", "three-valued"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "A controller requirement is unknown for one candidate and passed for another before a named one-query override.", "facts": [{"subject": "synthetic:appid:2001", "state": "controller_unknown_higher_fit"}, {"subject": "synthetic:appid:2002", "state": "controller_pass_lower_fit"}]},
+  "conversation": {"user": ["For this query only, include the unknown controller game anyway."], "paraphrase": "Override this unknown gate without changing saved evidence."},
+  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "user:controller=true", "--override", "appid:2001:user:controller=pass"]}], "prohibited": ["sync", "persist override", "feedback mutation"]},
+  "deterministic_oracle": {"recipe_or_contract": "M4 named query override proposed", "assertions": [
+    {"path": "$.results[0].appid", "operator": "equals", "expected": 2001}, {"path": "$.results[0].constraints['user:controller'].original", "operator": "equals", "expected": "unknown"}, {"path": "$.results[0].constraints['user:controller'].effective", "operator": "equals", "expected": "pass"}
+  ]},
+  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "override-lineage", "weight": 5, "requirement": "Return both original and effective constraint outcomes.", "hard_fail": true}, {"id": "override-not-persisted", "weight": 5, "requirement": "Do not rewrite or persist the underlying evidence.", "hard_fail": true}]},
+  "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "override-clarity", "weight": 3, "requirement": "Explain that the inclusion is a temporary caller override."}]},
+  "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_R10", "credential": "EVAL_CANARY_CREDENTIAL_R10", "local_path": "EVAL_CANARY_LOCAL_PATH_R10"}
+}

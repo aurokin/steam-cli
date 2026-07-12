@@ -298,6 +298,8 @@ are added.
 - [M2 truthful account inventory execution and evidence](docs/design/m2-execution.md)
 - [M3 wishlist and deal evidence execution](docs/design/m3-execution.md)
 - [M4 next-to-play and preference execution](docs/design/m4-execution.md)
+- [Cross-milestone common-question evaluation strategy](docs/design/evaluation-strategy.md)
+- [Synthetic evaluation corpus](evals/README.md)
 - [Decision register](docs/adr/README.md)
 - [Original research handoff](steam-library-agent-research-handoff.md)
 

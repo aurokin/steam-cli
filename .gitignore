@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 .ws/
+evals/results/
 
 # Local runtime data and credentials
 *.sqlite

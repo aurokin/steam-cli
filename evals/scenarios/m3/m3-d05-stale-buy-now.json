@@ -1,0 +1,17 @@
+{
+  "schema_version": "steam-agent-eval/0.1", "id": "m3-d05", "status": "active", "milestone": "M3",
+  "question_family": "buy now under stale evidence", "tags": ["freshness", "partial", "uncertainty"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "A retained last-good official offer is outside current freshness but inside hard retention.", "facts": [{"subject": "synthetic:appid:501", "state": "stale_last_good", "detail": "offer observed eight hours before frozen clock"}]},
+  "conversation": {"user": ["Should I buy this game right now?"], "paraphrase": "Is the cached deal current enough to act on?"},
+  "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "browser", "mutation"]},
+  "deterministic_oracle": {"recipe_or_contract": "M3 cache freshness", "assertions": [
+    {"path": "$.completeness", "operator": "equals", "expected": "partial"},
+    {"path": "$.items[0].deal.current_offer.freshness", "operator": "equals", "expected": "stale"},
+    {"path": "$.items[0].warnings", "operator": "contains", "expected": "STALE_PRICE_EVIDENCE"}
+  ]},
+  "fact_rubric": {"grading": "deterministic", "criteria": [
+    {"id": "stale-not-current", "weight": 10, "requirement": "Do not present the retained amount as a verified current price.", "hard_fail": true}
+  ]},
+  "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "action-caution", "weight": 3, "requirement": "Give proportionate caution while preserving the useful last-known fact."}]},
+  "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_D05", "credential": "EVAL_CANARY_CREDENTIAL_D05", "local_path": "EVAL_CANARY_LOCAL_PATH_D05"}
+}

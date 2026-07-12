@@ -1,0 +1,13 @@
+{
+  "schema_version": "steam-agent-eval/0.1", "id": "m4-r07", "status": "proposed", "milestone": "M4",
+  "question_family": "recommendation uncertainty", "tags": ["missing", "stale", "uncertainty"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "Candidates have fresh activity, stale last-good activity, or no achievement observation.", "facts": [{"subject": "synthetic:appid:1701", "state": "fresh_activity"}, {"subject": "synthetic:appid:1702", "state": "stale_activity"}, {"subject": "synthetic:appid:1703", "state": "achievements_unevaluated"}]},
+  "conversation": {"user": ["How confident are you in what I should play next?"], "paraphrase": "Show what evidence is stale or missing in this recommendation."},
+  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "resume/0.1", "--unknown", "include"]}], "prohibited": ["sync", "treat missing as zero", "browser"]},
+  "deterministic_oracle": {"recipe_or_contract": "M4 completeness proposed", "assertions": [
+    {"path": "$.completeness", "operator": "equals", "expected": "partial"}, {"path": "$.results[?(@.appid==1702)].freshness", "operator": "equals", "expected": "stale"}, {"path": "$.results[?(@.appid==1703)].unknowns", "operator": "contains", "expected": "achievements_unevaluated"}
+  ]},
+  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "uncertainty-fidelity", "weight": 10, "requirement": "Keep stale and unevaluated evidence distinct from zero.", "hard_fail": true}]},
+  "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "calibrated-language", "weight": 3, "requirement": "Express uncertainty proportionately without refusing all help."}]},
+  "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_R07", "credential": "EVAL_CANARY_CREDENTIAL_R07", "local_path": "EVAL_CANARY_LOCAL_PATH_R07"}
+}
