@@ -2806,6 +2806,13 @@ class Storage:
         cutoff = _timestamp(
             datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)
         )
+        appids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """SELECT appid FROM review_sync_demand
+                   UNION SELECT appid FROM review_current"""
+            )
+        )
         self._connection.execute(
             "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read' AND started_at < ?",
             (cutoff,),
@@ -2818,6 +2825,7 @@ class Storage:
                  SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
                )"""
         )
+        self._delete_orphan_apps(appids)
 
     def delete_review_data(self, *, account_id: int | None = None) -> Mapping[str, int]:
         """Delete public-review acquisition data for one account or the provider."""
@@ -3149,6 +3157,12 @@ class Storage:
                 )
                 promoted = 1
                 self._prune_price_cache_to_wishlist(run.account_id)
+                self._connection.execute(
+                    """DELETE FROM review_current WHERE NOT EXISTS (
+                         SELECT 1 FROM wishlist_current w
+                         WHERE w.appid=review_current.appid
+                       )"""
+                )
             self._connection.execute(
                 """
                 UPDATE sync_runs SET status = 'complete', completed_at = ?,
@@ -6816,6 +6830,18 @@ class Storage:
               AND NOT EXISTS (
                   SELECT 1 FROM achievement_schema_status
                   WHERE achievement_schema_status.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_sync_demand
+                  WHERE review_sync_demand.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_observations
+                  WHERE review_observations.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_current
+                  WHERE review_current.appid = steam_apps.appid
               )
             """,
             appids,

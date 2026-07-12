@@ -16,6 +16,7 @@ MAX_REVIEW_ITEMS = 100
 REVIEW_DISCLOSURE_VERSION = "2026-07-11.m4"
 REVIEW_PROVIDER = "steam-store-reviews"
 REVIEW_BUDGET_SCOPE = "public-aggregate"
+DEFAULT_RETRY_AFTER_SECONDS = 60
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], None]
 
@@ -135,12 +136,16 @@ def sync_wishlist_reviews(
             )
             counts["failed"] = counts.get("failed", 0) + 1
             retry_after = getattr(exc, "retry_after_seconds", None)
-            if retry_after is not None:
+            if retryable:
                 storage.defer_provider_requests(
                     provider=REVIEW_PROVIDER,
                     budget_scope=REVIEW_BUDGET_SCOPE,
                     requested_at=clock(),
-                    retry_after_seconds=retry_after,
+                    retry_after_seconds=(
+                        DEFAULT_RETRY_AFTER_SECONDS
+                        if retry_after is None
+                        else retry_after
+                    ),
                 )
             if retryable:
                 fatal = ReviewSyncError(code, retryable=True)

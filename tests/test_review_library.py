@@ -43,10 +43,17 @@ class PacedClock:
 
 
 class Client:
-    def __init__(self, *, fail_at: int | None = None, retryable: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: int | None = None,
+        retryable: bool = True,
+        retry_after: int | None = 30,
+    ) -> None:
         self.calls: list[int] = []
         self.fail_at = fail_at
         self.retryable = retryable
+        self.retry_after = retry_after
 
     def fetch_summary(self, appid: int) -> SteamReviewSummary:
         self.calls.append(appid)
@@ -54,7 +61,7 @@ class Client:
             raise SteamReviewError(
                 "RATE_LIMITED" if self.retryable else "PROVIDER_RESPONSE_INVALID",
                 retryable=self.retryable,
-                retry_after_seconds=30 if self.retryable else None,
+                retry_after_seconds=self.retry_after if self.retryable else None,
             )
         return SteamReviewSummary(
             appid,
@@ -207,6 +214,28 @@ def test_nonretryable_subject_failure_does_not_block_later_subjects(tmp_path) ->
         assert result.state_counts == {"ready": 2, "failed": 1}
 
 
+def test_retryable_failure_without_header_persists_default_restart_cooldown(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 2)
+        with pytest.raises(ReviewSyncError):
+            sync_wishlist_reviews(
+                storage,
+                account_id=account_id,
+                max_items=2,
+                client=Client(fail_at=100, retry_after=None),
+                clock=clock,
+            )
+        assert not storage.reserve_provider_request(
+            provider="steam-store-reviews",
+            budget_scope="public-aggregate",
+            requested_at=clock(),
+            minimum_interval_seconds=1,
+        )
+
+
 def test_review_projection_is_global_but_account_demand_isolated_and_pruned(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         first = setup_wishlist(storage, 1)
@@ -287,3 +316,34 @@ def test_account_provider_deletion_removes_sole_review_but_rehomes_shared(tmp_pa
                JOIN sync_runs r ON r.id=c.promoted_sync_run_id"""
         ).fetchone()
         assert row[0] == first
+
+
+def test_wishlist_removal_prunes_current_review_without_fk_rollback(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 1)
+        sync_wishlist_reviews(
+            storage, account_id=account_id, max_items=1, client=Client(), clock=Clock()
+        )
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(hours=1),
+        )
+        completed = storage.complete_wishlist_snapshot(
+            run.id,
+            (),
+            item_list_retrieved_at=NOW + timedelta(hours=1),
+            item_count_retrieved_at=NOW + timedelta(hours=1),
+            item_list_reported_count=0,
+            item_count_reported_count=0,
+            completed_at=NOW + timedelta(hours=1),
+        )
+        assert completed.status == "complete"
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM review_current"
+        ).fetchone()[0] == 0
+        # Attempt lineage retains the identity only until its bounded expiry.
+        assert storage.get_app(100) is not None
+        storage._prune_reviews("2026-07-20T12:00:00Z")  # noqa: SLF001
+        assert storage.get_app(100) is None
