@@ -1702,7 +1702,11 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     "support_level": "provisional",
                 },
             )
-        owned_appids = {game.appid for game in owned.games}
+        owned_appids = {
+            game.appid
+            for game in owned.games
+            if not app_facts_command or game.inclusion_basis == "visible_owned"
+        }
         if app_facts_command:
             wishlist = storage.read_wishlist_snapshot(account.id)
             installed = storage.read_installed_snapshot(machine.id)
@@ -2033,7 +2037,11 @@ def _declared_scope_appids(
 ) -> tuple[int, ...]:
     """Authorize one deterministic candidate set without consulting global demand."""
 
-    owned = {game.appid for game in storage.read_owned_snapshot(account_id).games}
+    owned = {
+        game.appid
+        for game in storage.read_owned_snapshot(account_id).games
+        if game.inclusion_basis == "visible_owned"
+    }
     wishlist = {game.appid for game in storage.read_wishlist_snapshot(account_id).games}
     installed = {
         game.appid for game in storage.read_installed_snapshot(machine_id).games

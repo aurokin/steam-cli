@@ -419,6 +419,84 @@ def test_app_facts_rechecks_bound_after_scope_expansion(
     assert result["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_played_free_rows_do_not_enter_m6_known_or_library_scope(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=NOW,
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-visible-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            run.id,
+            (OwnedObservation(400, 1, "played_free", NOW, "Played Free"),),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=0,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+    monkeypatch.setattr(
+        cli, "_declared_facts_client", lambda: pytest.fail("played-free app fetched")
+    )
+
+    code, synced, _ = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        "library",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0
+    assert synced["data"]["items"] == []
+
+    code, queried, _ = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "known",
+        "--limit",
+        "10",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0
+    assert queried["data"]["candidate_count"] == 0
+
+
 def test_contract_drift_disables_transport_until_retry_time(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
