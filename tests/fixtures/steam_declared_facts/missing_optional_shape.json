@@ -1,0 +1,12 @@
+{
+  "570": {
+    "success": true,
+    "data": {
+      "steam_appid": 570,
+      "categories": [
+        {"id": 68, "description": "Custom Volume Controls"},
+        {"id": 78, "description": "Adjustable Difficulty"}
+      ]
+    }
+  }
+}

@@ -110,6 +110,12 @@ from steam_agent.system_profile import (
     query_system_profile,
     sync_system_profile,
 )
+from steam_agent.steam_declared_facts import (
+    DECLARED_FACTS_DISCLOSURE_VERSION,
+    SteamDeclaredFactsClient,
+    SteamDeclaredFactsError,
+    declared_facts_payload,
+)
 
 
 EXIT_OK = 0
@@ -299,6 +305,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(system_sync)
     system_sync.add_argument("--machine", default="local")
     system_sync.add_argument("--acknowledge-local-storage", action="store_true")
+    compatibility_sync = sync_commands.add_parser(
+        "compatibility",
+        help="Synchronize provisional Steam-declared compatibility facts.",
+    )
+    _add_leaf_format(compatibility_sync)
+    compatibility_sync.add_argument("--scope", choices=("library",), required=True)
+    compatibility_sync.add_argument("--appid", action="append", type=int, default=[])
+    compatibility_sync.add_argument("--account", default="primary")
+    compatibility_sync.add_argument("--machine", default="local")
+    compatibility_sync.add_argument("--country", required=True)
+    compatibility_sync.add_argument("--language", required=True)
+    compatibility_sync.add_argument("--max-items", type=int, default=20)
+    compatibility_sync.add_argument("--acknowledge-local-storage", action="store_true")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -553,7 +572,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(delete_data)
     delete_data.add_argument(
         "--provider",
-        choices=("steam-web-api", "steam-store-reviews", "gg-deals", "cheapshark", "local-system"),
+        choices=(
+            "steam-web-api",
+            "steam-store-reviews",
+            "steam-store-appdetails",
+            "gg-deals",
+            "cheapshark",
+            "local-system",
+        ),
         required=True,
     )
     target = delete_data.add_mutually_exclusive_group(required=True)
@@ -718,6 +744,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_reviews(args, database_path)
     if args.command == "sync" and args.sync_command == "system":
         return _dispatch_system(args, database_path)
+    if args.command == "sync" and args.sync_command == "compatibility":
+        return _dispatch_sync_compatibility(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -1306,6 +1334,343 @@ def _machine_profile_identity_matches(
             and stored_arch == candidate_arch
         )
     )
+
+
+def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) -> int:
+    command = "sync.compatibility"
+    country = args.country.upper()
+    started_at = _utc_now()
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+            machine = storage.get_machine(args.machine)
+        except ValueError:
+            account = None
+            machine = None
+        if account is None:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                message="The requested Steam account is not configured.",
+            )
+        if machine is None:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The requested machine is not configured.",
+                exit_code=2,
+            )
+        owned = storage.read_owned_snapshot(account.id)
+        if owned.latest_complete is None:
+            return _emit_success(
+                args,
+                command=command,
+                context={
+                    "account_alias": account.alias,
+                    "machine_alias": machine.id,
+                    "country": country,
+                    "language": args.language,
+                    "scope": "library",
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["owned.visible.read"],
+                    warnings=[
+                        WarningRecord(
+                            code=ErrorCode.NOT_SYNCED,
+                            message=(
+                                "A complete visible-owned library snapshot is required "
+                                "before compatibility facts can be synchronized."
+                            ),
+                        )
+                    ],
+                ),
+                data={
+                    "sync_run_id": None,
+                    "sync_status": None,
+                    "items": [],
+                    "demand": [],
+                    "schema_id": "declared-app-facts/0.1",
+                    "support_level": "provisional",
+                },
+            )
+        owned_reference = owned.latest_complete.completed_at or owned.latest_complete.started_at
+        owned_age = (
+            started_at
+            - datetime.fromisoformat(owned_reference.replace("Z", "+00:00"))
+        ).total_seconds()
+        owned_dependency_stale = (
+            owned.latest is None
+            or owned.latest.status != "complete"
+            or owned_age < 0
+            or owned_age > _OWNED_SYNC_FRESHNESS_SECONDS
+        )
+        owned_appids = {game.appid for game in owned.games}
+        demanded_appids = args.appid or sorted(owned_appids)
+        if any(appid not in owned_appids for appid in demanded_appids):
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="Every prioritized AppID must be in the cached visible-owned library.",
+                exit_code=2,
+            )
+        if not demanded_appids:
+            return _emit_success(
+                args,
+                command=command,
+                context={
+                    "account_alias": account.alias,
+                    "machine_alias": machine.id,
+                    "country": country,
+                    "language": args.language,
+                    "scope": "library",
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(CompletenessStatus.COMPLETE),
+                data={
+                    "sync_run_id": None,
+                    "sync_status": "complete",
+                    "items": [],
+                    "demand": [],
+                    "schema_id": "declared-app-facts/0.1",
+                    "support_level": "provisional",
+                },
+            )
+        consent = storage.get_compatibility_data_consent(account.id)
+        if (
+            consent is None
+            or consent.disclosure_version != DECLARED_FACTS_DISCLOSURE_VERSION
+        ):
+            if not args.acknowledge_local_storage:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                    message=(
+                        "Compatibility sync stores normalized public platform, "
+                        "requirement, language, controller, accessibility-category, "
+                        "account-notice, and DRM-notice facts for explicitly demanded "
+                        "AppIDs. Raw responses and HTML are not retained. Account and "
+                        "machine demand lineage is private; backups may retain deleted copies."
+                    ),
+                    remediation=(
+                        "Rerun with --acknowledge-local-storage to accept this "
+                        "versioned local-storage policy."
+                    ),
+                )
+            storage.record_compatibility_data_consent(
+                account_id=account.id,
+                disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
+                accepted_at=started_at,
+                backups_acknowledged=True,
+            )
+        try:
+            run, candidates, targeted = storage.begin_declared_app_sync(
+                account_id=account.id,
+                machine_id=machine.id,
+                demanded_appids=demanded_appids,
+                country=country,
+                language=args.language,
+                max_items=args.max_items,
+                skip_fresh_terminal=True,
+                started_at=started_at,
+                disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
+            )
+        except ValueError:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The compatibility synchronization arguments are invalid.",
+                exit_code=2,
+            )
+        client = _declared_facts_client()
+        for index, appid in enumerate(targeted):
+            requested_at = _utc_now()
+            reserved = storage.reserve_provider_request(
+                provider="steam-store-appdetails",
+                budget_scope="global",
+                requested_at=requested_at,
+                minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
+            )
+            if not reserved:
+                time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS)
+                requested_at = _utc_now()
+                reserved = storage.reserve_provider_request(
+                    provider="steam-store-appdetails",
+                    budget_scope="global",
+                    requested_at=requested_at,
+                    minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
+                )
+            if not reserved:
+                storage.mark_remaining_declared_apps_unevaluated(
+                    run.id,
+                    observed_at=requested_at,
+                    error_code="REQUEST_THROTTLED",
+                )
+                break
+            try:
+                result = client.fetch(
+                    appid, country=country, language=args.language
+                )
+            except SteamDeclaredFactsError as exc:
+                try:
+                    storage.record_declared_app_result(
+                        run.id,
+                        account_id=account.id,
+                        appid=appid,
+                        state="failed",
+                        error_code=exc.code,
+                        observed_at=_utc_now(),
+                    )
+                except BaseException:
+                    storage.mark_remaining_declared_apps_unevaluated(
+                        run.id,
+                        observed_at=_utc_now(),
+                        error_code="SYNC_INTERRUPTED",
+                    )
+                    storage.finish_declared_app_sync(
+                        run.id, completed_at=_utc_now()
+                    )
+                    raise
+                retry_after = exc.retry_after_seconds
+                if exc.code == "RATE_LIMITED" and retry_after is None:
+                    retry_after = 300
+                if retry_after is not None:
+                    storage.defer_provider_requests(
+                        provider="steam-store-appdetails",
+                        budget_scope="global",
+                        requested_at=_utc_now(),
+                        retry_after_seconds=retry_after,
+                    )
+                if index + 1 < len(targeted):
+                    storage.mark_remaining_declared_apps_unevaluated(
+                        run.id,
+                        observed_at=_utc_now(),
+                        error_code=(
+                            "PROVIDER_COOLDOWN"
+                            if exc.code
+                            in {"PROVIDER_RESPONSE_INVALID", "RATE_LIMITED"}
+                            else exc.code
+                        ),
+                    )
+                break
+            except BaseException:
+                storage.mark_remaining_declared_apps_unevaluated(
+                    run.id,
+                    observed_at=_utc_now(),
+                    error_code="SYNC_INTERRUPTED",
+                )
+                storage.finish_declared_app_sync(run.id, completed_at=_utc_now())
+                raise
+            try:
+                storage.record_declared_app_result(
+                    run.id,
+                    account_id=account.id,
+                    appid=appid,
+                    state=result.state,
+                    facts=(
+                        None
+                        if result.facts is None
+                        else declared_facts_payload(result.facts)
+                    ),
+                    observed_at=_utc_now(),
+                )
+            except BaseException:
+                storage.mark_remaining_declared_apps_unevaluated(
+                    run.id,
+                    observed_at=_utc_now(),
+                    error_code="SYNC_INTERRUPTED",
+                )
+                storage.finish_declared_app_sync(run.id, completed_at=_utc_now())
+                raise
+        finished = storage.finish_declared_app_sync(
+            run.id, completed_at=_utc_now()
+        )
+        snapshot = storage.read_declared_app_snapshot(
+            account_id=account.id,
+            machine_id=machine.id,
+            country=country,
+            language=args.language,
+            appids=demanded_appids,
+        )
+    status = {
+        "complete": CompletenessStatus.COMPLETE,
+        "partial": CompletenessStatus.PARTIAL,
+        "failed": CompletenessStatus.UNAVAILABLE,
+    }[finished.status]
+    warnings = []
+    if finished.status != "complete":
+        warnings.append(
+            WarningRecord(
+                code=finished.error_code or ErrorCode.PARTIAL_SCAN,
+                message=(
+                    "Some demanded compatibility facts were not refreshed; "
+                    "available last-good facts were preserved."
+                ),
+            )
+        )
+    if owned_dependency_stale:
+        if status == CompletenessStatus.COMPLETE:
+            status = CompletenessStatus.PARTIAL
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.STALE_LAST_GOOD,
+                message=(
+                    "Compatibility demand came from a stale or superseded "
+                    "last-good visible-owned snapshot."
+                ),
+            )
+        )
+    return _emit_success(
+        args,
+        command=command,
+        context={
+            "account_alias": account.alias,
+            "machine_alias": machine.id,
+            "country": country,
+            "language": args.language,
+            "scope": "library",
+            "identifiers_included": True,
+        },
+        completeness_value=completeness(
+            status,
+            missing_capabilities=(
+                ["compatibility.declared.read"]
+                if finished.status == "failed"
+                else []
+            ),
+            stale_capabilities=(
+                sorted(
+                    ({"compatibility.declared.read"}
+                     if finished.status == "partial" else set())
+                    | ({"owned.visible.read"} if owned_dependency_stale else set())
+                )
+            ),
+            warnings=warnings,
+        ),
+        data={
+            "sync_run_id": finished.id,
+            "sync_status": finished.status,
+            "promoted": finished.promoted,
+            "error_code": finished.error_code,
+            "candidates": list(candidates),
+            "targeted": list(targeted),
+            "items": list(snapshot["items"]),
+            "demand": list(snapshot["latest_demand"]),
+            "schema_id": "declared-app-facts/0.1",
+            "support_level": "provisional",
+            "disclosure_version": DECLARED_FACTS_DISCLOSURE_VERSION,
+        },
+    )
+
+
+def _declared_facts_client() -> SteamDeclaredFactsClient:
+    return SteamDeclaredFactsClient()
 
 
 def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
@@ -3405,7 +3770,11 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
         deletion_subject = (
             "Local system-profile data"
             if args.provider == "local-system"
-            else "Steam Web API data"
+            else (
+                "Steam Store declared compatibility data"
+                if args.provider == "steam-store-appdetails"
+                else "Steam Web API data"
+            )
         )
         return _emit_error(
             args,
@@ -3447,6 +3816,47 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.provider in {"gg-deals", "cheapshark"}:
         return _delete_price_provider_data(args, database_path)
+    if args.provider == "steam-store-appdetails":
+        with Storage(database_path) as storage:
+            try:
+                account = (
+                    None if args.account is None else storage.get_account(args.account)
+                )
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="data.delete",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            deletion = (
+                {
+                    "observations_removed": 0,
+                    "demand_removed": 0,
+                    "current_removed": 0,
+                    "sync_runs_removed": 0,
+                    "consents_removed": 0,
+                }
+                if args.account is not None and account is None
+                else storage.delete_declared_app_data(
+                    account_id=None if account is None else account.id
+                )
+            )
+        return _emit_success(
+            args,
+            command="data.delete",
+            data={
+                "scope": "provider-all" if args.all else "account-provider",
+                "provider": args.provider,
+                "account_alias": args.account,
+                **deletion,
+                "global_public_current_preserved": not args.all,
+                "account_preserved": True,
+                "credential_preserved": True,
+                "backup_copies_require_separate_deletion": True,
+            },
+        )
     if args.provider == "steam-store-reviews":
         with Storage(database_path) as storage:
             try:

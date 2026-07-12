@@ -1,0 +1,22 @@
+{
+  "400": {
+    "success": true,
+    "data": {
+      "type": "game",
+      "steam_appid": 400,
+      "controller_support": "full",
+      "platforms": {"windows": true, "mac": false, "linux": true},
+      "pc_requirements": {
+        "minimum": "<p><strong>Minimum:</strong> 512MB RAM</p><p><strong>Recommended:</strong> 1GB RAM</p>"
+      },
+      "mac_requirements": {"minimum": "<strong>Minimum:</strong> 1GB RAM"},
+      "linux_requirements": [],
+      "supported_languages": "English<strong>*</strong>, French<br><strong>*</strong>languages with full audio support",
+      "categories": [
+        {"id": 28, "description": "Full controller support"},
+        {"id": 67, "description": "Camera Comfort"},
+        {"id": 9001, "description": "Future localized category"}
+      ]
+    }
+  }
+}

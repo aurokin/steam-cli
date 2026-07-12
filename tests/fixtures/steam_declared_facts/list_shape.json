@@ -1,0 +1,18 @@
+{
+  "620": {
+    "success": true,
+    "data": {
+      "steam_appid": 620,
+      "platforms": {"windows": true, "mac": false, "linux": true},
+      "pc_requirements": {
+        "minimum": "<strong>Minimum:</strong><br><ul class=\"bb_ul\"><li><strong>Memory:</strong> 2 GB RAM</li></ul>"
+      },
+      "mac_requirements": {},
+      "linux_requirements": null,
+      "supported_languages": "Portuguese - Brazil, Korean<strong>*</strong><br><strong>*</strong>languages with full audio support",
+      "categories": [],
+      "ext_user_account_notice": "Example account",
+      "drm_notice": "Example DRM"
+    }
+  }
+}

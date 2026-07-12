@@ -23,6 +23,8 @@ from steam_agent.local_accounts import validate_steam_id64
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
 TerminalSyncStatus = Literal["complete", "partial", "failed"]
+_DECLARED_APP_MAX_DEMAND = 10_000
+_DECLARED_APP_READ_CHUNK = 500
 STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID("d95b6568-2886-5d15-aa84-1986e4ac511e")
 
 
@@ -2127,6 +2129,50 @@ class Storage:
         values["backups_acknowledged"] = bool(values["backups_acknowledged"])
         return AccountDataConsent(**values)
 
+    def record_compatibility_data_consent(
+        self,
+        *,
+        account_id: int,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> AccountDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            self._require_steam_account(account_id)
+            self._connection.execute(
+                """INSERT INTO account_data_consents(
+                       account_id, consent_kind, disclosure_version,
+                       backups_acknowledged, accepted_at
+                   ) VALUES (?, 'compatibility_persistence', ?, 1, ?)
+                   ON CONFLICT(account_id, consent_kind) DO UPDATE SET
+                     disclosure_version=excluded.disclosure_version,
+                     backups_acknowledged=excluded.backups_acknowledged,
+                     accepted_at=excluded.accepted_at""",
+                (account_id, disclosure_version, timestamp),
+            )
+        consent = self.get_compatibility_data_consent(account_id)
+        assert consent is not None
+        return consent
+
+    def get_compatibility_data_consent(
+        self, account_id: int
+    ) -> AccountDataConsent | None:
+        row = self._connection.execute(
+            """SELECT * FROM account_data_consents
+               WHERE account_id=? AND consent_kind='compatibility_persistence'""",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return AccountDataConsent(**values)
+
     def record_system_profile_consent(
         self,
         *,
@@ -2501,6 +2547,647 @@ class Storage:
             "consents_removed": consent_cursor.rowcount,
             "evidence_removed": evidence_removed,
         }
+
+    def begin_declared_app_sync(
+        self,
+        *,
+        account_id: int,
+        machine_id: str,
+        demanded_appids: list[int] | tuple[int, ...],
+        country: str,
+        language: str,
+        max_items: int,
+        skip_fresh_terminal: bool,
+        started_at: str | datetime,
+        disclosure_version: str,
+    ) -> tuple[SyncRun, tuple[int, ...], tuple[int, ...]]:
+        """Schedule one bounded, account-authorized public-fact refresh."""
+
+        from steam_agent.steam_declared_facts import (
+            SteamDeclaredFactsRequestContext,
+        )
+
+        demanded = _catalog_appids(demanded_appids)
+        if not demanded:
+            raise ValueError("declared-app demand cannot be empty")
+        if len(demanded) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("declared-app demand exceeds the bounded maximum")
+        SteamDeclaredFactsRequestContext(country, language)
+        if (
+            not isinstance(max_items, int)
+            or isinstance(max_items, bool)
+            or not 1 <= max_items <= 100
+            or not isinstance(skip_fresh_terminal, bool)
+            or not disclosure_version
+        ):
+            raise ValueError("declared-app scheduling inputs are invalid")
+        timestamp = _timestamp(started_at)
+        fresh_cutoff = _timestamp(
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            - timedelta(days=7)
+        )
+        negative_cutoff = _timestamp(
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            - timedelta(hours=24)
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            if self.get_machine(machine_id) is None:
+                raise ValueError("declared-app machine is not configured")
+            consent = self.get_compatibility_data_consent(account_id)
+            if consent is None or consent.disclosure_version != disclosure_version:
+                raise InvalidSyncTransition(
+                    "current compatibility persistence consent is required"
+                )
+            self._prune_declared_apps(timestamp)
+            stale_cutoff = _timestamp(
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                - timedelta(minutes=15)
+            )
+            stale_runs = tuple(
+                int(row[0])
+                for row in self._connection.execute(
+                    """SELECT id FROM sync_runs
+                       WHERE account_id=?
+                         AND capability='compatibility.declared.read'
+                         AND status='running' AND started_at<?
+                         AND COALESCE((
+                           SELECT MAX(d.observed_at)
+                           FROM declared_app_sync_demand d
+                           WHERE d.sync_run_id=sync_runs.id
+                         ), started_at)<?""",
+                    (account_id, stale_cutoff, stale_cutoff),
+                )
+            )
+            for stale_run_id in stale_runs:
+                self._connection.execute(
+                    """UPDATE declared_app_sync_demand
+                       SET state='unevaluated', evaluated=0,
+                           error_code='SYNC_INTERRUPTED', observed_at=?
+                       WHERE sync_run_id=? AND state='running'""",
+                    (timestamp, stale_run_id),
+                )
+                self._connection.execute(
+                    """UPDATE sync_runs SET status='failed', promoted=0,
+                           completed_at=?, error_code='SYNC_INTERRUPTED',
+                           error_detail=NULL, records_seen=(
+                             SELECT COUNT(*) FROM declared_app_sync_demand
+                             WHERE sync_run_id=? AND evaluated=1
+                           )
+                       WHERE id=? AND status='running'""",
+                    (timestamp, stale_run_id, stale_run_id),
+                )
+            limit = self._connection.execute(
+                """SELECT cooldown_until FROM provider_request_limits
+                   WHERE provider='steam-store-appdetails'
+                     AND budget_scope='global'"""
+            ).fetchone()
+            cooldown_until = None if limit is None else limit["cooldown_until"]
+            if cooldown_until is not None and timestamp >= str(cooldown_until):
+                cooldown_until = None
+            candidates: list[int] = []
+            skip_codes: dict[int, str] = {}
+            for appid in demanded:
+                if cooldown_until is not None:
+                    skip_codes[appid] = "PROVIDER_COOLDOWN"
+                    continue
+                active = self._connection.execute(
+                    """SELECT 1 FROM declared_app_sync_demand d
+                       JOIN sync_runs r ON r.id=d.sync_run_id
+                       WHERE d.appid=? AND d.country=? AND d.language=?
+                         AND d.targeted=1 AND d.state='running'
+                         AND r.status='running' LIMIT 1""",
+                    (appid, country, language),
+                ).fetchone()
+                if active is not None:
+                    skip_codes[appid] = "ACTIVE_REQUEST"
+                    continue
+                if skip_fresh_terminal:
+                    current = self._connection.execute(
+                        """SELECT 1 FROM declared_app_current
+                           WHERE appid=? AND country=? AND language=?
+                             AND provider='steam_store' AND observed_at>=?""",
+                        (appid, country, language, fresh_cutoff),
+                    ).fetchone()
+                    negative = self._connection.execute(
+                        """SELECT 1 FROM declared_app_sync_demand d
+                           JOIN sync_runs r ON r.id=d.sync_run_id
+                           WHERE d.appid=? AND d.country=? AND d.language=?
+                             AND d.evaluated=1 AND d.observed_at>=?
+                             AND d.state='not_found'
+                           ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
+                        (appid, country, language, negative_cutoff),
+                    ).fetchone()
+                    if current is not None:
+                        skip_codes[appid] = "FRESH_LAST_GOOD"
+                        continue
+                    if negative is not None:
+                        skip_codes[appid] = "NOT_FOUND_CACHE"
+                        continue
+                candidates.append(appid)
+            targeted = tuple(candidates[:max_items])
+            target_set = set(targeted)
+            cursor = self._connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, status
+                   ) VALUES (
+                       'steam_store', 'compatibility.declared.read', ?, ?, 'running'
+                   )""",
+                (account_id, timestamp),
+            )
+            run_id = int(cursor.lastrowid)
+            candidate_set = set(candidates)
+            for ordinal, appid in enumerate(demanded):
+                self._ensure_steam_application_identity(appid, observed_at=timestamp)
+                targeted_value = appid in target_set
+                if targeted_value:
+                    state = "running"
+                    skip_code = None
+                elif appid not in candidate_set:
+                    state = "unevaluated"
+                    skip_code = skip_codes[appid]
+                else:
+                    state = "unevaluated"
+                    skip_code = "MAX_ITEMS_LIMIT"
+                self._connection.execute(
+                    """INSERT INTO declared_app_sync_demand(
+                           sync_run_id, account_id, machine_id, appid,
+                           country, language, ordinal, targeted, state,
+                           error_code, retry_at, observed_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        account_id,
+                        machine_id,
+                        appid,
+                        country,
+                        language,
+                        ordinal,
+                        int(targeted_value),
+                        state,
+                        skip_code,
+                        (
+                            cooldown_until
+                            if skip_code == "PROVIDER_COOLDOWN"
+                            else None
+                        ),
+                        None if targeted_value else timestamp,
+                    ),
+                )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(run_id), tuple(candidates), targeted
+
+    def record_declared_app_result(
+        self,
+        sync_run_id: int,
+        *,
+        account_id: int,
+        appid: int,
+        state: Literal["ready", "not_found", "failed"],
+        observed_at: str | datetime,
+        facts: Mapping[str, Any] | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """Record one target and promote only a newer complete public fact."""
+
+        from steam_agent.steam_declared_facts import (
+            validate_declared_facts_payload,
+        )
+
+        if state not in {"ready", "not_found", "failed"} or (
+            state == "ready"
+        ) != (facts is not None):
+            raise ValueError("declared-app result is invalid")
+        if state == "failed" and not error_code:
+            raise ValueError("failed declared-app result requires an error code")
+        if state != "failed" and error_code is not None:
+            raise ValueError("successful declared-app result cannot carry an error")
+        timestamp = _timestamp(observed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            demand = self._connection.execute(
+                """SELECT d.*, r.started_at FROM declared_app_sync_demand d
+                   JOIN sync_runs r ON r.id=d.sync_run_id
+                   WHERE d.sync_run_id=? AND d.account_id=? AND d.appid=?
+                     AND d.targeted=1""",
+                (sync_run_id, account_id, appid),
+            ).fetchone()
+            if demand is None or demand["state"] != "running":
+                raise InvalidSyncTransition("declared-app target is not running")
+            if facts is not None:
+                canonical = validate_declared_facts_payload(
+                    facts,
+                    appid=appid,
+                    country=str(demand["country"]),
+                    language=str(demand["language"]),
+                )
+                facts_json = json.dumps(
+                    canonical,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                source = canonical["source"]
+                self._connection.execute(
+                    """INSERT INTO declared_app_observations(
+                           sync_run_id, appid, country, language, schema_id,
+                           facts_json, provider, support_level, source_locator,
+                           human_reference_url, observed_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        sync_run_id,
+                        appid,
+                        demand["country"],
+                        demand["language"],
+                        canonical["schema_id"],
+                        facts_json,
+                        source["provider"],
+                        source["support_level"],
+                        source["source_locator"],
+                        source["human_reference_url"],
+                        timestamp,
+                    ),
+                )
+                current = self._connection.execute(
+                    """SELECT c.observed_at, c.promoted_sync_run_id, r.started_at
+                       FROM declared_app_current c
+                       LEFT JOIN sync_runs r ON r.id=c.promoted_sync_run_id
+                       WHERE c.appid=? AND c.country=? AND c.language=?
+                         AND c.provider='steam_store'""",
+                    (appid, demand["country"], demand["language"]),
+                ).fetchone()
+                promote = current is None or (
+                    timestamp >= str(current["observed_at"])
+                    and (
+                        current["started_at"] is None
+                        or (str(demand["started_at"]), sync_run_id)
+                        > (
+                            str(current["started_at"]),
+                            int(current["promoted_sync_run_id"]),
+                        )
+                    )
+                )
+                if promote:
+                    self._connection.execute(
+                        """INSERT INTO declared_app_current(
+                               appid, country, language, schema_id, facts_json,
+                               provider, support_level, source_locator,
+                               human_reference_url, observed_at,
+                               promoted_sync_run_id
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(appid, country, language, provider)
+                           DO UPDATE SET
+                             schema_id=excluded.schema_id,
+                             facts_json=excluded.facts_json,
+                             support_level=excluded.support_level,
+                             source_locator=excluded.source_locator,
+                             human_reference_url=excluded.human_reference_url,
+                             observed_at=excluded.observed_at,
+                             promoted_sync_run_id=excluded.promoted_sync_run_id""",
+                        (
+                            appid,
+                            demand["country"],
+                            demand["language"],
+                            canonical["schema_id"],
+                            facts_json,
+                            source["provider"],
+                            source["support_level"],
+                            source["source_locator"],
+                            source["human_reference_url"],
+                            timestamp,
+                            sync_run_id,
+                        ),
+                    )
+            self._connection.execute(
+                """UPDATE declared_app_sync_demand
+                   SET evaluated=1, state=?, error_code=?, observed_at=?
+                   WHERE sync_run_id=? AND appid=?""",
+                (state, error_code, timestamp, sync_run_id, appid),
+            )
+            if state == "failed" and error_code == "PROVIDER_RESPONSE_INVALID":
+                cooldown_until = _timestamp(
+                    datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    + timedelta(hours=24)
+                )
+                self._connection.execute(
+                    """INSERT INTO provider_request_limits(
+                           provider, budget_scope, next_allowed_at, cooldown_until
+                       ) VALUES ('steam-store-appdetails', 'global', ?, ?)
+                       ON CONFLICT(provider, budget_scope) DO UPDATE SET
+                         cooldown_until=CASE
+                           WHEN cooldown_until IS NULL
+                             OR cooldown_until < excluded.cooldown_until
+                           THEN excluded.cooldown_until ELSE cooldown_until END""",
+                    (timestamp, cooldown_until),
+                )
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def mark_remaining_declared_apps_unevaluated(
+        self, sync_run_id: int, *, observed_at: str | datetime, error_code: str
+    ) -> int:
+        if not error_code:
+            raise ValueError("declared-app interruption requires an error code")
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE declared_app_sync_demand
+                   SET state='unevaluated', evaluated=0,
+                       error_code=?, observed_at=?
+                   WHERE sync_run_id=? AND state='running'""",
+                (error_code, _timestamp(observed_at), sync_run_id),
+            )
+        return cursor.rowcount
+
+    def finish_declared_app_sync(
+        self, sync_run_id: int, *, completed_at: str | datetime
+    ) -> SyncRun:
+        timestamp = _timestamp(completed_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            run = self._connection.execute(
+                "SELECT * FROM sync_runs WHERE id=?", (sync_run_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["capability"] != "compatibility.declared.read"
+                or run["status"] != "running"
+            ):
+                raise InvalidSyncTransition("declared-app sync is not active")
+            self._connection.execute(
+                """UPDATE declared_app_sync_demand
+                   SET state='unevaluated', evaluated=0,
+                       error_code='SYNC_INTERRUPTED', observed_at=?
+                   WHERE sync_run_id=? AND state='running'""",
+                (timestamp, sync_run_id),
+            )
+            counts = self._connection.execute(
+                """SELECT
+                     SUM(CASE WHEN targeted=1 AND evaluated=1
+                               AND state IN ('ready','not_found') THEN 1 ELSE 0 END)
+                       + SUM(CASE WHEN targeted=0 AND error_code IN
+                                 ('FRESH_LAST_GOOD','NOT_FOUND_CACHE')
+                                  THEN 1 ELSE 0 END) AS valid,
+                     SUM(CASE WHEN targeted=1 AND
+                                    (state='failed' OR evaluated=0)
+                               THEN 1 ELSE 0 END)
+                       + SUM(CASE WHEN targeted=0 AND error_code IN
+                                 ('ACTIVE_REQUEST','MAX_ITEMS_LIMIT',
+                                  'PROVIDER_COOLDOWN')
+                                  THEN 1 ELSE 0 END) AS unresolved,
+                     SUM(CASE WHEN error_code='PROVIDER_COOLDOWN'
+                               THEN 1 ELSE 0 END) AS cooldown,
+                     SUM(CASE WHEN error_code='ACTIVE_REQUEST'
+                               THEN 1 ELSE 0 END) AS active,
+                     SUM(CASE WHEN error_code='MAX_ITEMS_LIMIT'
+                               THEN 1 ELSE 0 END) AS capped
+                   FROM declared_app_sync_demand WHERE sync_run_id=?""",
+                (sync_run_id,),
+            ).fetchone()
+            evaluated = int(
+                self._connection.execute(
+                    """SELECT COUNT(*) FROM declared_app_sync_demand
+                       WHERE sync_run_id=? AND evaluated=1""",
+                    (sync_run_id,),
+                ).fetchone()[0]
+            )
+            valid = int(counts["valid"] or 0)
+            unresolved = int(counts["unresolved"] or 0)
+            if unresolved == 0:
+                status = "complete"
+                error_code = None
+            else:
+                status = "partial" if valid > 0 else "failed"
+                if int(counts["cooldown"] or 0):
+                    error_code = "PROVIDER_COOLDOWN"
+                elif int(counts["active"] or 0):
+                    error_code = "ACTIVE_REQUEST"
+                elif int(counts["capped"] or 0):
+                    error_code = "MAX_ITEMS_LIMIT"
+                else:
+                    error_code = (
+                        "DECLARED_APP_SYNC_PARTIAL"
+                        if status == "partial"
+                        else "DECLARED_APP_SYNC_FAILED"
+                    )
+            promoted = int(
+                self._connection.execute(
+                    """SELECT EXISTS(
+                         SELECT 1 FROM declared_app_observations
+                         WHERE sync_run_id=?
+                       )""",
+                    (sync_run_id,),
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """UPDATE sync_runs SET status=?, promoted=?, records_seen=?,
+                     completed_at=?, error_code=?, error_detail=NULL WHERE id=?""",
+                (status, promoted, evaluated, timestamp, error_code, sync_run_id),
+            )
+            self._prune_declared_apps(timestamp)
+            self._connection.commit()
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+        return self.get_sync_run(sync_run_id)
+
+    def read_declared_app_snapshot(
+        self,
+        *,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        appids: list[int] | tuple[int, ...] = (),
+    ) -> Mapping[str, Any]:
+        """Read global current facts with account/machine demand lineage."""
+
+        from steam_agent.steam_declared_facts import (
+            SteamDeclaredFactsRequestContext,
+            validate_declared_facts_payload,
+        )
+
+        SteamDeclaredFactsRequestContext(country, language)
+        selected = _catalog_appids(appids)
+        if not selected:
+            raise ValueError("declared-app snapshot requires explicit appids")
+        if len(selected) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("declared-app demand exceeds the bounded maximum")
+        self._require_steam_account(account_id)
+        if self.get_machine(machine_id) is None:
+            raise ValueError("declared-app machine is not configured")
+        selected_rows = []
+        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
+            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            selected_rows.extend(
+                self._connection.execute(
+                    f"""SELECT c.* FROM declared_app_current c
+                        WHERE c.country=? AND c.language=?
+                          AND c.provider='steam_store'
+                          AND c.appid IN ({placeholders}) ORDER BY c.appid""",
+                    (country, language, *chunk),
+                )
+            )
+        rows = tuple(
+            {
+                **dict(row),
+                "facts": validate_declared_facts_payload(
+                    json.loads(row["facts_json"]),
+                    appid=int(row["appid"]),
+                    country=country,
+                    language=language,
+                ),
+            }
+            for row in selected_rows
+        )
+        by_appid = {
+            int(row["appid"]): {
+                key: value for key, value in row.items() if key != "facts_json"
+            }
+            for row in rows
+        }
+        items = tuple(
+            by_appid.get(appid, {"appid": appid, "facts": None})
+            for appid in selected
+        )
+        latest = self._connection.execute(
+            """SELECT r.* FROM sync_runs r
+               JOIN declared_app_sync_demand d ON d.sync_run_id=r.id
+               WHERE d.account_id=? AND d.machine_id=?
+                 AND d.country=? AND d.language=?
+               ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
+            (account_id, machine_id, country, language),
+        ).fetchone()
+        demand_by_appid: dict[int, Mapping[str, Any]] = {}
+        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
+            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            demand_rows = self._connection.execute(
+                f"""SELECT d.appid,d.ordinal,d.targeted,d.evaluated,d.state,
+                           d.error_code,d.retry_at,d.observed_at,
+                           r.id AS sync_run_id,r.status AS sync_status,
+                           r.started_at,r.completed_at
+                    FROM declared_app_sync_demand d
+                    JOIN sync_runs r ON r.id=d.sync_run_id
+                    WHERE d.account_id=? AND d.machine_id=?
+                      AND d.country=? AND d.language=?
+                      AND d.appid IN ({placeholders})
+                    ORDER BY d.appid,r.started_at DESC,r.id DESC""",
+                (account_id, machine_id, country, language, *chunk),
+            )
+            for row in demand_rows:
+                demand_by_appid.setdefault(int(row["appid"]), dict(row))
+        demand = tuple(
+            demand_by_appid.get(
+                appid,
+                {
+                    "appid": appid,
+                    "ordinal": None,
+                    "targeted": 0,
+                    "evaluated": 0,
+                    "state": "unattempted",
+                    "error_code": "NOT_SYNCED",
+                    "retry_at": None,
+                    "observed_at": None,
+                    "sync_run_id": None,
+                    "sync_status": None,
+                    "started_at": None,
+                    "completed_at": None,
+                },
+            )
+            for appid in selected
+        )
+        return {
+            "items": items,
+            "latest": None if latest is None else _sync_run(latest),
+            "latest_demand": demand,
+        }
+
+    def _prune_declared_apps(self, now: str) -> None:
+        cutoff = _timestamp(
+            datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=30)
+        )
+        self._connection.execute(
+            "DELETE FROM declared_app_current WHERE observed_at < ?", (cutoff,)
+        )
+        self._connection.execute(
+            """DELETE FROM sync_runs
+               WHERE capability='compatibility.declared.read' AND started_at < ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM declared_app_current c
+                   WHERE c.promoted_sync_run_id=sync_runs.id
+                 )""",
+            (cutoff,),
+        )
+
+    def delete_declared_app_data(
+        self, *, account_id: int | None = None
+    ) -> Mapping[str, int]:
+        """Delete account demand/consent or all provisional provider facts."""
+
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            if account_id is not None:
+                self._require_steam_account(account_id)
+            where = "" if account_id is None else " AND account_id=?"
+            parameters: tuple[object, ...] = () if account_id is None else (account_id,)
+            observations = int(
+                self._connection.execute(
+                    f"""SELECT COUNT(*) FROM declared_app_observations
+                        WHERE sync_run_id IN (
+                          SELECT id FROM sync_runs
+                          WHERE capability='compatibility.declared.read'{where}
+                        )""",
+                    parameters,
+                ).fetchone()[0]
+            )
+            demand = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM declared_app_sync_demand"
+                    + ("" if account_id is None else " WHERE account_id=?"),
+                    parameters,
+                ).fetchone()[0]
+            )
+            runs = self._connection.execute(
+                "DELETE FROM sync_runs WHERE capability='compatibility.declared.read'"
+                + where,
+                parameters,
+            ).rowcount
+            consent_where = (
+                "consent_kind='compatibility_persistence'"
+                if account_id is None
+                else "consent_kind='compatibility_persistence' AND account_id=?"
+            )
+            consents = self._connection.execute(
+                "DELETE FROM account_data_consents WHERE " + consent_where,
+                parameters,
+            ).rowcount
+            current = 0
+            if account_id is None:
+                current = self._connection.execute(
+                    "DELETE FROM declared_app_current"
+                ).rowcount
+                self._connection.execute(
+                    """DELETE FROM provider_request_limits
+                       WHERE provider='steam-store-appdetails'"""
+                )
+            self._connection.commit()
+            return {
+                "observations_removed": observations,
+                "demand_removed": demand,
+                "current_removed": current,
+                "sync_runs_removed": runs,
+                "consents_removed": consents,
+            }
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
 
     def begin_activity_sync(
         self,
