@@ -154,6 +154,37 @@ def configured(tmp_path: Path) -> tuple[Path, int]:
     return data_dir, account.id
 
 
+def test_unavailable_wishlist_is_not_empty_and_invalid_alias_is_typed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    with Storage(data_dir / "steam-agent.sqlite3") as storage:
+        storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=NOW,
+        )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    base = [
+        "--data-dir",
+        str(data_dir),
+        "recommendations",
+        "wishlist",
+        "--country",
+        "US",
+    ]
+    unavailable = invoke(base + ["--account", "primary"], capsys)
+    assert unavailable["completeness"]["status"] == "unavailable"
+    assert unavailable["data"]["empty"] is False
+    assert unavailable["data"]["degradation_reasons"] == []
+
+    assert cli.main(base + ["--account", "!invalid"]) == 2
+    invalid = json.loads(capsys.readouterr().out)
+    assert invalid["error"]["code"] == "INVALID_ARGUMENT"
+
+
 def test_review_sync_requires_current_disclosure_and_retains_no_body(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

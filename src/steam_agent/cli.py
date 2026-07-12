@@ -1177,7 +1177,13 @@ def _dispatch_sync_reviews(args: argparse.Namespace, database_path: Path) -> int
         try:
             account = storage.get_account(args.account)
         except ValueError:
-            account = None
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
         if account is None:
             return _emit_error(
                 args,
@@ -1315,7 +1321,13 @@ def _dispatch_wishlist_recommendations(
         try:
             account = storage.get_account(args.account)
         except ValueError:
-            account = None
+            return _emit_error(
+                args,
+                command="recommendations.wishlist",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+                exit_code=2,
+            )
         if account is None:
             return _emit_success(
                 args,

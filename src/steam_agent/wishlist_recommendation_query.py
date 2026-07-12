@@ -95,7 +95,7 @@ def build_wishlist_recommendation_query(
     assert isinstance(data, dict)
     data.update(
         {
-            "empty": not snapshot.deals.wishlist.games,
+            "empty": deal_result["data"]["empty"],  # type: ignore[index]
             "next_cursor": None,
             "deal_snapshot": deal_result["data"]["snapshots"],  # type: ignore[index]
             "deal_fallback": deal_result["data"]["fallback"],  # type: ignore[index]
@@ -135,7 +135,12 @@ def build_wishlist_recommendation_query(
                 "message": "Optional aggregate review evidence is future-dated and treated as unknown.",
             }
         )
-    if ranked.status == "degraded":
+    wishlist_known_empty = deal_result["data"]["empty"] is True  # type: ignore[index]
+    if not snapshot.deals.wishlist.games:
+        data["degradation_reasons"] = []
+    if wishlist_known_empty:
+        data["status"] = "complete"
+    if ranked.status == "degraded" and snapshot.deals.wishlist.games:
         status = "partial" if status != "unavailable" else status
         warnings.extend(
             {"code": reason.upper(), "message": reason.replace("_", " ")}

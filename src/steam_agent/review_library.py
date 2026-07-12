@@ -80,6 +80,7 @@ def sync_wishlist_reviews(
     fatal: ReviewSyncError | None = None
     for appid in targeted:
         observed = clock()
+        request_started = False
         try:
             if not storage.reserve_provider_request(
                 provider=REVIEW_PROVIDER,
@@ -98,6 +99,7 @@ def sync_wishlist_reviews(
                     minimum_interval_seconds=minimum_interval_seconds,
                 ):
                     raise ReviewSyncError("REQUEST_THROTTLED", retryable=True)
+            request_started = True
             summary = api.fetch_summary(appid)
             storage.record_review_result(
                 run.id,
@@ -126,6 +128,12 @@ def sync_wishlist_reviews(
         except (SteamReviewError, ReviewSyncError) as exc:
             code = exc.code
             retryable = exc.retryable
+            if not request_started:
+                fatal = ReviewSyncError(code, retryable=retryable)
+                storage.mark_remaining_reviews_unevaluated(
+                    run.id, observed_at=clock(), error_code=code
+                )
+                break
             storage.record_review_result(
                 run.id,
                 account_id=account_id,

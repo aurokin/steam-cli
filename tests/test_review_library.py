@@ -236,6 +236,36 @@ def test_retryable_failure_without_header_persists_default_restart_cooldown(
         )
 
 
+def test_pre_network_cooldown_leaves_every_subject_unevaluated(tmp_path) -> None:
+    paced = PacedClock()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 2)
+        storage.defer_provider_requests(
+            provider="steam-store-reviews",
+            budget_scope="public-aggregate",
+            requested_at=NOW,
+            retry_after_seconds=60,
+        )
+        client = Client()
+        with pytest.raises(ReviewSyncError, match="REQUEST_THROTTLED"):
+            sync_wishlist_reviews(
+                storage,
+                account_id=account_id,
+                max_items=2,
+                client=client,
+                clock=paced,
+                sleeper=paced.sleep,
+            )
+        assert client.calls == []
+        rows = storage._connection.execute(  # noqa: SLF001
+            "SELECT evaluated, state, error_code FROM review_sync_demand ORDER BY ordinal"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            (0, "unevaluated", "REQUEST_THROTTLED"),
+            (0, "unevaluated", "REQUEST_THROTTLED"),
+        ]
+
+
 def test_review_projection_is_global_but_account_demand_isolated_and_pruned(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         first = setup_wishlist(storage, 1)
