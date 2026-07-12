@@ -16,7 +16,7 @@ import sys
 import sqlite3
 import stat
 import time
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 import unicodedata
 import warnings
 
@@ -813,9 +813,19 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                 )
             try:
                 result = (
-                    query_activity(storage, account_id=account.id, appid=args.appid)
+                    query_activity(
+                        storage,
+                        account_id=account.id,
+                        appid=args.appid,
+                        clock=_utc_now,
+                    )
                     if args.command == "activity"
-                    else query_achievements(storage, account_id=account.id, appid=args.appid)
+                    else query_achievements(
+                        storage,
+                        account_id=account.id,
+                        appid=args.appid,
+                        clock=_utc_now,
+                    )
                 )
             except ValueError:
                 return _emit_error(
@@ -825,17 +835,7 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                     message="The query arguments are invalid.",
                     exit_code=2,
                 )
-        snapshot = result["snapshot"]
-        last_status = snapshot["last_attempt_status"]
-        query_completeness = completeness(
-            CompletenessStatus.UNAVAILABLE if last_status is None else CompletenessStatus.COMPLETE,
-            missing_capabilities=[] if last_status is not None else [f"{args.command}.read"],
-            warnings=(
-                []
-                if last_status is not None
-                else [WarningRecord(code=ErrorCode.NOT_SYNCED, message=f"{args.command.title()} have not been synchronized.")]
-            ),
-        )
+        query_completeness = _activity_query_completeness(args.command, result)
         return _emit_success(
             args,
             command=command,
@@ -3990,6 +3990,124 @@ def _installed_read_completeness(root: Path | None) -> dict[str, Any]:
     )
 
 
+def _activity_query_completeness(
+    subject: str, result: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Summarize behavioral evidence without hiding subject-level uncertainty."""
+
+    capability = f"{subject}.read"
+    snapshot = result["snapshot"]
+    status = snapshot["last_attempt_status"]
+    if status is None:
+        return completeness(
+            CompletenessStatus.UNAVAILABLE,
+            missing_capabilities=[capability],
+            warnings=[
+                WarningRecord(
+                    code=ErrorCode.NOT_SYNCED,
+                    message=f"{subject.title()} have not been synchronized.",
+                )
+            ],
+        )
+    if subject == "activity":
+        successful_at = snapshot.get("last_successful_sync_at")
+        if status == "running":
+            return completeness(
+                (
+                    CompletenessStatus.UNAVAILABLE
+                    if successful_at is None
+                    else CompletenessStatus.PARTIAL
+                ),
+                missing_capabilities=[capability] if successful_at is None else [],
+                stale_capabilities=[capability] if successful_at is not None else [],
+                warnings=[
+                    WarningRecord(
+                        code=ErrorCode.SYNC_IN_PROGRESS,
+                        message=(
+                            "Activity synchronization is in progress."
+                            if successful_at is None
+                            else "Activity synchronization is in progress; results use the last-good snapshot."
+                        ),
+                    )
+                ],
+            )
+        if status != "complete":
+            if successful_at is None:
+                return completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=[capability],
+                    warnings=[
+                        WarningRecord(
+                            code=snapshot.get("last_error_code") or ErrorCode.STALE_LAST_GOOD,
+                            message="The latest activity synchronization failed and no last-good snapshot exists.",
+                        )
+                    ],
+                )
+            return completeness(
+                CompletenessStatus.PARTIAL,
+                stale_capabilities=[capability],
+                warnings=[
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message="The latest activity synchronization failed; results use the last-good snapshot.",
+                    )
+                ],
+            )
+        stale = any(
+            item["freshness"]["activity"] != "fresh" for item in result["items"]
+        )
+        if not stale and successful_at is not None:
+            completed = datetime.fromisoformat(successful_at.replace("Z", "+00:00"))
+            stale = (_utc_now() - completed).total_seconds() > 6 * 60 * 60
+        if stale:
+            return completeness(
+                CompletenessStatus.PARTIAL,
+                stale_capabilities=[capability],
+                warnings=[
+                    WarningRecord(
+                        code=ErrorCode.STALE_LAST_GOOD,
+                        message="The activity snapshot is older than the freshness policy.",
+                    )
+                ],
+            )
+        return completeness(CompletenessStatus.COMPLETE)
+
+    items = result["items"]
+    uncertain = [
+        item for item in items if item["state"] in {"failed", "running", "unevaluated", "expired"}
+    ]
+    stale = [item for item in items if item.get("freshness") == "stale"]
+    if uncertain or stale or status != "complete":
+        warnings: list[WarningRecord] = []
+        if any(item["state"] == "running" for item in uncertain):
+            warnings.append(
+                WarningRecord(
+                    code=ErrorCode.SYNC_IN_PROGRESS,
+                    message="Achievement synchronization is still in progress for some subjects.",
+                )
+            )
+        if any(item["state"] in {"failed", "unevaluated", "expired"} for item in uncertain):
+            warnings.append(
+                WarningRecord(
+                    code=ErrorCode.PARTIAL_SCAN,
+                    message="Achievement evidence is unavailable for some requested subjects.",
+                )
+            )
+        if stale:
+            warnings.append(
+                WarningRecord(
+                    code=ErrorCode.STALE_LAST_GOOD,
+                    message="Some achievement evidence is older than the freshness policy.",
+                )
+            )
+        return completeness(
+            CompletenessStatus.PARTIAL,
+            stale_capabilities=[capability],
+            warnings=warnings,
+        )
+    return completeness(CompletenessStatus.COMPLETE)
+
+
 def _table_field(value: object) -> str:
     """Render one physical table field without terminal/control injection."""
 
@@ -4020,6 +4138,9 @@ def _print_table_fields(*values: object) -> None:
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
     if command == "activity.query":
+        _print_table_fields("COMPLETENESS", envelope["completeness"]["status"])
+        for warning in envelope["completeness"]["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
         _print_table_fields("APPID", "NAME", "LIFETIME_MINUTES", "RECENT_MINUTES", "LAST_PLAYED_AT", "FRESHNESS")
         for item in envelope["data"]["items"]:
             _print_table_fields(
@@ -4029,6 +4150,9 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
             )
         return
     if command == "achievements.query":
+        _print_table_fields("COMPLETENESS", envelope["completeness"]["status"])
+        for warning in envelope["completeness"]["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
         _print_table_fields("APPID", "NAME", "STATE", "TARGETED", "UNLOCKED", "TOTAL", "FRESHNESS")
         for item in envelope["data"]["items"]:
             _print_table_fields(

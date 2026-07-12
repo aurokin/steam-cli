@@ -63,10 +63,9 @@ def sync_activity(
     clock: Clock = now_utc,
 ) -> ActivitySyncResult:
     api = client or SteamActivityApiClient()
-    run = storage.begin_sync(
-        provider="steam_web_api",
-        capability="activity.read",
+    run = storage.begin_activity_sync(
         account_id=account_id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         started_at=clock(),
     )
     try:
@@ -93,6 +92,7 @@ def sync_activity(
             observed_at=observed_at,
             recent_observed_at=observed_at,
             completed_at=clock(),
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         )
         return ActivitySyncResult(completed, len(acquired.owned.games), len(acquired.recent.games))
     except BaseException as exc:
@@ -164,6 +164,7 @@ def query_activity(
         "items": items,
         "snapshot": {
             "last_attempt_status": None if latest is None else latest.status,
+            "last_error_code": None if latest is None else latest.error_code,
             "last_successful_sync_at": None if last_good is None else last_good.completed_at,
             "using_last_good": latest is not None and latest.status != "complete" and last_good is not None,
         },
@@ -219,8 +220,15 @@ def sync_achievements(
     candidates = achievement_candidates(storage, account_id=account_id, scope=scope, explicit_appids=explicit_appids)
     targeted = candidates[:max_items]
     api = client or SteamActivityApiClient()
-    run = storage.begin_achievement_sync(account_id=account_id, candidates=candidates, targeted=targeted, started_at=clock())
+    run = storage.begin_achievement_sync(
+        account_id=account_id,
+        candidates=candidates,
+        targeted=targeted,
+        started_at=clock(),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
     counts: dict[str, int] = {}
+    fatal: ActivitySyncError | None = None
     for target_index, appid in enumerate(targeted):
         state = "failed"
         error_code: str | None = None
@@ -249,17 +257,24 @@ def sync_achievements(
                     }
                     for item in cached_schema["achievements"]
                 )
-        except SteamActivityApiError as exc:
+        except (SteamActivityApiError, ActivitySyncError) as exc:
             error_code, _ = _provider_error(exc)
+            if isinstance(exc, ActivitySyncError):
+                fatal = ActivitySyncError(error_code, retryable=exc.retryable)
+        except BaseException:
+            error_code = "INTERNAL_ERROR"
+            fatal = ActivitySyncError(error_code, retryable=False)
         storage.record_achievement_result(
             run.id, account_id=account_id, appid=appid, state=state,
             player=player_rows, schema_state=schema_state, schema=schema_rows,
             observed_at=clock(), error_code=error_code,
             write_schema=write_schema,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         )
         counts[state] = counts.get(state, 0) + 1
         if state == "failed" and error_code in {
-            "AUTHENTICATION_FAILED", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE"
+            "AUTHENTICATION_FAILED", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE",
+            "REQUEST_THROTTLED", "INTERNAL_ERROR",
         }:
             storage.mark_remaining_achievements_unevaluated(
                 run.id, observed_at=clock(), error_code=error_code
@@ -271,14 +286,16 @@ def sync_achievements(
     completed = storage.finish_achievement_sync(run.id, completed_at=clock())
     if len(candidates) > len(targeted):
         counts["unevaluated"] = counts.get("unevaluated", 0) + len(candidates) - len(targeted)
+    if fatal is not None:
+        raise fatal
     return AchievementSyncResult(completed, len(candidates), len(targeted), dict(sorted(counts.items())))
 
 
 def query_achievements(
     storage: Storage, *, account_id: int, appid: int | None = None, clock: Clock = now_utc
 ) -> dict[str, object]:
-    snapshot = storage.read_achievement_snapshot(account_id, appid=appid)
     now = clock().astimezone(timezone.utc)
+    snapshot = storage.read_achievement_snapshot(account_id, appid=appid, now=now)
     items: list[dict[str, object]] = []
     for row in snapshot["items"]:
         visible: list[dict[str, object]] = []
@@ -327,6 +344,11 @@ def query_achievements(
             "last_good_summary": last_good_summary if state != "ready" else None,
             "achievements": visible if state == "ready" else [],
             "observed_at": observed_at,
+            "freshness": (
+                None
+                if age is None
+                else ("fresh" if age <= ACHIEVEMENT_FRESH else "stale")
+            ),
             "error_code": row["error_code"],
             "limitations": ["achievement_percentage_is_not_game_progress"],
         })

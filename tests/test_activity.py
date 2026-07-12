@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from steam_agent.activity import (
+    ACTIVITY_DISCLOSURE_VERSION,
     ActivitySyncError,
     query_activity,
     query_achievements,
@@ -22,7 +23,7 @@ from steam_agent.steam_activity_api import (
     PlayerAchievements,
     SteamActivityApiError,
 )
-from steam_agent.storage import Storage
+from steam_agent.storage import InvalidSyncTransition, Storage
 
 
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
@@ -60,6 +61,12 @@ class FakeClient:
 def configured() -> tuple[Storage, int]:
     storage = Storage(":memory:")
     account = storage.configure_steam_account(alias="primary", steam_id64="76561198000000001", configured_at=NOW)
+    storage.record_activity_data_consent(
+        account_id=account.id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        accepted_at=NOW,
+        backups_acknowledged=True,
+    )
     yield storage, account.id
     storage.close()
 
@@ -202,3 +209,198 @@ def test_fresh_schema_cache_is_reused_without_hiding_prior_subjects(configured: 
     assert client.schema_calls == [10, 20]
     items = query_achievements(storage, account_id=account_id, clock=lambda: NOW + timedelta(hours=1))["items"]
     assert [item["appid"] for item in items] == [10, 20]
+
+
+def test_storage_rejects_behavioral_collection_without_current_consent() -> None:
+    storage = Storage(":memory:")
+    account = storage.configure_steam_account(
+        alias="primary", steam_id64="76561198000000001", configured_at=NOW
+    )
+    client = FakeClient()
+    with pytest.raises(InvalidSyncTransition, match="consent"):
+        sync_activity(
+            storage,
+            account_id=account.id,
+            steamid=account.provider_account_id,
+            api_key=SecretValue("s"),
+            client=client,
+            clock=lambda: NOW,
+        )
+    storage.record_activity_data_consent(
+        account_id=account.id,
+        disclosure_version="obsolete",
+        accepted_at=NOW,
+        backups_acknowledged=True,
+    )
+    with pytest.raises(InvalidSyncTransition, match="consent"):
+        sync_achievements(
+            storage,
+            account_id=account.id,
+            steamid=account.provider_account_id,
+            api_key=SecretValue("s"),
+            scope="owned",
+            explicit_appids=(10,),
+            client=client,
+            clock=lambda: NOW,
+        )
+    storage.close()
+
+
+def test_request_gate_failure_terminalizes_achievement_demand(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+
+    def throttled() -> None:
+        raise ActivitySyncError("REQUEST_THROTTLED", retryable=True)
+
+    with pytest.raises(ActivitySyncError, match="REQUEST_THROTTLED"):
+        sync_achievements(
+            storage,
+            account_id=account_id,
+            steamid="76561198000000001",
+            api_key=SecretValue("s"),
+            scope="owned",
+            explicit_appids=(10, 20),
+            max_items=2,
+            client=FakeClient(),
+            request_gate=throttled,
+            clock=lambda: NOW,
+        )
+    rows = storage._connection.execute(
+        "SELECT state, evaluated, error_code FROM achievement_sync_demand ORDER BY appid"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("failed", 1, "REQUEST_THROTTLED"),
+        ("unevaluated", 0, "REQUEST_THROTTLED"),
+    ]
+    latest = storage.read_achievement_snapshot(account_id)["latest"]
+    assert latest is not None and latest.status == "complete"
+
+
+def test_achievement_query_hard_deletes_expired_account_evidence(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    client = FakeClient()
+    client.player[10] = PlayerAchievements(
+        10, "ready", (PlayerAchievement("A", True, 1),)
+    )
+    client.schema[10] = GameAchievementSchema(
+        10, "ready", "english", (AchievementDefinition("A", "A", None, False),)
+    )
+    sync_achievements(
+        storage,
+        account_id=account_id,
+        steamid="76561198000000001",
+        api_key=SecretValue("s"),
+        scope="owned",
+        explicit_appids=(10,),
+        client=client,
+        clock=lambda: NOW,
+    )
+    result = query_achievements(
+        storage, account_id=account_id, clock=lambda: NOW + timedelta(days=8)
+    )
+    assert result["items"] == []
+    for table in (
+        "sync_runs",
+        "achievement_sync_demand",
+        "achievement_player_observations",
+        "achievement_player_current",
+    ):
+        assert storage._connection.execute(
+            f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - fixed test table names
+        ).fetchone()[0] == 0
+    assert storage._connection.execute(
+        "SELECT COUNT(*) FROM achievement_schema_current"
+    ).fetchone()[0] == 1
+
+
+def test_late_older_activity_completion_cannot_replace_newer_projection(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    older = storage.begin_activity_sync(
+        account_id=account_id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        started_at=NOW,
+    )
+    newer = storage.begin_activity_sync(
+        account_id=account_id,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        started_at=NOW + timedelta(seconds=1),
+    )
+
+    def game(minutes: int) -> dict[str, object]:
+        return {"appid": 10, "playtime_forever_minutes": minutes}
+
+    storage.complete_activity_snapshot(
+        newer.id,
+        account_id=account_id,
+        games=(game(200),),
+        observed_at=NOW + timedelta(seconds=1),
+        recent_observed_at=NOW + timedelta(seconds=1),
+        completed_at=NOW + timedelta(seconds=2),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    completed_older = storage.complete_activity_snapshot(
+        older.id,
+        account_id=account_id,
+        games=(game(100),),
+        observed_at=NOW,
+        recent_observed_at=NOW,
+        completed_at=NOW + timedelta(seconds=3),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    assert completed_older.promoted is False
+    item = query_activity(storage, account_id=account_id, clock=lambda: NOW)["items"][0]
+    assert item["playtime"]["lifetime_minutes"] == 200
+
+
+def test_late_older_achievement_result_cannot_cross_join_with_newer_demand(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    older = storage.begin_achievement_sync(
+        account_id=account_id,
+        candidates=(10,),
+        targeted=(10,),
+        started_at=NOW,
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    newer = storage.begin_achievement_sync(
+        account_id=account_id,
+        candidates=(10,),
+        targeted=(10,),
+        started_at=NOW + timedelta(seconds=1),
+        disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+    )
+    common = {
+        "account_id": account_id,
+        "appid": 10,
+        "state": "ready",
+        "schema_state": "ready",
+        "error_code": None,
+        "write_schema": True,
+        "disclosure_version": ACTIVITY_DISCLOSURE_VERSION,
+    }
+    storage.record_achievement_result(
+        newer.id,
+        player=({"api_name": "NEW", "achieved": True, "unlock_time_unix": 2},),
+        schema=({"api_name": "NEW", "display_name": "New", "description": None, "hidden": False},),
+        observed_at=NOW + timedelta(seconds=1),
+        **common,
+    )
+    storage.finish_achievement_sync(newer.id, completed_at=NOW + timedelta(seconds=2))
+    storage.record_achievement_result(
+        older.id,
+        player=({"api_name": "OLD", "achieved": True, "unlock_time_unix": 1},),
+        schema=({"api_name": "OLD", "display_name": "Old", "description": None, "hidden": False},),
+        observed_at=NOW,
+        **common,
+    )
+    storage.finish_achievement_sync(older.id, completed_at=NOW + timedelta(seconds=3))
+    item = query_achievements(storage, account_id=account_id, clock=lambda: NOW)["items"][0]
+    assert item["state"] == "ready"
+    assert [achievement["api_name"] for achievement in item["achievements"]] == ["NEW"]
