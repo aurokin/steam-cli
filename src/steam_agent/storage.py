@@ -2656,8 +2656,16 @@ class Storage:
                     """SELECT id FROM sync_runs
                        WHERE account_id=?
                          AND capability='reviews.aggregate.read'
-                         AND status='running' AND started_at<?""",
-                    (account_id, stale_cutoff),
+                         AND status='running' AND started_at<?
+                         AND COALESCE(
+                           (
+                             SELECT MAX(d.observed_at) FROM review_sync_demand d
+                             WHERE d.sync_run_id=sync_runs.id
+                               AND d.observed_at IS NOT NULL
+                           ),
+                           started_at
+                         )<?""",
+                    (account_id, stale_cutoff, stale_cutoff),
                 )
             )
             for stale_run_id in stale_runs:

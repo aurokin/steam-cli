@@ -324,6 +324,45 @@ def test_stale_running_review_schedule_is_recovered_before_rescheduling(tmp_path
         storage.finish_review_sync(second.id, completed_at=NOW)
 
 
+def test_recent_progress_keeps_long_running_review_schedule_active(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 3)
+        first, _, first_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=2,
+            skip_fresh_terminal=True,
+            started_at=NOW,
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        assert first_targets == (100, 101)
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE review_sync_demand SET evaluated=1, state='failed',
+                   error_code='PROVIDER_RESPONSE_INVALID', observed_at=?
+               WHERE sync_run_id=? AND appid=100""",
+            (
+                (NOW + timedelta(minutes=16))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                first.id,
+            ),
+        )
+        storage._connection.commit()  # noqa: SLF001
+        second, second_candidates, second_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=1,
+            skip_fresh_terminal=True,
+            started_at=NOW + timedelta(minutes=20),
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        assert storage.get_sync_run(first.id).status == "running"
+        assert second_candidates == (102,) and second_targets == (102,)
+        for run in (first, second):
+            storage.mark_remaining_reviews_unevaluated(
+                run.id, observed_at=NOW, error_code="TEST_CLEANUP"
+            )
+            storage.finish_review_sync(run.id, completed_at=NOW)
+
+
 def test_keyboard_interrupt_finishes_review_run_without_masking_cancel(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup_wishlist(storage, 2)
