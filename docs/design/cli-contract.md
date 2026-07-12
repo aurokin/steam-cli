@@ -460,6 +460,13 @@ adds gate details. Returned Steam, SteamDB, ProtonDB, and PCGamingWiki URLs are
 typed `manual_only` references with `automation_supported=false`; the command
 does not open or read them.
 
+The assessment connection is query-only. It does not apply migrations, create
+SQLite WAL sidecars, or physically prune retained rows. An outdated schema or
+uncheckpointed WAL produces an actionable `DATABASE_ERROR`; any writable
+command applies due migrations, checkpointing, and retention maintenance.
+Expired declared facts and private demand lineage are excluded from assessment
+reads even before physical pruning.
+
 For Steam Deck, `--context-machine` selects the account/machine-scoped sync
 attempt lineage without applying that machine's system or installed facts. It
 is inferred only when exactly one machine exists and is required for a

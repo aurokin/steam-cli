@@ -68,6 +68,14 @@ language, support level, retrieval time, pacing, demand, attempt, and last-good
 lineage remain attributed. A shape change disables the adapter without erasing
 last-good.
 
+Normalized declarations and account/machine demand lineage have a 30-day
+logical retention boundary. Cache reads exclude expired rows. Physical pruning
+runs on the next writable storage open (including sync, status, and explicit
+data-management commands); `compatibility assess` deliberately opens the cache
+query-only and never performs retention writes. A user who keeps the cache
+offline and runs only assessment can use the documented provider/account data
+deletion command for immediate physical removal.
+
 Automated Deck-report retrieval and local `appinfo.vdf` are excluded because
 their public/cache contracts are undocumented. Steam/ProtonDB/PCGamingWiki may
 be typed human-only references. AreWeAntiCheatYet is a possible later
@@ -92,6 +100,11 @@ primitive gate is pass/fail/unknown; stale, inaccessible, and conflict remain
 orthogonal evidence states. Any decisive hard failure yields `incompatible`.
 Required unknowns yield `unknown`; otherwise a known manual/runtime condition
 yields `conditional`. `compatible` requires every mandatory gate to pass.
+
+The assessment opener rejects an outdated schema or uncheckpointed SQLite WAL
+with an actionable database error instead of migrating or creating a sidecar.
+Running a writable command applies migrations, checkpoints pending writes, and
+performs due retention maintenance before the assessment is retried.
 
 Publisher-declared native build, effective execution support, architecture,
 meets-minimum, exact Valve target review, runtime risks,
