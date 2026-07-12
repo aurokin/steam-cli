@@ -502,6 +502,76 @@ def test_retention_prunes_global_current_after_thirty_days(
     storage.finish_declared_app_sync(later.id, completed_at="2026-08-10T12:03:00Z")
 
 
+def test_expired_declared_rows_are_not_exposed_by_cache_reads(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    run, _, _ = begin(storage, account_id, [400])
+    storage.record_declared_app_result(
+        run.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=T1,
+    )
+    storage.finish_declared_app_sync(run.id, completed_at=T1)
+
+    snapshot = storage.read_declared_app_snapshot(
+        account_id=account_id,
+        machine_id="desktop",
+        country="US",
+        language="english",
+        appids=[400],
+        as_of="2026-08-10T12:02:00Z",
+    )
+
+    assert snapshot["items"] == ({"appid": 400, "facts": None},)
+    assert snapshot["latest"] is None
+    assert snapshot["latest_demand"][0]["error_code"] == "NOT_SYNCED"
+
+
+def test_opening_storage_prunes_expired_declared_private_lineage(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "steam-agent.sqlite3"
+    old = "2020-01-01T00:00:00Z"
+    with Storage(path) as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Gaming PC", "linux", "x86_64"),
+            observed_at=old,
+        )
+        account = storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=old,
+        )
+        storage.record_compatibility_data_consent(
+            account_id=account.id,
+            disclosure_version="m5-v1",
+            accepted_at=old,
+            backups_acknowledged=True,
+        )
+        run, _, _ = begin(storage, account.id, [400], at=old)
+        storage.record_declared_app_result(
+            run.id,
+            account_id=account.id,
+            appid=400,
+            state="ready",
+            facts=payload(400),
+            observed_at=old,
+        )
+        storage.finish_declared_app_sync(run.id, completed_at=old)
+
+    with Storage(path) as reopened:
+        assert reopened._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_current"
+        ).fetchone()[0] == 0
+        assert reopened._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_sync_demand"
+        ).fetchone()[0] == 0
+
+
 def test_older_observation_cannot_replace_newer_last_good(
     configured: tuple[Storage, int],
 ) -> None:

@@ -1018,6 +1018,17 @@ class Storage:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, applied_at),
                 )
+            # Retention is lifecycle maintenance, not a side effect of a
+            # provider refresh.  Every CLI process opens storage once, so this
+            # also removes expired declared facts and private demand lineage
+            # when a user only performs cache-backed reads after syncing.
+            if self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='declared_app_current'"
+            ).fetchone() is not None:
+                self._prune_declared_apps(
+                    _timestamp(datetime.now(timezone.utc))
+                )
             self._connection.commit()
         except BaseException:
             try:
@@ -3137,6 +3148,7 @@ class Storage:
         country: str,
         language: str,
         appids: list[int] | tuple[int, ...] = (),
+        as_of: str | datetime | None = None,
     ) -> Mapping[str, Any]:
         """Read global current facts with account/machine demand lineage."""
 
@@ -3150,6 +3162,7 @@ class Storage:
                 country=country,
                 language=language,
                 appids=appids,
+                as_of=(datetime.now(timezone.utc) if as_of is None else as_of),
             )
             self._connection.commit()
             return snapshot
@@ -3165,6 +3178,7 @@ class Storage:
         country: str,
         language: str,
         appids: list[int] | tuple[int, ...],
+        as_of: str | datetime,
     ) -> Mapping[str, Any]:
         """Read declared facts using the caller's active transaction."""
 
@@ -3179,6 +3193,12 @@ class Storage:
             raise ValueError("declared-app snapshot requires explicit appids")
         if len(selected) > _DECLARED_APP_MAX_DEMAND:
             raise ValueError("declared-app demand exceeds the bounded maximum")
+        retention_cutoff = _timestamp(
+            datetime.fromisoformat(
+                _timestamp(as_of).replace("Z", "+00:00")
+            )
+            - timedelta(days=30)
+        )
         self._require_steam_account(account_id)
         if self.get_machine(machine_id) is None:
             raise ValueError("declared-app machine is not configured")
@@ -3191,8 +3211,9 @@ class Storage:
                     f"""SELECT c.* FROM declared_app_current c
                         WHERE c.country=? AND c.language=?
                           AND c.provider='steam_store'
+                          AND c.observed_at>=?
                           AND c.appid IN ({placeholders}) ORDER BY c.appid""",
-                    (country, language, *chunk),
+                    (country, language, retention_cutoff, *chunk),
                 )
             )
         rows = tuple(
@@ -3222,8 +3243,9 @@ class Storage:
                JOIN declared_app_sync_demand d ON d.sync_run_id=r.id
                WHERE d.account_id=? AND d.machine_id=?
                  AND d.country=? AND d.language=?
+                 AND r.started_at>=?
                ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
-            (account_id, machine_id, country, language),
+            (account_id, machine_id, country, language, retention_cutoff),
         ).fetchone()
         demand_by_appid: dict[int, Mapping[str, Any]] = {}
         for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
@@ -3238,9 +3260,17 @@ class Storage:
                     JOIN sync_runs r ON r.id=d.sync_run_id
                     WHERE d.account_id=? AND d.machine_id=?
                       AND d.country=? AND d.language=?
+                      AND r.started_at>=?
                       AND d.appid IN ({placeholders})
                     ORDER BY d.appid,r.started_at DESC,r.id DESC""",
-                (account_id, machine_id, country, language, *chunk),
+                (
+                    account_id,
+                    machine_id,
+                    country,
+                    language,
+                    retention_cutoff,
+                    *chunk,
+                ),
             )
             for row in demand_rows:
                 values = dict(row)
@@ -3281,6 +3311,7 @@ class Storage:
         country: str,
         language: str,
         appids: tuple[int, ...],
+        as_of: str | datetime,
     ) -> DeclaredAppSnapshot:
         raw = self._read_declared_app_snapshot(
             account_id=account_id,
@@ -3288,6 +3319,7 @@ class Storage:
             country=country,
             language=language,
             appids=appids,
+            as_of=as_of,
         )
         subjects: list[DeclaredAppSubject] = []
         for item, demand in zip(
@@ -6691,6 +6723,7 @@ class Storage:
                 country=country,
                 language=language,
                 appids=selected,
+                as_of=as_of,
             )
             owned = self._read_owned_snapshot(account_id)
             installed = self._read_installed_snapshot(machine_id)
