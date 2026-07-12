@@ -3601,7 +3601,14 @@ class Storage:
             (cutoff,),
         )
         if affected_appids:
-            self._delete_orphan_apps(affected_appids)
+            variable_limit = self._connection.getlimit(
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER
+            )
+            chunk_size = max(1, min(_DECLARED_APP_READ_CHUNK, variable_limit))
+            for offset in range(0, len(affected_appids), chunk_size):
+                self._delete_orphan_apps(
+                    affected_appids[offset : offset + chunk_size]
+                )
 
     def delete_declared_app_data(
         self, *, account_id: int | None = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 from typing import Mapping
 
 import pytest
@@ -794,6 +795,49 @@ def test_opening_storage_prunes_expired_declared_private_lineage(
         ).fetchone()[0] == 0
         assert reopened._connection.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM declared_app_sync_demand"
+        ).fetchone()[0] == 0
+
+
+def test_declared_retention_chunks_orphan_reclaim_to_sqlite_variable_limit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "steam-agent.sqlite3"
+    old = "2020-01-01T00:00:00Z"
+    appids = tuple(range(1, 26))
+    with Storage(path) as storage:
+        storage._connection.executemany(  # noqa: SLF001 - retention fixture
+            """INSERT INTO steam_apps(appid,name,app_type,updated_at)
+               VALUES (?,NULL,'unknown',?)""",
+            ((appid, old) for appid in appids),
+        )
+        storage._connection.executemany(  # noqa: SLF001 - retention fixture
+            """INSERT INTO declared_app_current(
+                 appid,country,language,schema_id,facts_json,provider,
+                 support_level,source_locator,human_reference_url,observed_at,
+                 promoted_sync_run_id
+               ) VALUES (?,'US','english','declared-app-facts/0.1','{}',
+                 'steam_store','provisional','steam_store_appdetails',?, ?,NULL)""",
+            (
+                (appid, f"https://store.steampowered.com/app/{appid}/", old)
+                for appid in appids
+            ),
+        )
+        storage._connection.commit()  # noqa: SLF001
+        previous = storage._connection.setlimit(  # noqa: SLF001
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10
+        )
+        try:
+            storage._prune_declared_apps("2026-07-12T00:00:00Z")  # noqa: SLF001
+        finally:
+            storage._connection.setlimit(  # noqa: SLF001
+                sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous
+            )
+
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_current"
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM steam_apps"
         ).fetchone()[0] == 0
 
 
