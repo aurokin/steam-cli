@@ -1067,20 +1067,22 @@ class Storage:
         """Reject query-only opens that cannot safely apply required migrations."""
 
         migrations_dir = Path(__file__).with_name("migrations")
-        expected = max(
+        expected = {
             int(path.name.split("_", 1)[0])
             for path in migrations_dir.glob("[0-9][0-9][0-9]_*.sql")
-        )
+        }
         try:
-            row = self._connection.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()
+            actual = {
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
         except sqlite3.DatabaseError as error:
             self._connection.close()
             raise StorageError(
                 "database schema migration is required before read-only access"
             ) from error
-        actual = None if row is None else row[0]
         if actual != expected:
             self._connection.close()
             raise StorageError(

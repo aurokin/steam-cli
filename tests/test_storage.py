@@ -247,7 +247,7 @@ def test_migration_resource_is_packaged_and_applied_once(tmp_path: Path) -> None
     assert versions == [
         (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,),
             (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,), (20,), (21,),
-            (22,)
+            (22,), (23,), (24,)
     ]
     assert {"machines", "steam_apps", "sync_runs", "evidence"} <= tables
     assert {"installed_observations", "installed_current", "accounts"} <= tables
@@ -509,7 +509,7 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
         results = list(executor.map(initialize, range(workers)))
 
     assert results == [
-        (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+        (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
     ] * workers
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
@@ -517,7 +517,7 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
         ).fetchall() == [
             (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
                 (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,), (20,), (21,),
-                (22,)
+                (22,), (23,), (24,)
         ]
 
 
@@ -552,7 +552,7 @@ def test_readonly_storage_requires_current_schema(tmp_path: Path) -> None:
     with Storage(database_path):
         pass
     with sqlite3.connect(database_path) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version=22")
+        connection.execute("DELETE FROM schema_migrations WHERE version=23")
 
     with pytest.raises(StorageError, match="migration is required"):
         Storage(database_path, readonly=True)
