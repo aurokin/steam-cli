@@ -2996,7 +2996,15 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
 
 def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
     with Storage(database_path) as storage:
-        account = storage.get_account(args.account)
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            return _emit_error(
+                args,
+                command=_command_name(args),
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The account alias is invalid.",
+            )
         if account is None:
             return _emit_error(
                 args,

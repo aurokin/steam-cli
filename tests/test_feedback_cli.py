@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from steam_agent import cli
 from steam_agent.storage import Storage
 
@@ -167,3 +169,29 @@ def test_invalid_trait_and_missing_account_are_typed(tmp_path, capsys) -> None:
     )
     assert code == 1
     assert missing["error"]["code"] == "ACCOUNT_NOT_CONFIGURED"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("feedback", "query", "--account", "!invalid"),
+        (
+            "feedback",
+            "rate",
+            "10",
+            "--value",
+            "liked",
+            "--account",
+            "!invalid",
+        ),
+        ("preferences", "rule", "list", "--account", "!invalid"),
+    ),
+)
+def test_invalid_feedback_account_alias_is_typed(
+    tmp_path, capsys, arguments: tuple[str, ...]
+) -> None:
+    configured(tmp_path)
+    code, result, stderr = invoke(tmp_path, capsys, *arguments)
+    assert code == 1
+    assert stderr == ""
+    assert result["error"]["code"] == "INVALID_ARGUMENT"
