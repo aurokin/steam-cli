@@ -1670,11 +1670,43 @@ class Storage:
             for row in rows
         )
 
+    def read_group_ownership_for_appids(
+        self,
+        ref: MemberRef,
+        *,
+        appids: list[int] | tuple[int, ...],
+    ) -> tuple[GroupOwnershipAssertion, ...]:
+        """Read only explicitly bounded ownership assertions."""
+
+        selected = _catalog_appids(appids)
+        if not selected or len(selected) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("group ownership AppIDs must be non-empty and bounded")
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return ()
+        rows: list[sqlite3.Row] = []
+        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
+            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self._connection.execute(
+                    f"""SELECT appid, state, updated_at
+                        FROM group_ownership_current
+                        WHERE profile_id=? AND appid IN ({placeholders})""",
+                    (profile.id, *chunk),
+                )
+            )
+        return tuple(
+            GroupOwnershipAssertion(ref, int(row[0]), row[1], row[2])
+            for row in sorted(rows, key=lambda row: int(row[0]))
+        )
+
     def read_group_family_for_appids(
         self,
         recipient: MemberRef,
         *,
         appids: list[int] | tuple[int, ...],
+        sources: list[MemberRef] | tuple[MemberRef, ...],
     ) -> tuple[GroupFamilyAssertion, ...]:
         """Read only explicitly bounded family edges for one participant."""
 
@@ -1684,6 +1716,17 @@ class Storage:
         profile = self.get_group_profile(recipient)
         if profile is None or profile.id is None:
             return ()
+        if not sources or len(sources) > 64 or len(sources) != len(set(sources)):
+            raise ValueError("group family sources must be non-empty and bounded")
+        source_ids = tuple(
+            profile.id
+            for source in sources
+            for profile in [self.get_group_profile(source)]
+            if profile is not None and profile.id is not None
+        )
+        if not source_ids:
+            return ()
+        source_placeholders = ",".join("?" for _ in source_ids)
         rows: list[sqlite3.Row] = []
         for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
             chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
@@ -1696,8 +1739,9 @@ class Storage:
                         JOIN group_profiles source ON source.id=f.source_profile_id
                         LEFT JOIN accounts a ON a.id=source.account_id
                         WHERE f.recipient_profile_id=?
+                          AND f.source_profile_id IN ({source_placeholders})
                           AND f.appid IN ({placeholders})""",
-                    (profile.id, *chunk),
+                    (profile.id, *source_ids, *chunk),
                 )
             )
         return tuple(

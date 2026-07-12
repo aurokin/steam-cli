@@ -2567,7 +2567,7 @@ def _group_ownership_by_app(
     synthetic_states = {
         ref: {
             assertion.appid: assertion.state
-            for assertion in storage.read_group_ownership(ref)
+            for assertion in storage.read_group_ownership_for_appids(ref, appids=appids)
         }
         for ref in refs
         if ref.kind == "synthetic"
@@ -2934,7 +2934,9 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
             )
             family_by_member = (
                 {
-                    member: storage.read_group_family_for_appids(member, appids=appids)
+                    member: storage.read_group_family_for_appids(
+                        member, appids=appids, sources=refs
+                    )
                     for member in members
                 }
                 if declared is not None
@@ -3145,7 +3147,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
             family_by_member = {
                 member: (
                     storage.read_group_family_for_appids(
-                        member, appids=candidate_appids
+                        member, appids=candidate_appids, sources=refs
                     )
                     if candidate_appids
                     else ()

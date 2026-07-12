@@ -251,6 +251,9 @@ def test_group_fact_reads_are_bounded_to_requested_appids(tmp_path) -> None:
     with Storage(tmp_path / "db.sqlite3") as storage:
         synthetic(storage, "guest")
         synthetic(storage, "owner")
+        synthetic(storage, "other")
+        storage.set_group_ownership(GUEST, appid=10, state="owned", updated_at=T0)
+        storage.set_group_ownership(GUEST, appid=20, state="owned", updated_at=T0)
         for appid in (10, 20):
             storage.set_group_family(
                 GUEST,
@@ -266,11 +269,23 @@ def test_group_fact_reads_are_bounded_to_requested_appids(tmp_path) -> None:
                 value="present",
                 updated_at=T0,
             )
+        storage.set_group_family(
+            GUEST,
+            source=MemberRef("synthetic", "other"),
+            appid=10,
+            state="available",
+            updated_at=T0,
+        )
 
         assert [
             item.appid
-            for item in storage.read_group_family_for_appids(GUEST, appids=[10])
+            for item in storage.read_group_ownership_for_appids(GUEST, appids=[10])
         ] == [10]
+        family = storage.read_group_family_for_appids(
+            GUEST, appids=[10], sources=[OWNER]
+        )
+        assert [item.appid for item in family] == [10]
+        assert [item.source for item in family] == [OWNER]
         assert [
             item.appid
             for item in storage.read_group_app_assertions_for_appids(GUEST, appids=[10])
