@@ -1695,6 +1695,14 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 or owned_age > _OWNED_SYNC_FRESHNESS_SECONDS
             )
             demanded_appids = demanded_selection or tuple(sorted(owned_appids))
+        if len(demanded_appids) > MAX_DECLARED_APP_DEMAND:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The expanded declared-fact demand exceeds the bounded maximum.",
+                exit_code=2,
+            )
         if not app_facts_command and any(
             appid not in owned_appids for appid in demanded_appids
         ):

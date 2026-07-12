@@ -621,6 +621,7 @@ def test_empty_category_list_does_not_infer_multiplayer_absence_or_player_totals
     "updates",
     [
         {"genres": [{"id": "01", "description": "Action"}]},
+        {"genres": [{"id": "9" * 100_000, "description": "Action"}]},
         {"genres": [{"id": "1", "description": "A"}] * 2},
         {"genres": [{"id": "1", "description": "x" * 257}]},
         {"release_date": {"coming_soon": "yes", "date": "Soon"}},
@@ -639,3 +640,17 @@ def test_discovery_provider_fields_are_strict_and_bounded(
     client, _ = client_for(HttpResponse(200, valid_data(**updates), JSON_HEADERS))
     with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
         client.fetch(400, country="US", language="english")
+
+
+@pytest.mark.parametrize("numeric_ids", [[1, "2"], [[]]])
+def test_v02_validator_rejects_malformed_category_ids_as_value_error(
+    numeric_ids: list[object],
+) -> None:
+    client, _ = client_for(response_fixture("legacy_shape.json"))
+    facts = client.fetch(400, country="US", language="english").facts
+    assert facts is not None
+    payload = json.loads(json.dumps(declared_facts_payload(facts)))
+    payload["categories"]["numeric_ids"] = numeric_ids
+
+    with pytest.raises(ValueError, match="category"):
+        validate_declared_facts_payload(payload)

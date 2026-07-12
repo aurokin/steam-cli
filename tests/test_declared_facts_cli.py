@@ -389,6 +389,36 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
     assert result["data"]["items"] == []
 
 
+def test_app_facts_rechecks_bound_after_scope_expansion(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "MAX_DECLARED_APP_DEMAND", 0)
+    monkeypatch.setattr(
+        cli, "_declared_facts_client", lambda: pytest.fail("oversized demand fetched")
+    )
+
+    code, result, _ = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        "library",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 2
+    assert result["error"]["code"] == "INVALID_ARGUMENT"
+
+
 def test_contract_drift_disables_transport_until_retry_time(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:

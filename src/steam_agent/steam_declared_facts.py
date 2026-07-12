@@ -516,12 +516,14 @@ class SteamDeclaredFacts:
     def __post_init__(self) -> None:
         _validate_appid(self.appid)
         if (
-            len(self.category_source_ids) > MAX_DECLARATION_ITEMS
-            or tuple(sorted(set(self.category_source_ids))) != self.category_source_ids
+            not isinstance(self.category_source_ids, tuple)
+            or len(self.category_source_ids) > MAX_DECLARATION_ITEMS
         ):
             raise ValueError("source category IDs must be bounded, unique, and sorted")
         for identifier in self.category_source_ids:
             _validate_source_id(identifier, "category")
+        if tuple(sorted(set(self.category_source_ids))) != self.category_source_ids:
+            raise ValueError("source category IDs must be bounded, unique, and sorted")
         if (
             self.categories.state == "declared"
             and self.category_source_ids
@@ -1124,12 +1126,15 @@ def _genres(value: object) -> GenreDeclarations:
             not isinstance(identifier, str)
             or not identifier.isascii()
             or not identifier.isdecimal()
-            or identifier != str(int(identifier))
+            or not 1 <= len(identifier) <= 10
         ):
             raise _invalid()
         try:
+            numeric_identifier = int(identifier)
+            if identifier != str(numeric_identifier):
+                raise ValueError
             declaration = GenreDeclaration(
-                int(identifier),
+                numeric_identifier,
                 raw_item.get("description"),  # type: ignore[arg-type]
             )
         except (TypeError, ValueError):
