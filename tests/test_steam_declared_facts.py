@@ -11,7 +11,9 @@ import pytest
 import steam_agent.steam_declared_facts as subject
 from steam_agent.steam_declared_facts import (
     CATEGORY_SLUGS,
+    MULTIPLAYER_CATEGORY_SLUGS,
     CategoryDeclarations,
+    ComingSoonDeclaration,
     DeclaredText,
     HttpResponse,
     LanguageDeclaration,
@@ -22,7 +24,10 @@ from steam_agent.steam_declared_facts import (
     SteamDeclaredFactsError,
     SteamDeclaredFactsHumanReference,
     SteamDeclaredFactsRequestContext,
+    declared_discovery_facts,
+    declared_facts_payload,
     sanitize_html,
+    validate_declared_facts_payload,
 )
 
 
@@ -44,7 +49,9 @@ def response_fixture(name: str) -> HttpResponse:
     return HttpResponse(200, (FIXTURES / name).read_bytes(), JSON_HEADERS)
 
 
-def client_for(response: HttpResponse) -> tuple[SteamDeclaredFactsClient, FakeTransport]:
+def client_for(
+    response: HttpResponse,
+) -> tuple[SteamDeclaredFactsClient, FakeTransport]:
     transport = FakeTransport(response)
     return SteamDeclaredFactsClient(transport=transport), transport
 
@@ -253,7 +260,9 @@ def test_invalid_retry_after_is_not_retained(retry_after: str) -> None:
     assert raised.value.retry_after_seconds is None
 
 
-@pytest.mark.parametrize("content_type", [None, "text/html", "application/problem+json"])
+@pytest.mark.parametrize(
+    "content_type", [None, "text/html", "application/problem+json"]
+)
 def test_success_requires_json_content_type(content_type: str | None) -> None:
     headers = {} if content_type is None else {"content-type": content_type}
     client, _ = client_for(HttpResponse(200, b"{}", headers))
@@ -273,7 +282,7 @@ def test_success_requires_json_content_type(content_type: str | None) -> None:
         b'{"400":{"success":true,"data":[]}}',
         b'{"other":{"success":false}}',
         b'{"400":{"success":false},"extra":{}}',
-        b'\xff',
+        b"\xff",
     ],
 )
 def test_json_and_envelope_are_strict(body: bytes) -> None:
@@ -335,7 +344,12 @@ def valid_data(**updates: object) -> bytes:
         {"categories": {}},
         {"categories": [{"id": True, "description": "bad"}]},
         {"categories": [{"id": 64}]},
-        {"categories": [{"id": 64, "description": "a"}, {"id": 64, "description": "b"}]},
+        {
+            "categories": [
+                {"id": 64, "description": "a"},
+                {"id": 64, "description": "b"},
+            ]
+        },
         {"controller_support": "yes"},
         {"controller_support": []},
         {"ext_user_account_notice": 1},
@@ -348,7 +362,9 @@ def test_normalized_field_shapes_are_strict(updates: Mapping[str, object]) -> No
         client.fetch(400, country="US", language="english")
 
 
-def test_unknown_fields_are_discarded_and_unknown_category_text_is_not_retained() -> None:
+def test_unknown_fields_are_discarded_and_unknown_category_text_is_not_retained() -> (
+    None
+):
     body = valid_data(
         marketing_html="<script>secret</script>",
         platforms={"windows": True, "mac": False, "linux": True, "future": True},
@@ -368,7 +384,9 @@ def test_unrecognized_language_is_counted_but_not_retained() -> None:
     client, _ = client_for(
         HttpResponse(
             200,
-            valid_data(supported_languages="English, Future<script>x</script> Language"),
+            valid_data(
+                supported_languages="English, Future<script>x</script> Language"
+            ),
             JSON_HEADERS,
         )
     )
@@ -407,9 +425,12 @@ def test_sanitizer_mismatched_hidden_close_cannot_expose_requirement_text() -> N
 
 
 def test_sanitizer_tracks_nested_tags_inside_hidden_regions() -> None:
-    assert sanitize_html(
-        "Before<template><div><script>Memory: 64 GB</script></div></template>After"
-    ) == "BeforeAfter"
+    assert (
+        sanitize_html(
+            "Before<template><div><script>Memory: 64 GB</script></div></template>After"
+        )
+        == "BeforeAfter"
+    )
     with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
         sanitize_html("<template><div>hidden</template></div>Memory: 64 GB")
 
@@ -431,9 +452,7 @@ def test_language_parser_stops_at_self_closing_break_before_footnote() -> None:
         HttpResponse(
             200,
             valid_data(
-                supported_languages=(
-                    "English*<br/>*languages with full audio support"
-                )
+                supported_languages=("English*<br/>*languages with full audio support")
             ),
             JSON_HEADERS,
         )
@@ -461,9 +480,13 @@ def test_sanitizer_bounds_hostile_markup(value: str) -> None:
 
 def test_gzip_decoder_is_strict_and_bounded() -> None:
     raw = b'{"400":{"success":false}}'
-    assert subject._decode_content(gzip.compress(raw), {"Content-Encoding": "gzip"}) == raw
+    assert (
+        subject._decode_content(gzip.compress(raw), {"Content-Encoding": "gzip"}) == raw
+    )
     with pytest.raises(SteamDeclaredFactsError):
-        subject._decode_content(gzip.compress(raw) + b"junk", {"content-encoding": "gzip"})
+        subject._decode_content(
+            gzip.compress(raw) + b"junk", {"content-encoding": "gzip"}
+        )
     with pytest.raises(SteamDeclaredFactsError):
         subject._decode_content(raw, {"content-encoding": "br"})
     bomb = gzip.compress(b"x" * (subject.MAX_DECOMPRESSED_BYTES + 1))
@@ -502,3 +525,111 @@ def test_human_reference_cannot_change_origin_mode_or_context() -> None:
         replace(valid, url="https://store.steampowered.com/app/400/?l=english&cc=US")
     with pytest.raises(ValueError):
         replace(valid, automation_supported=True)  # type: ignore[arg-type]
+
+
+def test_new_fetch_projects_bounded_discovery_evidence_as_schema_0_2() -> None:
+    category_ids = tuple(MULTIPLAYER_CATEGORY_SLUGS)
+    client, _ = client_for(
+        HttpResponse(
+            200,
+            valid_data(
+                categories=[
+                    {"id": identifier, "description": f"Localized {identifier}"}
+                    for identifier in category_ids
+                ],
+                genres=[
+                    {"id": "1", "description": "Action"},
+                    {"id": "23", "description": "Indépendant"},
+                ],
+                release_date={"coming_soon": True, "date": "À venir bientôt"},
+            ),
+            JSON_HEADERS,
+        )
+    )
+
+    facts = client.fetch(400, country="US", language="english").facts
+
+    assert facts is not None
+    payload = declared_facts_payload(facts)
+    assert payload["schema_id"] == "declared-app-facts/0.2"
+    assert payload["categories"] == {
+        "state": "declared",
+        "known_slugs": sorted(MULTIPLAYER_CATEGORY_SLUGS.values()),
+        "unknown_ids": [],
+        "source": "steam_store_appdetails",
+        "numeric_ids": sorted(category_ids),
+    }
+    discovery = declared_discovery_facts(payload)
+    assert discovery.category_ids == tuple(sorted(category_ids))
+    assert discovery.multiplayer_modes == tuple(
+        MULTIPLAYER_CATEGORY_SLUGS[identifier] for identifier in sorted(category_ids)
+    )
+    assert [(item.id, item.localized_label) for item in discovery.genres.items] == [
+        (1, "Action"),
+        (23, "Indépendant"),
+    ]
+    assert discovery.coming_soon == ComingSoonDeclaration("present", "À venir bientôt")
+    assert validate_declared_facts_payload(payload) == payload
+
+
+def test_schema_0_1_round_trips_unchanged_and_discovery_fields_are_unknown() -> None:
+    client, _ = client_for(response_fixture("legacy_shape.json"))
+    facts = client.fetch(400, country="US", language="english").facts
+    assert facts is not None
+    current = declared_facts_payload(facts)
+    legacy = dict(current)
+    legacy["schema_id"] = "declared-app-facts/0.1"
+    legacy.pop("genres")
+    legacy.pop("coming_soon")
+    legacy_categories = dict(legacy["categories"])
+    legacy_categories.pop("source")
+    legacy_categories.pop("numeric_ids")
+    legacy["categories"] = legacy_categories
+
+    assert validate_declared_facts_payload(legacy) == legacy
+    discovery = declared_discovery_facts(legacy)
+    assert discovery.category_state == "unknown"
+    assert discovery.category_source is None
+    assert discovery.category_ids == ()
+    assert discovery.multiplayer_modes == ()
+    assert discovery.genres.state == "unknown"
+    assert discovery.coming_soon == ComingSoonDeclaration("unknown", None)
+
+
+def test_empty_category_list_does_not_infer_multiplayer_absence_or_player_totals() -> (
+    None
+):
+    client, _ = client_for(HttpResponse(200, valid_data(categories=[]), JSON_HEADERS))
+    facts = client.fetch(400, country="US", language="english").facts
+    assert facts is not None
+
+    discovery = declared_discovery_facts(declared_facts_payload(facts))
+
+    assert discovery.category_state == "undeclared"
+    assert discovery.multiplayer_modes == ()
+    assert not hasattr(discovery, "multiplayer")
+    assert not hasattr(discovery, "required_player_total")
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"genres": [{"id": "01", "description": "Action"}]},
+        {"genres": [{"id": "1", "description": "A"}] * 2},
+        {"genres": [{"id": "1", "description": "x" * 257}]},
+        {"release_date": {"coming_soon": "yes", "date": "Soon"}},
+        {"release_date": {"coming_soon": False, "date": "x" * 257}},
+        {
+            "categories": [
+                {"id": index + 1_000, "description": "category"}
+                for index in range(subject.MAX_DECLARATION_ITEMS + 1)
+            ]
+        },
+    ],
+)
+def test_discovery_provider_fields_are_strict_and_bounded(
+    updates: Mapping[str, object],
+) -> None:
+    client, _ = client_for(HttpResponse(200, valid_data(**updates), JSON_HEADERS))
+    with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
+        client.fetch(400, country="US", language="english")
