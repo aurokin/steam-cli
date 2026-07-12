@@ -399,6 +399,23 @@ def test_sanitizer_void_elements_do_not_consume_nesting_depth() -> None:
     assert sanitize_html(value) == "Safe"
 
 
+def test_sanitizer_mismatched_hidden_close_cannot_expose_requirement_text() -> None:
+    with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
+        sanitize_html("<template></script>Memory: 64 GB")
+
+
+def test_sanitizer_tracks_nested_tags_inside_hidden_regions() -> None:
+    assert sanitize_html(
+        "Before<template><div><script>Memory: 64 GB</script></div></template>After"
+    ) == "BeforeAfter"
+    with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
+        sanitize_html("<template><div>hidden</template></div>Memory: 64 GB")
+
+
+def test_sanitizer_self_closing_hidden_and_void_tags_do_not_open_regions() -> None:
+    assert sanitize_html("<template/><img/><br/>Memory: 8 GB") == "Memory: 8 GB"
+
+
 @pytest.mark.parametrize(
     "value",
     [

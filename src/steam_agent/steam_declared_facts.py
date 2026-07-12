@@ -860,7 +860,7 @@ class _BoundedHTMLParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.tokens = 0
-        self.depth = 0
+        self.open_tags: list[str] = []
         self.skip_depth = 0
         self.characters = 0
 
@@ -873,8 +873,8 @@ class _BoundedHTMLParser(HTMLParser):
         self._token()
         lowered = tag.casefold()
         if lowered not in self._VOID_TAGS:
-            self.depth += 1
-            if self.depth > MAX_HTML_DEPTH:
+            self.open_tags.append(lowered)
+            if len(self.open_tags) > MAX_HTML_DEPTH:
                 raise _invalid()
         if lowered in self._SKIP_TAGS:
             self.skip_depth += 1
@@ -890,12 +890,17 @@ class _BoundedHTMLParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         self._token()
         lowered = tag.casefold()
-        if lowered in self._SKIP_TAGS and self.skip_depth:
+        if lowered in self._VOID_TAGS:
+            if not self.skip_depth and lowered in self._BREAK_TAGS:
+                self.parts.append("\n")
+            return
+        if not self.open_tags or self.open_tags[-1] != lowered:
+            raise _invalid()
+        self.open_tags.pop()
+        if lowered in self._SKIP_TAGS:
             self.skip_depth -= 1
         elif not self.skip_depth and lowered in self._BREAK_TAGS:
             self.parts.append("\n")
-        if lowered not in self._VOID_TAGS:
-            self.depth = max(0, self.depth - 1)
 
     def handle_data(self, data: str) -> None:
         self._token()
