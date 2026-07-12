@@ -423,6 +423,37 @@ def test_account_provider_deletion_removes_sole_review_but_rehomes_shared(tmp_pa
         assert row[0] == first
 
 
+def test_account_deletion_does_not_rehome_expired_other_observation(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        first = setup_wishlist(storage, 1)
+        second = setup_wishlist(storage, 1, alias="secondary")
+        sync_wishlist_reviews(
+            storage, account_id=first, max_items=1, client=Client(), clock=Clock()
+        )
+        sync_wishlist_reviews(
+            storage,
+            account_id=second,
+            max_items=1,
+            client=Client(),
+            clock=Clock(NOW + timedelta(minutes=1)),
+        )
+        first_run = storage._connection.execute(  # noqa: SLF001
+            """SELECT id FROM sync_runs WHERE account_id=?
+               AND capability='reviews.aggregate.read'""",
+            (first,),
+        ).fetchone()[0]
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE review_observations SET observed_at='2026-06-01T00:00:00Z'
+               WHERE sync_run_id=?""",
+            (first_run,),
+        )
+        storage._connection.commit()  # noqa: SLF001
+        storage.delete_steam_account_data(second)
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM review_current"
+        ).fetchone()[0] == 0
+
+
 def test_wishlist_removal_prunes_current_review_without_fk_rollback(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup_wishlist(storage, 1)
@@ -448,6 +479,12 @@ def test_wishlist_removal_prunes_current_review_without_fk_rollback(tmp_path) ->
         assert storage._connection.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM review_current"
         ).fetchone()[0] == 0
+        snapshot = storage.read_wishlist_recommendation_snapshot(
+            account_id=account_id,
+            country="US",
+            now=NOW + timedelta(hours=1),
+        )
+        assert snapshot.review_demand == ()
         # Attempt lineage retains the identity only until its bounded expiry.
         assert storage.get_app(100) is not None
         storage._prune_reviews("2026-07-20T12:00:00Z")  # noqa: SLF001

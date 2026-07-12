@@ -2950,6 +2950,7 @@ class Storage:
         """Remove target-sourced current rows or promote another ready source."""
 
         removed = 0
+        retention_cutoff = _timestamp(datetime.now(timezone.utc) - timedelta(days=7))
         promoted_appids = tuple(
             int(row[0])
             for row in self._connection.execute(
@@ -2966,8 +2967,9 @@ class Storage:
                    JOIN review_sync_demand d
                      ON d.sync_run_id=o.sync_run_id AND d.appid=o.appid
                    WHERE o.appid=? AND r.account_id<>? AND d.state='ready'
+                     AND o.observed_at>=?
                    ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
-                (appid, account_id),
+                (appid, account_id, retention_cutoff),
             ).fetchone()
             if replacement is None:
                 removed += self._connection.execute(
@@ -5166,6 +5168,8 @@ class Storage:
                 for row in self._connection.execute(
                     """SELECT d.* FROM review_sync_demand d
                        JOIN sync_runs r ON r.id=d.sync_run_id
+                       JOIN wishlist_current w
+                         ON w.account_id=d.account_id AND w.appid=d.appid
                        WHERE d.account_id=? AND d.sync_run_id=(
                          SELECT d2.sync_run_id FROM review_sync_demand d2
                          JOIN sync_runs r2 ON r2.id=d2.sync_run_id
