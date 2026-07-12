@@ -330,6 +330,14 @@ def test_app_facts_explicit_sync_and_discovery_query_are_bounded_cache_only(
     assert queried["data"]["network_used"] is False
     assert queried["data"]["items"][0]["mode_requirement"] == "unknown"
     assert queried["data"]["items"][0]["health"] == {"state": "unsupported"}
+    assert queried["data"]["items"][0]["source"] == {
+        "provider": "steam_store",
+        "support_level": "provisional",
+        "source_locator": "steam_store_appdetails",
+        "human_reference_url": (
+            "https://store.steampowered.com/app/400/?cc=US&l=english"
+        ),
+    }
 
 
 def test_known_discovery_never_enumerates_another_accounts_explicit_demand(

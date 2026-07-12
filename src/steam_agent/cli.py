@@ -2155,6 +2155,12 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
                 "evidence_state": "declared",
                 "schema_id": payload["schema_id"],
                 "observed_at": raw.get("observed_at"),
+                "source": {
+                    "provider": raw.get("provider"),
+                    "support_level": raw.get("support_level"),
+                    "source_locator": raw.get("source_locator"),
+                    "human_reference_url": raw.get("human_reference_url"),
+                },
                 "category_ids": list(facts.category_ids),
                 "multiplayer_modes": modes,
                 "mode_requirement": (
@@ -2453,7 +2459,7 @@ def _group_ownership_by_app(
     refs: tuple[MemberRef, ...],
     appids: tuple[int, ...],
 ) -> dict[int, tuple[OwnershipFact, ...]]:
-    account_owned: dict[MemberRef, set[int]] = {}
+    account_owned: dict[MemberRef, set[int] | None] = {}
     for ref in refs:
         if ref.kind != "account":
             continue
@@ -2461,11 +2467,34 @@ def _group_ownership_by_app(
         if account is None:
             raise ValueError("selected account is not configured")
         snapshot = storage.read_owned_snapshot(account.id)
-        account_owned[ref] = {
-            game.appid
-            for game in snapshot.games
-            if game.inclusion_basis == "visible_owned"
-        }
+        latest_complete = snapshot.latest_complete
+        reference = (
+            None
+            if latest_complete is None
+            else latest_complete.completed_at or latest_complete.started_at
+        )
+        age = (
+            None
+            if reference is None
+            else (
+                _utc_now() - datetime.fromisoformat(reference.replace("Z", "+00:00"))
+            ).total_seconds()
+        )
+        authoritative = (
+            snapshot.latest is not None
+            and snapshot.latest.status == "complete"
+            and age is not None
+            and 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
+        )
+        account_owned[ref] = (
+            {
+                game.appid
+                for game in snapshot.games
+                if game.inclusion_basis == "visible_owned"
+            }
+            if authoritative
+            else None
+        )
     synthetic_states = {
         ref: {
             assertion.appid: assertion.state
@@ -2480,7 +2509,12 @@ def _group_ownership_by_app(
         for ref in refs:
             source = CopySourceRef(ref.kind, ref.key)
             if ref.kind == "account":
-                state = "owned" if appid in account_owned[ref] else "unknown"
+                known_owned = account_owned[ref]
+                state = (
+                    "owned"
+                    if known_owned is not None and appid in known_owned
+                    else "unknown"
+                )
             else:
                 state = synthetic_states[ref].get(appid, "unknown")
             facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
@@ -2738,6 +2772,11 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 if args.group_command == "eligibility"
                 else None
             )
+            missing_declared = (
+                0
+                if declared is None
+                else sum(item.get("facts") is None for item in declared["items"])
+            )
             family_by_member = (
                 {member: storage.read_group_family(member) for member in members}
                 if declared is not None
@@ -2817,6 +2856,20 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 "member_count": len(members),
                 "copy_source_count": len(source_refs),
             },
+            completeness_value=completeness(
+                (
+                    CompletenessStatus.COMPLETE
+                    if missing_declared == 0
+                    else (
+                        CompletenessStatus.UNAVAILABLE
+                        if missing_declared == len(appids)
+                        else CompletenessStatus.PARTIAL
+                    )
+                ),
+                missing_capabilities=(
+                    ["discovery.declared.read"] if missing_declared else []
+                ),
+            ),
             data={"schema": "group-eligibility/0.1", "results": rows},
         )
     except (StorageError, TypeError, ValueError):

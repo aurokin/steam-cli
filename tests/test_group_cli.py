@@ -223,6 +223,43 @@ def test_group_ownership_uses_visible_positive_and_synthetic_assertions_only(
     assert "steam_web_api" not in rendered
 
 
+def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE sync_runs SET started_at=?, completed_at=?
+               WHERE capability='owned.visible.read'""",
+            ("2026-07-01T00:00:00Z", "2026-07-01T00:00:01Z"),
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "ownership",
+        "400",
+        "--member",
+        "account:primary",
+        "--member",
+        "synthetic:Guest",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 0
+    assert value["data"]["results"][0]["ownership"]["members"][0]["state"] == "unknown"
+
+
 def test_group_eligibility_combines_mode_copies_players_and_policy(
     tmp_path: Path, capsys: object
 ) -> None:
@@ -277,3 +314,38 @@ def test_group_eligibility_combines_mode_copies_players_and_policy(
     ]
     rendered = json.dumps(value).casefold()
     assert "alpha" not in rendered and "beta" not in rendered
+
+
+def test_group_eligibility_reports_missing_declared_evidence_in_completeness(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Alpha")
+    create_profile(tmp_path, capsys, "synthetic:Beta")
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "eligibility",
+        "400",
+        "--member",
+        "synthetic:Alpha",
+        "--member",
+        "synthetic:Beta",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+    )
+
+    assert code == 0
+    assert value["completeness"]["status"] == "unavailable"
+    assert value["completeness"]["missing_capabilities"] == ["discovery.declared.read"]
+    assert value["data"]["results"][0]["eligibility"]["gates"][0]["state"] == "unknown"
