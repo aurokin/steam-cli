@@ -68,6 +68,27 @@ def test_synthetic_creation_requires_current_disclosure_and_backup_ack(
         assert storage.list_synthetic_group_profiles() == ()
 
 
+def test_existing_synthetic_profile_can_renew_versioned_consent(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        created = synthetic(storage)
+        assert created.id is not None
+        storage._connection.execute(  # noqa: SLF001
+            "UPDATE group_profile_consents SET disclosure_version='obsolete'"
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+        renewed = storage.create_synthetic_group_profile(
+            "guest",
+            disclosure_version=GROUP_PROFILE_DISCLOSURE_VERSION,
+            backups_acknowledged=True,
+            created_at=T1,
+        )
+
+        assert renewed.id == created.id
+        assert renewed.disclosure_version == GROUP_PROFILE_DISCLOSURE_VERSION
+        assert renewed.updated_at == T1.isoformat().replace("+00:00", "Z")
+
+
 def test_synthetic_profile_crud_is_case_insensitive_and_identifier_safe(
     tmp_path,
 ) -> None:
@@ -79,19 +100,25 @@ def test_synthetic_profile_crud_is_case_insensitive_and_identifier_safe(
             backups_acknowledged=True,
             created_at=T1,
         )
-        assert created == repeated
+        assert repeated.id == created.id
+        assert repeated.ref == created.ref
+        assert repeated.disclosure_version == created.disclosure_version
+        assert repeated.updated_at == T1.isoformat().replace("+00:00", "Z")
         assert created.ref == MemberRef("synthetic", "GUEST_USER")
         assert created.disclosure_version == GROUP_PROFILE_DISCLOSURE_VERSION
         assert created.backups_acknowledged is True
-        assert storage.get_synthetic_group_profile("guest_user") == created
-        assert storage.list_synthetic_group_profiles() == (created,)
+        assert storage.get_synthetic_group_profile("guest_user") == repeated
+        assert storage.list_synthetic_group_profiles() == (repeated,)
         serialized = asdict(created)
         assert "provider" not in serialized
         assert "steam" not in str(serialized).casefold()
 
         deleted = storage.delete_synthetic_group_profile("GUEST_USER")
         assert deleted.profile_removed and deleted.consent_removed
-        assert storage.delete_synthetic_group_profile("guest_user").profile_removed is False
+        assert (
+            storage.delete_synthetic_group_profile("guest_user").profile_removed
+            is False
+        )
 
 
 def test_aliases_cannot_collide_across_account_and_synthetic_kinds(tmp_path) -> None:
@@ -166,13 +193,9 @@ def test_synthetic_ownership_set_read_clear_and_account_override_rejection(
         assert storage.clear_group_ownership(GUEST, appid=10)
         assert not storage.clear_group_ownership(GUEST, appid=10)
         with pytest.raises(ValueError, match="Steam evidence"):
-            storage.set_group_ownership(
-                PRIMARY, appid=10, state="owned", updated_at=T0
-            )
+            storage.set_group_ownership(PRIMARY, appid=10, state="owned", updated_at=T0)
         with pytest.raises(ValueError, match="state"):
-            storage.set_group_ownership(
-                GUEST, appid=10, state="maybe", updated_at=T0
-            )
+            storage.set_group_ownership(GUEST, appid=10, state="maybe", updated_at=T0)
 
 
 def test_family_edges_require_explicit_distinct_source_and_are_typed(tmp_path) -> None:
@@ -352,12 +375,18 @@ def test_account_deletion_removes_only_its_group_row_and_edges(tmp_path) -> None
         assert storage.get_group_profile(GUEST) is not None
         assert storage.read_group_ownership(GUEST)[0].state == "owned"
         assert storage.read_group_app_assertions(GUEST)[0].value == 4
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM group_family_current"
-        ).fetchone()[0] == 0
-        assert storage._connection.execute(
-            "SELECT 1 FROM steam_apps WHERE appid = 20"
-        ).fetchone() is None
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM group_family_current"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT 1 FROM steam_apps WHERE appid = 20"
+            ).fetchone()
+            is None
+        )
 
 
 def test_all_account_deletion_preserves_unrelated_synthetic_facts(tmp_path) -> None:
@@ -405,4 +434,8 @@ def test_secure_delete_is_enabled_and_no_derived_group_results_are_persisted(
             "group_family_current",
             "group_app_assertion_current",
         } <= tables
-        assert not any("result" in name or "ranking" in name for name in tables if name.startswith("group_"))
+        assert not any(
+            "result" in name or "ranking" in name
+            for name in tables
+            if name.startswith("group_")
+        )

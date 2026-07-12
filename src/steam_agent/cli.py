@@ -2458,8 +2458,10 @@ def _group_ownership_by_app(
     *,
     refs: tuple[MemberRef, ...],
     appids: tuple[int, ...],
-) -> dict[int, tuple[OwnershipFact, ...]]:
+) -> tuple[dict[int, tuple[OwnershipFact, ...]], bool, bool]:
     account_owned: dict[MemberRef, set[int] | None] = {}
+    ownership_missing = False
+    ownership_stale = False
     for ref in refs:
         if ref.kind != "account":
             continue
@@ -2486,6 +2488,10 @@ def _group_ownership_by_app(
             and age is not None
             and 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
         )
+        if latest_complete is None:
+            ownership_missing = True
+        elif not authoritative:
+            ownership_stale = True
         account_owned[ref] = (
             {
                 game.appid
@@ -2519,7 +2525,7 @@ def _group_ownership_by_app(
                 state = synthetic_states[ref].get(appid, "unknown")
             facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
         result[appid] = tuple(facts)
-    return result
+    return result, ownership_missing, ownership_stale
 
 
 def _evaluate_group_app(
@@ -2707,6 +2713,50 @@ def _group_declared_payloads(
     return payloads
 
 
+def _group_query_completeness(
+    *,
+    missing_declared: int,
+    declared_total: int,
+    ownership_missing: bool,
+    ownership_stale: bool,
+) -> dict[str, Any]:
+    warnings: list[WarningRecord] = []
+    if ownership_missing:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.NOT_SYNCED,
+                message="At least one selected account has no visible-owned snapshot.",
+            )
+        )
+    if ownership_stale:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.STALE_LAST_GOOD,
+                message=(
+                    "At least one selected account has stale or superseded "
+                    "visible-owned evidence; its copy states remain unknown."
+                ),
+            )
+        )
+    if declared_total and missing_declared == declared_total:
+        status = CompletenessStatus.UNAVAILABLE
+    elif missing_declared or ownership_missing or ownership_stale:
+        status = CompletenessStatus.PARTIAL
+    else:
+        status = CompletenessStatus.COMPLETE
+    return completeness(
+        status,
+        missing_capabilities=sorted(
+            {
+                *(["discovery.declared.read"] if missing_declared else []),
+                *(["owned.visible.read"] if ownership_missing else []),
+            }
+        ),
+        stale_capabilities=(["owned.visible.read"] if ownership_stale else []),
+        warnings=warnings,
+    )
+
+
 def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
     if args.group_command == "recommend":
         return _dispatch_group_recommend(args, database_path)
@@ -2758,9 +2808,11 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
             for ref in refs:
                 if storage.get_group_profile(ref) is None:
                     raise ValueError("selected group profile is unavailable")
-            ownership_by_app = _group_ownership_by_app(
-                storage, refs=refs, appids=appids
-            )
+            (
+                ownership_by_app,
+                ownership_missing,
+                ownership_stale,
+            ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
             declared = (
                 storage.read_declared_app_snapshot(
                     account_id=context_account.id,
@@ -2856,19 +2908,11 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 "member_count": len(members),
                 "copy_source_count": len(source_refs),
             },
-            completeness_value=completeness(
-                (
-                    CompletenessStatus.COMPLETE
-                    if missing_declared == 0
-                    else (
-                        CompletenessStatus.UNAVAILABLE
-                        if missing_declared == len(appids)
-                        else CompletenessStatus.PARTIAL
-                    )
-                ),
-                missing_capabilities=(
-                    ["discovery.declared.read"] if missing_declared else []
-                ),
+            completeness_value=_group_query_completeness(
+                missing_declared=missing_declared,
+                declared_total=(len(appids) if declared is not None else 0),
+                ownership_missing=ownership_missing,
+                ownership_stale=ownership_stale,
             ),
             data={"schema": "group-eligibility/0.1", "results": rows},
         )
@@ -2974,9 +3018,11 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 candidate_appids=candidate_appids,
                 seed_appids=seed_appids,
             )
-            ownership_by_app = _group_ownership_by_app(
-                storage, refs=refs, appids=candidate_appids
-            )
+            (
+                ownership_by_app,
+                ownership_missing,
+                ownership_stale,
+            ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
             family_by_member = {
                 member: storage.read_group_family(member) for member in members
             }
@@ -3103,15 +3149,6 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
         missing_declared = sum(
             payload_by_appid.get(appid) is None for appid in demanded
         )
-        status = (
-            CompletenessStatus.COMPLETE
-            if missing_declared == 0
-            else (
-                CompletenessStatus.UNAVAILABLE
-                if demanded and missing_declared == len(demanded)
-                else CompletenessStatus.PARTIAL
-            )
-        )
         return _emit_success(
             args,
             command=command,
@@ -3126,11 +3163,11 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 "member_count": len(members),
                 "copy_source_count": len(source_refs),
             },
-            completeness_value=completeness(
-                status,
-                missing_capabilities=(
-                    ["discovery.declared.read"] if missing_declared else []
-                ),
+            completeness_value=_group_query_completeness(
+                missing_declared=missing_declared,
+                declared_total=len(demanded),
+                ownership_missing=ownership_missing,
+                ownership_stale=ownership_stale,
             ),
             data={
                 "schema": "group-fit/0.1",

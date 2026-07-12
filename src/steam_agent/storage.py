@@ -1180,13 +1180,14 @@ class Storage:
             # provider refresh.  Every CLI process opens storage once, so this
             # also removes expired declared facts and private demand lineage
             # when a user only performs cache-backed reads after syncing.
-            if self._connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='declared_app_current'"
-            ).fetchone() is not None:
-                self._prune_declared_apps(
-                    _timestamp(datetime.now(timezone.utc))
-                )
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='declared_app_current'"
+                ).fetchone()
+                is not None
+            ):
+                self._prune_declared_apps(_timestamp(datetime.now(timezone.utc)))
             self._connection.commit()
         except BaseException:
             try:
@@ -1264,7 +1265,9 @@ class Storage:
                 (normalized_alias,),
             ).fetchone()
             if synthetic_collision is not None:
-                raise AccountConflict("account alias conflicts with a synthetic profile")
+                raise AccountConflict(
+                    "account alias conflicts with a synthetic profile"
+                )
             alias_row = self._connection.execute(
                 "SELECT * FROM accounts WHERE alias = ? COLLATE NOCASE",
                 (normalized_alias,),
@@ -1365,9 +1368,12 @@ class Storage:
         timestamp = _timestamp(created_at)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            if self._connection.execute(
-                "SELECT 1 FROM accounts WHERE alias = ? COLLATE NOCASE", (ref.key,)
-            ).fetchone() is not None:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM accounts WHERE alias = ? COLLATE NOCASE", (ref.key,)
+                ).fetchone()
+                is not None
+            ):
                 raise AccountConflict(
                     "synthetic profile alias conflicts with a configured account"
                 )
@@ -1393,7 +1399,21 @@ class Storage:
                 )
             else:
                 profile_id = int(row[0])
-                self._require_group_profile_consent(profile_id)
+                self._connection.execute(
+                    """INSERT INTO group_profile_consents(
+                           profile_id, disclosure_version,
+                           backups_acknowledged, accepted_at
+                       ) VALUES (?, ?, 1, ?)
+                       ON CONFLICT(profile_id) DO UPDATE SET
+                           disclosure_version=excluded.disclosure_version,
+                           backups_acknowledged=1,
+                           accepted_at=excluded.accepted_at""",
+                    (profile_id, disclosure_version, timestamp),
+                )
+                self._connection.execute(
+                    "UPDATE group_profiles SET updated_at = ? WHERE id = ?",
+                    (timestamp, profile_id),
+                )
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()
@@ -1552,8 +1572,7 @@ class Storage:
             values,
         )
         return tuple(
-            GroupOwnershipAssertion(ref, int(row[0]), row[1], row[2])
-            for row in rows
+            GroupOwnershipAssertion(ref, int(row[0]), row[1], row[2]) for row in rows
         )
 
     def set_group_family(
@@ -1699,7 +1718,9 @@ class Storage:
         except BaseException:
             self._rollback_or_reopen()
             raise
-        return GroupAppAssertion(ref, appid, _group_fact_name(fact_kind, slug), state, integer, timestamp)  # type: ignore[arg-type]
+        return GroupAppAssertion(
+            ref, appid, _group_fact_name(fact_kind, slug), state, integer, timestamp
+        )  # type: ignore[arg-type]
 
     def clear_group_app_assertion(
         self, ref: MemberRef, *, appid: int, fact: str
@@ -1827,10 +1848,13 @@ class Storage:
                     (profile_id,),
                 ).fetchone()[0]
             )
-            consent = self._connection.execute(
-                "SELECT 1 FROM group_profile_consents WHERE profile_id = ?",
-                (profile_id,),
-            ).fetchone() is not None
+            consent = (
+                self._connection.execute(
+                    "SELECT 1 FROM group_profile_consents WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()
+                is not None
+            )
             cursor = self._connection.execute(
                 "DELETE FROM group_profiles WHERE id = ? AND kind = ?",
                 (profile_id, ref.kind),
@@ -1921,7 +1945,9 @@ class Storage:
                     )
                     continue
                 if not identity_ensured:
-                    self._ensure_steam_application_identity(appid, observed_at=timestamp)
+                    self._ensure_steam_application_identity(
+                        appid, observed_at=timestamp
+                    )
                     identity_ensured = True
                 value_text = value if isinstance(value, str) else None
                 value_integer = value if isinstance(value, int) else None
@@ -1932,7 +1958,14 @@ class Storage:
                         trait, recorded_at
                     ) VALUES (?, ?, ?, ?, ?, NULL, ?)
                     """,
-                    (account_id, appid, field_name, value_text, value_integer, timestamp),
+                    (
+                        account_id,
+                        appid,
+                        field_name,
+                        value_text,
+                        value_integer,
+                        timestamp,
+                    ),
                 )
                 event_id = int(cursor.lastrowid)
                 self._connection.execute(
@@ -2184,7 +2217,9 @@ class Storage:
                 (account_id, trait),
             ).fetchone()
             if existing is not None and (
-                existing["kind"], existing["strength"], existing["weight"]
+                existing["kind"],
+                existing["strength"],
+                existing["weight"],
             ) == (kind, strength, weight):
                 self._connection.commit()
                 return int(existing["last_event_id"])
@@ -2266,9 +2301,13 @@ class Storage:
         )
 
     def _require_steam_account(self, account_id: int) -> None:
-        if self._connection.execute(
-            "SELECT 1 FROM accounts WHERE id = ? AND provider = 'steam'", (account_id,)
-        ).fetchone() is None:
+        if (
+            self._connection.execute(
+                "SELECT 1 FROM accounts WHERE id = ? AND provider = 'steam'",
+                (account_id,),
+            ).fetchone()
+            is None
+        ):
             raise ValueError("Steam account is not configured")
 
     def _remove_empty_feedback_current(self, account_id: int, appid: int) -> None:
@@ -2968,9 +3007,7 @@ class Storage:
         assert consent is not None
         return consent
 
-    def get_system_profile_consent(
-        self, machine_id: str
-    ) -> MachineDataConsent | None:
+    def get_system_profile_consent(self, machine_id: str) -> MachineDataConsent | None:
         row = self._connection.execute(
             """SELECT * FROM machine_data_consents
                WHERE machine_id=? AND consent_kind='system_profile'""",
@@ -2994,7 +3031,9 @@ class Storage:
         try:
             consent = self.get_system_profile_consent(machine_id)
             if consent is None or consent.disclosure_version != disclosure_version:
-                raise InvalidSyncTransition("current system-profile consent is required")
+                raise InvalidSyncTransition(
+                    "current system-profile consent is required"
+                )
             started = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             abandoned_cutoff = _timestamp(started - timedelta(minutes=15))
             self._connection.execute(
@@ -3007,18 +3046,14 @@ class Storage:
             )
             # History is diagnostic only and bounded to 30 days. Never delete the
             # promoted run because the current projection references it.
-            cutoff = _timestamp(
-                started - timedelta(days=30)
-            )
+            cutoff = _timestamp(started - timedelta(days=30))
             self._connection.execute(
                 """CREATE TEMP TABLE IF NOT EXISTS
                    expired_system_profile_evidence_ids(
                      evidence_id INTEGER PRIMARY KEY
                    )"""
             )
-            self._connection.execute(
-                "DELETE FROM expired_system_profile_evidence_ids"
-            )
+            self._connection.execute("DELETE FROM expired_system_profile_evidence_ids")
             self._connection.execute(
                 """INSERT OR IGNORE INTO expired_system_profile_evidence_ids(evidence_id)
                    SELECT observations.evidence_id
@@ -3060,9 +3095,7 @@ class Storage:
                      WHERE system_profile_current.evidence_id=evidence.id
                    )"""
             )
-            self._connection.execute(
-                "DELETE FROM expired_system_profile_evidence_ids"
-            )
+            self._connection.execute("DELETE FROM expired_system_profile_evidence_ids")
             cursor = self._connection.execute(
                 """INSERT INTO sync_runs(
                        provider, capability, machine_id, started_at, status
@@ -3107,13 +3140,19 @@ class Storage:
                 raise InvalidSyncTransition("system-profile sync is not running")
             consent = self.get_system_profile_consent(run.machine_id)
             if consent is None or consent.disclosure_version != disclosure_version:
-                raise InvalidSyncTransition("current system-profile consent is required")
+                raise InvalidSyncTransition(
+                    "current system-profile consent is required"
+                )
             machine = self.get_machine(run.machine_id)
             assert machine is not None
             profile_family = validated["os"]["family"]["value"]
             stored_family = {
-                "darwin": "macos", "macos": "macos", "win32": "windows",
-                "windows": "windows", "linux": "linux", "unknown": profile_family,
+                "darwin": "macos",
+                "macos": "macos",
+                "win32": "windows",
+                "windows": "windows",
+                "linux": "linux",
+                "unknown": profile_family,
             }.get(machine.platform.casefold())
             profile_architecture = validated["cpu"]["architecture"]["value"]
             stored_architecture = canonical_architecture(machine.architecture)
@@ -3226,9 +3265,7 @@ class Storage:
             self._rollback_or_reopen()
             raise
 
-    def _read_system_profile_snapshot(
-        self, machine_id: str
-    ) -> SystemProfileSnapshot:
+    def _read_system_profile_snapshot(self, machine_id: str) -> SystemProfileSnapshot:
         """Read and validate a system profile in the caller's transaction."""
 
         from steam_agent.system_profile import validate_system_profile
@@ -3290,9 +3327,7 @@ class Storage:
                      evidence_id INTEGER PRIMARY KEY
                    )"""
             )
-            self._connection.execute(
-                "DELETE FROM deleted_system_profile_evidence_ids"
-            )
+            self._connection.execute("DELETE FROM deleted_system_profile_evidence_ids")
             self._connection.execute(
                 """INSERT OR IGNORE INTO deleted_system_profile_evidence_ids(evidence_id)
                    SELECT evidence_id FROM system_profile_observations
@@ -3326,9 +3361,7 @@ class Storage:
                      WHERE system_profile_current.evidence_id=evidence.id
                    )"""
             ).rowcount
-            self._connection.execute(
-                "DELETE FROM deleted_system_profile_evidence_ids"
-            )
+            self._connection.execute("DELETE FROM deleted_system_profile_evidence_ids")
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()
@@ -3376,8 +3409,7 @@ class Storage:
             raise ValueError("declared-app scheduling inputs are invalid")
         timestamp = _timestamp(started_at)
         fresh_cutoff = _timestamp(
-            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            - timedelta(days=7)
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00")) - timedelta(days=7)
         )
         negative_cutoff = _timestamp(
             datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -3592,11 +3624,7 @@ class Storage:
                         int(targeted_value),
                         state,
                         skip_code,
-                        (
-                            cooldown_until
-                            if skip_code == "PROVIDER_COOLDOWN"
-                            else None
-                        ),
+                        (cooldown_until if skip_code == "PROVIDER_COOLDOWN" else None),
                         None if targeted_value else timestamp,
                     ),
                 )
@@ -3623,9 +3651,9 @@ class Storage:
             validate_declared_facts_payload,
         )
 
-        if state not in {"ready", "not_found", "failed"} or (
-            state == "ready"
-        ) != (facts is not None):
+        if state not in {"ready", "not_found", "failed"} or (state == "ready") != (
+            facts is not None
+        ):
             raise ValueError("declared-app result is invalid")
         if state == "failed" and not error_code:
             raise ValueError("failed declared-app result requires an error code")
@@ -3941,9 +3969,7 @@ class Storage:
         if len(selected) > _DECLARED_APP_MAX_DEMAND:
             raise ValueError("declared-app demand exceeds the bounded maximum")
         retention_cutoff = _timestamp(
-            datetime.fromisoformat(
-                _timestamp(as_of).replace("Z", "+00:00")
-            )
+            datetime.fromisoformat(_timestamp(as_of).replace("Z", "+00:00"))
             - timedelta(days=30)
         )
         self._require_steam_account(account_id)
@@ -3982,8 +4008,7 @@ class Storage:
             for row in rows
         }
         items = tuple(
-            by_appid.get(appid, {"appid": appid, "facts": None})
-            for appid in selected
+            by_appid.get(appid, {"appid": appid, "facts": None}) for appid in selected
         )
         latest = self._connection.execute(
             """SELECT r.* FROM sync_runs r
@@ -4069,9 +4094,7 @@ class Storage:
             as_of=as_of,
         )
         subjects: list[DeclaredAppSubject] = []
-        for item, demand in zip(
-            raw["items"], raw["latest_demand"], strict=True
-        ):
+        for item, demand in zip(raw["items"], raw["latest_demand"], strict=True):
             current = None
             if item["facts"] is not None:
                 current = DeclaredAppProjection(
@@ -4093,9 +4116,7 @@ class Storage:
                 )
             typed_demand = DeclaredAppDemand(
                 appid=int(demand["appid"]),
-                ordinal=(
-                    None if demand["ordinal"] is None else int(demand["ordinal"])
-                ),
+                ordinal=(None if demand["ordinal"] is None else int(demand["ordinal"])),
                 targeted=bool(demand["targeted"]),
                 evaluated=bool(demand["evaluated"]),
                 state=str(demand["state"]),
@@ -4156,9 +4177,7 @@ class Storage:
             )
             chunk_size = max(1, min(_DECLARED_APP_READ_CHUNK, variable_limit))
             for offset in range(0, len(affected_appids), chunk_size):
-                self._delete_orphan_apps(
-                    affected_appids[offset : offset + chunk_size]
-                )
+                self._delete_orphan_apps(affected_appids[offset : offset + chunk_size])
 
     def delete_declared_app_data(
         self, *, account_id: int | None = None
@@ -4297,7 +4316,9 @@ class Storage:
                     game.get("last_played_unix"),
                     game.get("recent_window_minutes"),
                     observed,
-                    recent_observed if game.get("recent_window_minutes") is not None else None,
+                    recent_observed
+                    if game.get("recent_window_minutes") is not None
+                    else None,
                 )
                 self._connection.execute(
                     """INSERT INTO activity_observations VALUES
@@ -4344,7 +4365,10 @@ class Storage:
         self, sync_run_id: int, *, error_code: str, completed_at: str | datetime
     ) -> SyncRun:
         run = self._finish_simple_sync(
-            sync_run_id, "activity.read", error_code=error_code, completed_at=completed_at
+            sync_run_id,
+            "activity.read",
+            error_code=error_code,
+            completed_at=completed_at,
         )
         assert run.account_id is not None
         with self._connection:
@@ -4381,7 +4405,9 @@ class Storage:
             result = {
                 "items": rows,
                 "latest": None if latest_row is None else SyncRun(**dict(latest_row)),
-                "latest_complete": None if good_row is None else SyncRun(**dict(good_row)),
+                "latest_complete": None
+                if good_row is None
+                else SyncRun(**dict(good_row)),
             }
             self._connection.commit()
             return result
@@ -4419,7 +4445,14 @@ class Storage:
                     """INSERT INTO achievement_sync_demand
                        (sync_run_id, account_id, appid, ordinal, targeted, state)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (run_id, account_id, appid, ordinal, is_targeted, "running" if is_targeted else "unevaluated"),
+                    (
+                        run_id,
+                        account_id,
+                        appid,
+                        ordinal,
+                        is_targeted,
+                        "running" if is_targeted else "unevaluated",
+                    ),
                 )
             self._connection.commit()
         except BaseException:
@@ -4442,7 +4475,12 @@ class Storage:
         write_schema: bool = True,
         disclosure_version: str,
     ) -> None:
-        if state not in {"ready", "profile_not_public", "achievements_not_supported", "failed"}:
+        if state not in {
+            "ready",
+            "profile_not_public",
+            "achievements_not_supported",
+            "failed",
+        }:
             raise ValueError("achievement state is invalid")
         timestamp = _timestamp(observed_at)
         self._connection.execute("BEGIN IMMEDIATE")
@@ -4478,16 +4516,30 @@ class Storage:
                     )
                 for item in player:
                     values = (
-                        sync_run_id, account_id, appid, item["api_name"],
-                        bool(item["achieved"]), item.get("unlock_time_unix"), timestamp,
+                        sync_run_id,
+                        account_id,
+                        appid,
+                        item["api_name"],
+                        bool(item["achieved"]),
+                        item.get("unlock_time_unix"),
+                        timestamp,
                     )
                     self._connection.execute(
-                        "INSERT INTO achievement_player_observations VALUES (?, ?, ?, ?, ?, ?, ?)", values,
+                        "INSERT INTO achievement_player_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        values,
                     )
                     if promote:
                         self._connection.execute(
                             "INSERT INTO achievement_player_current VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (account_id, appid, item["api_name"], bool(item["achieved"]), item.get("unlock_time_unix"), timestamp, sync_run_id),
+                            (
+                                account_id,
+                                appid,
+                                item["api_name"],
+                                bool(item["achieved"]),
+                                item.get("unlock_time_unix"),
+                                timestamp,
+                                sync_run_id,
+                            ),
                         )
                 if promote:
                     self._connection.execute(
@@ -4501,26 +4553,37 @@ class Storage:
                     )
             if write_schema and state != "failed":
                 existing_schema = self._connection.execute(
-                        """SELECT observed_at FROM achievement_schema_status
+                    """SELECT observed_at FROM achievement_schema_status
                            WHERE appid = ? AND language = 'english'""",
-                        (appid,),
-                    ).fetchone()
-                if existing_schema is None or existing_schema["observed_at"] <= timestamp:
+                    (appid,),
+                ).fetchone()
+                if (
+                    existing_schema is None
+                    or existing_schema["observed_at"] <= timestamp
+                ):
                     self._connection.execute(
-                            "DELETE FROM achievement_schema_current WHERE appid = ? AND language = 'english'",
-                            (appid,),
-                        )
+                        "DELETE FROM achievement_schema_current WHERE appid = ? AND language = 'english'",
+                        (appid,),
+                    )
                     for item in schema:
                         self._connection.execute(
-                                """INSERT INTO achievement_schema_current VALUES
+                            """INSERT INTO achievement_schema_current VALUES
                                    (?, 'english', ?, ?, ?, ?, ?, ?)""",
-                                (appid, item["api_name"], schema_state, item.get("display_name"), item.get("description"), bool(item["hidden"]), timestamp),
-                            )
-                    self._connection.execute(
-                            """INSERT INTO achievement_schema_status VALUES (?, 'english', ?, ?)
-                               ON CONFLICT(appid, language) DO UPDATE SET state=excluded.state, observed_at=excluded.observed_at""",
-                            (appid, schema_state, timestamp),
+                            (
+                                appid,
+                                item["api_name"],
+                                schema_state,
+                                item.get("display_name"),
+                                item.get("description"),
+                                bool(item["hidden"]),
+                                timestamp,
+                            ),
                         )
+                    self._connection.execute(
+                        """INSERT INTO achievement_schema_status VALUES (?, 'english', ?, ?)
+                               ON CONFLICT(appid, language) DO UPDATE SET state=excluded.state, observed_at=excluded.observed_at""",
+                        (appid, schema_state, timestamp),
+                    )
             self._connection.execute(
                 """UPDATE achievement_sync_demand SET evaluated = 1, state = ?,
                    error_code = ?, observed_at = ? WHERE sync_run_id = ? AND appid = ?""",
@@ -4541,7 +4604,9 @@ class Storage:
         ).fetchone()
         if status is None:
             return None
-        observed = datetime.fromisoformat(str(status["observed_at"]).replace("Z", "+00:00"))
+        observed = datetime.fromisoformat(
+            str(status["observed_at"]).replace("Z", "+00:00")
+        )
         lifetime = timedelta(days=30 if status["state"] == "ready" else 7)
         age = evaluated - observed
         if age < timedelta(0) or age > lifetime:
@@ -4566,23 +4631,35 @@ class Storage:
             run = self._connection.execute(
                 "SELECT * FROM sync_runs WHERE id = ?", (sync_run_id,)
             ).fetchone()
-            if run is None or run["capability"] != "achievements.read" or run["status"] != "running":
+            if (
+                run is None
+                or run["capability"] != "achievements.read"
+                or run["status"] != "running"
+            ):
                 raise InvalidSyncTransition("achievement sync run is not active")
-            running = int(self._connection.execute(
-                "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id = ? AND state = 'running'", (sync_run_id,)
-            ).fetchone()[0])
+            running = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id = ? AND state = 'running'",
+                    (sync_run_id,),
+                ).fetchone()[0]
+            )
             if running:
                 self._connection.execute(
                     """UPDATE achievement_sync_demand SET state='failed', evaluated=1,
                        error_code='SYNC_INTERRUPTED', observed_at=?
-                       WHERE sync_run_id=? AND state='running'""", (completed, sync_run_id)
+                       WHERE sync_run_id=? AND state='running'""",
+                    (completed, sync_run_id),
                 )
-            evaluated = int(self._connection.execute(
-                "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id=? AND evaluated=1", (sync_run_id,)
-            ).fetchone()[0])
+            evaluated = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM achievement_sync_demand WHERE sync_run_id=? AND evaluated=1",
+                    (sync_run_id,),
+                ).fetchone()[0]
+            )
             self._connection.execute(
                 """UPDATE sync_runs SET status='complete', promoted=1, records_seen=?, completed_at=?
-                   WHERE id=?""", (evaluated, completed, sync_run_id)
+                   WHERE id=?""",
+                (evaluated, completed, sync_run_id),
             )
             self._prune_behavioral(int(run["account_id"]), completed)
             self._connection.commit()
@@ -4622,13 +4699,16 @@ class Storage:
             filter_sql = "" if appid is None else " AND d.appid = ?"
             latest = self._connection.execute(
                 """SELECT * FROM sync_runs WHERE account_id=? AND capability='achievements.read'
-                   ORDER BY started_at DESC, id DESC LIMIT 1""", (account_id,)
+                   ORDER BY started_at DESC, id DESC LIMIT 1""",
+                (account_id,),
             ).fetchone()
             if latest is None:
                 result: Mapping[str, Any] = {"items": (), "latest": None}
             else:
-                rows = tuple(dict(row) for row in self._connection.execute(
-                    f"""SELECT d.*, a.name FROM achievement_sync_demand d
+                rows = tuple(
+                    dict(row)
+                    for row in self._connection.execute(
+                        f"""SELECT d.*, a.name FROM achievement_sync_demand d
                         JOIN steam_apps a USING(appid)
                         JOIN sync_runs r ON r.id=d.sync_run_id
                         WHERE d.account_id=?{filter_sql}
@@ -4639,8 +4719,9 @@ class Storage:
                             ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
                           )
                         ORDER BY d.appid""",
-                    (account_id, *(() if appid is None else (appid,))),
-                ))
+                        (account_id, *(() if appid is None else (appid,))),
+                    )
+                )
                 items: list[dict[str, Any]] = []
                 for row in rows:
                     projection = self._connection.execute(
@@ -4649,20 +4730,25 @@ class Storage:
                            WHERE account_id=? AND appid=?""",
                         (account_id, row["appid"]),
                     ).fetchone()
-                    achievements = tuple(dict(item) for item in self._connection.execute(
-                        """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
+                    achievements = tuple(
+                        dict(item)
+                        for item in self._connection.execute(
+                            """SELECT p.api_name, p.achieved, p.unlock_time_unix, p.observed_at,
                                   s.display_name, s.description, COALESCE(s.hidden, 0) AS hidden
                            FROM achievement_player_current p
                            LEFT JOIN achievement_schema_current s ON s.appid=p.appid
                              AND s.language='english' AND s.api_name=p.api_name
                            WHERE p.account_id=? AND p.appid=? ORDER BY p.api_name""",
-                        (account_id, row["appid"]),
-                    ))
+                            (account_id, row["appid"]),
+                        )
+                    )
                     row["player_projection_observed_at"] = (
                         None if projection is None else projection["observed_at"]
                     )
                     row["player_projection_sync_run_id"] = (
-                        None if projection is None else projection["promoted_sync_run_id"]
+                        None
+                        if projection is None
+                        else projection["promoted_sync_run_id"]
                     )
                     row["achievements"] = achievements
                     items.append(row)
@@ -4758,7 +4844,9 @@ class Storage:
                 review_consent is None
                 or review_consent["disclosure_version"] != disclosure_version
             ):
-                raise InvalidSyncTransition("current review persistence consent is required")
+                raise InvalidSyncTransition(
+                    "current review persistence consent is required"
+                )
             self._prune_reviews(timestamp)
             stale_cutoff = _timestamp(
                 datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -4847,7 +4935,9 @@ class Storage:
         summary: Mapping[str, Any] | None = None,
         error_code: str | None = None,
     ) -> None:
-        if state not in {"ready", "failed"} or (state == "ready") != (summary is not None):
+        if state not in {"ready", "failed"} or (state == "ready") != (
+            summary is not None
+        ):
             raise ValueError("review result is invalid")
         timestamp = _timestamp(observed_at)
         if summary is not None:
@@ -5067,7 +5157,8 @@ class Storage:
                     account_id
                 )
             runs = self._connection.execute(
-                "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read'" + where,
+                "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read'"
+                + where,
                 parameters,
             ).rowcount
             consent_where = (
@@ -5080,16 +5171,21 @@ class Storage:
                 parameters,
             )
             if account_id is None:
-                current = self._connection.execute("DELETE FROM review_current").rowcount
+                current = self._connection.execute(
+                    "DELETE FROM review_current"
+                ).rowcount
                 self._connection.execute(
                     "DELETE FROM provider_request_limits WHERE provider='steam-store-reviews'"
                 )
             else:
-                current = target_current_removed + self._connection.execute(
-                    """DELETE FROM review_current WHERE NOT EXISTS (
+                current = (
+                    target_current_removed
+                    + self._connection.execute(
+                        """DELETE FROM review_current WHERE NOT EXISTS (
                          SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
                        )"""
-                ).rowcount
+                    ).rowcount
+                )
             self._connection.commit()
             return {
                 "observations_removed": observations,
@@ -5161,7 +5257,14 @@ class Storage:
             )
         return removed
 
-    def _finish_simple_sync(self, sync_run_id: int, capability: str, *, error_code: str, completed_at: str | datetime) -> SyncRun:
+    def _finish_simple_sync(
+        self,
+        sync_run_id: int,
+        capability: str,
+        *,
+        error_code: str,
+        completed_at: str | datetime,
+    ) -> SyncRun:
         timestamp = _timestamp(completed_at)
         with self._connection:
             cursor = self._connection.execute(
@@ -5174,13 +5277,16 @@ class Storage:
         return self.get_sync_run(sync_run_id)
 
     def _prune_activity(self, account_id: int, now: str) -> None:
-        cutoff = _timestamp(datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7))
+        cutoff = _timestamp(
+            datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)
+        )
         self._connection.execute(
             "DELETE FROM sync_runs WHERE account_id=? AND capability='activity.read' AND started_at < ?",
             (account_id, cutoff),
         )
         self._connection.execute(
-            "DELETE FROM activity_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
+            "DELETE FROM activity_current WHERE account_id=? AND observed_at < ?",
+            (account_id, cutoff),
         )
 
     def _prune_behavioral(self, account_id: int, now: str) -> None:
@@ -5196,20 +5302,24 @@ class Storage:
             (account_id, cutoff),
         )
         self._connection.execute(
-            "DELETE FROM achievement_player_current WHERE account_id=? AND observed_at < ?", (account_id, cutoff)
+            "DELETE FROM achievement_player_current WHERE account_id=? AND observed_at < ?",
+            (account_id, cutoff),
         )
         self._connection.execute(
             "DELETE FROM achievement_player_projection WHERE account_id=? AND observed_at < ?",
             (account_id, cutoff),
         )
         self._connection.execute(
-            "DELETE FROM achievement_schema_current WHERE observed_at < ?", (schema_cutoff,)
+            "DELETE FROM achievement_schema_current WHERE observed_at < ?",
+            (schema_cutoff,),
         )
         self._connection.execute(
-            "DELETE FROM achievement_schema_status WHERE state='ready' AND observed_at < ?", (schema_cutoff,)
+            "DELETE FROM achievement_schema_status WHERE state='ready' AND observed_at < ?",
+            (schema_cutoff,),
         )
         self._connection.execute(
-            "DELETE FROM achievement_schema_status WHERE state='achievements_not_supported' AND observed_at < ?", (cutoff,)
+            "DELETE FROM achievement_schema_status WHERE state='achievements_not_supported' AND observed_at < ?",
+            (cutoff,),
         )
 
     def _require_activity_consent(
@@ -5227,7 +5337,9 @@ class Storage:
             or row["disclosure_version"] != disclosure_version
             or not bool(row["backups_acknowledged"])
         ):
-            raise InvalidSyncTransition("current activity persistence consent is required")
+            raise InvalidSyncTransition(
+                "current activity persistence consent is required"
+            )
 
     def complete_wishlist_snapshot(
         self,
@@ -7615,9 +7727,16 @@ class Storage:
             )
             self._connection.commit()
             return RecommendationSnapshot(
-                owned, installed, activity_items, activity_latest,
-                activity_latest_complete, achievement_items, achievement_latest,
-                feedback, rules, catalog,
+                owned,
+                installed,
+                activity_items,
+                activity_latest,
+                activity_latest_complete,
+                achievement_items,
+                achievement_latest,
+                feedback,
+                rules,
+                catalog,
             )
         except BaseException:
             try:
@@ -7830,7 +7949,9 @@ class Storage:
                 activity_observations_removed=counts["activity_observations"],
                 activity_current_removed=counts["activity_current"],
                 achievement_demand_removed=counts["achievement_demand"],
-                achievement_player_observations_removed=counts["achievement_player_observations"],
+                achievement_player_observations_removed=counts[
+                    "achievement_player_observations"
+                ],
                 achievement_player_current_removed=counts["achievement_player_current"],
             )
         except BaseException:
@@ -7955,31 +8076,36 @@ class Storage:
                     "feedback_events": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM explicit_feedback_events "
-                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
                         ).fetchone()[0]
                     ),
                     "feedback_current": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM explicit_feedback_current "
-                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
                         ).fetchone()[0]
                     ),
                     "feedback_traits": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM explicit_trait_current "
-                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
                         ).fetchone()[0]
                     ),
                     "preference_rule_events": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM preference_rule_events "
-                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
                         ).fetchone()[0]
                     ),
                     "preference_rules": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM preference_rules_current "
-                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                            f"WHERE account_id IN ({id_placeholders})",
+                            account_ids,
                         ).fetchone()[0]
                     ),
                     "activity_observations": int(
@@ -8202,7 +8328,9 @@ class Storage:
                 activity_observations_removed=counts["activity_observations"],
                 activity_current_removed=counts["activity_current"],
                 achievement_demand_removed=counts["achievement_demand"],
-                achievement_player_observations_removed=counts["achievement_player_observations"],
+                achievement_player_observations_removed=counts[
+                    "achievement_player_observations"
+                ],
                 achievement_player_current_removed=counts["achievement_player_current"],
             )
         except BaseException:
@@ -9587,9 +9715,7 @@ def _group_fact_key(fact: str) -> tuple[str, str]:
     raise ValueError("group app fact is invalid")
 
 
-def _group_app_fact(
-    fact: str, value: int | str
-) -> tuple[str, str, str, int | None]:
+def _group_app_fact(fact: str, value: int | str) -> tuple[str, str, str, int | None]:
     kind, slug = _group_fact_key(fact)
     if kind in {"players_min", "players_max"}:
         if value == "unknown":

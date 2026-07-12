@@ -258,6 +258,8 @@ def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
 
     assert code == 0
     assert value["data"]["results"][0]["ownership"]["members"][0]["state"] == "unknown"
+    assert value["completeness"]["status"] == "partial"
+    assert value["completeness"]["stale_capabilities"] == ["owned.visible.read"]
 
 
 def test_group_eligibility_combines_mode_copies_players_and_policy(
