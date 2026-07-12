@@ -31,6 +31,17 @@ class Clock:
         return result
 
 
+class PacedClock:
+    def __init__(self) -> None:
+        self.value = NOW
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
 class Client:
     def __init__(self, *, fail_at: int | None = None, retryable: bool = True) -> None:
         self.calls: list[int] = []
@@ -138,6 +149,24 @@ def test_explicit_limit_refreshes_prefix_and_preserves_full_demand(tmp_path) -> 
             (0, 0, "unevaluated"),
             (0, 0, "unevaluated"),
         ]
+
+
+def test_multi_item_loop_paces_its_own_local_request_reservations(tmp_path) -> None:
+    paced = PacedClock()
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 3)
+        client = Client()
+        result = sync_wishlist_reviews(
+            storage,
+            account_id=account_id,
+            max_items=3,
+            client=client,
+            clock=paced,
+            sleeper=paced.sleep,
+        )
+        assert client.calls == [100, 101, 102]
+        assert result.state_counts == {"ready": 3}
+        assert paced.value == NOW + timedelta(seconds=2.1)
 
 
 def test_provider_failure_stops_fanout_and_persists_cooldown(tmp_path) -> None:

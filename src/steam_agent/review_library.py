@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 from typing import Callable
 
 from steam_agent.steam_reviews import SteamReviewClient, SteamReviewError
@@ -16,6 +17,7 @@ REVIEW_DISCLOSURE_VERSION = "2026-07-11.m4"
 REVIEW_PROVIDER = "steam-store-reviews"
 REVIEW_BUDGET_SCOPE = "public-aggregate"
 Clock = Callable[[], datetime]
+Sleeper = Callable[[float], None]
 
 
 def now_utc() -> datetime:
@@ -45,6 +47,7 @@ def sync_wishlist_reviews(
     client: SteamReviewClient | None = None,
     clock: Clock = now_utc,
     minimum_interval_seconds: float = 1.0,
+    sleeper: Sleeper = time.sleep,
 ) -> ReviewSyncResult:
     """Synchronize a deterministic, bounded wishlist review slice.
 
@@ -83,7 +86,17 @@ def sync_wishlist_reviews(
                 requested_at=observed,
                 minimum_interval_seconds=minimum_interval_seconds,
             ):
-                raise ReviewSyncError("REQUEST_THROTTLED", retryable=True)
+                # A request made by this same bounded loop commonly owns the
+                # one-interval reservation. Pace once, then re-check so a
+                # longer cross-run Retry-After cooldown still stops fanout.
+                sleeper(minimum_interval_seconds + 0.05)
+                if not storage.reserve_provider_request(
+                    provider=REVIEW_PROVIDER,
+                    budget_scope=REVIEW_BUDGET_SCOPE,
+                    requested_at=clock(),
+                    minimum_interval_seconds=minimum_interval_seconds,
+                ):
+                    raise ReviewSyncError("REQUEST_THROTTLED", retryable=True)
             summary = api.fetch_summary(appid)
             storage.record_review_result(
                 run.id,
