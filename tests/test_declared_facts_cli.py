@@ -16,7 +16,9 @@ from steam_agent.storage import Machine, OwnedObservation, Storage
 
 
 NOW = datetime(2026, 7, 12, 12, tzinfo=timezone.utc)
-FIXTURE = Path(__file__).parent / "fixtures" / "steam_declared_facts" / "legacy_shape.json"
+FIXTURE = (
+    Path(__file__).parent / "fixtures" / "steam_declared_facts" / "legacy_shape.json"
+)
 
 
 class FixtureTransport:
@@ -33,9 +35,7 @@ class FailingClient:
 
     def fetch(self, *_: object, **__: object):
         self.calls += 1
-        raise SteamDeclaredFactsError(
-            self.code, retryable=self.code == "RATE_LIMITED"
-        )
+        raise SteamDeclaredFactsError(self.code, retryable=self.code == "RATE_LIMITED")
 
 
 class InterruptingClient:
@@ -76,11 +76,7 @@ def configure(tmp_path: Path) -> None:
         )
         storage.complete_owned_snapshot(
             run.id,
-            (
-                OwnedObservation(
-                    400, 0, "visible_owned", NOW, "Fixture Game"
-                ),
-            ),
+            (OwnedObservation(400, 0, "visible_owned", NOW, "Fixture Game"),),
             base_retrieved_at=NOW,
             expanded_retrieved_at=NOW,
             base_reported_count=1,
@@ -217,9 +213,12 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     assert code == 0
     assert account_delete["data"]["global_public_current_preserved"] is True
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_current"
-        ).fetchone()[0] == 1
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_current"
+            ).fetchone()[0]
+            == 1
+        )
     code, provider_delete, _ = invoke(
         tmp_path,
         capsys,
@@ -233,9 +232,161 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     assert code == 0
     assert provider_delete["data"]["global_public_current_preserved"] is False
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_current"
-        ).fetchone()[0] == 0
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_current"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_app_facts_explicit_sync_and_discovery_query_are_bounded_cache_only(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        storage.record_compatibility_data_consent(
+            account_id=account.id,
+            disclosure_version="m5-declared-app-facts-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+    client = SteamDeclaredFactsClient(transport=FixtureTransport())
+    monkeypatch.setattr(cli, "_declared_facts_client", lambda: client)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    code, blocked, _ = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        "appids",
+        "--appid",
+        "400",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 1
+    assert blocked["error"]["code"] == "DATA_POLICY_ACKNOWLEDGMENT_REQUIRED"
+
+    code, synced, _ = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        "appids",
+        "--appid",
+        "400",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--acknowledge-local-storage",
+    )
+    assert code == 0
+    assert synced["data"]["schema_id"] == "declared-app-facts/0.2"
+    assert synced["context"]["scope"] == "appids"
+
+    monkeypatch.setattr(
+        cli, "_declared_facts_client", lambda: pytest.fail("query used network")
+    )
+    code, queried, error = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "appids",
+        "--appid",
+        "400",
+        "--limit",
+        "1",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--require-mode",
+        "online_co_op",
+    )
+    assert code == 0 and error == ""
+    assert queried["data"]["network_used"] is False
+    assert queried["data"]["items"][0]["mode_requirement"] == "unknown"
+    assert queried["data"]["items"][0]["health"] == {"state": "unsupported"}
+
+
+def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.configure_steam_account(
+            alias="other", steam_id64="76561198000000001", configured_at=NOW
+        )
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        "appids",
+        "--appid",
+        "400",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--acknowledge-local-storage",
+    )
+
+    code, result, _ = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "known",
+        "--limit",
+        "10",
+        "--account",
+        "other",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0
+    assert result["data"]["candidate_count"] == 0
+    assert result["data"]["items"] == []
 
 
 def test_contract_drift_disables_transport_until_retry_time(
@@ -476,9 +627,7 @@ def test_empty_owned_last_good_retains_stale_or_superseded_completeness(
             expanded_retrieved_at=NOW,
             base_reported_count=0,
             expanded_reported_count=0,
-            completed_at=(
-                "2026-07-10T00:00:01Z" if not superseded else NOW
-            ),
+            completed_at=("2026-07-10T00:00:01Z" if not superseded else NOW),
         )
         if superseded:
             failed = storage.begin_sync(
@@ -512,9 +661,7 @@ def test_empty_owned_last_good_retains_stale_or_superseded_completeness(
     assert error == ""
     assert result["data"]["items"] == []
     assert result["completeness"]["status"] == "partial"
-    assert result["completeness"]["stale_capabilities"] == [
-        "owned.visible.read"
-    ]
+    assert result["completeness"]["stale_capabilities"] == ["owned.visible.read"]
     assert result["completeness"]["warnings"] == [
         {
             "code": "STALE_LAST_GOOD",
@@ -560,9 +707,7 @@ def test_keyboard_interrupt_finishes_typed_recoverable_run(
     }
 
 
-def test_sync_rejects_unicode_country_case_expansion(
-    tmp_path: Path, capsys
-) -> None:
+def test_sync_rejects_unicode_country_case_expansion(tmp_path: Path, capsys) -> None:
     configure(tmp_path)
 
     code, result, stderr = invoke(

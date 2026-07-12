@@ -117,9 +117,11 @@ from steam_agent.system_profile import (
 )
 from steam_agent.steam_declared_facts import (
     DECLARED_FACTS_DISCLOSURE_VERSION,
+    MULTIPLAYER_CATEGORY_SLUGS,
     SteamDeclaredFactsClient,
     SteamDeclaredFactsError,
     SteamDeclaredFactsRequestContext,
+    declared_discovery_facts,
     declared_facts_payload,
 )
 from steam_agent.compatibility import (
@@ -335,6 +337,23 @@ def build_parser() -> argparse.ArgumentParser:
     compatibility_sync.add_argument("--language", required=True)
     compatibility_sync.add_argument("--max-items", type=int, default=20)
     compatibility_sync.add_argument("--acknowledge-local-storage", action="store_true")
+    app_facts_sync = sync_commands.add_parser(
+        "app-facts",
+        help="Synchronize bounded provisional declared store facts.",
+    )
+    _add_leaf_format(app_facts_sync)
+    app_facts_sync.add_argument(
+        "--scope",
+        choices=("known", "library", "wishlist", "installed", "appids"),
+        required=True,
+    )
+    app_facts_sync.add_argument("--appid", action="append", type=int, default=[])
+    app_facts_sync.add_argument("--account", default="primary")
+    app_facts_sync.add_argument("--machine", default="local")
+    app_facts_sync.add_argument("--country", required=True)
+    app_facts_sync.add_argument("--language", required=True)
+    app_facts_sync.add_argument("--max-items", type=int, default=20)
+    app_facts_sync.add_argument("--acknowledge-local-storage", action="store_true")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -346,6 +365,29 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
     query.add_argument("--include-paths", action="store_true")
+
+    discovery = commands.add_parser(
+        "discovery", help="Query bounded cached declared discovery evidence."
+    )
+    discovery_commands = discovery.add_subparsers(
+        dest="discovery_command", required=True
+    )
+    discovery_query = discovery_commands.add_parser(
+        "query", help="Query declared facts without network access."
+    )
+    _add_leaf_format(discovery_query)
+    discovery_query.add_argument(
+        "--scope",
+        choices=("known", "library", "wishlist", "installed", "appids"),
+        required=True,
+    )
+    discovery_query.add_argument("--appid", action="append", type=int, default=[])
+    discovery_query.add_argument("--limit", type=int, required=True)
+    discovery_query.add_argument("--account", default="primary")
+    discovery_query.add_argument("--machine", default="local")
+    discovery_query.add_argument("--country", required=True)
+    discovery_query.add_argument("--language", required=True)
+    discovery_query.add_argument("--require-mode")
 
     deals = commands.add_parser("deals", help="Query cached wishlist deal evidence.")
     deal_commands = deals.add_subparsers(dest="deals_command", required=True)
@@ -403,7 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     activity = commands.add_parser("activity", help="Query cached activity evidence.")
     activity_commands = activity.add_subparsers(dest="activity_command", required=True)
-    activity_query = activity_commands.add_parser("query", help="Query cached activity.")
+    activity_query = activity_commands.add_parser(
+        "query", help="Query cached activity."
+    )
     _add_leaf_format(activity_query)
     activity_query.add_argument("--account", default="primary")
     activity_query.add_argument("--appid", type=int)
@@ -456,7 +500,9 @@ def build_parser() -> argparse.ArgumentParser:
     compatibility_assess.add_argument("--override", action="append", default=[])
     compatibility_assess.add_argument("--explain", action="store_true")
 
-    feedback = commands.add_parser("feedback", help="Manage explicit local game feedback.")
+    feedback = commands.add_parser(
+        "feedback", help="Manage explicit local game feedback."
+    )
     feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
     rate = feedback_commands.add_parser("rate", help="Set an explicit game rating.")
     _add_leaf_format(rate)
@@ -466,7 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     rate_choice.add_argument("--value", choices=("liked", "disliked", "neutral"))
     rate_choice.add_argument("--clear", action="store_true")
     for command_name in ("finish", "abandon", "resume"):
-        state = feedback_commands.add_parser(command_name, help=f"Mark a game as {command_name}.")
+        state = feedback_commands.add_parser(
+            command_name, help=f"Mark a game as {command_name}."
+        )
         _add_leaf_format(state)
         state.add_argument("appid", type=int)
         state.add_argument("--account", default="primary")
@@ -476,14 +524,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(clear_state)
     clear_state.add_argument("appid", type=int)
     clear_state.add_argument("--account", default="primary")
-    snooze = feedback_commands.add_parser("snooze", help="Set or clear a temporary snooze.")
+    snooze = feedback_commands.add_parser(
+        "snooze", help="Set or clear a temporary snooze."
+    )
     _add_leaf_format(snooze)
     snooze.add_argument("appid", type=int)
     snooze.add_argument("--account", default="primary")
     snooze_choice = snooze.add_mutually_exclusive_group(required=True)
     snooze_choice.add_argument("--until")
     snooze_choice.add_argument("--clear", action="store_true")
-    estimate = feedback_commands.add_parser("estimate", help="Set or clear explicit time estimates.")
+    estimate = feedback_commands.add_parser(
+        "estimate", help="Set or clear explicit time estimates."
+    )
     _add_leaf_format(estimate)
     estimate.add_argument("appid", type=int)
     estimate.add_argument("--account", default="primary")
@@ -491,7 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     estimate.add_argument("--remaining-minutes", type=int)
     estimate.add_argument("--clear-minimum-session-minutes", action="store_true")
     estimate.add_argument("--clear-remaining-minutes", action="store_true")
-    trait = feedback_commands.add_parser("trait", help="Set an explicit user-namespaced trait.")
+    trait = feedback_commands.add_parser(
+        "trait", help="Set an explicit user-namespaced trait."
+    )
     _add_leaf_format(trait)
     trait.add_argument("appid", type=int)
     trait.add_argument("--account", default="primary")
@@ -499,26 +553,38 @@ def build_parser() -> argparse.ArgumentParser:
     trait_choice = trait.add_mutually_exclusive_group(required=True)
     trait_choice.add_argument("--value", choices=("present", "absent", "unknown"))
     trait_choice.add_argument("--clear", action="store_true")
-    feedback_query = feedback_commands.add_parser("query", help="Query cached explicit feedback.")
+    feedback_query = feedback_commands.add_parser(
+        "query", help="Query cached explicit feedback."
+    )
     _add_leaf_format(feedback_query)
     feedback_query.add_argument("--account", default="primary")
     feedback_query.add_argument("--appid", type=int)
 
-    preferences = commands.add_parser("preferences", help="Manage explicit profile preference rules.")
-    preference_commands = preferences.add_subparsers(dest="preferences_command", required=True)
-    rules = preference_commands.add_parser("rule", help="Manage trait preference rules.")
+    preferences = commands.add_parser(
+        "preferences", help="Manage explicit profile preference rules."
+    )
+    preference_commands = preferences.add_subparsers(
+        dest="preferences_command", required=True
+    )
+    rules = preference_commands.add_parser(
+        "rule", help="Manage trait preference rules."
+    )
     rule_commands = rules.add_subparsers(dest="rule_command", required=True)
     rule_set = rule_commands.add_parser("set", help="Set a trait preference rule.")
     _add_leaf_format(rule_set)
     rule_set.add_argument("--account", default="primary")
     rule_set.add_argument("--trait", required=True)
-    rule_set.add_argument("--kind", choices=("prefer", "avoid", "require"), required=True)
+    rule_set.add_argument(
+        "--kind", choices=("prefer", "avoid", "require"), required=True
+    )
     rule_set.add_argument("--strength", choices=("soft", "hard"), required=True)
     rule_set.add_argument("--weight", type=int, required=True)
     rule_list = rule_commands.add_parser("list", help="List trait preference rules.")
     _add_leaf_format(rule_list)
     rule_list.add_argument("--account", default="primary")
-    rule_remove = rule_commands.add_parser("remove", help="Remove a trait preference rule.")
+    rule_remove = rule_commands.add_parser(
+        "remove", help="Remove a trait preference rule."
+    )
     _add_leaf_format(rule_remove)
     rule_remove.add_argument("--account", default="primary")
     rule_remove.add_argument("--trait", required=True)
@@ -784,7 +850,7 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_reviews(args, database_path)
     if args.command == "sync" and args.sync_command == "system":
         return _dispatch_system(args, database_path)
-    if args.command == "sync" and args.sync_command == "compatibility":
+    if args.command == "sync" and args.sync_command in {"compatibility", "app-facts"}:
         return _dispatch_sync_compatibility(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
@@ -946,6 +1012,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_system(args, database_path)
     if args.command == "compatibility":
         return _dispatch_compatibility(args, database_path)
+    if args.command == "discovery":
+        return _dispatch_discovery(args, database_path)
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
     if args.command == "recommendations" and args.recommendations_command == "wishlist":
@@ -1028,7 +1096,10 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                     message="The requested account alias is not configured.",
                 )
             consent = storage.get_activity_data_consent(account.id)
-            if consent is None or consent.disclosure_version != ACTIVITY_DISCLOSURE_VERSION:
+            if (
+                consent is None
+                or consent.disclosure_version != ACTIVITY_DISCLOSURE_VERSION
+            ):
                 if not args.acknowledge_local_storage:
                     return _emit_error(
                         args,
@@ -1206,7 +1277,9 @@ def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
                 status = CompletenessStatus.PARTIAL
                 if "system_profile.read" not in stale:
                     stale.append("system_profile.read")
-                if not any(warning.code == ErrorCode.STALE_LAST_GOOD for warning in warnings):
+                if not any(
+                    warning.code == ErrorCode.STALE_LAST_GOOD for warning in warnings
+                ):
                     warnings.append(
                         WarningRecord(
                             code=ErrorCode.STALE_LAST_GOOD,
@@ -1321,12 +1394,16 @@ def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
             if result.run.status == "complete"
             else CompletenessStatus.PARTIAL
         )
-        warnings = [] if result.run.status == "complete" else [
-            WarningRecord(
-                code=result.run.error_code or ErrorCode.PARTIAL_SCAN,
-                message="Required system facts were unavailable; the last-good profile was preserved.",
-            )
-        ]
+        warnings = (
+            []
+            if result.run.status == "complete"
+            else [
+                WarningRecord(
+                    code=result.run.error_code or ErrorCode.PARTIAL_SCAN,
+                    message="Required system facts were unavailable; the last-good profile was preserved.",
+                )
+            ]
+        )
         return _emit_success(
             args,
             command=command,
@@ -1379,7 +1456,8 @@ def _machine_profile_identity_matches(
 
 
 def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) -> int:
-    command = "sync.compatibility"
+    app_facts_command = args.sync_command == "app-facts"
+    command = "sync.app-facts" if app_facts_command else "sync.compatibility"
     started_at = _utc_now()
     try:
         # Validate the complete provider/scheduler contract before any
@@ -1398,8 +1476,10 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
         ):
             raise ValueError("AppIDs must be positive uint32 values")
         demanded_selection = tuple(sorted(set(supplied_appids)))
+        if app_facts_command and args.scope == "appids" and not demanded_selection:
+            raise ValueError("appids scope requires at least one AppID")
         if len(demanded_selection) > 10_000:
-            raise ValueError("compatibility demand exceeds the bounded maximum")
+            raise ValueError("declared-fact demand exceeds the bounded maximum")
         if (
             isinstance(args.max_items, bool)
             or not isinstance(args.max_items, int)
@@ -1411,7 +1491,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             args,
             command=command,
             code=ErrorCode.INVALID_ARGUMENT,
-            message="The compatibility synchronization arguments are invalid.",
+            message="The declared-fact synchronization arguments are invalid.",
             exit_code=2,
         )
     with Storage(database_path) as storage:
@@ -1439,7 +1519,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 exit_code=2,
             )
         owned = storage.read_owned_snapshot(account.id)
-        if owned.latest_complete is None:
+        if not app_facts_command and owned.latest_complete is None:
             return _emit_success(
                 args,
                 command=command,
@@ -1469,24 +1549,43 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     "sync_status": None,
                     "items": [],
                     "demand": [],
-                    "schema_id": "declared-app-facts/0.1",
+                    "schema_id": "declared-app-facts/0.2",
                     "support_level": "provisional",
                 },
             )
-        owned_reference = owned.latest_complete.completed_at or owned.latest_complete.started_at
-        owned_age = (
-            started_at
-            - datetime.fromisoformat(owned_reference.replace("Z", "+00:00"))
-        ).total_seconds()
-        owned_dependency_stale = (
-            owned.latest is None
-            or owned.latest.status != "complete"
-            or owned_age < 0
-            or owned_age > _OWNED_SYNC_FRESHNESS_SECONDS
-        )
         owned_appids = {game.appid for game in owned.games}
-        demanded_appids = demanded_selection or tuple(sorted(owned_appids))
-        if any(appid not in owned_appids for appid in demanded_appids):
+        if app_facts_command:
+            wishlist = storage.read_wishlist_snapshot(account.id)
+            installed = storage.read_installed_snapshot(machine.id)
+            wishlist_appids = {game.appid for game in wishlist.games}
+            installed_appids = {game.appid for game in installed.games}
+            scope_appids = {
+                "library": owned_appids,
+                "wishlist": wishlist_appids,
+                "installed": installed_appids,
+                "known": owned_appids | wishlist_appids | installed_appids,
+                "appids": set(),
+            }[args.scope]
+            demanded_appids = tuple(sorted(scope_appids | set(demanded_selection)))
+            owned_dependency_stale = False
+        else:
+            owned_reference = (
+                owned.latest_complete.completed_at or owned.latest_complete.started_at
+            )
+            owned_age = (
+                started_at
+                - datetime.fromisoformat(owned_reference.replace("Z", "+00:00"))
+            ).total_seconds()
+            owned_dependency_stale = (
+                owned.latest is None
+                or owned.latest.status != "complete"
+                or owned_age < 0
+                or owned_age > _OWNED_SYNC_FRESHNESS_SECONDS
+            )
+            demanded_appids = demanded_selection or tuple(sorted(owned_appids))
+        if not app_facts_command and any(
+            appid not in owned_appids for appid in demanded_appids
+        ):
             return _emit_error(
                 args,
                 command=command,
@@ -1521,7 +1620,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     "machine_alias": machine.id,
                     "country": country,
                     "language": args.language,
-                    "scope": "library",
+                    "scope": args.scope,
                     "identifiers_included": False,
                 },
                 completeness_value=completeness(
@@ -1536,7 +1635,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     "sync_status": "complete",
                     "items": [],
                     "demand": [],
-                    "schema_id": "declared-app-facts/0.1",
+                    "schema_id": "declared-app-facts/0.2",
                     "support_level": "provisional",
                 },
             )
@@ -1551,11 +1650,12 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     command=command,
                     code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
                     message=(
-                        "Compatibility sync stores normalized public platform, "
+                        "Declared-fact sync stores normalized public platform, "
                         "requirement, language, controller, accessibility-category, "
-                        "account-notice, and DRM-notice facts for explicitly demanded "
-                        "AppIDs. Raw responses and HTML are not retained. Account and "
-                        "machine demand lineage is private; backups may retain deleted copies."
+                        "genre, release-display, multiplayer-category, account-notice, "
+                        "and DRM-notice facts for explicitly bounded AppIDs. Raw "
+                        "responses and HTML are not retained. Account and machine "
+                        "demand lineage is private; backups may retain deleted copies."
                     ),
                     remediation=(
                         "Rerun with --acknowledge-local-storage to accept this "
@@ -1585,7 +1685,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 args,
                 command=command,
                 code=ErrorCode.INVALID_ARGUMENT,
-                message="The compatibility synchronization arguments are invalid.",
+                message="The declared-fact synchronization arguments are invalid.",
                 exit_code=2,
             )
         client = _declared_facts_client()
@@ -1618,9 +1718,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 )
                 break
             try:
-                result = client.fetch(
-                    appid, country=country, language=args.language
-                )
+                result = client.fetch(appid, country=country, language=args.language)
             except SteamDeclaredFactsError as exc:
                 try:
                     storage.record_declared_app_result(
@@ -1650,8 +1748,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                         observed_at=_utc_now(),
                         error_code=(
                             "PROVIDER_COOLDOWN"
-                            if exc.code
-                            in {"PROVIDER_RESPONSE_INVALID", "RATE_LIMITED"}
+                            if exc.code in {"PROVIDER_RESPONSE_INVALID", "RATE_LIMITED"}
                             else exc.code
                         ),
                     )
@@ -1675,9 +1772,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             except BaseException:
                 _interrupt_declared_sync(storage, run.id)
                 raise
-        finished = storage.finish_declared_app_sync(
-            run.id, completed_at=_utc_now()
-        )
+        finished = storage.finish_declared_app_sync(run.id, completed_at=_utc_now())
         snapshot = storage.read_declared_app_snapshot(
             account_id=account.id,
             machine_id=machine.id,
@@ -1688,7 +1783,9 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
     source_gaps = _declared_sync_source_gaps(snapshot)
     missing_declared = any(item["missing_capabilities"] for item in source_gaps)
     stale_declared = any(item["stale_capabilities"] for item in source_gaps)
-    available_declared = any(item.get("facts") is not None for item in snapshot["items"])
+    available_declared = any(
+        item.get("facts") is not None for item in snapshot["items"]
+    )
     if missing_declared and not available_declared:
         status = CompletenessStatus.UNAVAILABLE
     elif missing_declared or stale_declared or finished.status != "complete":
@@ -1736,15 +1833,13 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             "machine_alias": machine.id,
             "country": country,
             "language": args.language,
-            "scope": "library",
+            "scope": args.scope,
             "identifiers_included": True,
         },
         completeness_value=completeness(
             status,
             missing_capabilities=(
-                ["compatibility.declared.read"]
-                if missing_declared
-                else []
+                ["compatibility.declared.read"] if missing_declared else []
             ),
             stale_capabilities=(
                 sorted(
@@ -1764,9 +1859,186 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             "items": list(snapshot["items"]),
             "demand": list(snapshot["latest_demand"]),
             "source_gaps": source_gaps,
-            "schema_id": "declared-app-facts/0.1",
+            "schema_id": "declared-app-facts/0.2",
             "support_level": "provisional",
             "disclosure_version": DECLARED_FACTS_DISCLOSURE_VERSION,
+        },
+    )
+
+
+def _declared_scope_appids(
+    storage: Storage,
+    *,
+    account_id: int,
+    machine_id: str,
+    scope: str,
+    explicit: Sequence[int],
+) -> tuple[int, ...]:
+    """Authorize one deterministic candidate set without consulting global demand."""
+
+    owned = {game.appid for game in storage.read_owned_snapshot(account_id).games}
+    wishlist = {game.appid for game in storage.read_wishlist_snapshot(account_id).games}
+    installed = {
+        game.appid for game in storage.read_installed_snapshot(machine_id).games
+    }
+    scoped = {
+        "library": owned,
+        "wishlist": wishlist,
+        "installed": installed,
+        "known": owned | wishlist | installed,
+        "appids": set(),
+    }[scope]
+    return tuple(sorted(scoped | set(explicit)))
+
+
+def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
+    command = "discovery.query"
+    try:
+        if re.fullmatch(r"[A-Za-z]{2}", args.country) is None:
+            raise ValueError("invalid country")
+        country = args.country.upper()
+        SteamDeclaredFactsRequestContext(country, args.language)
+        explicit = tuple(sorted(set(args.appid)))
+        if any(not 1 <= appid <= (1 << 32) - 1 for appid in explicit):
+            raise ValueError("invalid AppID")
+        if args.scope == "appids" and not explicit:
+            raise ValueError("appids scope requires AppIDs")
+        if not 1 <= args.limit <= 10_000:
+            raise ValueError("invalid limit")
+        known_modes = frozenset(MULTIPLAYER_CATEGORY_SLUGS.values())
+        if args.require_mode is not None and args.require_mode not in known_modes:
+            raise ValueError("invalid mode")
+    except (TypeError, ValueError):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The bounded discovery query arguments are invalid.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+            machine = storage.get_machine(args.machine)
+        except ValueError:
+            account = machine = None
+        if account is None:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                message="The requested Steam account is not configured.",
+            )
+        if machine is None:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The requested machine is not configured.",
+                exit_code=2,
+            )
+        candidates = _declared_scope_appids(
+            storage,
+            account_id=account.id,
+            machine_id=machine.id,
+            scope=args.scope,
+            explicit=explicit,
+        )
+        bounded = candidates[: args.limit]
+        if bounded:
+            snapshot = storage.read_declared_app_snapshot(
+                account_id=account.id,
+                machine_id=machine.id,
+                country=country,
+                language=args.language,
+                appids=bounded,
+            )
+            raw_items = snapshot["items"]
+        else:
+            snapshot = {"latest": None, "latest_demand": ()}
+            raw_items = ()
+    items: list[dict[str, Any]] = []
+    missing = 0
+    for raw in raw_items:
+        payload = raw.get("facts")
+        if payload is None:
+            missing += 1
+            items.append(
+                {
+                    "appid": raw["appid"],
+                    "evidence_state": "unknown",
+                    "mode_requirement": (
+                        None if args.require_mode is None else "unknown"
+                    ),
+                    "genres": {"state": "unknown", "items": []},
+                    "multiplayer_modes": [],
+                    "coming_soon": {
+                        "state": "unknown",
+                        "localized_date_display": None,
+                    },
+                    "player_count": {"state": "unsupported"},
+                    "health": {"state": "unsupported"},
+                    "tags_and_mechanics": {"state": "unsupported"},
+                }
+            )
+            continue
+        facts = declared_discovery_facts(payload)
+        modes = list(facts.multiplayer_modes)
+        items.append(
+            {
+                "appid": raw["appid"],
+                "evidence_state": "declared",
+                "schema_id": payload["schema_id"],
+                "observed_at": raw.get("observed_at"),
+                "category_ids": list(facts.category_ids),
+                "multiplayer_modes": modes,
+                "mode_requirement": (
+                    None
+                    if args.require_mode is None
+                    else ("pass" if args.require_mode in modes else "unknown")
+                ),
+                "genres": {
+                    "state": facts.genres.state,
+                    "items": [asdict(item) for item in facts.genres.items],
+                },
+                "coming_soon": asdict(facts.coming_soon),
+                "player_count": {"state": "unsupported"},
+                "health": {"state": "unsupported"},
+                "tags_and_mechanics": {"state": "unsupported"},
+            }
+        )
+    status = (
+        CompletenessStatus.COMPLETE
+        if not missing
+        else (
+            CompletenessStatus.UNAVAILABLE
+            if missing == len(items)
+            else CompletenessStatus.PARTIAL
+        )
+    )
+    return _emit_success(
+        args,
+        command=command,
+        context={
+            "account_alias": account.alias,
+            "machine_alias": machine.id,
+            "country": country,
+            "language": args.language,
+            "scope": args.scope,
+            "identifiers_included": True,
+        },
+        completeness_value=completeness(
+            status,
+            missing_capabilities=(["discovery.declared.read"] if missing else []),
+        ),
+        data={
+            "items": items,
+            "candidate_count": len(candidates),
+            "returned_count": len(items),
+            "truncated": len(candidates) > len(bounded),
+            "limit": args.limit,
+            "network_used": False,
+            "schema_id": "discovery-query/0.1",
         },
     )
 
@@ -1775,9 +2047,7 @@ def _declared_sync_source_gaps(snapshot: Mapping[str, Any]) -> list[dict[str, An
     """Classify each demanded subject without letting one last-good mask another."""
 
     gaps: list[dict[str, Any]] = []
-    for item, demand in zip(
-        snapshot["items"], snapshot["latest_demand"], strict=True
-    ):
+    for item, demand in zip(snapshot["items"], snapshot["latest_demand"], strict=True):
         missing: list[str] = []
         stale: list[str] = []
         has_facts = item.get("facts") is not None
@@ -1812,14 +2082,11 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             raise ValueError("country must be an ASCII alpha-2 code")
         country = args.country.upper()
         supplied_appids = tuple(args.appids)
-        if (
-            not supplied_appids
-            or any(
-                isinstance(appid, bool)
-                or not isinstance(appid, int)
-                or not 1 <= appid <= (1 << 32) - 1
-                for appid in supplied_appids
-            )
+        if not supplied_appids or any(
+            isinstance(appid, bool)
+            or not isinstance(appid, int)
+            or not 1 <= appid <= (1 << 32) - 1
+            for appid in supplied_appids
         ):
             raise ValueError("AppIDs must be positive uint32 values")
         # The CLI has historically treated repeated positional AppIDs as one
@@ -1986,9 +2253,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
     # either as a failed M5 synchronization.
     envelope_inapplicable = {"operations.ready.read"}
     if target.kind == "valve_deck":
-        envelope_inapplicable.update(
-            {"system_profile.read", "library.installed.read"}
-        )
+        envelope_inapplicable.update({"system_profile.read", "library.installed.read"})
     missing = tuple(
         capability
         for capability in query.completeness.missing_capabilities
@@ -2015,7 +2280,9 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             )
         )
     completeness_value = completeness(
-        CompletenessStatus.PARTIAL if (missing or stale) else CompletenessStatus.COMPLETE,
+        CompletenessStatus.PARTIAL
+        if (missing or stale)
+        else CompletenessStatus.COMPLETE,
         missing_capabilities=missing,
         stale_capabilities=stale,
         warnings=warnings_out,
@@ -2294,10 +2561,7 @@ def _dispatch_sync_reviews(args: argparse.Namespace, database_path: Path) -> int
                 message="The requested Steam account is not configured.",
             )
         consent = storage.get_review_data_consent(account.id)
-        if (
-            consent is None
-            or consent.disclosure_version != REVIEW_DISCLOSURE_VERSION
-        ):
+        if consent is None or consent.disclosure_version != REVIEW_DISCLOSURE_VERSION:
             if not args.acknowledge_local_storage:
                 return _emit_error(
                     args,
@@ -2455,11 +2719,14 @@ def _dispatch_wishlist_recommendations(
             )
         spec = _CREDENTIAL_PROVIDERS["gg-deals"]
         credential_ref = _provider_credential_ref(database_path, spec)
-        gg_configured = storage.get_credential_reference(
-            provider=credential_ref.provider,
-            kind=credential_ref.kind,
-            profile_id=credential_ref.profile_id,
-        ) is not None
+        gg_configured = (
+            storage.get_credential_reference(
+                provider=credential_ref.provider,
+                kind=credential_ref.kind,
+                profile_id=credential_ref.profile_id,
+            )
+            is not None
+        )
         snapshot = storage.read_wishlist_recommendation_snapshot(
             account_id=account.id, country=country, now=generated_at
         )
@@ -2502,7 +2769,9 @@ _MAX_RECOMMEND_FILTERS = 32
 
 
 def _seconds_old(value: str, now: datetime) -> float:
-    observed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    observed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
     return (now - observed).total_seconds()
 
 
@@ -2511,16 +2780,25 @@ def _recommendation_filters(
 ) -> tuple[tuple[Requirement, ...], tuple[ConstraintOverride, ...]]:
     if args.time_minutes is not None and not 0 <= args.time_minutes <= (1 << 32) - 1:
         raise ValueError("time-minutes is out of range")
-    if len(args.require) > _MAX_RECOMMEND_FILTERS or len(args.override) > _MAX_RECOMMEND_FILTERS:
+    if (
+        len(args.require) > _MAX_RECOMMEND_FILTERS
+        or len(args.override) > _MAX_RECOMMEND_FILTERS
+    ):
         raise ValueError("too many recommendation filters")
     requirements: list[Requirement] = []
     for expression in args.require:
-        if len(expression) > 128 or (match := _RECOMMEND_REQUIREMENT.fullmatch(expression)) is None:
+        if (
+            len(expression) > 128
+            or (match := _RECOMMEND_REQUIREMENT.fullmatch(expression)) is None
+        ):
             raise ValueError("requirement expression is invalid")
         requirements.append(Requirement(match.group(1), match.group(2) == "true"))
     overrides: list[ConstraintOverride] = []
     for expression in args.override:
-        if len(expression) > 160 or (match := _RECOMMEND_OVERRIDE.fullmatch(expression)) is None:
+        if (
+            len(expression) > 160
+            or (match := _RECOMMEND_OVERRIDE.fullmatch(expression)) is None
+        ):
             raise ValueError("override expression is invalid")
         appid = int(match.group(1))
         if appid > (1 << 32) - 1:
@@ -2533,7 +2811,9 @@ def _recommendation_filters(
     return tuple(requirements), tuple(overrides)
 
 
-def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Path) -> int:
+def _dispatch_recommendations_query(
+    args: argparse.Namespace, database_path: Path
+) -> int:
     generated_at = _utc_now().astimezone(timezone.utc).replace(microsecond=0)
     if (
         not isinstance(args.machine, str)
@@ -2583,7 +2863,12 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
                 completeness_value=completeness(
                     CompletenessStatus.UNAVAILABLE,
                     missing_capabilities=["account.identity"],
-                    warnings=[WarningRecord(ErrorCode.ACCOUNT_NOT_CONFIGURED, "The requested account alias is not configured.")],
+                    warnings=[
+                        WarningRecord(
+                            ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                            "The requested account alias is not configured.",
+                        )
+                    ],
                 ),
                 data={
                     "schema": "recommendations/0.1",
@@ -2592,7 +2877,12 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
                     "eligible": [],
                     "conditional": [],
                     "excluded": [],
-                    "counts": {"eligible": 0, "conditional": 0, "excluded": 0, "total": 0},
+                    "counts": {
+                        "eligible": 0,
+                        "conditional": 0,
+                        "excluded": 0,
+                        "total": 0,
+                    },
                     "empty": False,
                 },
             )
@@ -2614,7 +2904,12 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
             completeness_value=completeness(
                 CompletenessStatus.UNAVAILABLE,
                 missing_capabilities=["owned.visible.read"],
-                warnings=[WarningRecord(ErrorCode.NOT_SYNCED, "Visible-owned games have not been synchronized.")],
+                warnings=[
+                    WarningRecord(
+                        ErrorCode.NOT_SYNCED,
+                        "Visible-owned games have not been synchronized.",
+                    )
+                ],
             ),
             data={
                 "schema": "recommendations/0.1",
@@ -2651,7 +2946,9 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
     warnings: list[WarningRecord] = []
     owned_appids = {item.appid for item in snapshot.owned.games}
     classified = {
-        fact.appid: fact for fact in snapshot.catalog.facts if fact.appid in owned_appids
+        fact.appid: fact
+        for fact in snapshot.catalog.facts
+        if fact.appid in owned_appids
     }
     if owned_appids and (
         set(classified) != owned_appids
@@ -2673,20 +2970,45 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
         run = attempt.run
         if run.status in {"failed", "partial"}:
             stale.add("catalog.application.read")
-            warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, "A relevant catalog refresh did not replace its last-good classification."))
+            warnings.append(
+                WarningRecord(
+                    ErrorCode.STALE_LAST_GOOD,
+                    "A relevant catalog refresh did not replace its last-good classification.",
+                )
+            )
         elif run.status == "running":
-            abandoned = _seconds_old(run.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            abandoned = (
+                _seconds_old(run.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            )
             if abandoned:
                 stale.add("catalog.application.read")
-            warnings.append(WarningRecord(
-                ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS,
-                "A relevant catalog refresh appears abandoned." if abandoned else "A relevant catalog refresh is in progress.",
-            ))
-    if owned_appids and any(item.name == "installed" for item in requirements) and snapshot.installed.latest_complete is None:
+            warnings.append(
+                WarningRecord(
+                    ErrorCode.SYNC_ABANDONED
+                    if abandoned
+                    else ErrorCode.SYNC_IN_PROGRESS,
+                    "A relevant catalog refresh appears abandoned."
+                    if abandoned
+                    else "A relevant catalog refresh is in progress.",
+                )
+            )
+    if (
+        owned_appids
+        and any(item.name == "installed" for item in requirements)
+        and snapshot.installed.latest_complete is None
+    ):
         missing.add("installed.read")
-    if owned_appids and args.recipe in {"resume/0.1", "preference-fit/0.1"} and snapshot.activity_latest_complete is None:
+    if (
+        owned_appids
+        and args.recipe in {"resume/0.1", "preference-fit/0.1"}
+        and snapshot.activity_latest_complete is None
+    ):
         missing.add("activity.read")
-    if owned_appids and args.recipe in {"resume/0.1", "finishability/0.1"} and snapshot.achievement_latest is None:
+    if (
+        owned_appids
+        and args.recipe in {"resume/0.1", "finishability/0.1"}
+        and snapshot.achievement_latest is None
+    ):
         missing.add("achievements.read")
     owned_good = snapshot.owned.latest_complete
     if owned_good is not None:
@@ -2697,26 +3019,45 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
             stale.add("owned.visible.read")
     for latest, capability, relevant in (
         (snapshot.owned.latest, "owned.visible.read", True),
-        (snapshot.activity_latest, "activity.read", args.recipe in {"resume/0.1", "preference-fit/0.1"}),
-        (snapshot.installed.latest, "installed.read", any(item.name == "installed" for item in requirements)),
+        (
+            snapshot.activity_latest,
+            "activity.read",
+            args.recipe in {"resume/0.1", "preference-fit/0.1"},
+        ),
+        (
+            snapshot.installed.latest,
+            "installed.read",
+            any(item.name == "installed" for item in requirements),
+        ),
     ):
         if latest is None or not relevant or latest.status == "complete":
             continue
         if latest.status == "running":
-            abandoned = _seconds_old(latest.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            abandoned = (
+                _seconds_old(latest.started_at, generated_at) > _SYNC_ABANDONED_SECONDS
+            )
             if abandoned:
                 stale.add(capability)
-            warnings.append(WarningRecord(
-                ErrorCode.SYNC_ABANDONED if abandoned else ErrorCode.SYNC_IN_PROGRESS,
-                f"The {capability} refresh appears abandoned." if abandoned else f"The {capability} refresh is in progress.",
-            ))
+            warnings.append(
+                WarningRecord(
+                    ErrorCode.SYNC_ABANDONED
+                    if abandoned
+                    else ErrorCode.SYNC_IN_PROGRESS,
+                    f"The {capability} refresh appears abandoned."
+                    if abandoned
+                    else f"The {capability} refresh is in progress.",
+                )
+            )
         else:
             stale.add(capability)
-            warnings.append(WarningRecord(ErrorCode.STALE_LAST_GOOD, f"The {capability} refresh did not replace its last-good snapshot."))
+            warnings.append(
+                WarningRecord(
+                    ErrorCode.STALE_LAST_GOOD,
+                    f"The {capability} refresh did not replace its last-good snapshot.",
+                )
+            )
     components = [
-        component
-        for item in ranking["results"]
-        for component in item["components"]
+        component for item in ranking["results"] for component in item["components"]
     ]
     if any(
         component["evidence_kind"] == "behavioral"
@@ -2735,11 +3076,19 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
         status = CompletenessStatus.PARTIAL
     ranking["empty"] = len(snapshot.owned.games) == 0
     ranking["snapshots"] = {
-        "owned_last_attempt_status": snapshot.owned.latest.status if snapshot.owned.latest else None,
+        "owned_last_attempt_status": snapshot.owned.latest.status
+        if snapshot.owned.latest
+        else None,
         "owned_last_successful_sync_at": snapshot.owned.latest_complete.completed_at,
-        "installed_last_attempt_status": snapshot.installed.latest.status if snapshot.installed.latest else None,
-        "activity_last_attempt_status": snapshot.activity_latest.status if snapshot.activity_latest else None,
-        "achievements_last_attempt_status": snapshot.achievement_latest.status if snapshot.achievement_latest else None,
+        "installed_last_attempt_status": snapshot.installed.latest.status
+        if snapshot.installed.latest
+        else None,
+        "activity_last_attempt_status": snapshot.activity_latest.status
+        if snapshot.activity_latest
+        else None,
+        "achievements_last_attempt_status": snapshot.achievement_latest.status
+        if snapshot.achievement_latest
+        else None,
     }
     return _emit_success(
         args,
@@ -4155,7 +4504,10 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                 return _emit_success(
                     args,
                     command=_command_name(args),
-                    context={"account_alias": account.alias, "identifiers_included": False},
+                    context={
+                        "account_alias": account.alias,
+                        "identifiers_included": False,
+                    },
                     data=data,
                 )
 
@@ -4164,7 +4516,10 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                 return _emit_success(
                     args,
                     command="feedback.query",
-                    context={"account_alias": account.alias, "identifiers_included": False},
+                    context={
+                        "account_alias": account.alias,
+                        "identifiers_included": False,
+                    },
                     data={
                         "items": list(service.query(account.id, appid=args.appid)),
                         "next_cursor": None,
@@ -5853,7 +6208,8 @@ def _activity_query_completeness(
                     missing_capabilities=[capability],
                     warnings=[
                         WarningRecord(
-                            code=snapshot.get("last_error_code") or ErrorCode.STALE_LAST_GOOD,
+                            code=snapshot.get("last_error_code")
+                            or ErrorCode.STALE_LAST_GOOD,
                             message="The latest activity synchronization failed and no last-good snapshot exists.",
                         )
                     ],
@@ -5889,7 +6245,9 @@ def _activity_query_completeness(
 
     items = result["items"]
     uncertain = [
-        item for item in items if item["state"] in {"failed", "running", "unevaluated", "expired"}
+        item
+        for item in items
+        if item["state"] in {"failed", "running", "unevaluated", "expired"}
     ]
     stale = [item for item in items if item.get("freshness") == "stale"]
     if uncertain or stale or status != "complete":
@@ -5901,7 +6259,9 @@ def _activity_query_completeness(
                     message="Achievement synchronization is still in progress for some subjects.",
                 )
             )
-        if any(item["state"] in {"failed", "unevaluated", "expired"} for item in uncertain):
+        if any(
+            item["state"] in {"failed", "unevaluated", "expired"} for item in uncertain
+        ):
             warnings.append(
                 WarningRecord(
                     code=ErrorCode.PARTIAL_SCAN,
@@ -6007,26 +6367,32 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
         for section in ("os", "cpu", "memory"):
             for name, item in profile[section].items():
                 _print_table_fields(
-                    section, name, item["state"], item.get("value", ""),
+                    section,
+                    name,
+                    item["state"],
+                    item.get("value", ""),
                     envelope["data"]["freshness"].get(section, "unknown"),
                 )
         for section in ("graphics", "storage", "gamepad", "vr"):
             item = profile[section]
-            section_freshness = envelope["data"]["freshness"].get(
-                section, "unknown"
-            )
+            section_freshness = envelope["data"]["freshness"].get(section, "unknown")
             if section == "storage":
                 storage_states = [
                     envelope["data"]["freshness"].get(name, "unknown")
                     for name in ("storage_capacity", "storage_available")
                 ]
                 section_freshness = (
-                    "stale" if "stale" in storage_states
-                    else "unknown" if "unknown" in storage_states
+                    "stale"
+                    if "stale" in storage_states
+                    else "unknown"
+                    if "unknown" in storage_states
                     else "fresh"
                 )
             _print_table_fields(
-                section, "summary", item["state"], item.get("value", ""),
+                section,
+                "summary",
+                item["state"],
+                item.get("value", ""),
                 section_freshness,
             )
         return
@@ -6057,24 +6423,46 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
             _print_table_fields("STALE_CAPABILITY", capability)
         for warning in query_completeness["warnings"]:
             _print_table_fields("WARNING", warning["code"], warning["message"])
-        _print_table_fields("APPID", "NAME", "ELIGIBILITY", "SCORE", "CONFIDENCE", "UNKNOWNS")
+        _print_table_fields(
+            "APPID", "NAME", "ELIGIBILITY", "SCORE", "CONFIDENCE", "UNKNOWNS"
+        )
         for item in envelope["data"]["results"]:
             _print_table_fields(
-                item["appid"], item["name"], item["eligibility"], item["score"],
-                item["confidence"], ",".join(item["unknowns"]),
+                item["appid"],
+                item["name"],
+                item["eligibility"],
+                item["score"],
+                item["confidence"],
+                ",".join(item["unknowns"]),
             )
             if envelope["data"].get("context", {}).get("explain"):
-                _print_table_fields("FACTORS", item["appid"], ",".join(item["positive_factors"]), ",".join(item["negative_factors"]), ",".join(item["tradeoffs"]))
+                _print_table_fields(
+                    "FACTORS",
+                    item["appid"],
+                    ",".join(item["positive_factors"]),
+                    ",".join(item["negative_factors"]),
+                    ",".join(item["tradeoffs"]),
+                )
         return
     if command == "activity.query":
         _print_table_fields("COMPLETENESS", envelope["completeness"]["status"])
         for warning in envelope["completeness"]["warnings"]:
             _print_table_fields("WARNING", warning["code"], warning["message"])
-        _print_table_fields("APPID", "NAME", "LIFETIME_MINUTES", "RECENT_MINUTES", "LAST_PLAYED_AT", "FRESHNESS")
+        _print_table_fields(
+            "APPID",
+            "NAME",
+            "LIFETIME_MINUTES",
+            "RECENT_MINUTES",
+            "LAST_PLAYED_AT",
+            "FRESHNESS",
+        )
         for item in envelope["data"]["items"]:
             _print_table_fields(
-                item["appid"], item["name"], item["playtime"]["lifetime_minutes"],
-                item["playtime"]["recent_window_minutes"], item["last_played_at"],
+                item["appid"],
+                item["name"],
+                item["playtime"]["lifetime_minutes"],
+                item["playtime"]["recent_window_minutes"],
+                item["last_played_at"],
                 item["freshness"]["activity"],
             )
         return
@@ -6082,35 +6470,52 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
         _print_table_fields("COMPLETENESS", envelope["completeness"]["status"])
         for warning in envelope["completeness"]["warnings"]:
             _print_table_fields("WARNING", warning["code"], warning["message"])
-        _print_table_fields("APPID", "NAME", "STATE", "TARGETED", "UNLOCKED", "TOTAL", "FRESHNESS")
+        _print_table_fields(
+            "APPID", "NAME", "STATE", "TARGETED", "UNLOCKED", "TOTAL", "FRESHNESS"
+        )
         for item in envelope["data"]["items"]:
             _print_table_fields(
-                item["appid"], item["name"], item["state"], item["targeted"],
-                item["summary"]["unlocked"], item["summary"]["total"],
+                item["appid"],
+                item["name"],
+                item["state"],
+                item["targeted"],
+                item["summary"]["unlocked"],
+                item["summary"]["total"],
                 item["summary"]["freshness"],
             )
         return
     if command == "feedback.query":
         _print_table_fields(
-            "APPID", "RATING", "PLAY_STATE", "SNOOZED_UNTIL",
-            "MINIMUM_SESSION_MINUTES", "REMAINING_MINUTES", "TRAITS"
+            "APPID",
+            "RATING",
+            "PLAY_STATE",
+            "SNOOZED_UNTIL",
+            "MINIMUM_SESSION_MINUTES",
+            "REMAINING_MINUTES",
+            "TRAITS",
         )
         for item in envelope["data"]["items"]:
             traits = ",".join(
                 f"{trait['trait']}={trait['value']}" for trait in item["traits"]
             )
             _print_table_fields(
-                item["appid"], item["rating"], item["play_state"],
+                item["appid"],
+                item["rating"],
+                item["play_state"],
                 item["snooze"]["until"],
                 item["estimates"]["minimum_session_minutes"],
-                item["estimates"]["remaining_minutes"], traits,
+                item["estimates"]["remaining_minutes"],
+                traits,
             )
         return
     if command == "preferences.rule.list":
         _print_table_fields("TRAIT", "KIND", "STRENGTH", "WEIGHT", "UPDATED_AT")
         for item in envelope["data"]["rules"]:
             _print_table_fields(
-                item["trait"], item["kind"], item["strength"], item["weight"],
+                item["trait"],
+                item["kind"],
+                item["strength"],
+                item["weight"],
                 item["updated_at"],
             )
         return
