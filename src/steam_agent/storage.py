@@ -2609,15 +2609,14 @@ class Storage:
                 int(row[0])
                 for row in self._connection.execute(
                     """SELECT id FROM sync_runs
-                       WHERE account_id=?
-                         AND capability='compatibility.declared.read'
+                       WHERE capability='compatibility.declared.read'
                          AND status='running' AND started_at<?
                          AND COALESCE((
                            SELECT MAX(d.observed_at)
                            FROM declared_app_sync_demand d
                            WHERE d.sync_run_id=sync_runs.id
                          ), started_at)<?""",
-                    (account_id, stale_cutoff, stale_cutoff),
+                    (stale_cutoff, stale_cutoff),
                 )
             )
             for stale_run_id in stale_runs:
@@ -2862,11 +2861,26 @@ class Storage:
                             sync_run_id,
                         ),
                     )
+                    self._connection.execute(
+                        """UPDATE declared_app_observations SET promoted=1
+                           WHERE sync_run_id=? AND appid=?""",
+                        (sync_run_id, appid),
+                    )
+            stored_error_code = error_code
+            if state == "not_found":
+                has_last_good = self._connection.execute(
+                    """SELECT 1 FROM declared_app_current
+                       WHERE appid=? AND country=? AND language=?
+                         AND provider='steam_store'""",
+                    (appid, demand["country"], demand["language"]),
+                ).fetchone()
+                if has_last_good is not None:
+                    stored_error_code = "NOT_FOUND_LAST_GOOD_PRESERVED"
             self._connection.execute(
                 """UPDATE declared_app_sync_demand
                    SET evaluated=1, state=?, error_code=?, observed_at=?
                    WHERE sync_run_id=? AND appid=?""",
-                (state, error_code, timestamp, sync_run_id, appid),
+                (state, stored_error_code, timestamp, sync_run_id, appid),
             )
             if state == "failed" and error_code == "PROVIDER_RESPONSE_INVALID":
                 cooldown_until = _timestamp(
@@ -2929,12 +2943,17 @@ class Storage:
             counts = self._connection.execute(
                 """SELECT
                      SUM(CASE WHEN targeted=1 AND evaluated=1
-                               AND state IN ('ready','not_found') THEN 1 ELSE 0 END)
+                               AND (state='ready' OR (
+                                 state='not_found' AND error_code IS NULL
+                               )) THEN 1 ELSE 0 END)
                        + SUM(CASE WHEN targeted=0 AND error_code IN
                                  ('FRESH_LAST_GOOD','NOT_FOUND_CACHE')
+                                  THEN 1 ELSE 0 END)
+                       + SUM(CASE WHEN error_code='NOT_FOUND_LAST_GOOD_PRESERVED'
                                   THEN 1 ELSE 0 END) AS valid,
                      SUM(CASE WHEN targeted=1 AND
-                                    (state='failed' OR evaluated=0)
+                                    (state='failed' OR evaluated=0 OR
+                                     error_code='NOT_FOUND_LAST_GOOD_PRESERVED')
                                THEN 1 ELSE 0 END)
                        + SUM(CASE WHEN targeted=0 AND error_code IN
                                  ('ACTIVE_REQUEST','MAX_ITEMS_LIMIT',
@@ -2979,7 +2998,7 @@ class Storage:
                 self._connection.execute(
                     """SELECT EXISTS(
                          SELECT 1 FROM declared_app_observations
-                         WHERE sync_run_id=?
+                         WHERE sync_run_id=? AND promoted=1
                        )""",
                     (sync_run_id,),
                 ).fetchone()[0]
@@ -3082,15 +3101,18 @@ class Storage:
                 (account_id, machine_id, country, language, *chunk),
             )
             for row in demand_rows:
-                demand_by_appid.setdefault(int(row["appid"]), dict(row))
+                values = dict(row)
+                values["targeted"] = bool(values["targeted"])
+                values["evaluated"] = bool(values["evaluated"])
+                demand_by_appid.setdefault(int(row["appid"]), values)
         demand = tuple(
             demand_by_appid.get(
                 appid,
                 {
                     "appid": appid,
                     "ordinal": None,
-                    "targeted": 0,
-                    "evaluated": 0,
+                    "targeted": False,
+                    "evaluated": False,
                     "state": "unattempted",
                     "error_code": "NOT_SYNCED",
                     "retry_at": None,

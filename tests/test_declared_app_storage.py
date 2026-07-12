@@ -300,6 +300,54 @@ def test_success_false_is_bounded_negative_cache(
     assert storage.finish_declared_app_sync(cached.id, completed_at=T2).status == "complete"
 
 
+def test_not_found_refresh_preserves_last_good_as_partial_stale_evidence(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    ready, _, _ = begin(storage, account_id, [400], at=T0)
+    storage.record_declared_app_result(
+        ready.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=T1,
+    )
+    storage.finish_declared_app_sync(ready.id, completed_at=T1)
+    refresh, _, _ = storage.begin_declared_app_sync(
+        account_id=account_id,
+        machine_id="desktop",
+        demanded_appids=[400],
+        country="US",
+        language="english",
+        max_items=1,
+        skip_fresh_terminal=False,
+        started_at=T2,
+        disclosure_version="m5-v1",
+    )
+    storage.record_declared_app_result(
+        refresh.id,
+        account_id=account_id,
+        appid=400,
+        state="not_found",
+        observed_at=T2,
+    )
+
+    finished = storage.finish_declared_app_sync(refresh.id, completed_at=T2)
+    snapshot = storage.read_declared_app_snapshot(
+        account_id=account_id,
+        machine_id="desktop",
+        country="US",
+        language="english",
+        appids=[400],
+    )
+    assert finished.status == "partial"
+    assert snapshot["items"][0]["facts"] is not None
+    assert snapshot["latest_demand"][0]["error_code"] == (
+        "NOT_FOUND_LAST_GOOD_PRESERVED"
+    )
+
+
 def test_snapshot_chunks_more_than_one_thousand_explicit_appids(
     configured: tuple[Storage, int],
 ) -> None:

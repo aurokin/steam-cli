@@ -54,6 +54,7 @@ CREATE TABLE declared_app_observations (
     source_locator TEXT NOT NULL CHECK (source_locator = 'steam_store_appdetails'),
     human_reference_url TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    promoted INTEGER NOT NULL DEFAULT 0 CHECK (promoted IN (0, 1)),
     PRIMARY KEY (sync_run_id, appid),
     FOREIGN KEY (sync_run_id, appid)
         REFERENCES declared_app_sync_demand(sync_run_id, appid) ON DELETE CASCADE

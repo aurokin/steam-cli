@@ -1343,9 +1343,11 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
     with Storage(database_path) as storage:
         try:
             account = storage.get_account(args.account)
-            machine = storage.get_machine(args.machine)
         except ValueError:
             account = None
+        try:
+            machine = storage.get_machine(args.machine)
+        except ValueError:
             machine = None
         if account is None:
             return _emit_error(
@@ -1490,15 +1492,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             )
         client = _declared_facts_client()
         for index, appid in enumerate(targeted):
-            requested_at = _utc_now()
-            reserved = storage.reserve_provider_request(
-                provider="steam-store-appdetails",
-                budget_scope="global",
-                requested_at=requested_at,
-                minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
-            )
-            if not reserved:
-                time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS)
+            try:
                 requested_at = _utc_now()
                 reserved = storage.reserve_provider_request(
                     provider="steam-store-appdetails",
@@ -1506,6 +1500,18 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     requested_at=requested_at,
                     minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
                 )
+                if not reserved:
+                    time.sleep(_PROVIDER_MINIMUM_INTERVAL_SECONDS + 0.05)
+                    requested_at = _utc_now()
+                    reserved = storage.reserve_provider_request(
+                        provider="steam-store-appdetails",
+                        budget_scope="global",
+                        requested_at=requested_at,
+                        minimum_interval_seconds=_PROVIDER_MINIMUM_INTERVAL_SECONDS,
+                    )
+            except BaseException:
+                _interrupt_declared_sync(storage, run.id)
+                raise
             if not reserved:
                 storage.mark_remaining_declared_apps_unevaluated(
                     run.id,
@@ -1528,14 +1534,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                         observed_at=_utc_now(),
                     )
                 except BaseException:
-                    storage.mark_remaining_declared_apps_unevaluated(
-                        run.id,
-                        observed_at=_utc_now(),
-                        error_code="SYNC_INTERRUPTED",
-                    )
-                    storage.finish_declared_app_sync(
-                        run.id, completed_at=_utc_now()
-                    )
+                    _interrupt_declared_sync(storage, run.id)
                     raise
                 retry_after = exc.retry_after_seconds
                 if exc.code == "RATE_LIMITED" and retry_after is None:
@@ -1560,12 +1559,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     )
                 break
             except BaseException:
-                storage.mark_remaining_declared_apps_unevaluated(
-                    run.id,
-                    observed_at=_utc_now(),
-                    error_code="SYNC_INTERRUPTED",
-                )
-                storage.finish_declared_app_sync(run.id, completed_at=_utc_now())
+                _interrupt_declared_sync(storage, run.id)
                 raise
             try:
                 storage.record_declared_app_result(
@@ -1581,12 +1575,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                     observed_at=_utc_now(),
                 )
             except BaseException:
-                storage.mark_remaining_declared_apps_unevaluated(
-                    run.id,
-                    observed_at=_utc_now(),
-                    error_code="SYNC_INTERRUPTED",
-                )
-                storage.finish_declared_app_sync(run.id, completed_at=_utc_now())
+                _interrupt_declared_sync(storage, run.id)
                 raise
         finished = storage.finish_declared_app_sync(
             run.id, completed_at=_utc_now()
@@ -1603,6 +1592,9 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
         "partial": CompletenessStatus.PARTIAL,
         "failed": CompletenessStatus.UNAVAILABLE,
     }[finished.status]
+    has_last_good = any(item.get("facts") is not None for item in snapshot["items"])
+    if finished.status == "failed" and has_last_good:
+        status = CompletenessStatus.PARTIAL
     warnings = []
     if finished.status != "complete":
         warnings.append(
@@ -1641,13 +1633,15 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             status,
             missing_capabilities=(
                 ["compatibility.declared.read"]
-                if finished.status == "failed"
+                if finished.status == "failed" and not has_last_good
                 else []
             ),
             stale_capabilities=(
                 sorted(
                     ({"compatibility.declared.read"}
-                     if finished.status == "partial" else set())
+                     if finished.status == "partial" or (
+                         finished.status == "failed" and has_last_good
+                     ) else set())
                     | ({"owned.visible.read"} if owned_dependency_stale else set())
                 )
             ),
@@ -1671,6 +1665,21 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
 
 def _declared_facts_client() -> SteamDeclaredFactsClient:
     return SteamDeclaredFactsClient()
+
+
+def _interrupt_declared_sync(storage: Storage, sync_run_id: int) -> None:
+    """Best-effort cleanup without replacing the caller's BaseException."""
+
+    try:
+        storage.mark_remaining_declared_apps_unevaluated(
+            sync_run_id,
+            observed_at=_utc_now(),
+            error_code="SYNC_INTERRUPTED",
+        )
+        if storage.get_sync_run(sync_run_id).status == "running":
+            storage.finish_declared_app_sync(sync_run_id, completed_at=_utc_now())
+    except BaseException:
+        pass
 
 
 def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
