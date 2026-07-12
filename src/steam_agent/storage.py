@@ -28,6 +28,17 @@ _DECLARED_APP_READ_CHUNK = 500
 STEAM_APPLICATION_IDENTITY_NAMESPACE = uuid.UUID("d95b6568-2886-5d15-aa84-1986e4ac511e")
 
 
+def _database_uses_wal(path: Path) -> bool:
+    """Read SQLite header journal bytes without opening or creating sidecars."""
+
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(20)
+    except OSError as error:
+        raise StorageError("database header is unavailable") from error
+    return len(header) >= 20 and header[18:20] == b"\x02\x02"
+
+
 def steam_application_stable_id(appid: int | str) -> str:
     """Return the stable UUIDv5 for one typed Steam application identity."""
 
@@ -921,6 +932,7 @@ class Storage:
     def __init__(self, path: str | Path, *, readonly: bool = False) -> None:
         self.path = Path(path)
         self.readonly = readonly
+        self._normalize_clean_wal = False
         if readonly:
             if self.path == Path(":memory:"):
                 raise StorageError("in-memory storage cannot be opened read-only")
@@ -932,6 +944,10 @@ class Storage:
             if wal_path.exists() and wal_path.stat().st_size:
                 raise StorageError(
                     "read-only database has an uncheckpointed WAL; writable maintenance is required"
+                )
+            if _database_uses_wal(self.path):
+                raise StorageError(
+                    "read-only database uses WAL journal mode; writable maintenance is required"
                 )
             self._connection = self._open_connection()
             self._require_current_schema()
@@ -948,6 +964,14 @@ class Storage:
                     raise StorageError("database parent must be a directory") from None
             if created_parent and os.name != "nt":
                 self.path.parent.chmod(0o700)
+        if self.path.is_file():
+            wal_path = Path(f"{self.path}-wal")
+            shm_path = Path(f"{self.path}-shm")
+            self._normalize_clean_wal = (
+                _database_uses_wal(self.path)
+                and not wal_path.exists()
+                and not shm_path.exists()
+            )
         self._connection = self._open_connection()
         if self.path != Path(":memory:") and os.name != "nt":
             self.path.chmod(0o600)
@@ -960,6 +984,15 @@ class Storage:
             )
         else:
             connection = sqlite3.connect(str(self.path))
+            if self._normalize_clean_wal:
+                journal_mode = connection.execute(
+                    "PRAGMA journal_mode=DELETE"
+                ).fetchone()[0]
+                if str(journal_mode).casefold() != "delete":
+                    connection.close()
+                    raise StorageError(
+                        "database WAL maintenance could not be completed"
+                    )
         connection.row_factory = sqlite3.Row
         connection.create_function(
             "steam_application_uuid_v5",

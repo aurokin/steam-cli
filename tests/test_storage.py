@@ -573,3 +573,28 @@ def test_readonly_storage_rejects_uncheckpointed_wal(tmp_path: Path) -> None:
 
         with pytest.raises(StorageError, match="uncheckpointed WAL"):
             Storage(database_path, readonly=True)
+
+
+def test_readonly_storage_rejects_clean_persistent_wal_without_sidecars(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "steam-agent.sqlite3"
+    with Storage(database_path) as storage:
+        assert storage._connection.execute(  # noqa: SLF001 - boundary setup
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0] == "wal"
+    assert not Path(f"{database_path}-wal").exists()
+    files_before = {path.name for path in tmp_path.iterdir()}
+
+    with pytest.raises(StorageError, match="uses WAL journal mode"):
+        Storage(database_path, readonly=True)
+
+    assert {path.name for path in tmp_path.iterdir()} == files_before
+    # The next writable lifecycle open normalizes a clean persistent WAL so a
+    # subsequent assessment can remain physically query-only.
+    with Storage(database_path):
+        pass
+    with Storage(database_path, readonly=True) as readonly:
+        assert readonly._connection.execute(  # noqa: SLF001
+            "PRAGMA journal_mode"
+        ).fetchone()[0] == "delete"
