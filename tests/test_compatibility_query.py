@@ -590,9 +590,11 @@ class SafeMinimumEvaluator:
         normalized_facts: Mapping[str, Any],
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
+        declared_projection_identity: str | int | None,
         system_observed_at: datetime | None,
         system_snapshot_id: str | int | None,
         system_promoted_run_id: str | int | None,
+        system_latest_attempt_id: str | int | None,
         system_profile_freshness: str,
         storage_available_freshness: str,
         generated_at: datetime,
@@ -601,9 +603,11 @@ class SafeMinimumEvaluator:
             normalized_facts,
             system_profile,
             declared_observed_at,
+            declared_projection_identity,
             system_observed_at,
             system_snapshot_id,
             system_promoted_run_id,
+            system_latest_attempt_id,
             system_profile_freshness,
             storage_available_freshness,
             generated_at,
@@ -832,6 +836,63 @@ def test_derived_minimum_lineage_binds_exact_promoted_system_evidence() -> None:
         "PRIVATE-PROMOTED-TWO",
     ):
         assert opaque_id not in rendered
+
+
+def test_derived_minimum_lineage_binds_equal_time_latest_attempt_identity() -> None:
+    payload = {
+        **facts(10),
+        "requirements": [
+            {
+                "platform": "windows",
+                "state": "declared",
+                "minimum": "Memory: 8 GiB RAM\nArchitecture: x86_64",
+                "recommended": None,
+            }
+        ],
+    }
+    base = system()
+    first = SystemSnapshot(
+        base.target_key,
+        base.profile,
+        base.observed_at,
+        "shared-snapshot",
+        base.observed_at,
+        "failed",
+        "PRIVATE-LATEST-ONE",
+        "shared-promoted",
+    )
+    second = SystemSnapshot(
+        base.target_key,
+        base.profile,
+        base.observed_at,
+        "shared-snapshot",
+        base.observed_at,
+        "failed",
+        "PRIVATE-LATEST-TWO",
+        "shared-promoted",
+    )
+
+    first_item = result(snapshot=declared(10, payload=payload), system_snapshot=first)
+    second_item = result(snapshot=declared(10, payload=payload), system_snapshot=second)
+    first_ids = {
+        evidence_id
+        for gate in first_item.gates
+        if gate.name in {"architecture", "meets_minimum"}
+        for evidence_id in gate.original_evidence_ids
+    }
+    second_ids = {
+        evidence_id
+        for gate in second_item.gates
+        if gate.name in {"architecture", "meets_minimum"}
+        for evidence_id in gate.original_evidence_ids
+    }
+
+    assert first_ids
+    assert second_ids
+    assert first_ids.isdisjoint(second_ids)
+    rendered = json.dumps((asdict(first_item), asdict(second_item)), default=str)
+    assert "PRIVATE-LATEST-ONE" not in rendered
+    assert "PRIVATE-LATEST-TWO" not in rendered
 
 
 def test_real_system_storage_role_is_used_but_not_a_compatibility_failure_for_installed_app() -> None:

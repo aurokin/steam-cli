@@ -271,6 +271,65 @@ def test_typed_adapter_preserves_all_run_lineage_for_same_second_attempts(
     assert gates["readiness:visible_owned"].original_freshness == "stale"
 
 
+def test_typed_adapter_minimum_lineage_binds_exact_declared_content(
+    tmp_path: Path,
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    subject = snapshot.declared_apps.subjects[0]
+    assert subject.current is not None
+
+    def with_recommended(text: str):
+        facts = {
+            **subject.current.facts,
+            "requirements": [
+                {
+                    "platform": "linux",
+                    "state": "declared",
+                    "minimum": (
+                        "Memory: 4 GiB RAM\nStorage: 4 GiB available space\n"
+                        "Architecture: x86_64"
+                    ),
+                    "recommended": text,
+                }
+            ],
+        }
+        current = replace(subject.current, facts=facts)
+        return replace(
+            snapshot,
+            declared_apps=replace(
+                snapshot.declared_apps,
+                subjects=(replace(subject, current=current),),
+            ),
+        )
+
+    first = assess_compatibility_snapshot(
+        with_recommended("PRIVATE-ONE"),
+        target=CompatibilityTarget("machine", "local", "linux"),
+    )
+    second = assess_compatibility_snapshot(
+        with_recommended("PRIVATE-TWO"),
+        target=CompatibilityTarget("machine", "local", "linux"),
+    )
+    first_gate = next(
+        gate for gate in first.assessment.results[0].gates
+        if gate.name == "meets_minimum"
+    )
+    second_gate = next(
+        gate for gate in second.assessment.results[0].gates
+        if gate.name == "meets_minimum"
+    )
+
+    assert first_gate.original == second_gate.original == "pass"
+    assert set(first_gate.original_evidence_ids).isdisjoint(
+        second_gate.original_evidence_ids
+    )
+    rendered = json.dumps(
+        [first_gate.original_evidence_ids, second_gate.original_evidence_ids]
+    )
+    assert "PRIVATE-ONE" not in rendered
+    assert "PRIVATE-TWO" not in rendered
+
+
 def test_typed_adapter_accepts_established_uppercase_machine_alias(
     tmp_path: Path,
 ) -> None:

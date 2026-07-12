@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 from typing import Any, Literal, Mapping, Protocol
 from urllib.parse import quote
 
@@ -187,9 +188,11 @@ class MinimumEvaluator(Protocol):
         normalized_facts: Mapping[str, Any],
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
+        declared_projection_identity: str | int | None,
         system_observed_at: datetime | None,
         system_snapshot_id: str | int | None,
         system_promoted_run_id: str | int | None,
+        system_latest_attempt_id: str | int | None,
         system_profile_freshness: Freshness,
         storage_available_freshness: Freshness,
         generated_at: datetime,
@@ -207,9 +210,11 @@ class ConservativeMinimumEvaluator:
         normalized_facts: Mapping[str, Any],
         system_profile: Mapping[str, Any] | None,
         declared_observed_at: datetime,
+        declared_projection_identity: str | int | None,
         system_observed_at: datetime | None,
         system_snapshot_id: str | int | None,
         system_promoted_run_id: str | int | None,
+        system_latest_attempt_id: str | int | None,
         system_profile_freshness: Freshness,
         storage_available_freshness: Freshness,
         generated_at: datetime,
@@ -235,8 +240,10 @@ class ConservativeMinimumEvaluator:
             observed,
             _worst_freshness(declared_freshness, system_profile_freshness),
             "minimum-architecture",
+            declared_projection_identity,
             system_snapshot_id,
             system_promoted_run_id,
+            system_latest_attempt_id,
         )
         # A current free-space failure is useful only for fifteen minutes when
         # it is decisive.  If a non-storage component independently fails, the
@@ -267,8 +274,10 @@ class ConservativeMinimumEvaluator:
             observed,
             minimum_freshness,
             "minimum-overall",
+            declared_projection_identity,
             system_snapshot_id,
             system_promoted_run_id,
+            system_latest_attempt_id,
         )
         without_storage = _comparison_evidence(
             without_storage_state,
@@ -277,8 +286,10 @@ class ConservativeMinimumEvaluator:
             observed,
             _worst_freshness(declared_freshness, system_profile_freshness),
             "minimum-overall-without-storage",
+            declared_projection_identity,
             system_snapshot_id,
             system_promoted_run_id,
+            system_latest_attempt_id,
         )
         return MinimumEvaluation(architecture, minimum, without_storage)
 
@@ -428,10 +439,14 @@ def _candidate(
             normalized_facts=facts,
             system_profile=None if system is None else system.profile,
             declared_observed_at=declared_at,
+            declared_projection_identity=_declared_projection_identity(item, facts),
             system_observed_at=None if system is None else system.observed_at,
             system_snapshot_id=None if system is None else system.snapshot_id,
             system_promoted_run_id=(
                 None if system is None else system.promoted_sync_run_id
+            ),
+            system_latest_attempt_id=(
+                None if system is None else system.latest_attempt_id
             ),
             system_profile_freshness=_system_freshness(
                 system, generated_at, SYSTEM_FRESH
@@ -897,8 +912,10 @@ def _comparison_evidence(
     observed_at: datetime,
     freshness: Freshness,
     kind: str,
+    declared_projection_identity: str | int | None,
     system_snapshot_id: str | int | None,
     system_promoted_run_id: str | int | None,
+    system_latest_attempt_id: str | int | None,
 ) -> PrimitiveEvidence:
     # Opaque source identities bind this derivation to the exact promoted
     # system evidence.  They are hashed into lineage and never serialized.
@@ -908,8 +925,10 @@ def _comparison_evidence(
         observed_at,
         state,
         reason,
+        declared_projection_identity,
         system_snapshot_id,
         system_promoted_run_id,
+        system_latest_attempt_id,
     )
     if state == "unknown":
         return PrimitiveEvidence(
@@ -929,6 +948,28 @@ def _comparison_evidence(
         freshness,
         evidence_id,
     )
+
+
+def _declared_projection_identity(
+    item: Mapping[str, Any] | None, facts: Mapping[str, Any]
+) -> str | int:
+    """Return an opaque exact-projection identity, defensively deriving one."""
+
+    supplied = None if item is None else item.get("projection_identity")
+    if isinstance(supplied, (str, int)) and not isinstance(supplied, bool):
+        return supplied
+    canonical = json.dumps(
+        {
+            "facts": facts,
+            "promoted_sync_run_id": (
+                None if item is None else item.get("promoted_sync_run_id")
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"declared-projection:{hashlib.sha256(canonical).hexdigest()[:24]}"
 
 
 def _overall_reason(comparison: Any) -> str:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any, Mapping
 
 from steam_agent.compatibility import (
@@ -40,6 +42,10 @@ def assess_compatibility_snapshot(
                 "facts": subject.current.facts,
                 "observed_at": subject.current.observed_at,
                 "promoted_sync_run_id": subject.current.promoted_sync_run_id,
+                "projection_identity": _declared_projection_identity(
+                    subject.current.facts,
+                    subject.current.promoted_sync_run_id,
+                ),
             }
             for subject in snapshot.declared_apps.subjects
             if subject.current is not None
@@ -206,6 +212,20 @@ def _run_time(run: SyncRun | None) -> datetime | None:
     if run is None:
         return None
     return _time(run.completed_at or run.started_at)
+
+
+def _declared_projection_identity(
+    facts: Mapping[str, Any], promoted_sync_run_id: str | int | None
+) -> str:
+    """Bind derived evidence to exact normalized content without exposing it."""
+
+    canonical = json.dumps(
+        {"facts": facts, "promoted_sync_run_id": promoted_sync_run_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"declared-projection:{hashlib.sha256(canonical).hexdigest()[:24]}"
 
 
 def _time(value: str) -> datetime:
