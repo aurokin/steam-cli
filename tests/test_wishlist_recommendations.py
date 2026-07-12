@@ -246,6 +246,17 @@ def test_review_counts_are_report_only_and_never_user_taste() -> None:
     )
 
 
+def test_unknown_review_freshness_is_report_only_and_missing_for_completeness() -> None:
+    value = candidate(
+        1,
+        review=ReviewSummary("valve", 8, 10, NOW, "unknown", ("review:1",)),
+    )
+    result = rank_wishlist((value,), rules=(), context=context())
+    assert result.ranked[0].review is not None
+    assert result.ranked[0].review.freshness == "unknown"
+    assert "review" in result.ranked[0].missing
+
+
 def test_m3_not_found_is_unknown_price_not_free() -> None:
     missing = deal(
         state="not_found",

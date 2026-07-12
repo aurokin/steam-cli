@@ -187,6 +187,18 @@ def smoke(wheel: Path) -> None:
             )
         ):
             raise RuntimeError("installed help does not expose recommendation contracts")
+        reviews_help = _run([str(executable), "sync", "reviews", "--help"])
+        wishlist_fit_help = _run(
+            [str(executable), "recommendations", "wishlist", "--help"]
+        )
+        if not all(
+            option in reviews_help.stdout
+            for option in ("--scope", "--account", "--max-items", "--acknowledge-local-storage")
+        ) or not all(
+            option in wishlist_fit_help.stdout
+            for option in ("--account", "--country", "--store-class", "--unknown", "--override")
+        ):
+            raise RuntimeError("installed help does not expose wishlist-fit contracts")
 
         data_dir = root / "data"
         query = [
@@ -223,6 +235,21 @@ def smoke(wheel: Path) -> None:
             or recommendation.get("data", {}).get("empty") is not False
         ):
             raise RuntimeError("fresh-profile recommendation truth state is invalid")
+        wishlist_fit = json.loads(
+            _run(
+                [
+                    str(executable), "--data-dir", str(data_dir),
+                    "recommendations", "wishlist", "--account", "primary",
+                    "--country", "US",
+                ]
+            ).stdout
+        )
+        if (
+            wishlist_fit.get("completeness", {}).get("status") != "unavailable"
+            or wishlist_fit.get("data", {}).get("purchase_recommendation_supported") is not False
+            or wishlist_fit.get("data", {}).get("empty") is not False
+        ):
+            raise RuntimeError("fresh-profile wishlist-fit truth state is invalid")
 
         database = data_dir / "steam-agent.sqlite3"
         before = _versions(database)
@@ -236,6 +263,8 @@ def smoke(wheel: Path) -> None:
             or "activity_current" not in _tables(database)
             or "achievement_sync_demand" not in _tables(database)
             or "achievement_player_current" not in _tables(database)
+            or "review_sync_demand" not in _tables(database)
+            or "review_current" not in _tables(database)
         ):
             raise RuntimeError(
                 "installed wheel did not apply the complete source schema"

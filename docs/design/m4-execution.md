@@ -149,6 +149,16 @@ Deal value remains the accepted M3 `deal-evidence/0.1` dimension. M4 never
 folds deal value into preference fit or treats missing prices as a play
 eligibility failure.
 
+AUR-642 is implemented with `sync reviews --scope wishlist` and
+`recommendations wishlist` under recipe `wishlist-fit/0.1`. Default review
+syncs converge in bounded batches, explicit limits refresh a deterministic
+prefix, retryable provider failures stop fanout with a persisted cooldown, and
+nonretryable per-AppID failures do not block later subjects. The query reuses
+the accepted M3 deal normalization rather than recomputing price meaning.
+Direct rating, snooze, play-state, trait, and rule lineage remain field-specific.
+Review aggregates and their typed manual reference are report-only. No release
+or compatibility provider is activated.
+
 ## Acceptance harness
 
 Normal CI must cover:

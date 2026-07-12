@@ -91,6 +91,16 @@ from steam_agent.activity import (
 from steam_agent.recommendations import ConstraintOverride, Requirement
 from steam_agent.recommendation_query import build_recommendation_query
 from steam_agent.steam_activity_api import SteamActivityApiClient
+from steam_agent.steam_reviews import SteamReviewClient
+from steam_agent.review_library import (
+    REVIEW_DISCLOSURE_VERSION,
+    ReviewSyncError,
+    sync_wishlist_reviews,
+)
+from steam_agent.wishlist_recommendations import GateOverride
+from steam_agent.wishlist_recommendation_query import (
+    build_wishlist_recommendation_query,
+)
 
 
 EXIT_OK = 0
@@ -266,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
     achievements_sync.add_argument("--appid", type=int, action="append", default=[])
     achievements_sync.add_argument("--max-items", type=int, default=20)
     achievements_sync.add_argument("--acknowledge-local-storage", action="store_true")
+    reviews_sync = sync_commands.add_parser(
+        "reviews", help="Synchronize bounded public aggregate wishlist reviews."
+    )
+    _add_leaf_format(reviews_sync)
+    reviews_sync.add_argument("--scope", choices=("wishlist",), required=True)
+    reviews_sync.add_argument("--account", default="primary")
+    reviews_sync.add_argument("--max-items", type=int)
+    reviews_sync.add_argument("--acknowledge-local-storage", action="store_true")
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
@@ -318,6 +336,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommendation_query.add_argument("--override", action="append", default=[])
     recommendation_query.add_argument("--explain", action="store_true")
+    wishlist_recommendation = recommendation_commands.add_parser(
+        "wishlist", help="Rank wishlist fit from one cached evidence snapshot."
+    )
+    _add_leaf_format(wishlist_recommendation)
+    wishlist_recommendation.add_argument("--account", required=True)
+    wishlist_recommendation.add_argument("--country", required=True)
+    wishlist_recommendation.add_argument(
+        "--store-class", choices=("official", "keyshop", "unknown"), default="official"
+    )
+    wishlist_recommendation.add_argument(
+        "--unknown", choices=("include", "exclude"), default="exclude"
+    )
+    wishlist_recommendation.add_argument("--override", action="append", default=[])
 
     activity = commands.add_parser("activity", help="Query cached activity evidence.")
     activity_commands = activity.add_subparsers(dest="activity_command", required=True)
@@ -494,7 +525,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_leaf_format(delete_data)
     delete_data.add_argument(
-        "--provider", choices=("steam-web-api", "gg-deals", "cheapshark"), required=True
+        "--provider",
+        choices=("steam-web-api", "steam-store-reviews", "gg-deals", "cheapshark"),
+        required=True,
     )
     target = delete_data.add_mutually_exclusive_group(required=True)
     target.add_argument("--account")
@@ -653,6 +686,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_sync_prices(args, database_path)
     if args.command == "sync" and args.sync_command in {"activity", "achievements"}:
         return _dispatch_activity(args, database_path)
+    if args.command == "sync" and args.sync_command == "reviews":
+        return _dispatch_sync_reviews(args, database_path)
     if args.command == "sync" and args.sync_command == "installed":
         root = args.steam_root or discover_steam_root()
         if root is None:
@@ -811,6 +846,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
+    if args.command == "recommendations" and args.recommendations_command == "wishlist":
+        return _dispatch_wishlist_recommendations(args, database_path)
     if args.command == "recommendations":
         return _dispatch_recommendations_query(args, database_path)
     if args.command in {"activity", "achievements"}:
@@ -1127,6 +1164,213 @@ def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
     return _emit_success(
         args,
         command="deals.query",
+        generated_at=generated_at,
+        context=result["context"],  # type: ignore[arg-type]
+        completeness_value=result["completeness"],  # type: ignore[arg-type]
+        data=result["data"],  # type: ignore[arg-type]
+    )
+
+
+def _dispatch_sync_reviews(args: argparse.Namespace, database_path: Path) -> int:
+    command = "sync.reviews"
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            account = None
+        if account is None:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                message="The requested Steam account is not configured.",
+            )
+        consent = storage.get_review_data_consent(account.id)
+        if (
+            consent is None
+            or consent.disclosure_version != REVIEW_DISCLOSURE_VERSION
+        ):
+            if not args.acknowledge_local_storage:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.DATA_POLICY_ACKNOWLEDGMENT_REQUIRED,
+                    message=(
+                        "Review sync stores public normalized aggregate counts, "
+                        "request context, account-scoped demand, and coarse attempt "
+                        "lineage for up to seven days. Review text, reviewers, and raw "
+                        "responses are not retained. Backups may retain deleted copies."
+                    ),
+                    remediation="Rerun with --acknowledge-local-storage.",
+                )
+            storage.record_review_data_consent(
+                account_id=account.id,
+                disclosure_version=REVIEW_DISCLOSURE_VERSION,
+                accepted_at=_utc_now(),
+                backups_acknowledged=True,
+            )
+        try:
+            result = sync_wishlist_reviews(
+                storage,
+                account_id=account.id,
+                max_items=args.max_items,
+                client=_steam_review_client(),
+                clock=_utc_now,
+            )
+        except ReviewSyncError as exc:
+            return _emit_error(
+                args,
+                command=command,
+                code=exc.code,
+                message="Steam aggregate review synchronization stopped early.",
+                retryable=exc.retryable,
+            )
+        except (ValueError, StorageError):
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="Review synchronization requires a synchronized, disclosed wishlist.",
+                exit_code=2,
+            )
+    return _emit_success(
+        args,
+        command=command,
+        context={
+            "account_alias": account.alias,
+            "scope": "wishlist",
+            "provider": "steam_store",
+            "identifiers_included": False,
+        },
+        data={
+            "sync_run_id": result.run.id,
+            "sync_status": result.run.status,
+            "candidate_count": result.candidate_count,
+            "targeted_count": result.targeted_count,
+            "state_counts": result.state_counts,
+            "request_context": {
+                "filter": "all",
+                "language": "all",
+                "day_range": 365,
+                "review_type": "all",
+                "purchase_type": "all",
+                "num_per_page": 1,
+                "off_topic_activity_filtered": True,
+            },
+            "review_text_retained": False,
+            "reviewer_data_retained": False,
+            "raw_response_retained": False,
+        },
+    )
+
+
+_WISHLIST_OVERRIDE = re.compile(
+    r"appid:([1-9][0-9]{0,9}):((?:explicit_hard_exclude|active_snooze|hard_(?:avoid|require):user:[a-z0-9][a-z0-9._-]{0,58}))\Z"
+)
+
+
+def _wishlist_overrides(values: list[str]) -> tuple[GateOverride, ...]:
+    if len(values) > 64:
+        raise ValueError("too many wishlist overrides")
+    result: list[GateOverride] = []
+    for index, expression in enumerate(values, start=1):
+        match = _WISHLIST_OVERRIDE.fullmatch(expression)
+        if match is None or int(match.group(1)) > (1 << 32) - 1:
+            raise ValueError("wishlist override is invalid")
+        result.append(
+            GateOverride(
+                f"override:cli-{index}",
+                int(match.group(1)),
+                match.group(2),
+                (f"request:override-{index}",),
+            )
+        )
+    return tuple(result)
+
+
+def _dispatch_wishlist_recommendations(
+    args: argparse.Namespace, database_path: Path
+) -> int:
+    generated_at = _utc_now().astimezone(timezone.utc).replace(microsecond=0)
+    country = args.country.upper()
+    if country != "US":
+        return _emit_error(
+            args,
+            command="recommendations.wishlist",
+            code="UNSUPPORTED_COUNTRY",
+            message="Cached wishlist deal evidence is currently US/USD only.",
+            exit_code=2,
+        )
+    try:
+        overrides = _wishlist_overrides(args.override)
+    except ValueError:
+        return _emit_error(
+            args,
+            command="recommendations.wishlist",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="A wishlist recommendation override is invalid.",
+            exit_code=2,
+        )
+    with Storage(database_path) as storage:
+        try:
+            account = storage.get_account(args.account)
+        except ValueError:
+            account = None
+        if account is None:
+            return _emit_success(
+                args,
+                command="recommendations.wishlist",
+                generated_at=generated_at,
+                context={
+                    "account_alias": args.account,
+                    "recipe": "wishlist-fit/0.1",
+                    "identifiers_included": False,
+                },
+                completeness_value=completeness(
+                    CompletenessStatus.UNAVAILABLE,
+                    missing_capabilities=["account.identity"],
+                ),
+                data={
+                    "recipe": "wishlist-fit/0.1",
+                    "ranked": [],
+                    "excluded": [],
+                    "purchase_recommendation_supported": False,
+                    "empty": False,
+                    "next_cursor": None,
+                },
+            )
+        spec = _CREDENTIAL_PROVIDERS["gg-deals"]
+        credential_ref = _provider_credential_ref(database_path, spec)
+        gg_configured = storage.get_credential_reference(
+            provider=credential_ref.provider,
+            kind=credential_ref.kind,
+            profile_id=credential_ref.profile_id,
+        ) is not None
+        snapshot = storage.read_wishlist_recommendation_snapshot(
+            account_id=account.id, country=country, now=generated_at
+        )
+    try:
+        result = build_wishlist_recommendation_query(
+            snapshot,
+            account_alias=account.alias,
+            country=country,
+            store_class=args.store_class,
+            unknown_policy=args.unknown,
+            overrides=overrides,
+            generated_at=generated_at,
+            gg_credential_configured=gg_configured,
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command="recommendations.wishlist",
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The wishlist recommendation request conflicts with cached evidence.",
+            exit_code=2,
+        )
+    return _emit_success(
+        args,
+        command="recommendations.wishlist",
         generated_at=generated_at,
         context=result["context"],  # type: ignore[arg-type]
         completeness_value=result["completeness"],  # type: ignore[arg-type]
@@ -2885,6 +3129,44 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
         )
     if args.provider in {"gg-deals", "cheapshark"}:
         return _delete_price_provider_data(args, database_path)
+    if args.provider == "steam-store-reviews":
+        with Storage(database_path) as storage:
+            try:
+                account = (
+                    None if args.account is None else storage.get_account(args.account)
+                )
+            except ValueError:
+                return _emit_error(
+                    args,
+                    command="data.delete",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The account alias is invalid.",
+                    exit_code=2,
+                )
+            if args.account is not None and account is None:
+                deletion = {
+                    "observations_removed": 0,
+                    "demand_removed": 0,
+                    "current_removed": 0,
+                    "sync_runs_removed": 0,
+                }
+            else:
+                deletion = storage.delete_review_data(
+                    account_id=None if account is None else account.id
+                )
+        return _emit_success(
+            args,
+            command="data.delete",
+            data={
+                "scope": "provider-all" if args.all else "account-provider",
+                "provider": args.provider,
+                "account_alias": args.account,
+                **deletion,
+                "account_preserved": True,
+                "credential_preserved": True,
+                "backup_copies_require_separate_deletion": True,
+            },
+        )
     with _credential_operation_lock(database_path):
         if args.account is not None:
             with Storage(database_path) as storage:
@@ -4147,6 +4429,10 @@ def _gg_deals_client(request_gate: Any) -> GgDealsClient:
     return GgDealsClient(request_gate=request_gate)
 
 
+def _steam_review_client() -> SteamReviewClient:
+    return SteamReviewClient()
+
+
 def _cheapshark_client(request_gate: Any) -> CheapSharkClient:
     return CheapSharkClient(
         request_gate=request_gate, retry_observer=_defer_cheapshark_requests
@@ -4460,6 +4746,24 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "recommendations.wishlist":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields(
+            "APPID", "NAME", "ELIGIBILITY", "PREFERENCE_FIT", "DEAL", "REVIEW_TOTAL"
+        )
+        for item in envelope["data"]["ranked"]:
+            _print_table_fields(
+                item["appid"],
+                item["name"],
+                item["eligibility"]["state"],
+                item["preference_fit"]["score"],
+                item["deal_value"]["state"],
+                "" if item["review"] is None else item["review"]["total"],
+            )
+        return
     if command == "recommendations.query":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])

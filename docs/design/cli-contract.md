@@ -397,6 +397,28 @@ tradeoffs, unknowns, freshness, confidence, and completeness under schema
 `recommendations/0.1`. Missing titles are allowed; SteamID64, internal account
 IDs, secrets, and local filesystem paths are not returned.
 
+### Wishlist fit and public review evidence
+
+```text
+steam-agent sync reviews --scope wishlist --account ALIAS [--max-items N] [--acknowledge-local-storage]
+steam-agent recommendations wishlist --account ALIAS --country US [--store-class official|keyshop|unknown] [--unknown include|exclude] [--override appid:N:CONSTRAINT] [--format json|table]
+```
+
+`sync reviews` retains only normalized aggregate counts, the complete fixed
+request context, a fixed source locator, a typed manual-only store-page
+reference, and bounded demand/attempt lineage. It never retains review text,
+authors, cursors, or raw bodies. An omitted limit converges through fresh
+terminal subjects in batches of 20; an explicit limit refreshes the
+deterministic wishlist prefix.
+
+`recommendations wishlist` reads wishlist, accepted M3 deal evidence, direct
+feedback and rules, and optional aggregate reviews in one cache-only
+transaction. Its immutable recipe is `wishlist-fit/0.1`. Eligibility,
+preference fit, deal value, reviews, release, and compatibility remain separate
+dimensions. Reviews are report-only; release and compatibility are explicitly
+unknown, and `purchase_recommendation_supported` is false when every preference
+dimension is unknown.
+
 ## Exploratory future command shape
 
 A composable vocabulary scales better than one command per natural-language

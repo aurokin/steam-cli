@@ -140,6 +140,9 @@ class DirectFeedback:
     hard_exclude: bool = False
     traits: tuple[TraitAssertion, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    rating_evidence_ids: tuple[str, ...] = ()
+    snooze_evidence_ids: tuple[str, ...] = ()
+    hard_exclude_evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.rating not in {None, "liked", "disliked", "neutral"}:
@@ -161,6 +164,15 @@ class DirectFeedback:
             self, "traits", tuple(sorted(self.traits, key=lambda item: item.trait))
         )
         object.__setattr__(self, "evidence_ids", _ids(self.evidence_ids))
+        object.__setattr__(
+            self, "rating_evidence_ids", _ids(self.rating_evidence_ids)
+        )
+        object.__setattr__(
+            self, "snooze_evidence_ids", _ids(self.snooze_evidence_ids)
+        )
+        object.__setattr__(
+            self, "hard_exclude_evidence_ids", _ids(self.hard_exclude_evidence_ids)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +388,61 @@ class DealDimension:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewRequestContext:
+    filter: Literal["all"] = "all"
+    language: Literal["all"] = "all"
+    day_range: Literal[365] = 365
+    review_type: Literal["all"] = "all"
+    purchase_type: Literal["all"] = "all"
+    num_per_page: Literal[1] = 1
+    off_topic_activity_filtered: Literal[True] = True
+
+    def __post_init__(self) -> None:
+        if (
+            self.filter != "all"
+            or self.language != "all"
+            or self.day_range != 365
+            or self.review_type != "all"
+            or self.purchase_type != "all"
+            or self.num_per_page != 1
+            or self.off_topic_activity_filtered is not True
+        ):
+            raise ValueError("review request context is unsupported")
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewHumanReference:
+    appid: int
+    url: str
+    purpose: Literal["view_store_reviews"] = "view_store_reviews"
+    access_mode: Literal["manual_only"] = "manual_only"
+    automation_supported: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        _bounded_int(self.appid, name="review reference appid", maximum=MAX_APPID)
+        try:
+            parsed = urlsplit(self.url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise ValueError("review human reference is invalid") from None
+        if (
+            self.appid == 0
+            or parsed.scheme != "https"
+            or parsed.hostname != "store.steampowered.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path != f"/app/{self.appid}/"
+            or parsed.query
+            or parsed.fragment != "app_reviews_hash"
+            or self.purpose != "view_store_reviews"
+            or self.access_mode != "manual_only"
+            or self.automation_supported is not False
+        ):
+            raise ValueError("review human reference is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewSummary:
     provider: str
     positive: int
@@ -383,13 +450,41 @@ class ReviewSummary:
     observed_at: datetime
     freshness: Freshness
     evidence_ids: tuple[str, ...] = ()
+    review_score: int | None = None
+    negative: int | None = None
+    request_context: ReviewRequestContext | None = None
+    source_locator: Literal["steam_store_appreviews"] | None = None
+    human_reference: ReviewHumanReference | None = None
 
     def __post_init__(self) -> None:
         _bounded_text(self.provider, name="review provider")
-        _bounded_int(self.positive, name="positive", maximum=MAX_APPID)
-        _bounded_int(self.total, name="total", maximum=MAX_APPID)
+        _bounded_int(self.positive, name="positive", maximum=MAX_MINOR_UNITS)
+        _bounded_int(self.total, name="total", maximum=MAX_MINOR_UNITS)
         if self.positive > self.total:
             raise ValueError("positive review count cannot exceed total")
+        if self.review_score is not None:
+            _bounded_int(self.review_score, name="review_score", maximum=10)
+        if self.negative is not None:
+            _bounded_int(self.negative, name="negative", maximum=MAX_MINOR_UNITS)
+            if self.positive + self.negative != self.total:
+                raise ValueError("review positive and negative counts must equal total")
+        if self.request_context is not None and not isinstance(
+            self.request_context, ReviewRequestContext
+        ):
+            raise ValueError("review request_context is invalid")
+        if self.source_locator not in {None, "steam_store_appreviews"}:
+            raise ValueError("review source locator is invalid")
+        if self.human_reference is not None and not isinstance(
+            self.human_reference, ReviewHumanReference
+        ):
+            raise ValueError("review human_reference is invalid")
+        attributed = (
+            self.request_context is not None,
+            self.source_locator is not None,
+            self.human_reference is not None,
+        )
+        if any(attributed) and not all(attributed):
+            raise ValueError("review attribution must be complete")
         object.__setattr__(
             self, "observed_at", _time(self.observed_at, name="observed_at")
         )
@@ -654,7 +749,11 @@ def _evaluate(
     used_overrides: set[str] = set()
     if candidate.feedback.hard_exclude:
         factor, blocked = _gate_factor(
-            "explicit_hard_exclude", "fail", candidate.feedback.evidence_ids, overrides
+            "explicit_hard_exclude",
+            "fail",
+            candidate.feedback.hard_exclude_evidence_ids
+            or candidate.feedback.evidence_ids,
+            overrides,
         )
         gate_factors.append(factor)
         failed = failed or blocked
@@ -665,7 +764,11 @@ def _evaluate(
         and candidate.feedback.snoozed_until > context.generated_at
     ):
         factor, blocked = _gate_factor(
-            "active_snooze", "fail", candidate.feedback.evidence_ids, overrides
+            "active_snooze",
+            "fail",
+            candidate.feedback.snooze_evidence_ids
+            or candidate.feedback.evidence_ids,
+            overrides,
         )
         gate_factors.append(factor)
         failed = failed or blocked
@@ -716,7 +819,8 @@ def _evaluate(
                 f"direct_rating:{candidate.feedback.rating}",
                 "applied",
                 contribution,
-                candidate.feedback.evidence_ids,
+                candidate.feedback.rating_evidence_ids
+                or candidate.feedback.evidence_ids,
             )
         )
     for rule in rules:
@@ -760,6 +864,8 @@ def _evaluate(
     if deal.state in {"stale", "expired"}:
         stale.append("deal_value")
     if candidate.review is None:
+        missing.append("review")
+    elif candidate.review.freshness == "unknown":
         missing.append("review")
     elif candidate.review.freshness in {"stale", "expired"}:
         stale.append("review")

@@ -624,6 +624,18 @@ class RecommendationSnapshot:
     catalog: CatalogSnapshot
 
 
+@dataclass(frozen=True)
+class WishlistRecommendationSnapshot:
+    """All wishlist-fit inputs captured in one SQLite transaction."""
+
+    deals: WishlistDealSnapshot
+    feedback: tuple[ExplicitFeedback, ...]
+    rules: tuple[PreferenceRule, ...]
+    reviews: tuple[Mapping[str, Any], ...]
+    review_attempts: tuple[SyncRun, ...]
+    review_demand: tuple[Mapping[str, Any], ...]
+
+
 def _timestamp(value: str | datetime) -> str:
     if isinstance(value, str):
         candidate = value
@@ -750,6 +762,61 @@ def _validate_price_fact(
     if not valid_url:
         raise ValueError("price provider URL is invalid")
     return observed, effective
+
+
+def _validate_review_summary(appid: int, value: Mapping[str, Any]) -> None:
+    required = {
+        "appid",
+        "review_score",
+        "total_positive",
+        "total_negative",
+        "total_reviews",
+        "request_filter",
+        "language",
+        "day_range",
+        "review_type",
+        "purchase_type",
+        "num_per_page",
+        "off_topic_activity_filtered",
+        "source_locator",
+        "human_reference_url",
+    }
+    integers = (
+        value.get("review_score"),
+        value.get("total_positive"),
+        value.get("total_negative"),
+        value.get("total_reviews"),
+    )
+    try:
+        parsed = urlsplit(str(value.get("human_reference_url", "")))
+        port = parsed.port
+    except ValueError:
+        raise ValueError("review summary is invalid") from None
+    if (
+        set(value) != required
+        or value.get("appid") != appid
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in integers)
+        or not 0 <= integers[0] <= 10
+        or any(not 0 <= item <= (1 << 63) - 1 for item in integers[1:])
+        or integers[1] + integers[2] != integers[3]
+        or value.get("request_filter") != "all"
+        or value.get("language") != "all"
+        or value.get("day_range") != 365
+        or value.get("review_type") != "all"
+        or value.get("purchase_type") != "all"
+        or value.get("num_per_page") != 1
+        or value.get("off_topic_activity_filtered") is not True
+        or value.get("source_locator") != "steam_store_appreviews"
+        or parsed.scheme != "https"
+        or parsed.hostname != "store.steampowered.com"
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment != "app_reviews_hash"
+        or parsed.path != f"/app/{appid}/"
+    ):
+        raise ValueError("review summary is invalid")
 
 
 class Storage:
@@ -1948,6 +2015,48 @@ class Storage:
             SELECT * FROM account_data_consents
             WHERE account_id = ? AND consent_kind = 'wishlist_persistence'
             """,
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        values["backups_acknowledged"] = bool(values["backups_acknowledged"])
+        return AccountDataConsent(**values)
+
+    def record_review_data_consent(
+        self,
+        *,
+        account_id: int,
+        disclosure_version: str,
+        accepted_at: str | datetime,
+        backups_acknowledged: bool,
+    ) -> AccountDataConsent:
+        if not disclosure_version or len(disclosure_version) > 128:
+            raise ValueError("disclosure_version must be between 1 and 128 characters")
+        if backups_acknowledged is not True:
+            raise ValueError("backup implications must be acknowledged")
+        timestamp = _timestamp(accepted_at)
+        with self._connection:
+            self._require_steam_account(account_id)
+            self._connection.execute(
+                """INSERT INTO account_data_consents(
+                       account_id, consent_kind, disclosure_version,
+                       backups_acknowledged, accepted_at
+                   ) VALUES (?, 'review_persistence', ?, 1, ?)
+                   ON CONFLICT(account_id, consent_kind) DO UPDATE SET
+                     disclosure_version=excluded.disclosure_version,
+                     backups_acknowledged=excluded.backups_acknowledged,
+                     accepted_at=excluded.accepted_at""",
+                (account_id, disclosure_version, timestamp),
+            )
+        consent = self.get_review_data_consent(account_id)
+        assert consent is not None
+        return consent
+
+    def get_review_data_consent(self, account_id: int) -> AccountDataConsent | None:
+        row = self._connection.execute(
+            """SELECT * FROM account_data_consents
+               WHERE account_id=? AND consent_kind='review_persistence'""",
             (account_id,),
         ).fetchone()
         if row is None:
@@ -4876,6 +4985,79 @@ class Storage:
             self._rollback_transaction()
             raise
 
+    def read_wishlist_recommendation_snapshot(
+        self,
+        *,
+        account_id: int,
+        country: str,
+        now: str | datetime,
+    ) -> WishlistRecommendationSnapshot:
+        """Read wishlist, deals, feedback, rules, and reviews atomically."""
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        country = country.upper()
+        evaluated_now = _timestamp(now)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            self._expire_price_data(evaluated_now)
+            self._prune_reviews(evaluated_now)
+            wishlist = self._read_wishlist_snapshot(account_id)
+            prices = self._read_price_snapshot(
+                account_id=account_id,
+                country=country,
+                provider=None,
+                evaluated_now=evaluated_now,
+            )
+            deals = WishlistDealSnapshot(
+                wishlist=wishlist,
+                prices=prices,
+                stable_game_ids_by_appid=wishlist.stable_game_ids_by_appid,
+            )
+            feedback = self.list_explicit_feedback(account_id)
+            rules = self.list_preference_rules(account_id)
+            reviews = tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    """SELECT c.* FROM review_current c
+                       JOIN wishlist_current w ON w.appid=c.appid
+                       WHERE w.account_id=? ORDER BY c.appid""",
+                    (account_id,),
+                )
+            )
+            demand = tuple(
+                dict(row)
+                for row in self._connection.execute(
+                    """SELECT d.* FROM review_sync_demand d
+                       JOIN sync_runs r ON r.id=d.sync_run_id
+                       WHERE d.account_id=? AND d.sync_run_id=(
+                         SELECT d2.sync_run_id FROM review_sync_demand d2
+                         JOIN sync_runs r2 ON r2.id=d2.sync_run_id
+                         WHERE d2.account_id=d.account_id AND d2.appid=d.appid
+                         ORDER BY r2.started_at DESC, r2.id DESC LIMIT 1
+                       ) ORDER BY d.appid""",
+                    (account_id,),
+                )
+            )
+            attempts = tuple(
+                SyncRun(**dict(row))
+                for row in self._connection.execute(
+                    """SELECT DISTINCT r.* FROM sync_runs r
+                       JOIN review_sync_demand d ON d.sync_run_id=r.id
+                       WHERE d.account_id=? ORDER BY r.started_at, r.id""",
+                    (account_id,),
+                )
+            )
+            result = WishlistRecommendationSnapshot(
+                deals, feedback, rules, reviews, attempts, demand
+            )
+            self._connection.commit()
+            return result
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
     def read_catalog_snapshot(
         self,
         appids: list[int] | tuple[int, ...],
@@ -5171,8 +5353,10 @@ class Storage:
                     SELECT appid FROM activity_observations WHERE account_id = ?
                     UNION
                     SELECT appid FROM achievement_sync_demand WHERE account_id = ?
+                    UNION
+                    SELECT appid FROM review_sync_demand WHERE account_id = ?
                     """,
-                    (account_id, account_id, account_id, account_id, account_id, account_id),
+                    (account_id, account_id, account_id, account_id, account_id, account_id, account_id),
                 )
             )
             (
@@ -5214,6 +5398,11 @@ class Storage:
             evidence_removed += catalog_evidence_removed
             self._delete_orphan_achievement_schemas(
                 tuple(sorted({*appids, *catalog_appids}))
+            )
+            self._connection.execute(
+                """DELETE FROM review_current WHERE NOT EXISTS (
+                     SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
+                   )"""
             )
             orphan_apps_removed = self._delete_orphan_apps(
                 tuple(sorted({*appids, *catalog_appids}))
@@ -5544,6 +5733,7 @@ class Storage:
             account_cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE provider = 'steam'"
             )
+            self._connection.execute("DELETE FROM review_current")
             self._connection.execute("DELETE FROM achievement_schema_current")
             self._connection.execute("DELETE FROM achievement_schema_status")
             catalog_runs_cursor = self._connection.execute(
