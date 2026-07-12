@@ -10,8 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.client
 import json
-from typing import Mapping, Protocol
-from urllib.parse import urlencode
+from typing import Literal, Mapping, Protocol
+from urllib.parse import urlencode, urlsplit
 
 
 STEAM_STORE_HOST = "store.steampowered.com"
@@ -83,17 +83,73 @@ class FixedHttpsTransport:
 
 
 @dataclass(frozen=True, slots=True)
+class SteamReviewRequestContext:
+    """The complete, immutable filter context for an aggregate observation."""
+
+    filter: Literal["all"] = "all"
+    language: Literal["all"] = "all"
+    day_range: Literal[365] = 365
+    review_type: Literal["all"] = "all"
+    purchase_type: Literal["all"] = "all"
+    num_per_page: Literal[1] = 1
+    off_topic_activity_filtered: Literal[True] = True
+
+    def __post_init__(self) -> None:
+        if (
+            self.filter != "all"
+            or self.language != "all"
+            or self.day_range != 365
+            or self.review_type != "all"
+            or self.purchase_type != "all"
+            or self.num_per_page != 1
+            or self.off_topic_activity_filtered is not True
+        ):
+            raise ValueError("unsupported Steam review request context")
+
+
+@dataclass(frozen=True, slots=True)
+class SteamReviewHumanReference:
+    """A human-only store-page reference, never an ingestion endpoint."""
+
+    appid: int
+    url: str
+    purpose: Literal["view_store_reviews"] = "view_store_reviews"
+    access_mode: Literal["manual_only"] = "manual_only"
+    automation_supported: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        _validate_appid(self.appid)
+        try:
+            parsed = urlsplit(self.url)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("invalid Steam review human-reference URL") from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != STEAM_STORE_HOST
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path != f"/app/{self.appid}/"
+            or parsed.query
+            or parsed.fragment != "app_reviews_hash"
+            or self.purpose != "view_store_reviews"
+            or self.access_mode != "manual_only"
+            or self.automation_supported is not False
+        ):
+            raise ValueError("invalid Steam review human-reference URL")
+
+
+@dataclass(frozen=True, slots=True)
 class SteamReviewSummary:
     appid: int
     review_score: int
     total_positive: int
     total_negative: int
     total_reviews: int
-    language: str = "all"
-    review_type: str = "all"
-    purchase_type: str = "all"
-    off_topic_activity_filtered: bool = True
-    source_url: str = ""
+    request_context: SteamReviewRequestContext
+    source_locator: Literal["steam_store_appreviews"]
+    human_reference: SteamReviewHumanReference
 
 
 class SteamReviewClient:
@@ -109,21 +165,19 @@ class SteamReviewClient:
         self._timeout = timeout
 
     def fetch_summary(self, appid: int) -> SteamReviewSummary:
-        if (
-            not isinstance(appid, int)
-            or isinstance(appid, bool)
-            or not 1 <= appid <= (1 << 32) - 1
-        ):
-            raise ValueError("appid must be a positive unsigned 32-bit integer")
+        _validate_appid(appid)
+        context = SteamReviewRequestContext()
         parameters = {
             "json": "1",
-            "filter": "all",
-            "language": "all",
-            "day_range": "365",
-            "review_type": "all",
-            "purchase_type": "all",
-            "num_per_page": "1",
-            "filter_offtopic_activity": "1",
+            "filter": context.filter,
+            "language": context.language,
+            "day_range": str(context.day_range),
+            "review_type": context.review_type,
+            "purchase_type": context.purchase_type,
+            "num_per_page": str(context.num_per_page),
+            "filter_offtopic_activity": (
+                "1" if context.off_topic_activity_filtered else "0"
+            ),
         }
         path = f"/appreviews/{appid}?{urlencode(parameters)}"
         response = self._transport.request(
@@ -159,7 +213,12 @@ class SteamReviewClient:
             total_positive=positive,
             total_negative=negative,
             total_reviews=total,
-            source_url=f"https://{STEAM_STORE_HOST}/appreviews/{appid}",
+            request_context=context,
+            source_locator="steam_store_appreviews",
+            human_reference=SteamReviewHumanReference(
+                appid=appid,
+                url=f"https://{STEAM_STORE_HOST}/app/{appid}/#app_reviews_hash",
+            ),
         )
 
 
@@ -170,8 +229,12 @@ def _raise_for_status(response: HttpResponse) -> None:
             retryable=True,
             retry_after_seconds=_retry_after(response.headers),
         )
-    if response.status >= 500:
-        raise SteamReviewError("PROVIDER_UNAVAILABLE", retryable=True)
+    if response.status in {408, 425} or response.status >= 500:
+        raise SteamReviewError(
+            "PROVIDER_UNAVAILABLE",
+            retryable=True,
+            retry_after_seconds=_retry_after(response.headers),
+        )
     if response.status != 200:
         raise SteamReviewError("PROVIDER_RESPONSE_INVALID", retryable=False)
 
@@ -187,11 +250,22 @@ def _bounded_int(value: object, *, maximum: int = (1 << 63) - 1) -> int:
 
 
 def _retry_after(headers: Mapping[str, str]) -> int | None:
-    value = headers.get("retry-after")
+    value = next(
+        (item for key, item in headers.items() if key.lower() == "retry-after"), None
+    )
     if value is None or not value.isascii() or not value.isdecimal() or len(value) > 5:
         return None
     seconds = int(value)
     return seconds if 0 <= seconds <= 86_400 else None
+
+
+def _validate_appid(appid: object) -> None:
+    if (
+        not isinstance(appid, int)
+        or isinstance(appid, bool)
+        or not 1 <= appid <= (1 << 32) - 1
+    ):
+        raise ValueError("appid must be a positive unsigned 32-bit integer")
 
 
 __all__ = [
@@ -199,5 +273,7 @@ __all__ = [
     "STEAM_STORE_HOST",
     "SteamReviewClient",
     "SteamReviewError",
+    "SteamReviewHumanReference",
+    "SteamReviewRequestContext",
     "SteamReviewSummary",
 ]
