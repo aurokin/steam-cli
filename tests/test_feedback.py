@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import sqlite3
 
 import pytest
 
@@ -22,8 +23,10 @@ def test_feedback_projection_audit_idempotence_and_semantics(tmp_path) -> None:
     with Storage(tmp_path / "db.sqlite3") as storage:
         account_id = account(storage)
         service = FeedbackService(storage, clock=lambda: NOW)
-        rating_event = service.rate(account_id, 10, "liked")
-        assert service.rate(account_id, 10, "liked") == rating_event
+        rating_change = service.rate(account_id, 10, "liked")
+        assert rating_change.changed and rating_change.event_id is not None
+        repeated = service.rate(account_id, 10, "liked")
+        assert not repeated.changed and repeated.event_id is None
         service.play_state(account_id, 10, "user_abandoned")
         service.snooze(account_id, 10, until="2026-07-13T04:00:00Z", clear=False)
         service.estimate(
@@ -34,8 +37,10 @@ def test_feedback_projection_audit_idempotence_and_semantics(tmp_path) -> None:
             clear_minimum_session_minutes=False,
             clear_remaining_minutes=False,
         )
-        trait_event = service.trait(account_id, 10, "user:crafting", "absent")
-        assert service.trait(account_id, 10, "user:crafting", "absent") == trait_event
+        trait_change = service.trait(account_id, 10, "user:crafting", "absent")
+        assert trait_change.changed and trait_change.event_id is not None
+        repeated_trait = service.trait(account_id, 10, "user:crafting", "absent")
+        assert not repeated_trait.changed and repeated_trait.event_id is None
 
         item = service.query(account_id)[0]
         assert item["game_id"].startswith("game:")
@@ -60,6 +65,123 @@ def test_clear_fields_and_expired_snooze(tmp_path) -> None:
         assert service.query(account_id)[0]["snooze"]["state"] == "expired"
         service.snooze(account_id, 10, until=None, clear=True)
         assert service.query(account_id) == ()
+
+
+def test_cross_field_noop_never_claims_another_fields_event(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = account(storage)
+        service = FeedbackService(storage, clock=lambda: NOW)
+        rating = service.rate(account_id, 10, "liked")
+        play_state = service.play_state(account_id, 10, "finished")
+
+        repeated = service.rate(account_id, 10, "liked")
+
+        assert rating.event_id != play_state.event_id
+        assert repeated.changed is False
+        assert repeated.event_id is None
+
+
+def test_clear_all_scalar_fields_and_trait_prunes_current_rows(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = account(storage)
+        service = FeedbackService(storage, clock=lambda: NOW)
+        service.rate(account_id, 10, "neutral")
+        service.play_state(account_id, 10, "active")
+        service.trait(account_id, 10, "user:crafting", "unknown")
+
+        assert service.rate(account_id, 10, None, clear=True).changed
+        assert service.play_state(account_id, 10, None, clear=True).changed
+        cleared_trait = service.trait(
+            account_id, 10, "user:crafting", None, clear=True
+        )
+        repeated_trait = service.trait(
+            account_id, 10, "user:crafting", None, clear=True
+        )
+
+        assert cleared_trait.changed and cleared_trait.event_id is not None
+        assert not repeated_trait.changed and repeated_trait.event_id is None
+        assert service.query(account_id) == ()
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM explicit_feedback_current"
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM explicit_trait_current"
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM explicit_feedback_events"
+        ).fetchone()[0] == 6
+
+
+def test_multi_estimate_change_is_atomic_when_second_insert_fails(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = account(storage)
+        service = FeedbackService(storage, clock=lambda: NOW)
+        storage._connection.execute(
+            """
+            CREATE TRIGGER fail_remaining_estimate
+            BEFORE INSERT ON explicit_feedback_events
+            WHEN NEW.event_kind = 'remaining_minutes'
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic second change failure');
+            END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            service.estimate(
+                account_id,
+                10,
+                minimum_session_minutes=30,
+                remaining_minutes=90,
+                clear_minimum_session_minutes=False,
+                clear_remaining_minutes=False,
+            )
+
+        assert service.query(account_id) == ()
+        assert storage._connection.execute(
+            "SELECT COUNT(*) FROM explicit_feedback_events"
+        ).fetchone()[0] == 0
+
+
+def test_both_estimates_clear_atomically_with_one_timestamp(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        account_id = account(storage)
+        service = FeedbackService(storage, clock=lambda: NOW)
+        service.estimate(
+            account_id,
+            10,
+            minimum_session_minutes=30,
+            remaining_minutes=90,
+            clear_minimum_session_minutes=False,
+            clear_remaining_minutes=False,
+        )
+
+        changes = service.estimate(
+            account_id,
+            10,
+            minimum_session_minutes=None,
+            remaining_minutes=None,
+            clear_minimum_session_minutes=True,
+            clear_remaining_minutes=True,
+        )
+
+        assert [change.field for change in changes] == [
+            "minimum_session_minutes",
+            "remaining_minutes",
+        ]
+        assert all(change.changed and change.event_id is not None for change in changes)
+        assert service.query(account_id) == ()
+        timestamps = {
+            row[0]
+            for row in storage._connection.execute(
+                """
+                SELECT recorded_at FROM explicit_feedback_events
+                WHERE id IN (?, ?)
+                """,
+                tuple(change.event_id for change in changes),
+            )
+        }
+        assert timestamps == {"2026-07-12T04:00:00Z"}
 
 
 def test_preference_rules_are_sorted_idempotent_and_removable(tmp_path) -> None:

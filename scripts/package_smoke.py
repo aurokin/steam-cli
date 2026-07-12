@@ -157,6 +157,17 @@ def smoke(wheel: Path) -> None:
             )
         ):
             raise RuntimeError("installed help does not expose explicit estimates")
+        rate_help = _run([str(executable), "feedback", "rate", "--help"])
+        trait_help = _run([str(executable), "feedback", "trait", "--help"])
+        clear_state_help = _run(
+            [str(executable), "feedback", "clear-state", "--help"]
+        )
+        if (
+            "--clear" not in rate_help.stdout
+            or "--clear" not in trait_help.stdout
+            or "appid" not in clear_state_help.stdout
+        ):
+            raise RuntimeError("installed help does not expose explicit feedback clearing")
         activity_help = _run([str(executable), "sync", "activity", "--help"])
         achievements_help = _run([str(executable), "sync", "achievements", "--help"])
         if "--acknowledge-local-storage" not in activity_help.stdout or not all(

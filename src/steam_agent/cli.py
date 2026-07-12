@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import errno
 import getpass
@@ -317,12 +317,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(rate)
     rate.add_argument("appid", type=int)
     rate.add_argument("--account", default="primary")
-    rate.add_argument("--value", choices=("liked", "disliked", "neutral"), required=True)
+    rate_choice = rate.add_mutually_exclusive_group(required=True)
+    rate_choice.add_argument("--value", choices=("liked", "disliked", "neutral"))
+    rate_choice.add_argument("--clear", action="store_true")
     for command_name in ("finish", "abandon", "resume"):
         state = feedback_commands.add_parser(command_name, help=f"Mark a game as {command_name}.")
         _add_leaf_format(state)
         state.add_argument("appid", type=int)
         state.add_argument("--account", default="primary")
+    clear_state = feedback_commands.add_parser(
+        "clear-state", help="Clear the explicit play state."
+    )
+    _add_leaf_format(clear_state)
+    clear_state.add_argument("appid", type=int)
+    clear_state.add_argument("--account", default="primary")
     snooze = feedback_commands.add_parser("snooze", help="Set or clear a temporary snooze.")
     _add_leaf_format(snooze)
     snooze.add_argument("appid", type=int)
@@ -343,7 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
     trait.add_argument("appid", type=int)
     trait.add_argument("--account", default="primary")
     trait.add_argument("--trait", required=True)
-    trait.add_argument("--value", choices=("present", "absent", "unknown"), required=True)
+    trait_choice = trait.add_mutually_exclusive_group(required=True)
+    trait_choice.add_argument("--value", choices=("present", "absent", "unknown"))
+    trait_choice.add_argument("--clear", action="store_true")
     feedback_query = feedback_commands.add_parser("query", help="Query cached explicit feedback.")
     _add_leaf_format(feedback_query)
     feedback_query.add_argument("--account", default="primary")
@@ -2492,16 +2502,27 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                     },
                 )
             if command == "rate":
-                event_ids = (service.rate(account.id, args.appid, args.value),)
+                changes = (
+                    service.rate(
+                        account.id,
+                        args.appid,
+                        args.value,
+                        clear=args.clear,
+                    ),
+                )
             elif command in {"finish", "abandon", "resume"}:
                 state = {
                     "finish": "finished",
                     "abandon": "user_abandoned",
                     "resume": "active",
                 }[command]
-                event_ids = (service.play_state(account.id, args.appid, state),)
+                changes = (service.play_state(account.id, args.appid, state),)
+            elif command == "clear-state":
+                changes = (
+                    service.play_state(account.id, args.appid, None, clear=True),
+                )
             elif command == "snooze":
-                event_ids = (
+                changes = (
                     service.snooze(
                         account.id,
                         args.appid,
@@ -2510,7 +2531,7 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                     ),
                 )
             elif command == "estimate":
-                event_ids = service.estimate(
+                changes = service.estimate(
                     account.id,
                     args.appid,
                     minimum_session_minutes=args.minimum_session_minutes,
@@ -2519,9 +2540,13 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                     clear_remaining_minutes=args.clear_remaining_minutes,
                 )
             elif command == "trait":
-                event_ids = (
+                changes = (
                     service.trait(
-                        account.id, args.appid, args.trait, args.value
+                        account.id,
+                        args.appid,
+                        args.trait,
+                        args.value,
+                        clear=args.clear,
                     ),
                 )
             else:
@@ -2532,7 +2557,7 @@ def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
                 command=f"feedback.{command}",
                 context={"account_alias": account.alias, "identifiers_included": False},
                 data={
-                    "event_ids": list(event_ids),
+                    "changes": [asdict(change) for change in changes],
                     "item": None if not item else item[0],
                 },
             )

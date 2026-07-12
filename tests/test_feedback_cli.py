@@ -27,6 +27,8 @@ def test_feedback_cli_round_trip_and_user_abandoned_name(tmp_path, capsys) -> No
     )
     assert code == 0 and stderr == ""
     assert rated["data"]["item"]["rating"] == "liked"
+    assert rated["data"]["changes"][0]["changed"] is True
+    assert rated["data"]["changes"][0]["event_id"] is not None
 
     code, abandoned, _ = invoke(tmp_path, capsys, "feedback", "abandon", "10")
     assert code == 0
@@ -41,6 +43,25 @@ def test_feedback_cli_round_trip_and_user_abandoned_name(tmp_path, capsys) -> No
     encoded = json.dumps(queried)
     assert "765611" not in encoded
     assert str(tmp_path) not in encoded
+
+    code, cleared_rating, _ = invoke(
+        tmp_path, capsys, "feedback", "rate", "10", "--clear"
+    )
+    assert code == 0
+    assert cleared_rating["data"]["changes"][0]["field"] == "rating"
+    assert cleared_rating["data"]["changes"][0]["changed"] is True
+    code, cleared_state, _ = invoke(
+        tmp_path, capsys, "feedback", "clear-state", "10"
+    )
+    assert code == 0
+    assert cleared_state["data"]["item"] is None
+    code, repeated_clear, _ = invoke(
+        tmp_path, capsys, "feedback", "clear-state", "10"
+    )
+    assert code == 0
+    assert repeated_clear["data"]["changes"] == [
+        {"field": "play_state", "changed": False, "event_id": None, "trait": None}
+    ]
 
 
 def test_estimate_clear_trait_and_rules_cli(tmp_path, capsys) -> None:
@@ -79,6 +100,25 @@ def test_estimate_clear_trait_and_rules_cli(tmp_path, capsys) -> None:
         "--value",
         "present",
     )[0] == 0
+    code, trait_cleared, _ = invoke(
+        tmp_path,
+        capsys,
+        "feedback",
+        "trait",
+        "10",
+        "--trait",
+        "user:relaxing",
+        "--clear",
+    )
+    assert code == 0
+    trait_change = trait_cleared["data"]["changes"][0]
+    assert trait_change["event_id"] is not None
+    assert trait_change == {
+        "field": "trait",
+        "changed": True,
+        "event_id": trait_change["event_id"],
+        "trait": "user:relaxing",
+    }
     code, rule, _ = invoke(
         tmp_path,
         capsys,

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import re
 from typing import Callable
 
-from steam_agent.storage import ExplicitFeedback, PreferenceRule, Storage
+from steam_agent.storage import ExplicitFeedback, FeedbackChange, PreferenceRule, Storage
 
 
 MAX_UNSIGNED_32 = (1 << 32) - 1
@@ -54,21 +54,29 @@ class FeedbackService:
         self.storage = storage
         self.clock = clock
 
-    def rate(self, account_id: int, appid: int, value: str) -> int:
+    def rate(
+        self, account_id: int, appid: int, value: str | None, *, clear: bool = False
+    ) -> FeedbackChange:
         validate_appid(appid)
-        if value not in {"liked", "disliked", "neutral"}:
+        if clear == (value is not None):
+            raise ValueError("provide exactly one of value or clear")
+        if value is not None and value not in {"liked", "disliked", "neutral"}:
             raise ValueError("rating is invalid")
         return self._set(account_id, appid, "rating", value)
 
-    def play_state(self, account_id: int, appid: int, value: str) -> int:
+    def play_state(
+        self, account_id: int, appid: int, value: str | None, *, clear: bool = False
+    ) -> FeedbackChange:
         validate_appid(appid)
-        if value not in {"finished", "user_abandoned", "active"}:
+        if clear == (value is not None):
+            raise ValueError("provide exactly one of value or clear")
+        if value is not None and value not in {"finished", "user_abandoned", "active"}:
             raise ValueError("play state is invalid")
         return self._set(account_id, appid, "play_state", value)
 
     def snooze(
         self, account_id: int, appid: int, *, until: str | None, clear: bool
-    ) -> int:
+    ) -> FeedbackChange:
         validate_appid(appid)
         if clear == (until is not None):
             raise ValueError("provide exactly one of until or clear")
@@ -86,7 +94,7 @@ class FeedbackService:
         remaining_minutes: int | None,
         clear_minimum_session_minutes: bool,
         clear_remaining_minutes: bool,
-    ) -> tuple[int, ...]:
+    ) -> tuple[FeedbackChange, ...]:
         validate_appid(appid)
         if minimum_session_minutes is not None:
             validate_minutes(minimum_session_minutes)
@@ -104,27 +112,46 @@ class FeedbackService:
         )
         if not any(changes):
             raise ValueError("at least one estimate change is required")
-        event_ids: list[int] = []
+        changes_to_apply: list[tuple[str, int | None]] = []
         if minimum_session_minutes is not None or clear_minimum_session_minutes:
-            event_ids.append(
-                self._set(
-                    account_id,
-                    appid,
-                    "minimum_session_minutes",
-                    minimum_session_minutes,
-                )
+            changes_to_apply.append(
+                ("minimum_session_minutes", minimum_session_minutes)
             )
         if remaining_minutes is not None or clear_remaining_minutes:
-            event_ids.append(
-                self._set(account_id, appid, "remaining_minutes", remaining_minutes)
+            changes_to_apply.append(
+                ("remaining_minutes", remaining_minutes)
             )
-        return tuple(event_ids)
+        recorded_at = self.clock()
+        return self.storage.apply_explicit_feedback_fields(
+            account_id=account_id,
+            appid=appid,
+            changes=tuple(changes_to_apply),
+            recorded_at=recorded_at,
+        )
 
-    def trait(self, account_id: int, appid: int, trait: str, value: str) -> int:
+    def trait(
+        self,
+        account_id: int,
+        appid: int,
+        trait: str,
+        value: str | None,
+        *,
+        clear: bool = False,
+    ) -> FeedbackChange:
         validate_appid(appid)
         validate_trait(trait)
-        if value not in {"present", "absent", "unknown"}:
+        if clear == (value is not None):
+            raise ValueError("provide exactly one of value or clear")
+        if value is not None and value not in {"present", "absent", "unknown"}:
             raise ValueError("trait value is invalid")
+        if clear:
+            return self.storage.clear_explicit_trait(
+                account_id=account_id,
+                appid=appid,
+                trait=trait,
+                recorded_at=self.clock(),
+            )
+        assert value is not None
         return self.storage.set_explicit_trait(
             account_id=account_id,
             appid=appid,
@@ -177,7 +204,7 @@ class FeedbackService:
 
     def _set(
         self, account_id: int, appid: int, field_name: str, value: str | int | None
-    ) -> int:
+    ) -> FeedbackChange:
         return self.storage.set_explicit_feedback_field(
             account_id=account_id,
             appid=appid,

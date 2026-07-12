@@ -429,6 +429,14 @@ class ExplicitTrait:
 
 
 @dataclass(frozen=True)
+class FeedbackChange:
+    field: str
+    changed: bool
+    event_id: int | None
+    trait: str | None = None
+
+
+@dataclass(frozen=True)
 class PreferenceRule:
     account_id: int
     trait: str
@@ -975,7 +983,22 @@ class Storage:
         field_name: str,
         value: str | int | None,
         recorded_at: str | datetime,
-    ) -> int:
+    ) -> FeedbackChange:
+        return self.apply_explicit_feedback_fields(
+            account_id=account_id,
+            appid=appid,
+            changes=((field_name, value),),
+            recorded_at=recorded_at,
+        )[0]
+
+    def apply_explicit_feedback_fields(
+        self,
+        *,
+        account_id: int,
+        appid: int,
+        changes: tuple[tuple[str, str | int | None], ...],
+        recorded_at: str | datetime,
+    ) -> tuple[FeedbackChange, ...]:
         fields = {
             "rating": "rating",
             "play_state": "play_state",
@@ -983,75 +1006,89 @@ class Storage:
             "minimum_session_minutes": "minimum_session_minutes",
             "remaining_minutes": "remaining_minutes",
         }
-        column = fields.get(field_name)
-        if column is None:
-            raise ValueError("unsupported explicit feedback field")
-        allowed_values: dict[str, set[object]] = {
-            "rating": {None, "liked", "disliked", "neutral"},
-            "play_state": {None, "finished", "user_abandoned", "active"},
-        }
-        if field_name in allowed_values and value not in allowed_values[field_name]:
-            raise ValueError("explicit feedback value is invalid")
-        if field_name == "snooze" and value is not None:
-            if not isinstance(value, str):
-                raise ValueError("snooze timestamp is invalid")
-            _timestamp(value)
-        if field_name in {"minimum_session_minutes", "remaining_minutes"} and (
-            value is not None
-            and (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not 0 <= value <= (1 << 32) - 1
-            )
-        ):
-            raise ValueError("explicit estimate is invalid")
+        if not changes or len({field for field, _ in changes}) != len(changes):
+            raise ValueError("explicit feedback changes must be non-empty and unique")
+        validated: list[tuple[str, str, str | int | None]] = []
+        for field_name, value in changes:
+            column = fields.get(field_name)
+            if column is None:
+                raise ValueError("unsupported explicit feedback field")
+            allowed_values: dict[str, set[object]] = {
+                "rating": {None, "liked", "disliked", "neutral"},
+                "play_state": {None, "finished", "user_abandoned", "active"},
+            }
+            if field_name in allowed_values and value not in allowed_values[field_name]:
+                raise ValueError("explicit feedback value is invalid")
+            if field_name == "snooze" and value is not None:
+                if not isinstance(value, str):
+                    raise ValueError("snooze timestamp is invalid")
+                _timestamp(value)
+            if field_name in {"minimum_session_minutes", "remaining_minutes"} and (
+                value is not None
+                and (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 0 <= value <= (1 << 32) - 1
+                )
+            ):
+                raise ValueError("explicit estimate is invalid")
+            validated.append((field_name, column, value))
         timestamp = _timestamp(recorded_at)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_steam_account(account_id)
-            existing = self._connection.execute(
-                f"SELECT {column}, last_event_id FROM explicit_feedback_current "
-                "WHERE account_id = ? AND appid = ?",
-                (account_id, appid),
-            ).fetchone()
-            if existing is not None and existing[column] == value:
-                self._connection.commit()
-                return int(existing["last_event_id"])
-            if existing is None and value is None:
-                self._connection.commit()
-                return 0
-            self._ensure_steam_application_identity(appid, observed_at=timestamp)
-            value_text = value if isinstance(value, str) else None
-            value_integer = value if isinstance(value, int) else None
-            cursor = self._connection.execute(
-                """
-                INSERT INTO explicit_feedback_events(
-                    account_id, appid, event_kind, value_text, value_integer,
-                    trait, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (account_id, appid, field_name, value_text, value_integer, timestamp),
-            )
-            event_id = int(cursor.lastrowid)
-            self._connection.execute(
-                """
-                INSERT INTO explicit_feedback_current(
-                    account_id, appid, updated_at, last_event_id
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(account_id, appid) DO UPDATE SET
-                    updated_at = excluded.updated_at,
-                    last_event_id = excluded.last_event_id
-                """,
-                (account_id, appid, timestamp, event_id),
-            )
-            self._connection.execute(
-                f"UPDATE explicit_feedback_current SET {column} = ? "
-                "WHERE account_id = ? AND appid = ?",
-                (value, account_id, appid),
-            )
+            output: list[FeedbackChange] = []
+            identity_ensured = False
+            for field_name, column, value in validated:
+                existing = self._connection.execute(
+                    f"SELECT {column} FROM explicit_feedback_current "
+                    "WHERE account_id = ? AND appid = ?",
+                    (account_id, appid),
+                ).fetchone()
+                if (existing is None and value is None) or (
+                    existing is not None and existing[column] == value
+                ):
+                    output.append(
+                        FeedbackChange(field=field_name, changed=False, event_id=None)
+                    )
+                    continue
+                if not identity_ensured:
+                    self._ensure_steam_application_identity(appid, observed_at=timestamp)
+                    identity_ensured = True
+                value_text = value if isinstance(value, str) else None
+                value_integer = value if isinstance(value, int) else None
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO explicit_feedback_events(
+                        account_id, appid, event_kind, value_text, value_integer,
+                        trait, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (account_id, appid, field_name, value_text, value_integer, timestamp),
+                )
+                event_id = int(cursor.lastrowid)
+                self._connection.execute(
+                    """
+                    INSERT INTO explicit_feedback_current(
+                        account_id, appid, updated_at, last_event_id
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(account_id, appid) DO UPDATE SET
+                        updated_at = excluded.updated_at,
+                        last_event_id = excluded.last_event_id
+                    """,
+                    (account_id, appid, timestamp, event_id),
+                )
+                self._connection.execute(
+                    f"UPDATE explicit_feedback_current SET {column} = ? "
+                    "WHERE account_id = ? AND appid = ?",
+                    (value, account_id, appid),
+                )
+                output.append(
+                    FeedbackChange(field=field_name, changed=True, event_id=event_id)
+                )
             self._remove_empty_feedback_current(account_id, appid)
             self._connection.commit()
-            return event_id
+            return tuple(output)
         except BaseException:
             self._rollback_or_reopen()
             raise
@@ -1064,7 +1101,7 @@ class Storage:
         trait: str,
         value: str,
         recorded_at: str | datetime,
-    ) -> int:
+    ) -> FeedbackChange:
         trait = _user_trait(trait)
         if value not in {"present", "absent", "unknown"}:
             raise ValueError("explicit trait value is invalid")
@@ -1082,7 +1119,9 @@ class Storage:
             ).fetchone()
             if existing is not None and existing["value"] == value:
                 self._connection.commit()
-                return int(existing["last_event_id"])
+                return FeedbackChange(
+                    field="trait", trait=trait, changed=False, event_id=None
+                )
             cursor = self._connection.execute(
                 """
                 INSERT INTO explicit_feedback_events(
@@ -1106,7 +1145,60 @@ class Storage:
                 (account_id, appid, trait, value, timestamp, event_id),
             )
             self._connection.commit()
-            return event_id
+            return FeedbackChange(
+                field="trait", trait=trait, changed=True, event_id=event_id
+            )
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def clear_explicit_trait(
+        self,
+        *,
+        account_id: int,
+        appid: int,
+        trait: str,
+        recorded_at: str | datetime,
+    ) -> FeedbackChange:
+        trait = _user_trait(trait)
+        timestamp = _timestamp(recorded_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            existing = self._connection.execute(
+                """
+                SELECT 1 FROM explicit_trait_current
+                WHERE account_id = ? AND appid = ? AND trait = ?
+                """,
+                (account_id, appid, trait),
+            ).fetchone()
+            if existing is None:
+                self._connection.commit()
+                return FeedbackChange(
+                    field="trait", trait=trait, changed=False, event_id=None
+                )
+            cursor = self._connection.execute(
+                """
+                INSERT INTO explicit_feedback_events(
+                    account_id, appid, event_kind, value_text, value_integer,
+                    trait, recorded_at
+                ) VALUES (?, ?, 'trait', NULL, NULL, ?, ?)
+                """,
+                (account_id, appid, trait, timestamp),
+            )
+            event_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                DELETE FROM explicit_trait_current
+                WHERE account_id = ? AND appid = ? AND trait = ?
+                """,
+                (account_id, appid, trait),
+            )
+            self._remove_empty_feedback_current(account_id, appid)
+            self._connection.commit()
+            return FeedbackChange(
+                field="trait", trait=trait, changed=True, event_id=event_id
+            )
         except BaseException:
             self._rollback_or_reopen()
             raise
@@ -6175,6 +6267,7 @@ __all__ = [
     "EvidenceInput",
     "ExplicitFeedback",
     "ExplicitTrait",
+    "FeedbackChange",
     "InstalledGame",
     "InstalledObservation",
     "InstalledSnapshot",
