@@ -27,7 +27,10 @@ recipes, public aggregate-review evidence, and wishlist-fit joins are
 available. **M5 compatibility and ready-now is implemented and accepted:**
 redacted system profiles, provisional publisher declarations, and cache-only
 target assessments are available. **M6 discovery, household, and groups is
-active.** Artwork and Steam actions remain behind later milestone boundaries.
+implemented and accepted:** bounded declared-fact discovery, synthetic/account
+group evidence, missing-copy ranges, and deterministic group recommendations
+are available. **M7 local operations and safe plans is active.** Executable
+Steam actions remain disabled.
 
 ## Install and develop
 
@@ -314,6 +317,27 @@ boundary.
 For Steam Deck, `--context-machine` selects declared-fact attempt lineage and
 is required when multiple machines are configured; it does not apply that
 machine's hardware or installed state to the Deck assessment.
+
+## M6 discovery, household, and groups
+
+M6 adds bounded cache-only discovery and group decisions without crawling the
+store or enumerating friends/family:
+
+```text
+uv run steam-agent sync app-facts --scope known --account primary --machine local --country US --language english --max-items 20 --acknowledge-local-storage
+uv run steam-agent discovery query --scope known --limit 100 --account primary --machine local --country US --language english
+uv run steam-agent profiles create synthetic:guest --acknowledge-group-storage --acknowledge-backups
+uv run steam-agent group eligibility APPID --member account:primary --member synthetic:guest --account primary --machine local --country US --language english --mode online_coop
+uv run steam-agent group recommend --scope known --limit 10 --member account:primary --member synthetic:guest --context-account primary --context-machine local --country US --language english --mode online_coop --objective min-copies
+```
+
+Declared genres are not tags or mechanics; missing categories never prove a
+mode absent. Exact player counts and game-health verdicts remain unsupported
+unless represented as explicit user facts. Group output uses request-local
+ordinals, preserves unknown/stale ownership, and reports missing copies as a
+range. Queries never fetch implicitly. See the
+[M6 execution plan](docs/design/m6-execution.md) for accepted evidence,
+privacy, and ranking semantics.
 
 The current working direction is:
 

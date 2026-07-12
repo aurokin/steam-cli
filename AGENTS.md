@@ -14,10 +14,12 @@
 - M5 compatibility and ready-now is accepted. Preserve the redacted system-profile,
   layered evidence, target scope, provisional-provider, and no-performance-promise
   boundaries in `docs/design/m5-execution.md`.
-- M6 discovery, household, and groups is active. Keep its candidate universe
-  bounded and profiles synthetic unless real-person data is explicitly approved.
-- Keep artwork and action capabilities in design until their
-  Linear milestone is explicitly activated.
+- M6 discovery, household, and groups is accepted. Keep its candidate universe
+  account/machine/locale scoped, its private reads bounded, and its missing-copy
+  guarantees conservative under stale or unknown ownership.
+- M7 local operations and safe plans is active. It is read-only: observe, rank,
+  build plans, and emit human-open references only. Do not launch, install,
+  uninstall, mutate Steam state, or execute generated plans.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
 - Preserve the M1 last-good rule: partial or failed scans must not replace a complete installed projection.
@@ -41,6 +43,7 @@
 | M3 implementation scope and acceptance evidence | `docs/design/m3-execution.md` |
 | M4 implementation scope and acceptance evidence | `docs/design/m4-execution.md` |
 | M5 implementation scope and acceptance evidence | `docs/design/m5-execution.md` |
+| M6 implementation scope and acceptance evidence | `docs/design/m6-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions

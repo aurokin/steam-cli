@@ -1,6 +1,6 @@
 # M6 discovery, household, and groups execution plan
 
-Status: active 2026-07-12
+Status: accepted 2026-07-12
 
 ## Outcome and sequence
 
@@ -128,16 +128,19 @@ Planned tracer commands:
 ```text
 steam-agent sync app-facts --scope known|library|wishlist|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
 steam-agent discovery query [APPID...] --scope known|library|wishlist|installed|appids --limit N --account ALIAS --machine MACHINE --country CC --language LANG [--require mode:MODE] [--format json|table]
-steam-agent discovery annotate set|clear --profile PROFILE --appid APPID --fact trait:SLUG|policy:SLUG|players:min|players:max --value VALUE
-steam-agent profiles create ALIAS --kind synthetic --acknowledge-local-storage
-steam-agent profiles get|delete ALIAS
-steam-agent profiles ownership set --profile ALIAS --appid APPID --state owned|not-owned|unknown
-steam-agent profiles ownership clear --profile ALIAS --appid APPID
-steam-agent profiles family set --profile ALIAS --appid APPID --state available|unavailable|unknown [--from-profile ALIAS]
-steam-agent profiles family clear --profile ALIAS --appid APPID [--from-profile ALIAS]
-steam-agent group ownership APPID... --members MEMBER... [--copy-sources PROFILE...] --country CC --language LANG [--format json|table]
-steam-agent group eligibility APPID... --members MEMBER... [--copy-sources PROFILE...] --mode MODE --country CC --language LANG [--member-target MEMBER=MACHINE...] [--require-policy all:user:SLUG=present] [--format json|table]
-steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --members MEMBER... [--copy-sources PROFILE...] --mode MODE --country CC --language LANG --objective no-purchase|min-copies|preference-fit [--member-target MEMBER=MACHINE...] [--like APPID] [--dislike APPID] [--exclude-trait user:SLUG] [--format json|table]
+steam-agent profiles create synthetic:ALIAS --acknowledge-group-storage --acknowledge-backups
+steam-agent profiles get|delete synthetic:ALIAS [--yes]
+steam-agent profiles list
+steam-agent profiles clear-account account:ALIAS --yes
+steam-agent ownership set PROFILE APPID owned|not_owned|unknown
+steam-agent ownership clear PROFILE APPID --yes
+steam-agent family set RECIPIENT APPID available|unavailable|unknown --source SOURCE
+steam-agent family clear RECIPIENT APPID --source SOURCE --yes
+steam-agent fact set PROFILE APPID players:min|players:max|trait:user:SLUG|policy:user:SLUG VALUE
+steam-agent fact clear PROFILE APPID FACT --yes
+steam-agent group ownership APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG
+steam-agent group eligibility APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG --mode MODE [--host MEMBER] [--policy user:SLUG]
+steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --member MEMBER... [--copy-source SOURCE...] --context-account ALIAS --context-machine MACHINE --country CC --language LANG --mode MODE [--host MEMBER] --objective no-purchase|min-copies|preference-fit [--like MEMBER=APPID] [--dislike MEMBER=APPID] [--exclude-trait user:SLUG]
 ```
 
 The final grammar may be compacted during tracer implementation, but explicit
@@ -185,3 +188,13 @@ Provider acceptance uses redacted fixtures and a tiny bounded public live probe;
 it records no AppIDs, titles, labels, response bodies, account identifiers, or
 credentials. Diffwarden and adversarial review run to zero valid issues before
 M6 acceptance.
+
+## Acceptance evidence
+
+Accepted on 2026-07-12 with 1,375 repository tests, Ruff, source/wheel builds,
+focused cache-only/privacy/migration oracles, and a final Diffwarden review with
+zero findings. The tracer includes `declared-app-facts/0.2`, scoped explicit
+demand, discovery queries, durable synthetic/account group facts, copy-range
+eligibility, and all three deterministic `group-fit/0.1` objectives. Automated
+tags/mechanics, provider player counts, health verdicts, social enumeration,
+scraping, and implicit network queries remain unsupported.

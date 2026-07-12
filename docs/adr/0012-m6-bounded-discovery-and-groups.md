@@ -1,6 +1,6 @@
 # ADR 0012: bounded discovery universe and explicit group evidence
 
-Status: accepted for active M6 on 2026-07-12
+Status: accepted with M6 on 2026-07-12
 
 ## Context
 
