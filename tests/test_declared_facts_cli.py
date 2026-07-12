@@ -560,6 +560,29 @@ def test_keyboard_interrupt_finishes_typed_recoverable_run(
     }
 
 
+def test_sync_rejects_unicode_country_case_expansion(
+    tmp_path: Path, capsys
+) -> None:
+    configure(tmp_path)
+
+    code, result, stderr = invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "compatibility",
+        "--scope",
+        "library",
+        "--machine",
+        "desktop",
+        "--country",
+        "ß",
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert result["error"]["code"] == "INVALID_ARGUMENT"
+
+
 def test_rate_limit_without_retry_after_uses_default_persisted_backoff(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:

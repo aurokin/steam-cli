@@ -1374,12 +1374,14 @@ def _machine_profile_identity_matches(
 
 def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) -> int:
     command = "sync.compatibility"
-    country = args.country.upper()
     started_at = _utc_now()
     try:
         # Validate the complete provider/scheduler contract before any
         # dependency-specific early return.  Otherwise an unsynchronized owned
         # library could make malformed arguments appear valid.
+        if re.fullmatch(r"[A-Za-z]{2}", args.country) is None:
+            raise ValueError("country must be an ASCII alpha-2 code")
+        country = args.country.upper()
         SteamDeclaredFactsRequestContext(country, args.language)
         supplied_appids = tuple(args.appid)
         if any(
@@ -1797,10 +1799,12 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
 
     command = "compatibility.assess"
     now = _utc_now()
-    country = args.country.upper()
     # Validate the caller-controlled contract before touching cached evidence so
     # request mistakes remain distinct from malformed persisted projections.
     try:
+        if re.fullmatch(r"[A-Za-z]{2}", args.country) is None:
+            raise ValueError("country must be an ASCII alpha-2 code")
+        country = args.country.upper()
         supplied_appids = tuple(args.appids)
         if (
             not supplied_appids

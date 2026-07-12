@@ -969,7 +969,7 @@ def test_assess_missing_account_is_typed_without_identity_disclosure(
 
 @pytest.mark.parametrize(
     ("country", "language"),
-    (("USA", "english"), ("US", "English"), ("US", "en glish")),
+    (("USA", "english"), ("ß", "english"), ("US", "English"), ("US", "en glish")),
 )
 def test_assess_rejects_noncanonical_locale_context(
     tmp_path: Path, capsys: object, country: str, language: str

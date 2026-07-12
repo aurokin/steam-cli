@@ -2936,6 +2936,12 @@ class Storage:
                 )
                 for lineage_run_id in future_lineage:
                     self._connection.execute(
+                        """DELETE FROM declared_app_observations
+                           WHERE sync_run_id=? AND appid=? AND country=?
+                             AND language=?""",
+                        (lineage_run_id, appid, country, language),
+                    )
+                    self._connection.execute(
                         """DELETE FROM declared_app_sync_demand
                            WHERE sync_run_id=? AND appid=? AND country=?
                              AND language=?""",

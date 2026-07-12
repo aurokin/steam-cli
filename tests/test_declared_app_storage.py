@@ -701,6 +701,11 @@ def test_future_quarantine_is_exact_and_preserves_other_subjects(
         (broad.id,),
     ).fetchone()[0] == 1
     assert storage._connection.execute(  # noqa: SLF001
+        """SELECT COUNT(*) FROM declared_app_observations
+           WHERE sync_run_id=? AND appid=400""",
+        (broad.id,),
+    ).fetchone()[0] == 0
+    assert storage._connection.execute(  # noqa: SLF001
         "SELECT COUNT(*) FROM declared_app_current WHERE appid=400"
     ).fetchone()[0] == 0
     other_current = storage._connection.execute(  # noqa: SLF001
