@@ -1284,13 +1284,22 @@ def _dispatch_recommendations_query(args: argparse.Namespace, database_path: Pat
     missing: set[str] = set()
     stale: set[str] = set()
     warnings: list[WarningRecord] = []
-    if any(item[1] == "not_observed" for item in snapshot.classifications) or len(snapshot.classifications) < len(snapshot.owned.games):
+    owned_appids = {item.appid for item in snapshot.owned.games}
+    classified = {
+        appid: classification
+        for appid, classification, _ in snapshot.classifications
+        if appid in owned_appids
+    }
+    if owned_appids and (
+        set(classified) != owned_appids
+        or any(value == "not_observed" for value in classified.values())
+    ):
         missing.add("catalog.classification")
-    if any(item.name == "installed" for item in requirements) and snapshot.installed.latest_complete is None:
+    if owned_appids and any(item.name == "installed" for item in requirements) and snapshot.installed.latest_complete is None:
         missing.add("installed.read")
-    if args.recipe in {"resume/0.1", "preference-fit/0.1"} and snapshot.activity_latest_complete is None:
+    if owned_appids and args.recipe in {"resume/0.1", "preference-fit/0.1"} and snapshot.activity_latest_complete is None:
         missing.add("activity.read")
-    if args.recipe in {"resume/0.1", "finishability/0.1"} and snapshot.achievement_latest is None:
+    if owned_appids and args.recipe in {"resume/0.1", "finishability/0.1"} and snapshot.achievement_latest is None:
         missing.add("achievements.read")
     if snapshot.owned.latest is not None and snapshot.owned.latest.status != "complete":
         stale.add("owned.visible.read")

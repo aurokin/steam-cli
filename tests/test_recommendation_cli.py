@@ -251,3 +251,30 @@ def test_fresh_profile_is_truthfully_unavailable(tmp_path, capsys) -> None:
     assert code == 0
     assert result["completeness"]["status"] == "unavailable"
     assert result["data"]["empty"] is False
+
+
+def test_valid_empty_owned_snapshot_is_complete_without_enrichment(tmp_path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.configure_steam_account(
+            alias="primary", steam_id64="76561198000000000", configured_at=T0
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id, disclosure_version="2026-07-11.m2",
+            accepted_at=T0, backups_acknowledged=True,
+        )
+        run = storage.begin_sync(
+            provider="steam_web_api", capability="owned.visible.read",
+            account_id=account.id, started_at=T0,
+        )
+        storage.complete_owned_snapshot(
+            run.id, (), base_retrieved_at=T0, expanded_retrieved_at=T0,
+            base_reported_count=0, expanded_reported_count=0, completed_at=T1,
+        )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    result = invoke(
+        tmp_path, capsys, "recommendations", "query", "--account", "primary",
+        "--recipe", "resume/0.1", "--require", "installed=true",
+    )[1]
+    assert result["completeness"]["status"] == "complete"
+    assert result["data"]["empty"] is True
+    assert result["data"]["results"] == []
