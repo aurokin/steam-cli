@@ -11,8 +11,11 @@
 - M4 next-to-play and preference is accepted. Keep explicit feedback separate
   from behavioral inference, queries cache-only, hard gates three-valued, and
   recipes deterministic under `docs/design/m4-execution.md`.
-- Keep compatibility, artwork, group/discovery, and action capabilities in
-  design until their Linear milestone is explicitly activated.
+- M5 compatibility and ready-now is active. Preserve the redacted system-profile,
+  layered evidence, target scope, provisional-provider, and no-performance-promise
+  boundaries in `docs/design/m5-execution.md`.
+- Keep artwork, group/discovery, and action capabilities in design until their
+  Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
 - Preserve the M1 last-good rule: partial or failed scans must not replace a complete installed projection.
@@ -35,6 +38,7 @@
 | M2 implementation scope and acceptance evidence | `docs/design/m2-execution.md` |
 | M3 implementation scope and acceptance evidence | `docs/design/m3-execution.md` |
 | M4 implementation scope and acceptance evidence | `docs/design/m4-execution.md` |
+| M5 implementation scope and acceptance evidence | `docs/design/m5-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions
