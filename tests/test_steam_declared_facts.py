@@ -337,6 +337,7 @@ def valid_data(**updates: object) -> bytes:
         {"categories": [{"id": 64}]},
         {"categories": [{"id": 64, "description": "a"}, {"id": 64, "description": "b"}]},
         {"controller_support": "yes"},
+        {"controller_support": []},
         {"ext_user_account_notice": 1},
         {"drm_notice": []},
     ],

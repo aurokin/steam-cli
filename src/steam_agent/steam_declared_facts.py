@@ -708,7 +708,9 @@ def _interpret_facts(
     appid: int, context: SteamDeclaredFactsRequestContext, data: Mapping[str, object]
 ) -> SteamDeclaredFacts:
     controller = data.get("controller_support")
-    if controller is not None and controller not in {"full", "partial"}:
+    if controller is not None and (
+        not isinstance(controller, str) or controller not in {"full", "partial"}
+    ):
         raise _invalid()
     requirements = tuple(
         sorted(
