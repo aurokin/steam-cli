@@ -3556,6 +3556,7 @@ class Storage:
                         """SELECT 1 FROM declared_app_current
                            WHERE appid=? AND country=? AND language=?
                              AND provider='steam_store'
+                             AND schema_id='declared-app-facts/0.2'
                              AND observed_at>=? AND observed_at<=?""",
                         (appid, country, language, fresh_cutoff, timestamp),
                     ).fetchone()

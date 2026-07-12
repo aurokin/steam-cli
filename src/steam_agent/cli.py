@@ -169,6 +169,7 @@ _WISHLIST_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
 _CATALOG_SYNC_FRESHNESS_SECONDS = 24 * 60 * 60
 _SYNC_ABANDONED_SECONDS = 15 * 60
 _PROVIDER_MINIMUM_INTERVAL_SECONDS = 1.0
+_DECLARED_FACT_FRESHNESS_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -2057,6 +2058,27 @@ def _declared_scope_appids(
     return tuple(sorted(scoped | set(explicit)))
 
 
+def _declared_item_is_stale(
+    item: Mapping[str, Any], demand: Mapping[str, Any], *, now: datetime
+) -> bool:
+    if item.get("facts") is None:
+        return False
+    observed_at = item.get("observed_at")
+    if not isinstance(observed_at, str):
+        return True
+    try:
+        age = (
+            now - datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        ).total_seconds()
+    except ValueError:
+        return True
+    if age < 0 or age > _DECLARED_FACT_FRESHNESS_SECONDS:
+        return True
+    return demand.get("sync_run_id") is not None and not (
+        demand.get("state") == "ready" or demand.get("error_code") == "FRESH_LAST_GOOD"
+    )
+
+
 def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
     command = "discovery.query"
     try:
@@ -2125,7 +2147,10 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             raw_items = ()
     items: list[dict[str, Any]] = []
     missing = 0
-    for raw in raw_items:
+    stale = 0
+    demands = snapshot["latest_demand"]
+    now = _utc_now()
+    for raw, demand in zip(raw_items, demands, strict=True):
         payload = raw.get("facts")
         if payload is None:
             missing += 1
@@ -2149,6 +2174,8 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             )
             continue
         facts = declared_discovery_facts(payload)
+        item_stale = _declared_item_is_stale(raw, demand, now=now)
+        stale += int(item_stale)
         modes = list(facts.multiplayer_modes)
         items.append(
             {
@@ -2156,6 +2183,7 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
                 "evidence_state": "declared",
                 "schema_id": payload["schema_id"],
                 "observed_at": raw.get("observed_at"),
+                "freshness": "stale" if item_stale else "fresh",
                 "source": {
                     "provider": raw.get("provider"),
                     "support_level": raw.get("support_level"),
@@ -2181,7 +2209,7 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
         )
     status = (
         CompletenessStatus.COMPLETE
-        if not missing
+        if not missing and not stale
         else (
             CompletenessStatus.UNAVAILABLE
             if missing == len(items)
@@ -2202,6 +2230,7 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
         completeness_value=completeness(
             status,
             missing_capabilities=(["discovery.declared.read"] if missing else []),
+            stale_capabilities=(["discovery.declared.read"] if stale else []),
         ),
         data={
             "items": items,
@@ -2695,10 +2724,11 @@ def _group_declared_payloads(
     language: str,
     candidate_appids: tuple[int, ...],
     seed_appids: tuple[int, ...],
-) -> dict[int, Mapping[str, Any] | None]:
+) -> tuple[dict[int, Mapping[str, Any] | None], frozenset[int]]:
     """Read independently bounded candidate and seed projections."""
 
     payloads: dict[int, Mapping[str, Any] | None] = {}
+    stale_appids: set[int] = set()
     candidate_set = set(candidate_appids)
     for batch in (
         candidate_appids,
@@ -2716,12 +2746,21 @@ def _group_declared_payloads(
         payloads.update(
             {int(item["appid"]): item.get("facts") for item in snapshot["items"]}
         )
-    return payloads
+        now = _utc_now()
+        stale_appids.update(
+            int(item["appid"])
+            for item, demand in zip(
+                snapshot["items"], snapshot["latest_demand"], strict=True
+            )
+            if _declared_item_is_stale(item, demand, now=now)
+        )
+    return payloads, frozenset(stale_appids)
 
 
 def _group_query_completeness(
     *,
     missing_declared: int,
+    stale_declared: int,
     declared_total: int,
     ownership_missing: bool,
     ownership_stale: bool,
@@ -2749,7 +2788,7 @@ def _group_query_completeness(
         declared_total and missing_declared == declared_total
     ):
         status = CompletenessStatus.UNAVAILABLE
-    elif missing_declared or ownership_missing or ownership_stale:
+    elif missing_declared or stale_declared or ownership_missing or ownership_stale:
         status = CompletenessStatus.PARTIAL
     else:
         status = CompletenessStatus.COMPLETE
@@ -2761,7 +2800,12 @@ def _group_query_completeness(
                 *(["owned.visible.read"] if ownership_missing else []),
             }
         ),
-        stale_capabilities=(["owned.visible.read"] if ownership_stale else []),
+        stale_capabilities=sorted(
+            {
+                *(["discovery.declared.read"] if stale_declared else []),
+                *(["owned.visible.read"] if ownership_stale else []),
+            }
+        ),
         warnings=warnings,
     )
 
@@ -2838,6 +2882,16 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 0
                 if declared is None
                 else sum(item.get("facts") is None for item in declared["items"])
+            )
+            stale_declared = (
+                0
+                if declared is None
+                else sum(
+                    _declared_item_is_stale(item, demand, now=_utc_now())
+                    for item, demand in zip(
+                        declared["items"], declared["latest_demand"], strict=True
+                    )
+                )
             )
             family_by_member = (
                 {member: storage.read_group_family(member) for member in members}
@@ -2920,6 +2974,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
             },
             completeness_value=_group_query_completeness(
                 missing_declared=missing_declared,
+                stale_declared=stale_declared,
                 declared_total=(len(appids) if declared is not None else 0),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
@@ -3026,7 +3081,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 )
             )
             demanded = tuple(sorted({*candidate_appids, *seed_appids}))
-            payload_by_appid = _group_declared_payloads(
+            payload_by_appid, stale_declared_appids = _group_declared_payloads(
                 storage,
                 account_id=context_account.id,
                 machine_id=machine.id,
@@ -3183,6 +3238,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
             },
             completeness_value=_group_query_completeness(
                 missing_declared=missing_declared,
+                stale_declared=len(stale_declared_appids),
                 declared_total=len(demanded),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,

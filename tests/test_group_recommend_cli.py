@@ -30,11 +30,16 @@ def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
             appids = kwargs["appids"]
             assert isinstance(appids, tuple)
             self.calls.append(appids)
-            return {"items": tuple({"appid": appid, "facts": None} for appid in appids)}
+            return {
+                "items": tuple({"appid": appid, "facts": None} for appid in appids),
+                "latest_demand": tuple(
+                    {"appid": appid, "sync_run_id": None} for appid in appids
+                ),
+            }
 
     storage = FakeStorage()
     candidates = tuple(range(1, 10_001))
-    result = cli._group_declared_payloads(  # noqa: SLF001
+    result, stale = cli._group_declared_payloads(  # noqa: SLF001
         storage,  # type: ignore[arg-type]
         account_id=1,
         machine_id="local",
@@ -46,6 +51,7 @@ def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
 
     assert [len(call) for call in storage.calls] == [10_000, 1]
     assert len(result) == 10_001
+    assert stale == frozenset()
 
 
 def test_preference_seed_bound_is_rejected_before_storage(

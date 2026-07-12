@@ -56,9 +56,9 @@ def configured(tmp_path: Path) -> tuple[Storage, int]:
 
 
 def payload(appid: int) -> Mapping[str, object]:
-    result = SteamDeclaredFactsClient(
-        transport=FixtureTransport(appid)
-    ).fetch(appid, country="US", language="english")
+    result = SteamDeclaredFactsClient(transport=FixtureTransport(appid)).fetch(
+        appid, country="US", language="english"
+    )
     assert result.facts is not None
     return declared_facts_payload(result.facts)
 
@@ -105,6 +105,33 @@ def test_v02_migration_allows_legacy_and_expanded_projection_ids(
 
     assert "declared-app-facts/0.1" in sql
     assert "declared-app-facts/0.2" in sql
+
+
+def test_fresh_legacy_projection_is_targeted_for_m6_upgrade(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    legacy = json.loads(json.dumps(payload(400)))
+    legacy["schema_id"] = "declared-app-facts/0.1"
+    legacy["categories"].pop("source")
+    legacy["categories"].pop("numeric_ids")
+    legacy.pop("genres")
+    legacy.pop("coming_soon")
+    run, _, _ = begin(storage, account_id, [400], at=T0)
+    storage.record_declared_app_result(
+        run.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=legacy,
+        observed_at=T0,
+    )
+    storage.finish_declared_app_sync(run.id, completed_at=T0)
+
+    _, candidates, targeted = begin(storage, account_id, [400], at=T1)
+
+    assert candidates == (400,)
+    assert targeted == (400,)
 
 
 def test_scheduler_retains_complete_ordered_demand_and_cap_reason(
@@ -156,9 +183,7 @@ def test_fresh_and_active_skips_remain_visible_and_next_cap_slice_converges(
     assert candidates == ()
     assert targeted == ()
     assert demand_rows(storage, active_skip.id)[0]["error_code"] == "ACTIVE_REQUEST"
-    active_finished = storage.finish_declared_app_sync(
-        active_skip.id, completed_at=T1
-    )
+    active_finished = storage.finish_declared_app_sync(active_skip.id, completed_at=T1)
     assert active_finished.status == "failed"
     assert active_finished.error_code == "ACTIVE_REQUEST"
 
@@ -278,9 +303,7 @@ def test_contract_drift_fails_run_sets_global_cooldown_and_is_not_negative_cache
         "error_code": "PROVIDER_COOLDOWN",
         "retry_at": "2026-07-11T12:01:00Z",
     }
-    cooldown_finished = storage.finish_declared_app_sync(
-        next_run.id, completed_at=T2
-    )
+    cooldown_finished = storage.finish_declared_app_sync(next_run.id, completed_at=T2)
     assert cooldown_finished.status == "failed"
     assert cooldown_finished.error_code == "PROVIDER_COOLDOWN"
     recovered, candidates, targeted = begin(
@@ -288,9 +311,7 @@ def test_contract_drift_fails_run_sets_global_cooldown_and_is_not_negative_cache
     )
     assert candidates == (400,)
     assert targeted == (400,)
-    storage.finish_declared_app_sync(
-        recovered.id, completed_at="2026-07-11T12:01:01Z"
-    )
+    storage.finish_declared_app_sync(recovered.id, completed_at="2026-07-11T12:01:01Z")
 
 
 def test_terminal_cache_precedes_cooldown_but_expired_negative_does_not(
@@ -360,13 +381,18 @@ def test_success_false_is_bounded_negative_cache(
         state="not_found",
         observed_at=T1,
     )
-    assert storage.finish_declared_app_sync(run.id, completed_at=T1).status == "complete"
+    assert (
+        storage.finish_declared_app_sync(run.id, completed_at=T1).status == "complete"
+    )
 
     cached, candidates, targeted = begin(storage, account_id, [570], at=T2)
     assert candidates == ()
     assert targeted == ()
     assert demand_rows(storage, cached.id)[0]["error_code"] == "NOT_FOUND_CACHE"
-    assert storage.finish_declared_app_sync(cached.id, completed_at=T2).status == "complete"
+    assert (
+        storage.finish_declared_app_sync(cached.id, completed_at=T2).status
+        == "complete"
+    )
 
 
 def test_future_not_found_observation_is_not_used_by_earlier_sync_clock(
@@ -530,18 +556,27 @@ def test_account_deletion_removes_private_lineage_but_retains_global_public_fact
     ).fetchone()
     assert current is not None
     assert current["promoted_sync_run_id"] is None
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM declared_app_sync_demand WHERE account_id=?",
-        (account_id,),
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_sync_demand WHERE account_id=?",
+            (account_id,),
+        ).fetchone()[0]
+        == 0
+    )
     assert storage.remove_account("primary") is True
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
-    ).fetchone()[0] == 1
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
+        ).fetchone()[0]
+        == 1
+    )
     storage._prune_declared_apps("2026-08-10T12:02:00Z")  # noqa: SLF001
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM steam_apps WHERE appid=400"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_provider_deletion_removes_global_fact_cooldown_and_all_private_lineage(
@@ -569,10 +604,13 @@ def test_provider_deletion_removes_global_fact_cooldown_and_all_private_lineage(
 
     assert removed["current_removed"] == 1
     assert removed["sync_runs_removed"] == 1
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM provider_request_limits WHERE provider=?",
-        ("steam-store-appdetails",),
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM provider_request_limits WHERE provider=?",
+            ("steam-store-appdetails",),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_retention_prunes_global_current_after_thirty_days(
@@ -596,9 +634,12 @@ def test_retention_prunes_global_current_after_thirty_days(
 
     assert candidates == (400,)
     assert targeted == (400,)
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM declared_app_current"
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_current"
+        ).fetchone()[0]
+        == 0
+    )
     storage.finish_declared_app_sync(later.id, completed_at="2026-08-10T12:03:00Z")
 
 
@@ -622,9 +663,12 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
 
     assert candidates == (400,)
     assert targeted == (400,)
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM sync_runs WHERE id=?", (first.id,)
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM sync_runs WHERE id=?", (first.id,)
+        ).fetchone()[0]
+        == 0
+    )
     storage.record_declared_app_result(
         second.id,
         account_id=account_id,
@@ -675,18 +719,24 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
     assert snapshot["items"][0]["observed_at"] == T2
     assert snapshot["latest_demand"][0]["sync_run_id"] == failure.id
     assert snapshot["latest_demand"][0]["state"] == "failed"
-    assert storage._connection.execute(  # noqa: SLF001
-        """SELECT COUNT(*) FROM declared_app_sync_demand
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            """SELECT COUNT(*) FROM declared_app_sync_demand
            WHERE appid=400 AND country='US' AND language='english'
              AND observed_at>?""",
-        (T3,),
-    ).fetchone()[0] == 0
-    assert storage._connection.execute(  # noqa: SLF001
-        """SELECT COUNT(*) FROM declared_app_observations
+            (T3,),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            """SELECT COUNT(*) FROM declared_app_observations
            WHERE appid=400 AND country='US' AND language='english'
              AND observed_at>?""",
-        (T3,),
-    ).fetchone()[0] == 0
+            (T3,),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_future_quarantine_is_exact_and_preserves_other_subjects(
@@ -709,28 +759,40 @@ def test_future_quarantine_is_exact_and_preserves_other_subjects(
     corrective, _, targeted = begin(storage, account_id, [400], at=T2)
 
     assert targeted == (400,)
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM sync_runs WHERE id=?", (broad.id,)
-    ).fetchone()[0] == 1
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM sync_runs WHERE id=?", (broad.id,)
+        ).fetchone()[0]
+        == 1
+    )
     remaining = storage._connection.execute(  # noqa: SLF001
         """SELECT appid FROM declared_app_sync_demand
            WHERE sync_run_id=? ORDER BY appid""",
         (broad.id,),
     ).fetchall()
     assert [int(row[0]) for row in remaining] == [620]
-    assert storage._connection.execute(  # noqa: SLF001
-        """SELECT COUNT(*) FROM declared_app_observations
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            """SELECT COUNT(*) FROM declared_app_observations
            WHERE sync_run_id=? AND appid=620""",
-        (broad.id,),
-    ).fetchone()[0] == 1
-    assert storage._connection.execute(  # noqa: SLF001
-        """SELECT COUNT(*) FROM declared_app_observations
+            (broad.id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            """SELECT COUNT(*) FROM declared_app_observations
            WHERE sync_run_id=? AND appid=400""",
-        (broad.id,),
-    ).fetchone()[0] == 0
-    assert storage._connection.execute(  # noqa: SLF001
-        "SELECT COUNT(*) FROM declared_app_current WHERE appid=400"
-    ).fetchone()[0] == 0
+            (broad.id,),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_current WHERE appid=400"
+        ).fetchone()[0]
+        == 0
+    )
     other_current = storage._connection.execute(  # noqa: SLF001
         """SELECT observed_at,promoted_sync_run_id FROM declared_app_current
            WHERE appid=620 AND country='US' AND language='english'"""
@@ -804,12 +866,18 @@ def test_opening_storage_prunes_expired_declared_private_lineage(
         storage.finish_declared_app_sync(run.id, completed_at=old)
 
     with Storage(path) as reopened:
-        assert reopened._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_current"
-        ).fetchone()[0] == 0
-        assert reopened._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_sync_demand"
-        ).fetchone()[0] == 0
+        assert (
+            reopened._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_current"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            reopened._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_sync_demand"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_declared_retention_chunks_orphan_reclaim_to_sqlite_variable_limit(
@@ -847,12 +915,18 @@ def test_declared_retention_chunks_orphan_reclaim_to_sqlite_variable_limit(
                 sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous
             )
 
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_current"
-        ).fetchone()[0] == 0
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM steam_apps"
-        ).fetchone()[0] == 0
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_current"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM steam_apps"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_retention_prunes_old_private_run_while_preserving_fresh_public_fact(
@@ -899,17 +973,26 @@ def test_retention_prunes_old_private_run_while_preserving_fresh_public_fact(
             "observed_at": observed,
             "promoted_sync_run_id": None,
         }
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM sync_runs WHERE id=?", (run.id,)
-        ).fetchone()[0] == 0
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_sync_demand WHERE sync_run_id=?",
-            (run.id,),
-        ).fetchone()[0] == 0
-        assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM declared_app_observations WHERE sync_run_id=?",
-            (run.id,),
-        ).fetchone()[0] == 0
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM sync_runs WHERE id=?", (run.id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_sync_demand WHERE sync_run_id=?",
+                (run.id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            storage._connection.execute(  # noqa: SLF001
+                "SELECT COUNT(*) FROM declared_app_observations WHERE sync_run_id=?",
+                (run.id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_older_observation_cannot_replace_newer_last_good(

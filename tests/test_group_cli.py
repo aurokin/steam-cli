@@ -387,3 +387,43 @@ def test_group_eligibility_reports_missing_declared_evidence_in_completeness(
     assert value["completeness"]["status"] == "unavailable"
     assert value["completeness"]["missing_capabilities"] == ["discovery.declared.read"]
     assert value["data"]["results"][0]["eligibility"]["gates"][0]["state"] == "unknown"
+
+
+def test_group_eligibility_propagates_stale_declared_facts(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Alpha")
+    create_profile(tmp_path, capsys, "synthetic:Beta")
+    seed_declared(tmp_path, 400)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            "UPDATE declared_app_current SET observed_at='2026-07-04T00:00:00Z'"
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "eligibility",
+        "400",
+        "--member",
+        "synthetic:Alpha",
+        "--member",
+        "synthetic:Beta",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+    )
+
+    assert code == 0
+    assert value["completeness"]["status"] == "partial"
+    assert value["completeness"]["stale_capabilities"] == ["discovery.declared.read"]

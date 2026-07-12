@@ -397,6 +397,71 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
     assert result["data"]["items"] == []
 
 
+def test_discovery_reports_retained_declared_facts_as_stale(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    assert (
+        invoke(
+            tmp_path,
+            capsys,
+            "sync",
+            "app-facts",
+            "--scope",
+            "appids",
+            "--appid",
+            "400",
+            "--account",
+            "primary",
+            "--machine",
+            "desktop",
+            "--country",
+            "US",
+            "--language",
+            "english",
+            "--acknowledge-local-storage",
+        )[0]
+        == 0
+    )
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            "UPDATE declared_app_current SET observed_at='2026-07-04T00:00:00Z'"
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, result, _ = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "appids",
+        "--appid",
+        "400",
+        "--limit",
+        "1",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 0
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["stale_capabilities"] == ["discovery.declared.read"]
+    assert result["data"]["items"][0]["freshness"] == "stale"
+
+
 def test_app_facts_rechecks_bound_after_scope_expansion(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
