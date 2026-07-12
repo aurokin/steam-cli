@@ -62,40 +62,43 @@ def _execute(scenario: dict[str, Any]) -> dict[str, Any]:
     assert invocation["command"] == "steam-agent compatibility assess"
     assert invocation["command"] in scenario["tool_policy"]["allowed"]
     arguments = invocation["arguments"]
-    target = _target_from_arguments(arguments)
-    requested = tuple(
-        int(arguments[index + 1])
-        for index, argument in enumerate(arguments)
-        if argument == "--appid"
+    assert "--machine" not in arguments and "--appid" not in arguments
+    first_option = next(
+        (index for index, value in enumerate(arguments) if value.startswith("--")),
+        len(arguments),
     )
-    assert requested
+    assert first_option > 0
+    assert all(value.isascii() and value.isdigit() for value in arguments[:first_option])
+    allowed_options = {
+        "--account", "--target", "--country", "--language", "--require", "--override"
+    }
+    option_tail = arguments[first_option:]
+    assert len(option_tail) % 2 == 0
+    assert all(option_tail[index] in allowed_options for index in range(0, len(option_tail), 2))
+    assert all(not option_tail[index].startswith("--") for index in range(1, len(option_tail), 2))
+    requested = tuple(int(value) for value in arguments[:first_option])
+    assert _single_option(arguments, "--account") == "synthetic"
+    assert _single_option(arguments, "--country") == "US"
+    assert _single_option(arguments, "--language") == "english"
+    target = _target_from_arguments(arguments)
     facts = scenario["fixture"]["facts"]
     fixture_appids = tuple(int(fact["subject"].rsplit(":", 1)[1]) for fact in facts)
     assert set(requested) == set(fixture_appids)
-    requirements: tuple[FeatureRequirement, ...] = ()
-    overrides: tuple[GateOverride, ...] = ()
-    requirement_values = [
-        arguments[index + 1]
-        for index, argument in enumerate(arguments)
-        if argument == "--require"
-    ]
+    requirement_values = _repeated_options(arguments, "--require")
     requirements = tuple(
         FeatureRequirement(*value.split(":", 1))  # type: ignore[arg-type]
         for value in requirement_values
     )
-    override_values = [
-        arguments[index + 1]
-        for index, argument in enumerate(arguments)
-        if argument == "--override"
-    ]
+    override_values = _repeated_options(arguments, "--override")
     parsed_overrides = []
     for value in override_values:
         left, effective = value.rsplit("=", 1)
-        name, gate = left.split(":", 1)
-        assert len(requested) == 1
+        appid_text, name, gate = left.split(":", 2)
+        appid = int(appid_text)
+        assert appid in requested
         parsed_overrides.append(
             GateOverride(
-                name, requested[0], gate, effective, ("eval:override",), now  # type: ignore[arg-type]
+                name, appid, gate, effective, ("eval:override",), now  # type: ignore[arg-type]
             )
         )
     overrides = tuple(parsed_overrides)
@@ -117,15 +120,25 @@ def _execute(scenario: dict[str, Any]) -> dict[str, Any]:
 
 
 def _target_from_arguments(arguments: list[str]) -> CompatibilityTarget:
-    if "--machine" in arguments:
-        index = arguments.index("--machine")
-        return CompatibilityTarget("machine", arguments[index + 1], "linux")
-    if "--target" in arguments:
-        index = arguments.index("--target")
-        key = arguments[index + 1]
-        assert key == "valve-deck"
-        return CompatibilityTarget("valve_deck", key, "steamos")
-    raise AssertionError("compatibility eval must declare an exact target")
+    value = _single_option(arguments, "--target")
+    if value.startswith("machine:"):
+        key = value.removeprefix("machine:")
+        assert key
+        return CompatibilityTarget("machine", key, "linux")
+    assert value == "valve:steam-deck"
+    return CompatibilityTarget("valve_deck", "steam-deck", "steamos")
+
+
+def _single_option(arguments: list[str], name: str) -> str:
+    values = _repeated_options(arguments, name)
+    assert len(values) == 1, f"{name} must occur exactly once"
+    return values[0]
+
+
+def _repeated_options(arguments: list[str], name: str) -> list[str]:
+    indexes = [index for index, value in enumerate(arguments) if value == name]
+    assert all(index + 1 < len(arguments) for index in indexes)
+    return [arguments[index + 1] for index in indexes]
 
 
 def _materialize(

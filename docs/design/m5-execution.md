@@ -79,7 +79,7 @@ MIT-licensed runtime-risk adapter; it is not required for the first M5 tracer.
 steam-agent sync system --machine MACHINE [--acknowledge-local-storage]
 steam-agent system query --machine MACHINE
 steam-agent sync compatibility --scope library --account ALIAS --machine MACHINE --country CC --language LANG [--max-items N] [--acknowledge-local-storage]
-steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck [--country CC] [--language LANG] [--require FIELD=VALUE] [--override appid:N:FIELD=pass|fail|unknown] [--explain]
+steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck --country CC --language LANG [--require KIND:NAME] [--override APPID:NAME:GATE=pass|fail|unknown] [--explain]
 ```
 
 Assessment is cache-only and returns every explicitly requested AppID. Every
