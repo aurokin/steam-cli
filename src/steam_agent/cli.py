@@ -79,6 +79,7 @@ from steam_agent.gg_deals import GgDealsClient, GgDealsError
 from steam_agent.cheapshark import CheapSharkClient, CheapSharkError
 from steam_agent.price_library import PriceSyncError, sync_wishlist_prices
 from steam_agent.deal_query import build_deal_query_from_snapshot
+from steam_agent.feedback import FeedbackService
 
 
 EXIT_OK = 0
@@ -263,6 +264,63 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("official", "keyshop", "unknown"),
         default="official",
     )
+
+    feedback = commands.add_parser("feedback", help="Manage explicit local game feedback.")
+    feedback_commands = feedback.add_subparsers(dest="feedback_command", required=True)
+    rate = feedback_commands.add_parser("rate", help="Set an explicit game rating.")
+    _add_leaf_format(rate)
+    rate.add_argument("appid", type=int)
+    rate.add_argument("--account", default="primary")
+    rate.add_argument("--value", choices=("liked", "disliked", "neutral"), required=True)
+    for command_name in ("finish", "abandon", "resume"):
+        state = feedback_commands.add_parser(command_name, help=f"Mark a game as {command_name}.")
+        _add_leaf_format(state)
+        state.add_argument("appid", type=int)
+        state.add_argument("--account", default="primary")
+    snooze = feedback_commands.add_parser("snooze", help="Set or clear a temporary snooze.")
+    _add_leaf_format(snooze)
+    snooze.add_argument("appid", type=int)
+    snooze.add_argument("--account", default="primary")
+    snooze_choice = snooze.add_mutually_exclusive_group(required=True)
+    snooze_choice.add_argument("--until")
+    snooze_choice.add_argument("--clear", action="store_true")
+    estimate = feedback_commands.add_parser("estimate", help="Set or clear explicit time estimates.")
+    _add_leaf_format(estimate)
+    estimate.add_argument("appid", type=int)
+    estimate.add_argument("--account", default="primary")
+    estimate.add_argument("--minimum-session-minutes", type=int)
+    estimate.add_argument("--remaining-minutes", type=int)
+    estimate.add_argument("--clear-minimum-session-minutes", action="store_true")
+    estimate.add_argument("--clear-remaining-minutes", action="store_true")
+    trait = feedback_commands.add_parser("trait", help="Set an explicit user-namespaced trait.")
+    _add_leaf_format(trait)
+    trait.add_argument("appid", type=int)
+    trait.add_argument("--account", default="primary")
+    trait.add_argument("--trait", required=True)
+    trait.add_argument("--value", choices=("present", "absent", "unknown"), required=True)
+    feedback_query = feedback_commands.add_parser("query", help="Query cached explicit feedback.")
+    _add_leaf_format(feedback_query)
+    feedback_query.add_argument("--account", default="primary")
+    feedback_query.add_argument("--appid", type=int)
+
+    preferences = commands.add_parser("preferences", help="Manage explicit profile preference rules.")
+    preference_commands = preferences.add_subparsers(dest="preferences_command", required=True)
+    rules = preference_commands.add_parser("rule", help="Manage trait preference rules.")
+    rule_commands = rules.add_subparsers(dest="rule_command", required=True)
+    rule_set = rule_commands.add_parser("set", help="Set a trait preference rule.")
+    _add_leaf_format(rule_set)
+    rule_set.add_argument("--account", default="primary")
+    rule_set.add_argument("--trait", required=True)
+    rule_set.add_argument("--kind", choices=("prefer", "avoid", "require"), required=True)
+    rule_set.add_argument("--strength", choices=("soft", "hard"), required=True)
+    rule_set.add_argument("--weight", type=int, required=True)
+    rule_list = rule_commands.add_parser("list", help="List trait preference rules.")
+    _add_leaf_format(rule_list)
+    rule_list.add_argument("--account", default="primary")
+    rule_remove = rule_commands.add_parser("remove", help="Remove a trait preference rule.")
+    _add_leaf_format(rule_remove)
+    rule_remove.add_argument("--account", default="primary")
+    rule_remove.add_argument("--trait", required=True)
 
     accounts = commands.add_parser(
         "accounts", help="Configure Steam account identities."
@@ -499,6 +557,8 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
             completeness_value=_installed_read_completeness(root),
         )
+    if args.command in {"feedback", "preferences"}:
+        return _dispatch_feedback(args, database_path)
     if args.command == "sync" and args.sync_command == "owned":
         return _dispatch_sync_owned(args, database_path)
     if args.command == "sync" and args.sync_command == "catalog":
@@ -2143,6 +2203,114 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
     )
 
 
+def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
+    with Storage(database_path) as storage:
+        account = storage.get_account(args.account)
+        if account is None:
+            return _emit_error(
+                args,
+                command=_command_name(args),
+                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                message="The requested account alias is not configured.",
+            )
+        service = FeedbackService(storage)
+        try:
+            if args.command == "preferences":
+                if args.rule_command == "set":
+                    event_id = service.set_rule(
+                        account.id,
+                        trait=args.trait,
+                        kind=args.kind,
+                        strength=args.strength,
+                        weight=args.weight,
+                    )
+                    data: dict[str, Any] = {
+                        "event_id": event_id,
+                        "rule": next(
+                            item
+                            for item in service.list_rules(account.id)
+                            if item["trait"] == args.trait
+                        ),
+                    }
+                elif args.rule_command == "remove":
+                    data = {
+                        "removed": service.remove_rule(account.id, trait=args.trait),
+                        "trait": args.trait,
+                    }
+                else:
+                    data = {"rules": list(service.list_rules(account.id))}
+                return _emit_success(
+                    args,
+                    command=_command_name(args),
+                    context={"account_alias": account.alias, "identifiers_included": False},
+                    data=data,
+                )
+
+            command = args.feedback_command
+            if command == "query":
+                return _emit_success(
+                    args,
+                    command="feedback.query",
+                    context={"account_alias": account.alias, "identifiers_included": False},
+                    data={
+                        "items": list(service.query(account.id, appid=args.appid)),
+                        "next_cursor": None,
+                    },
+                )
+            if command == "rate":
+                event_ids = (service.rate(account.id, args.appid, args.value),)
+            elif command in {"finish", "abandon", "resume"}:
+                state = {
+                    "finish": "finished",
+                    "abandon": "user_abandoned",
+                    "resume": "active",
+                }[command]
+                event_ids = (service.play_state(account.id, args.appid, state),)
+            elif command == "snooze":
+                event_ids = (
+                    service.snooze(
+                        account.id,
+                        args.appid,
+                        until=args.until,
+                        clear=args.clear,
+                    ),
+                )
+            elif command == "estimate":
+                event_ids = service.estimate(
+                    account.id,
+                    args.appid,
+                    minimum_session_minutes=args.minimum_session_minutes,
+                    remaining_minutes=args.remaining_minutes,
+                    clear_minimum_session_minutes=args.clear_minimum_session_minutes,
+                    clear_remaining_minutes=args.clear_remaining_minutes,
+                )
+            elif command == "trait":
+                event_ids = (
+                    service.trait(
+                        account.id, args.appid, args.trait, args.value
+                    ),
+                )
+            else:
+                raise AssertionError("unhandled feedback command")
+            item = service.query(account.id, appid=args.appid)
+            return _emit_success(
+                args,
+                command=f"feedback.{command}",
+                context={"account_alias": account.alias, "identifiers_included": False},
+                data={
+                    "event_ids": list(event_ids),
+                    "item": None if not item else item[0],
+                },
+            )
+        except ValueError:
+            return _emit_error(
+                args,
+                command=_command_name(args),
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="The feedback arguments are invalid.",
+            )
+
+
 def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
     if args.data_command != "delete":
         raise AssertionError("unhandled data command")
@@ -2183,6 +2351,11 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                             "price_observations_removed": 0,
                             "price_current_removed": 0,
                             "price_subjects_removed": 0,
+                            "feedback_events_removed": 0,
+                            "feedback_current_removed": 0,
+                            "feedback_traits_removed": 0,
+                            "preference_rule_events_removed": 0,
+                            "preference_rules_removed": 0,
                             "sync_runs_removed": 0,
                             "probes_removed": 0,
                             "consents_removed": 0,
@@ -2207,6 +2380,11 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                     "price_observations_removed": result.price_observations_removed,
                     "price_current_removed": result.price_current_removed,
                     "price_subjects_removed": result.price_subjects_removed,
+                    "feedback_events_removed": result.feedback_events_removed,
+                    "feedback_current_removed": result.feedback_current_removed,
+                    "feedback_traits_removed": result.feedback_traits_removed,
+                    "preference_rule_events_removed": result.preference_rule_events_removed,
+                    "preference_rules_removed": result.preference_rules_removed,
                     "sync_runs_removed": result.sync_runs_removed,
                     "probes_removed": result.probes_removed,
                     "consents_removed": result.consents_removed,
@@ -2430,6 +2608,11 @@ def _delete_all_steam_web_api_data(
             "price_observations_removed": deletion.price_observations_removed,
             "price_current_removed": deletion.price_current_removed,
             "price_subjects_removed": deletion.price_subjects_removed,
+            "feedback_events_removed": deletion.feedback_events_removed,
+            "feedback_current_removed": deletion.feedback_current_removed,
+            "feedback_traits_removed": deletion.feedback_traits_removed,
+            "preference_rule_events_removed": deletion.preference_rule_events_removed,
+            "preference_rules_removed": deletion.preference_rules_removed,
             "sync_runs_removed": deletion.sync_runs_removed,
             "probes_removed": deletion.probes_removed,
             "consents_removed": deletion.consents_removed,
@@ -2663,6 +2846,21 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 ),
                 "price_subjects_removed": (
                     0 if deletion is None else deletion.price_subjects_removed
+                ),
+                "feedback_events_removed": (
+                    0 if deletion is None else deletion.feedback_events_removed
+                ),
+                "feedback_current_removed": (
+                    0 if deletion is None else deletion.feedback_current_removed
+                ),
+                "feedback_traits_removed": (
+                    0 if deletion is None else deletion.feedback_traits_removed
+                ),
+                "preference_rule_events_removed": (
+                    0 if deletion is None else deletion.preference_rule_events_removed
+                ),
+                "preference_rules_removed": (
+                    0 if deletion is None else deletion.preference_rules_removed
                 ),
                 "sync_runs_removed": 0
                 if deletion is None
@@ -3458,6 +3656,9 @@ def _command_name(args: argparse.Namespace) -> str:
         "auth_command",
         "owned_command",
         "data_command",
+        "feedback_command",
+        "preferences_command",
+        "rule_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -3538,6 +3739,30 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "feedback.query":
+        _print_table_fields(
+            "APPID", "RATING", "PLAY_STATE", "SNOOZED_UNTIL",
+            "MINIMUM_SESSION_MINUTES", "REMAINING_MINUTES", "TRAITS"
+        )
+        for item in envelope["data"]["items"]:
+            traits = ",".join(
+                f"{trait['trait']}={trait['value']}" for trait in item["traits"]
+            )
+            _print_table_fields(
+                item["appid"], item["rating"], item["play_state"],
+                item["snooze"]["until"],
+                item["estimates"]["minimum_session_minutes"],
+                item["estimates"]["remaining_minutes"], traits,
+            )
+        return
+    if command == "preferences.rule.list":
+        _print_table_fields("TRAIT", "KIND", "STRENGTH", "WEIGHT", "UPDATED_AT")
+        for item in envelope["data"]["rules"]:
+            _print_table_fields(
+                item["trait"], item["kind"], item["strength"], item["weight"],
+                item["updated_at"],
+            )
+        return
     if command == "deals.query":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])

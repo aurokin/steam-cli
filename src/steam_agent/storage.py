@@ -405,6 +405,40 @@ class PriceDataDeletion:
     credential_refs_removed: int = 0
 
 
+@dataclass(frozen=True)
+class ExplicitFeedback:
+    account_id: int
+    appid: int
+    game_id: str
+    rating: str | None
+    play_state: str | None
+    snoozed_until: str | None
+    minimum_session_minutes: int | None
+    remaining_minutes: int | None
+    updated_at: str | None
+    last_event_id: int | None
+    traits: tuple[ExplicitTrait, ...]
+
+
+@dataclass(frozen=True)
+class ExplicitTrait:
+    trait: str
+    value: str
+    updated_at: str
+    last_event_id: int
+
+
+@dataclass(frozen=True)
+class PreferenceRule:
+    account_id: int
+    trait: str
+    kind: str
+    strength: str
+    weight: int
+    updated_at: str
+    last_event_id: int
+
+
 CatalogClassification = Literal["game", "non_game", "not_observed"]
 CatalogStreamName = Literal["games", "non_games"]
 
@@ -507,6 +541,11 @@ class AccountDataDeletion:
     price_observations_removed: int = 0
     price_current_removed: int = 0
     price_subjects_removed: int = 0
+    feedback_events_removed: int = 0
+    feedback_current_removed: int = 0
+    feedback_traits_removed: int = 0
+    preference_rule_events_removed: int = 0
+    preference_rules_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -533,6 +572,11 @@ class AllSteamAccountDataDeletion:
     price_observations_removed: int = 0
     price_current_removed: int = 0
     price_subjects_removed: int = 0
+    feedback_events_removed: int = 0
+    feedback_current_removed: int = 0
+    feedback_traits_removed: int = 0
+    preference_rule_events_removed: int = 0
+    preference_rules_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -912,6 +956,346 @@ class Storage:
                 (normalized_alias,),
             )
         return cursor.rowcount > 0
+
+    def set_explicit_feedback_field(
+        self,
+        *,
+        account_id: int,
+        appid: int,
+        field_name: str,
+        value: str | int | None,
+        recorded_at: str | datetime,
+    ) -> int:
+        fields = {
+            "rating": "rating",
+            "play_state": "play_state",
+            "snooze": "snoozed_until",
+            "minimum_session_minutes": "minimum_session_minutes",
+            "remaining_minutes": "remaining_minutes",
+        }
+        column = fields.get(field_name)
+        if column is None:
+            raise ValueError("unsupported explicit feedback field")
+        allowed_values: dict[str, set[object]] = {
+            "rating": {None, "liked", "disliked", "neutral"},
+            "play_state": {None, "finished", "user_abandoned", "active"},
+        }
+        if field_name in allowed_values and value not in allowed_values[field_name]:
+            raise ValueError("explicit feedback value is invalid")
+        if field_name == "snooze" and value is not None:
+            if not isinstance(value, str):
+                raise ValueError("snooze timestamp is invalid")
+            _timestamp(value)
+        if field_name in {"minimum_session_minutes", "remaining_minutes"} and (
+            value is not None
+            and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= (1 << 32) - 1
+            )
+        ):
+            raise ValueError("explicit estimate is invalid")
+        timestamp = _timestamp(recorded_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            existing = self._connection.execute(
+                f"SELECT {column}, last_event_id FROM explicit_feedback_current "
+                "WHERE account_id = ? AND appid = ?",
+                (account_id, appid),
+            ).fetchone()
+            if existing is not None and existing[column] == value:
+                self._connection.commit()
+                return int(existing["last_event_id"])
+            if existing is None and value is None:
+                self._connection.commit()
+                return 0
+            self._ensure_steam_application_identity(appid, observed_at=timestamp)
+            value_text = value if isinstance(value, str) else None
+            value_integer = value if isinstance(value, int) else None
+            cursor = self._connection.execute(
+                """
+                INSERT INTO explicit_feedback_events(
+                    account_id, appid, event_kind, value_text, value_integer,
+                    trait, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (account_id, appid, field_name, value_text, value_integer, timestamp),
+            )
+            event_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO explicit_feedback_current(
+                    account_id, appid, updated_at, last_event_id
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, appid) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    last_event_id = excluded.last_event_id
+                """,
+                (account_id, appid, timestamp, event_id),
+            )
+            self._connection.execute(
+                f"UPDATE explicit_feedback_current SET {column} = ? "
+                "WHERE account_id = ? AND appid = ?",
+                (value, account_id, appid),
+            )
+            self._remove_empty_feedback_current(account_id, appid)
+            self._connection.commit()
+            return event_id
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def set_explicit_trait(
+        self,
+        *,
+        account_id: int,
+        appid: int,
+        trait: str,
+        value: str,
+        recorded_at: str | datetime,
+    ) -> int:
+        trait = _user_trait(trait)
+        if value not in {"present", "absent", "unknown"}:
+            raise ValueError("explicit trait value is invalid")
+        timestamp = _timestamp(recorded_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            self._ensure_steam_application_identity(appid, observed_at=timestamp)
+            existing = self._connection.execute(
+                """
+                SELECT value, last_event_id FROM explicit_trait_current
+                WHERE account_id = ? AND appid = ? AND trait = ?
+                """,
+                (account_id, appid, trait),
+            ).fetchone()
+            if existing is not None and existing["value"] == value:
+                self._connection.commit()
+                return int(existing["last_event_id"])
+            cursor = self._connection.execute(
+                """
+                INSERT INTO explicit_feedback_events(
+                    account_id, appid, event_kind, value_text, value_integer,
+                    trait, recorded_at
+                ) VALUES (?, ?, 'trait', ?, NULL, ?, ?)
+                """,
+                (account_id, appid, value, trait, timestamp),
+            )
+            event_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO explicit_trait_current(
+                    account_id, appid, trait, value, updated_at, last_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, appid, trait) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at,
+                    last_event_id = excluded.last_event_id
+                """,
+                (account_id, appid, trait, value, timestamp, event_id),
+            )
+            self._connection.commit()
+            return event_id
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def list_explicit_feedback(
+        self, account_id: int, *, appid: int | None = None
+    ) -> tuple[ExplicitFeedback, ...]:
+        parameters: list[object]
+        app_filter = ""
+        if appid is not None:
+            app_filter = " AND appid = ?"
+            parameters = [account_id, appid, account_id, appid]
+        else:
+            parameters = [account_id, account_id]
+        rows = self._connection.execute(
+            f"""
+            SELECT appid FROM explicit_feedback_current
+            WHERE account_id = ?{app_filter}
+            UNION
+            SELECT appid FROM explicit_trait_current
+            WHERE account_id = ?{app_filter}
+            ORDER BY appid
+            """,
+            parameters,
+        ).fetchall()
+        output: list[ExplicitFeedback] = []
+        for row in rows:
+            current_appid = int(row[0])
+            current = self._connection.execute(
+                """
+                SELECT rating, play_state, snoozed_until,
+                       minimum_session_minutes, remaining_minutes, updated_at,
+                       last_event_id
+                FROM explicit_feedback_current
+                WHERE account_id = ? AND appid = ?
+                """,
+                (account_id, current_appid),
+            ).fetchone()
+            traits = tuple(
+                ExplicitTrait(**dict(item))
+                for item in self._connection.execute(
+                    """
+                    SELECT trait, value, updated_at, last_event_id
+                    FROM explicit_trait_current
+                    WHERE account_id = ? AND appid = ?
+                    ORDER BY trait
+                    """,
+                    (account_id, current_appid),
+                )
+            )
+            values = {} if current is None else dict(current)
+            output.append(
+                ExplicitFeedback(
+                    account_id=account_id,
+                    appid=current_appid,
+                    game_id=f"game:{steam_application_stable_id(current_appid)}",
+                    rating=values.get("rating"),
+                    play_state=values.get("play_state"),
+                    snoozed_until=values.get("snoozed_until"),
+                    minimum_session_minutes=values.get("minimum_session_minutes"),
+                    remaining_minutes=values.get("remaining_minutes"),
+                    updated_at=values.get("updated_at"),
+                    last_event_id=values.get("last_event_id"),
+                    traits=traits,
+                )
+            )
+        return tuple(output)
+
+    def set_preference_rule(
+        self,
+        *,
+        account_id: int,
+        trait: str,
+        kind: str,
+        strength: str,
+        weight: int,
+        recorded_at: str | datetime,
+    ) -> int:
+        trait = _user_trait(trait)
+        if kind not in {"prefer", "avoid", "require"}:
+            raise ValueError("preference kind is invalid")
+        if strength not in {"soft", "hard"}:
+            raise ValueError("preference strength is invalid")
+        if (
+            not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or not 0 <= weight <= 100
+        ):
+            raise ValueError("preference weight is invalid")
+        timestamp = _timestamp(recorded_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            existing = self._connection.execute(
+                """
+                SELECT kind, strength, weight, last_event_id
+                FROM preference_rules_current
+                WHERE account_id = ? AND trait = ?
+                """,
+                (account_id, trait),
+            ).fetchone()
+            if existing is not None and (
+                existing["kind"], existing["strength"], existing["weight"]
+            ) == (kind, strength, weight):
+                self._connection.commit()
+                return int(existing["last_event_id"])
+            cursor = self._connection.execute(
+                """
+                INSERT INTO preference_rule_events(
+                    account_id, trait, action, kind, strength, weight, recorded_at
+                ) VALUES (?, ?, 'set', ?, ?, ?, ?)
+                """,
+                (account_id, trait, kind, strength, weight, timestamp),
+            )
+            event_id = int(cursor.lastrowid)
+            self._connection.execute(
+                """
+                INSERT INTO preference_rules_current(
+                    account_id, trait, kind, strength, weight, updated_at,
+                    last_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, trait) DO UPDATE SET
+                    kind = excluded.kind,
+                    strength = excluded.strength,
+                    weight = excluded.weight,
+                    updated_at = excluded.updated_at,
+                    last_event_id = excluded.last_event_id
+                """,
+                (account_id, trait, kind, strength, weight, timestamp, event_id),
+            )
+            self._connection.commit()
+            return event_id
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def remove_preference_rule(
+        self, *, account_id: int, trait: str, recorded_at: str | datetime
+    ) -> bool:
+        trait = _user_trait(trait)
+        timestamp = _timestamp(recorded_at)
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_steam_account(account_id)
+            exists = self._connection.execute(
+                "SELECT 1 FROM preference_rules_current WHERE account_id = ? AND trait = ?",
+                (account_id, trait),
+            ).fetchone()
+            if exists is None:
+                self._connection.commit()
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO preference_rule_events(
+                    account_id, trait, action, kind, strength, weight, recorded_at
+                ) VALUES (?, ?, 'remove', NULL, NULL, NULL, ?)
+                """,
+                (account_id, trait, timestamp),
+            )
+            self._connection.execute(
+                "DELETE FROM preference_rules_current WHERE account_id = ? AND trait = ?",
+                (account_id, trait),
+            )
+            self._connection.commit()
+            return exists is not None
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
+    def list_preference_rules(self, account_id: int) -> tuple[PreferenceRule, ...]:
+        return tuple(
+            PreferenceRule(**dict(row))
+            for row in self._connection.execute(
+                """
+                SELECT account_id, trait, kind, strength, weight, updated_at,
+                       last_event_id
+                FROM preference_rules_current
+                WHERE account_id = ? ORDER BY trait
+                """,
+                (account_id,),
+            )
+        )
+
+    def _require_steam_account(self, account_id: int) -> None:
+        if self._connection.execute(
+            "SELECT 1 FROM accounts WHERE id = ? AND provider = 'steam'", (account_id,)
+        ).fetchone() is None:
+            raise ValueError("Steam account is not configured")
+
+    def _remove_empty_feedback_current(self, account_id: int, appid: int) -> None:
+        self._connection.execute(
+            """
+            DELETE FROM explicit_feedback_current
+            WHERE account_id = ? AND appid = ?
+              AND rating IS NULL AND play_state IS NULL AND snoozed_until IS NULL
+              AND minimum_session_minutes IS NULL AND remaining_minutes IS NULL
+            """,
+            (account_id, appid),
+        )
 
     def upsert_credential_reference(
         self,
@@ -3616,6 +4000,21 @@ class Storage:
                 "price_subjects": self._count_where(
                     "price_subject_current", "account_id", account_id
                 ),
+                "feedback_events": self._count_where(
+                    "explicit_feedback_events", "account_id", account_id
+                ),
+                "feedback_current": self._count_where(
+                    "explicit_feedback_current", "account_id", account_id
+                ),
+                "feedback_traits": self._count_where(
+                    "explicit_trait_current", "account_id", account_id
+                ),
+                "preference_rule_events": self._count_where(
+                    "preference_rule_events", "account_id", account_id
+                ),
+                "preference_rules": self._count_where(
+                    "preference_rules_current", "account_id", account_id
+                ),
                 "sync_runs": self._count_where("sync_runs", "account_id", account_id),
                 "consents": self._count_where(
                     "account_data_consents", "account_id", account_id
@@ -3650,8 +4049,10 @@ class Storage:
                     SELECT appid FROM wishlist_observations WHERE account_id = ?
                     UNION
                     SELECT appid FROM price_sync_demand WHERE account_id = ?
+                    UNION
+                    SELECT appid FROM explicit_feedback_events WHERE account_id = ?
                     """,
-                    (account_id, account_id, account_id),
+                    (account_id, account_id, account_id, account_id),
                 )
             )
             (
@@ -3709,6 +4110,11 @@ class Storage:
                 price_observations_removed=counts["price_observations"],
                 price_current_removed=counts["price_current"],
                 price_subjects_removed=counts["price_subjects"],
+                feedback_events_removed=counts["feedback_events"],
+                feedback_current_removed=counts["feedback_current"],
+                feedback_traits_removed=counts["feedback_traits"],
+                preference_rule_events_removed=counts["preference_rule_events"],
+                preference_rules_removed=counts["preference_rules"],
             )
         except BaseException:
             try:
@@ -3760,6 +4166,11 @@ class Storage:
                 "price_observations": 0,
                 "price_current": 0,
                 "price_subjects": 0,
+                "feedback_events": 0,
+                "feedback_current": 0,
+                "feedback_traits": 0,
+                "preference_rule_events": 0,
+                "preference_rules": 0,
                 "sync_runs": 0,
                 "consents": 0,
                 "probes": 0,
@@ -3819,6 +4230,36 @@ class Storage:
                             account_ids,
                         ).fetchone()[0]
                     ),
+                    "feedback_events": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM explicit_feedback_events "
+                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                        ).fetchone()[0]
+                    ),
+                    "feedback_current": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM explicit_feedback_current "
+                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                        ).fetchone()[0]
+                    ),
+                    "feedback_traits": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM explicit_trait_current "
+                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                        ).fetchone()[0]
+                    ),
+                    "preference_rule_events": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM preference_rule_events "
+                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                        ).fetchone()[0]
+                    ),
+                    "preference_rules": int(
+                        self._connection.execute(
+                            f"SELECT COUNT(*) FROM preference_rules_current "
+                            f"WHERE account_id IN ({id_placeholders})", account_ids
+                        ).fetchone()[0]
+                    ),
                     "sync_runs": int(
                         self._connection.execute(
                             f"SELECT COUNT(*) FROM sync_runs "
@@ -3870,8 +4311,11 @@ class Storage:
                         UNION
                         SELECT appid FROM price_sync_demand
                         WHERE account_id IN ({id_placeholders})
+                        UNION
+                        SELECT appid FROM explicit_feedback_events
+                        WHERE account_id IN ({id_placeholders})
                         """,
-                        (*account_ids, *account_ids, *account_ids),
+                        (*account_ids, *account_ids, *account_ids, *account_ids),
                     )
                 )
 
@@ -3970,6 +4414,11 @@ class Storage:
                 price_observations_removed=counts["price_observations"],
                 price_current_removed=counts["price_current"],
                 price_subjects_removed=counts["price_subjects"],
+                feedback_events_removed=counts["feedback_events"],
+                feedback_current_removed=counts["feedback_current"],
+                feedback_traits_removed=counts["feedback_traits"],
+                preference_rule_events_removed=counts["preference_rule_events"],
+                preference_rules_removed=counts["preference_rules"],
             )
         except BaseException:
             try:
@@ -4358,6 +4807,11 @@ class Storage:
             ("price_observations", "account_id"),
             ("price_current", "account_id"),
             ("price_subject_current", "account_id"),
+            ("explicit_feedback_events", "account_id"),
+            ("explicit_feedback_current", "account_id"),
+            ("explicit_trait_current", "account_id"),
+            ("preference_rule_events", "account_id"),
+            ("preference_rules_current", "account_id"),
             ("sync_runs", "account_id"),
             ("account_data_consents", "account_id"),
         }
@@ -4873,6 +5327,18 @@ class Storage:
                   SELECT 1 FROM price_subject_current
                   WHERE price_subject_current.appid = steam_apps.appid
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM explicit_feedback_events
+                  WHERE explicit_feedback_events.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM explicit_feedback_current
+                  WHERE explicit_feedback_current.appid = steam_apps.appid
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM explicit_trait_current
+                  WHERE explicit_trait_current.appid = steam_apps.appid
+              )
             """,
             appids,
         )
@@ -5134,6 +5600,8 @@ __all__ = [
     "CatalogStreamProvenance",
     "CredentialReferenceRecord",
     "EvidenceInput",
+    "ExplicitFeedback",
+    "ExplicitTrait",
     "InstalledGame",
     "InstalledObservation",
     "InstalledSnapshot",
@@ -5146,6 +5614,7 @@ __all__ = [
     "OwnedSnapshot",
     "OwnedSnapshotProvenance",
     "ProviderProbeRecord",
+    "PreferenceRule",
     "SteamApp",
     "Storage",
     "StorageError",
@@ -5194,6 +5663,27 @@ def _account_alias(value: str) -> str:
         raise ValueError(
             "account alias may contain only ASCII letters, digits, _ and -"
         )
+    return value
+
+
+def _user_trait(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("user:"):
+        raise ValueError("trait must use the user namespace")
+    slug = value[5:]
+    if not 1 <= len(slug) <= 59:
+        raise ValueError("user trait is invalid")
+    if not slug[0].isascii() or not slug[0].islower() and not slug[0].isdigit():
+        raise ValueError("user trait is invalid")
+    if not slug[-1].isascii() or not slug[-1].islower() and not slug[-1].isdigit():
+        raise ValueError("user trait is invalid")
+    if any(
+        not (
+            character.isascii()
+            and (character.islower() or character.isdigit() or character in "._-")
+        )
+        for character in slug
+    ):
+        raise ValueError("user trait is invalid")
     return value
 
 

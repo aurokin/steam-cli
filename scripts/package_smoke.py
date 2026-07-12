@@ -146,6 +146,17 @@ def smoke(wheel: Path) -> None:
             for option in ("--scope", "--account", "--country", "--store-class")
         ):
             raise RuntimeError("installed help does not expose the deal-query contract")
+        feedback_help = _run([str(executable), "feedback", "estimate", "--help"])
+        if not all(
+            option in feedback_help.stdout
+            for option in (
+                "--minimum-session-minutes",
+                "--remaining-minutes",
+                "--clear-minimum-session-minutes",
+                "--clear-remaining-minutes",
+            )
+        ):
+            raise RuntimeError("installed help does not expose explicit estimates")
 
         data_dir = root / "data"
         query = [
@@ -174,6 +185,8 @@ def smoke(wheel: Path) -> None:
             before != expected
             or "wishlist_current" not in _tables(database)
             or "targeted" not in _columns(database, "price_sync_demand")
+            or "explicit_feedback_current" not in _tables(database)
+            or "preference_rules_current" not in _tables(database)
         ):
             raise RuntimeError(
                 "installed wheel did not apply the complete source schema"
