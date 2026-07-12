@@ -48,6 +48,49 @@ def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
     assert len(result) == 10_001
 
 
+def test_preference_seed_bound_is_rejected_before_storage(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cli, "Storage", lambda *_args, **_kwargs: pytest.fail("storage was opened")
+    )
+    arguments = [
+        "group",
+        "recommend",
+        "--scope",
+        "appids",
+        "--limit",
+        "1",
+        "--appid",
+        "400",
+        "--member",
+        "synthetic:alpha",
+        "--member",
+        "synthetic:beta",
+        "--context-account",
+        "primary",
+        "--context-machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+        "--objective",
+        "preference-fit",
+        "--like",
+        "synthetic:beta=400",
+    ]
+    for appid in range(1, 66):
+        arguments.extend(("--like", f"synthetic:alpha={appid}"))
+
+    code, value, _ = invoke(tmp_path, capsys, *arguments)
+
+    assert code == 2
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
 def invoke(tmp_path: Path, capsys: object, *arguments: str):
     code = cli.main(["--data-dir", str(tmp_path), *arguments])
     captured = capsys.readouterr()  # type: ignore[attr-defined]

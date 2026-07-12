@@ -262,6 +262,42 @@ def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
     assert value["completeness"]["stale_capabilities"] == ["owned.visible.read"]
 
 
+def test_group_with_only_unsynced_accounts_is_unavailable(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.configure_steam_account(
+            alias="other",
+            steam_id64="76561198999999998",
+            configured_at=NOW,
+        )
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "ownership",
+        "400",
+        "--member",
+        "account:primary",
+        "--member",
+        "account:other",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 0
+    assert value["completeness"]["status"] == "unavailable"
+    assert value["completeness"]["missing_capabilities"] == ["owned.visible.read"]
+
+
 def test_group_eligibility_combines_mode_copies_players_and_policy(
     tmp_path: Path, capsys: object
 ) -> None:

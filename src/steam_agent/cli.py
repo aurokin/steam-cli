@@ -141,6 +141,7 @@ from steam_agent.groups import (
     FeatureSet,
     FamilyEdge,
     GroupCandidate,
+    MAX_SEEDS_PER_MEMBER,
     MemberPreference,
     MemberRef,
     OwnershipFact,
@@ -2458,7 +2459,7 @@ def _group_ownership_by_app(
     *,
     refs: tuple[MemberRef, ...],
     appids: tuple[int, ...],
-) -> tuple[dict[int, tuple[OwnershipFact, ...]], bool, bool]:
+) -> tuple[dict[int, tuple[OwnershipFact, ...]], bool, bool, bool]:
     account_owned: dict[MemberRef, set[int] | None] = {}
     ownership_missing = False
     ownership_stale = False
@@ -2509,6 +2510,11 @@ def _group_ownership_by_app(
         for ref in refs
         if ref.kind == "synthetic"
     }
+    ownership_any_evidence = any(
+        values is not None for values in account_owned.values()
+    ) or any(
+        any(appid in states for appid in appids) for states in synthetic_states.values()
+    )
     result: dict[int, tuple[OwnershipFact, ...]] = {}
     for appid in appids:
         facts: list[OwnershipFact] = []
@@ -2525,7 +2531,7 @@ def _group_ownership_by_app(
                 state = synthetic_states[ref].get(appid, "unknown")
             facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
         result[appid] = tuple(facts)
-    return result, ownership_missing, ownership_stale
+    return result, ownership_missing, ownership_stale, ownership_any_evidence
 
 
 def _evaluate_group_app(
@@ -2719,6 +2725,7 @@ def _group_query_completeness(
     declared_total: int,
     ownership_missing: bool,
     ownership_stale: bool,
+    ownership_any_evidence: bool,
 ) -> dict[str, Any]:
     warnings: list[WarningRecord] = []
     if ownership_missing:
@@ -2738,7 +2745,9 @@ def _group_query_completeness(
                 ),
             )
         )
-    if declared_total and missing_declared == declared_total:
+    if (ownership_missing and not ownership_any_evidence) or (
+        declared_total and missing_declared == declared_total
+    ):
         status = CompletenessStatus.UNAVAILABLE
     elif missing_declared or ownership_missing or ownership_stale:
         status = CompletenessStatus.PARTIAL
@@ -2812,6 +2821,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 ownership_by_app,
                 ownership_missing,
                 ownership_stale,
+                ownership_any_evidence,
             ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
             declared = (
                 storage.read_declared_app_snapshot(
@@ -2913,6 +2923,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 declared_total=(len(appids) if declared is not None else 0),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
+                ownership_any_evidence=ownership_any_evidence,
             ),
             data={"schema": "group-eligibility/0.1", "results": rows},
         )
@@ -2960,6 +2971,12 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 raise ValueError("user assertion slug is invalid")
         liked = _parse_member_seeds(args.like, members=members)
         disliked = _parse_member_seeds(args.dislike, members=members)
+        for member in members:
+            member_seeds = (*liked[member], *disliked[member])
+            if len(member_seeds) > MAX_SEEDS_PER_MEMBER or len(member_seeds) != len(
+                set(member_seeds)
+            ):
+                raise ValueError("member preference seeds exceed the bounded contract")
         if args.objective == "preference-fit":
             if any(not liked[member] and not disliked[member] for member in members):
                 raise ValueError("every member needs a preference seed")
@@ -3022,6 +3039,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_by_app,
                 ownership_missing,
                 ownership_stale,
+                ownership_any_evidence,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
             family_by_member = {
                 member: storage.read_group_family(member) for member in members
@@ -3168,6 +3186,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 declared_total=len(demanded),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
+                ownership_any_evidence=ownership_any_evidence,
             ),
             data={
                 "schema": "group-fit/0.1",
