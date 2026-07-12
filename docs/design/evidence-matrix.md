@@ -20,6 +20,7 @@ Support levels used below:
 | Store catalog identity | Steam `IStoreService/GetAppList` | Documented | Ordered paginated full-catalog stream with no documented arbitrary-AppID filter; persistence can be demand-bounded, but initial retrieval scans through the highest demanded AppID; returns change signals, not rich metadata or price history |
 | Wishlist | Valve `IWishlistService` | Provisional | Missing from Valve's supported reference; share-token/auth behavior varies |
 | Rich store metadata/current price | Storefront `api/appdetails` | Provisional | Undocumented shape/rate limits; country and language affect results |
+| Declared genre/multiplayer/release | Same isolated storefront `api/appdetails` lifecycle | Provisional | Numeric category/genre identity only; missing categories are unknown; genres are not tags/mechanics; no exact player counts or health verdict |
 | Store reviews | Steam store review API | Documented | Review windows and filters must be recorded |
 | Installed games | `libraryfolders.vdf` + `appmanifest_*.acf` | Local heuristic | Installed is not owned; file formats are not stable public APIs |
 | System profile | OS-native probes | Local observation | Minimize collection and redact device identifiers by default |
@@ -32,6 +33,7 @@ Support levels used below:
 | Default artwork | Steam CDN references | Provisional/public asset | Adequate for core display; respect origin and avoid treating art as game facts |
 | Custom artwork | SteamGridDB, opt in | Contractual third party | Personal/non-commercial and attribution/licensing questions; not canonical metadata |
 | Deck status | Valve compatibility review | Documented concept, provisional retrieval | Strong for Deck/SteamOS target only; machine retrieval is undocumented |
+| Group copy eligibility | Local configured accounts plus explicit synthetic/family assertions | Local/user-authored derivation | No friend/family enumeration; family availability cannot invent a copy; missing copies are a range under unknown ownership |
 | SteamDB history | SteamDB page link | Human only | No public API; scraping/crawling is prohibited |
 | License-aware private data | SteamKit/SteamCMD, later high-trust mode | Higher-trust integration | Session secrets, account risk, and complexity exceed core mode |
 

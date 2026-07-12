@@ -16,14 +16,14 @@ constraints, rank eligible candidates, and explain the result.
 | Backlog | What is unplayed, abandoned, or finishable this weekend? | Playtime, recency, completion evidence, length estimate or user override, install size |
 | Compatibility | What works well on this system? | System profile, declared OS support and requirements, Deck evidence where relevant, launchers/anti-cheat, local observations |
 | Mood and time | Something relaxing I can play for 30 minutes? | Tags, save/interruptibility, session estimate, accessibility and difficulty options, user feedback |
-| Discovery | What is like X but without crafting? | Candidate catalog, weighted tags/mechanics, explicit positive and negative examples, exclusions |
+| Discovery | What is like X but without crafting? | Bounded known/explicit candidates, declared genre/category similarity, explicit positive/negative examples; mechanic exclusion requires user-authored traits because automated tags/mechanics are unsupported |
 | Wishlist | What fits me now? | Wishlist state, preference fit, compatibility, reviews, price and release state |
 | Deals | Is this a good deal or should I wait? | Region, currency, exact edition/package, current price, local snapshots, attributed history, timestamp |
-| Multiplayer/group | What can four of us play without buying copies? | Per-person availability, privacy completeness, exact multiplayer mode/count, Remote Play Together, system/input constraints |
+| Multiplayer/group | What can four of us play without buying copies? | Per-person availability, privacy completeness, exact mode plus count state/user assertion, Remote Play Together, system/input constraints |
 | Achievements | What am I close to finishing? | Schema, unlocks, timestamps, global rarity, playtime; rarity alone is not effort |
 | Accessibility | What meets these non-negotiable needs? | Developer-declared features and user requirements represented as pass/fail/unknown |
 | Household/family | Do we need another copy? What is child-appropriate? | Copy ownership, family availability, share eligibility, parental rules; most are not public API facts |
-| Current health | Is multiplayer alive or the game maintained? | Review windows, announcements/updates, player snapshot, service evidence with strong caveats |
+| Current health | Is multiplayer alive or the game maintained? | Unsupported in the initial bounded slice; reviews are sentiment, catalog changes are not maintenance, and any future player snapshot needs explicit coverage/freshness caveats |
 | Data quality | Why is this missing? How sure are you? | Capabilities, source freshness, privacy failures, conflicts, unsupported fields |
 | Ready now | What is licensed, installed, updated, and launchable with this input/device? | License source, family-copy state, install/update/download state, runtime/login/online requirements |
 | Install/storage | What should I install for a trip? What can I remove to free 100 GB? | Drive space, install/download size, saves/mods/shaders, update queue, rollback and bandwidth |

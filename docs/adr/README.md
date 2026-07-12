@@ -1,6 +1,6 @@
 # Architecture decision register
 
-Only decisions required by accepted M1–M4 and active M5 slices are accepted.
+Only decisions required by accepted M1–M5 and active M6 slices are accepted.
 This register keeps later product and provider choices open until evidence
 supports them.
 
@@ -12,7 +12,7 @@ supports them.
 | D004 | Provider support-level model | M3 bounded contract accepted | Costly if omitted | Contract-failure fixtures and runtime support/fallback output |
 | D005 | Wishlist adapter in supported core | [Accepted provisionally for M3](0004-provisional-wishlist.md) | Easy if isolated | Live count/list, missing-key, malformed, and last-good evidence |
 | D006 | Historical-price provider portfolio | [Accepted degraded M3 ladder](0005-m3-deal-providers.md) | Easy if adapter-based | GG/CheapShark live smokes; ITAD remains conditional |
-| D007 | Full catalog vs demand-driven enrichment | Demand-bounded observed-AppID slice implemented for M2; broader discovery catalog remains open | Moderate | Live six-page scan persisted only 782 demanded identities; broader discovery quality and storage measurements remain |
+| D007 | Full catalog vs demand-driven enrichment | [Accepted for M6: bounded known/explicit universe](0012-m6-bounded-discovery-and-groups.md) | Moderate | Owned/installed/wishlist/explicit bounds, no-implicit-fetch tests, and group/discovery evals |
 | D008 | SteamGridDB integration | Optional | Easy | Art use cases and terms/attribution review |
 | D009 | High-trust SteamKit/SteamCMD mode | Deferred | Moderate | Private-data value vs account/session risk |
 | D010 | MCP surface | Deferred until CLI stabilizes | Easy | Multiple consumers needing typed live tools |
@@ -30,6 +30,7 @@ supports them.
 | D022 | Activity/achievement purpose and retention | [Accepted bounded M4 slice](0009-m4-activity-retention.md) | Costly for privacy | Disclosure, live privacy/no-stats evidence, LKG/expiry, bounded demand, and deletion tests |
 | D023 | System-profile identity, minimization, and retention | [Accepted with M5](0010-m5-system-profile.md) | Costly for privacy and portability | Cross-platform fixtures, denylist canaries, consent, freshness, LKG, isolation, and deletion tests |
 | D024 | Compatibility evidence and precedence | [Accepted layered M5 boundary](0011-m5-layered-compatibility.md) | Costly once agents consume verdicts | Provisional shape fixtures, pure gate/eval oracles, target scoping, unknowns, overrides, and live redacted evidence |
+| D025 | Discovery/group evidence, copy matching, and ranking boundary | [Accepted for active M6](0012-m6-bounded-discovery-and-groups.md) | Costly once multi-profile results are consumed | Schema migration, category ladders, Kleene sets, matching ranges, privacy/deletion, bounded-universe and ranking evals |
 
 ## When to create an ADR
 
