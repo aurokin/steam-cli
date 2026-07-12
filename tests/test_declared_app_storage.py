@@ -95,6 +95,18 @@ def demand_rows(storage: Storage, run_id: int) -> list[dict[str, object]]:
     ]
 
 
+def test_v02_migration_allows_legacy_and_expanded_projection_ids(
+    tmp_path: Path,
+) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        sql = storage._connection.execute(  # noqa: SLF001
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='declared_app_current'"
+        ).fetchone()[0]
+
+    assert "declared-app-facts/0.1" in sql
+    assert "declared-app-facts/0.2" in sql
+
+
 def test_scheduler_retains_complete_ordered_demand_and_cap_reason(
     configured: tuple[Storage, int],
 ) -> None:
