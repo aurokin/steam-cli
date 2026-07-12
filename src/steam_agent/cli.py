@@ -2031,6 +2031,34 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
     )
 
 
+def _owned_scope_state(snapshot: Any, *, now: datetime) -> tuple[bool, bool, bool]:
+    latest_complete = snapshot.latest_complete
+    reference = (
+        None
+        if latest_complete is None
+        else latest_complete.completed_at or latest_complete.started_at
+    )
+    age = (
+        None
+        if reference is None
+        else (
+            now - datetime.fromisoformat(reference.replace("Z", "+00:00"))
+        ).total_seconds()
+    )
+    authoritative = (
+        snapshot.latest is not None
+        and snapshot.latest.status == "complete"
+        and snapshot.latest.promoted
+        and age is not None
+        and 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
+    )
+    return (
+        latest_complete is None,
+        latest_complete is not None and not authoritative,
+        authoritative,
+    )
+
+
 def _declared_scope_appids(
     storage: Storage,
     *,
@@ -2146,6 +2174,12 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             scope=args.scope,
             explicit=explicit,
         )
+        if args.scope in {"library", "known"}:
+            owned_scope_missing, owned_scope_stale, _ = _owned_scope_state(
+                storage.read_owned_snapshot(account.id), now=_utc_now()
+            )
+        else:
+            owned_scope_missing = owned_scope_stale = False
         bounded = candidates[: args.limit]
         if bounded:
             snapshot = storage.read_declared_app_snapshot(
@@ -2223,10 +2257,13 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
         )
     status = (
         CompletenessStatus.COMPLETE
-        if not missing and not stale
+        if not missing
+        and not stale
+        and not owned_scope_missing
+        and not owned_scope_stale
         else (
             CompletenessStatus.UNAVAILABLE
-            if missing == len(items)
+            if missing == len(items) or (owned_scope_missing and not candidates)
             else CompletenessStatus.PARTIAL
         )
     )
@@ -2243,8 +2280,18 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
         },
         completeness_value=completeness(
             status,
-            missing_capabilities=(["discovery.declared.read"] if missing else []),
-            stale_capabilities=(["discovery.declared.read"] if stale else []),
+            missing_capabilities=sorted(
+                {
+                    *(["discovery.declared.read"] if missing else []),
+                    *(["owned.visible.read"] if owned_scope_missing else []),
+                }
+            ),
+            stale_capabilities=sorted(
+                {
+                    *(["discovery.declared.read"] if stale else []),
+                    *(["owned.visible.read"] if owned_scope_stale else []),
+                }
+            ),
         ),
         data={
             "items": items,
@@ -2532,30 +2579,9 @@ def _group_ownership_by_app(
         if account is None:
             raise ValueError("selected account is not configured")
         snapshot = storage.read_owned_snapshot(account.id)
-        latest_complete = snapshot.latest_complete
-        reference = (
-            None
-            if latest_complete is None
-            else latest_complete.completed_at or latest_complete.started_at
-        )
-        age = (
-            None
-            if reference is None
-            else (
-                _utc_now() - datetime.fromisoformat(reference.replace("Z", "+00:00"))
-            ).total_seconds()
-        )
-        authoritative = (
-            snapshot.latest is not None
-            and snapshot.latest.status == "complete"
-            and snapshot.latest.promoted
-            and age is not None
-            and 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
-        )
-        if latest_complete is None:
-            ownership_missing = True
-        elif not authoritative:
-            ownership_stale = True
+        missing, stale, authoritative = _owned_scope_state(snapshot, now=_utc_now())
+        ownership_missing = ownership_missing or missing
+        ownership_stale = ownership_stale or stale
         account_owned[ref] = (
             {
                 game.appid
@@ -3118,6 +3144,12 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 scope=args.scope,
                 explicit=explicit,
             )
+            if args.scope in {"library", "known"}:
+                scope_owned_missing, scope_owned_stale, _ = _owned_scope_state(
+                    storage.read_owned_snapshot(context_account.id), now=_utc_now()
+                )
+            else:
+                scope_owned_missing = scope_owned_stale = False
             if len(candidate_appids) > 10_000:
                 raise ValueError("group candidate universe exceeds the bound")
             seed_appids = tuple(
@@ -3145,6 +3177,8 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_stale,
                 ownership_any_evidence,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
+            ownership_missing = ownership_missing or scope_owned_missing
+            ownership_stale = ownership_stale or scope_owned_stale
             family_by_member = {
                 member: (
                     storage.read_group_family_for_appids(

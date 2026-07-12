@@ -483,6 +483,68 @@ def test_discovery_reports_retained_declared_facts_as_stale(
     assert result["data"]["items"][0]["freshness"] == "stale"
 
 
+def test_discovery_reports_stale_owned_candidate_scope(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    assert (
+        invoke(
+            tmp_path,
+            capsys,
+            "sync",
+            "app-facts",
+            "--scope",
+            "library",
+            "--account",
+            "primary",
+            "--machine",
+            "desktop",
+            "--country",
+            "US",
+            "--language",
+            "english",
+            "--acknowledge-local-storage",
+        )[0]
+        == 0
+    )
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE sync_runs SET started_at=?, completed_at=?
+               WHERE capability='owned.visible.read'""",
+            ("2026-07-01T00:00:00Z", "2026-07-01T00:00:01Z"),
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, result, _ = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "library",
+        "--limit",
+        "10",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 0
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["stale_capabilities"] == ["owned.visible.read"]
+
+
 def test_app_facts_rechecks_bound_after_scope_expansion(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
