@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import socket
 
 import pytest
 
@@ -226,6 +227,7 @@ def test_assess_is_cache_only_exact_and_does_not_persist_overrides(
     monkeypatch.setattr(cli, "_credential_store", forbid)
     monkeypatch.setattr(cli, "discover_steam_root", forbid)
     monkeypatch.setattr(cli.time, "sleep", forbid)
+    monkeypatch.setattr(socket, "create_connection", forbid)
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
 
     code, value, stderr = invoke(
@@ -258,6 +260,7 @@ def test_assess_is_cache_only_exact_and_does_not_persist_overrides(
         "account_alias": "primary",
         "cache_only": True,
         "country": "US",
+        "evidence_machine": "local",
         "language": "english",
         "overrides_ephemeral": True,
         "requirements": ["language:english"],
@@ -376,6 +379,43 @@ def test_assess_default_json_and_table_remain_compact_and_safe(
     assert captured.err == ""
     assert "APPID\tCOMPATIBILITY\tPLAYABLE_NOW\tCOMPLETENESS\tUNKNOWNS" in captured.out
     assert "76561198999999999" not in captured.out
+
+
+def test_deck_target_uses_the_only_configured_nonlocal_machine_context(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Private desktop", "linux", "x86_64"),
+            observed_at=NOW,
+        )
+        storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198999999999",
+            configured_at=NOW,
+        )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "valve:steam-deck",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert value["context"]["evidence_machine"] == "desktop"
 
 
 def test_assess_missing_account_is_typed_without_identity_disclosure(

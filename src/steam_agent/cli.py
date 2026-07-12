@@ -438,6 +438,10 @@ def build_parser() -> argparse.ArgumentParser:
     compatibility_assess.add_argument("appids", metavar="APPID", nargs="+", type=int)
     compatibility_assess.add_argument("--account", required=True)
     compatibility_assess.add_argument("--target", required=True)
+    compatibility_assess.add_argument(
+        "--context-machine",
+        help="Machine alias carrying declared-fact lineage for non-machine targets.",
+    )
     compatibility_assess.add_argument("--country", required=True)
     compatibility_assess.add_argument("--language", required=True)
     compatibility_assess.add_argument("--require", action="append", default=[])
@@ -1731,7 +1735,9 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
                     code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
                     message="The requested account alias is not configured.",
                 )
-            target, machine_id = _compatibility_target(storage, args.target)
+            target, machine_id = _compatibility_target(
+                storage, args.target, args.context_machine
+            )
             snapshot = storage.read_compatibility_snapshot(
                 account.id,
                 machine_id,
@@ -1789,6 +1795,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         context={
             "account_alias": args.account,
             "target": args.target,
+            "evidence_machine": machine_id,
             "country": args.country,
             "language": args.language,
             "cache_only": True,
@@ -1801,17 +1808,30 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
 
 
 def _compatibility_target(
-    storage: Storage, raw: str
+    storage: Storage, raw: str, context_machine: str | None
 ) -> tuple[CompatibilityTarget, str]:
     if raw == "valve:steam-deck":
-        # Declared-fact demand is currently synchronized in the local context;
-        # no local profile or installed state is applied to the Deck target.
-        if storage.get_machine("local") is None:
-            raise ValueError("local compatibility context is not configured")
-        return CompatibilityTarget("valve_deck", "steam-deck", "steamos"), "local"
+        # Declared facts are global, while attempt lineage remains scoped to an
+        # account and machine.  A sole configured machine is unambiguous; a
+        # multi-machine store must name the desired evidence context.
+        machine_id = context_machine
+        if machine_id is None:
+            machines = storage.list_machines()
+            local = next((item for item in machines if item.id == "local"), None)
+            if local is not None:
+                machine_id = local.id
+            elif len(machines) == 1:
+                machine_id = machines[0].id
+            else:
+                raise ValueError("Deck assessment requires an explicit machine context")
+        if storage.get_machine(machine_id) is None:
+            raise ValueError("compatibility context machine is not configured")
+        return CompatibilityTarget("valve_deck", "steam-deck", "steamos"), machine_id
     if not raw.startswith("machine:"):
         raise ValueError("target is invalid")
     machine_id = raw.removeprefix("machine:")
+    if context_machine is not None and context_machine != machine_id:
+        raise ValueError("machine target and evidence context must match")
     machine = storage.get_machine(machine_id)
     if machine is None:
         raise ValueError("compatibility machine is not configured")

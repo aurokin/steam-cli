@@ -1072,6 +1072,16 @@ class Storage:
         ).fetchone()
         return None if row is None else Machine(**dict(row))
 
+    def list_machines(self) -> tuple[Machine, ...]:
+        """Return configured machine contexts in stable identifier order."""
+
+        return tuple(
+            Machine(**dict(row))
+            for row in self._connection.execute(
+                "SELECT id, name, platform, architecture FROM machines ORDER BY id"
+            )
+        )
+
     def configure_steam_account(
         self,
         *,
