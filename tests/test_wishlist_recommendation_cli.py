@@ -87,7 +87,15 @@ def test_m3_ladder_not_found_and_retained_evidence_are_not_collapsed() -> None:
             bucket="noncomparable",
             grade="degraded",
             attempts=[],
-            facts=[{**retained[0], "fresh": True}],
+            facts=[
+                retained[0],
+                {
+                    **retained[0],
+                    "evidence_id": 8,
+                    "fresh": True,
+                    "observed_at": "2026-07-11T11:00:00Z",
+                },
+            ],
         ),
         "US",
         "official",
@@ -95,6 +103,7 @@ def test_m3_ladder_not_found_and_retained_evidence_are_not_collapsed() -> None:
     )
     assert noncomparable is not None and noncomparable.bucket == "noncomparable"
     assert noncomparable.evidence_grade == "degraded"
+    assert noncomparable.freshness == "fresh"
 
 
 class Client:

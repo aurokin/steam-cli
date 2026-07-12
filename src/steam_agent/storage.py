@@ -2584,6 +2584,11 @@ class Storage:
                    WHERE d.account_id = w.account_id AND d.appid = w.appid
                      AND d.evaluated = 1 AND d.state IN ('ready', 'failed')
                      AND d.observed_at >= ?
+                     AND (
+                       d.state = 'failed' OR EXISTS (
+                         SELECT 1 FROM review_current c WHERE c.appid=d.appid
+                       )
+                     )
                  ))
                ORDER BY w.priority, w.date_added, w.appid""",
             (account_id, int(skip_fresh_terminal), fresh_cutoff),
@@ -2594,25 +2599,19 @@ class Storage:
         self,
         *,
         account_id: int,
-        candidates: tuple[int, ...],
-        targeted: tuple[int, ...],
+        max_items: int,
+        skip_fresh_terminal: bool,
         started_at: str | datetime,
         disclosure_version: str,
-    ) -> SyncRun:
+    ) -> tuple[SyncRun, tuple[int, ...], tuple[int, ...]]:
         timestamp = _timestamp(started_at)
         if (
-            len(candidates) != len(set(candidates))
-            or len(targeted) != len(set(targeted))
-            or not set(targeted) <= set(candidates)
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 1 <= value <= (1 << 32) - 1
-                for value in candidates
-            )
+            isinstance(max_items, bool)
+            or not isinstance(max_items, int)
+            or not 1 <= max_items <= 100
+            or not isinstance(skip_fresh_terminal, bool)
         ):
-            raise ValueError("review demand is invalid")
-        target_set = set(targeted)
+            raise ValueError("review scheduling inputs are invalid")
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._require_steam_account(account_id)
@@ -2634,6 +2633,13 @@ class Storage:
             ):
                 raise InvalidSyncTransition("current review persistence consent is required")
             self._prune_reviews(timestamp)
+            candidates = self.review_sync_candidates(
+                account_id,
+                now=timestamp,
+                skip_fresh_terminal=skip_fresh_terminal,
+            )
+            targeted = candidates[:max_items]
+            target_set = set(targeted)
             cursor = self._connection.execute(
                 """INSERT INTO sync_runs(provider, capability, account_id, started_at, status)
                    VALUES ('steam_store', 'reviews.aggregate.read', ?, ?, 'running')""",
@@ -2660,7 +2666,7 @@ class Storage:
         except BaseException:
             self._rollback_or_reopen()
             raise
-        return self.get_sync_run(run_id)
+        return self.get_sync_run(run_id), candidates, targeted
 
     def record_review_result(
         self,
@@ -2830,6 +2836,9 @@ class Storage:
         return self.get_sync_run(sync_run_id)
 
     def _prune_reviews(self, now: str) -> None:
+        # Consent records the user's durable disclosure choice, not provider
+        # cache evidence. It remains until provider/account deletion so a
+        # seven-day cache expiry never triggers surprise re-consent prompts.
         cutoff = _timestamp(
             datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)
         )
@@ -2841,16 +2850,21 @@ class Storage:
             )
         )
         self._connection.execute(
-            "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read' AND started_at < ?",
-            (cutoff,),
-        )
-        self._connection.execute(
             "DELETE FROM review_current WHERE observed_at < ?", (cutoff,)
         )
         self._connection.execute(
             """DELETE FROM review_current WHERE NOT EXISTS (
                  SELECT 1 FROM wishlist_current w WHERE w.appid=review_current.appid
                )"""
+        )
+        self._connection.execute(
+            """DELETE FROM sync_runs
+               WHERE capability='reviews.aggregate.read' AND started_at < ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM review_current c
+                   WHERE c.promoted_sync_run_id=sync_runs.id
+                 )""",
+            (cutoff,),
         )
         self._delete_orphan_apps(appids)
 
@@ -2927,8 +2941,8 @@ class Storage:
             int(row[0])
             for row in self._connection.execute(
                 """SELECT c.appid FROM review_current c
-                   JOIN sync_runs r ON r.id=c.promoted_sync_run_id
-                   WHERE r.account_id=?""",
+                   LEFT JOIN sync_runs r ON r.id=c.promoted_sync_run_id
+                   WHERE r.account_id=? OR c.promoted_sync_run_id IS NULL""",
                 (account_id,),
             )
         )
@@ -5151,9 +5165,10 @@ class Storage:
             attempts = tuple(
                 SyncRun(**dict(row))
                 for row in self._connection.execute(
-                    """SELECT DISTINCT r.* FROM sync_runs r
-                       JOIN review_sync_demand d ON d.sync_run_id=r.id
-                       WHERE d.account_id=? ORDER BY r.started_at, r.id""",
+                    """SELECT r.* FROM sync_runs r
+                       WHERE r.account_id=?
+                         AND r.capability='reviews.aggregate.read'
+                       ORDER BY r.started_at, r.id""",
                     (account_id,),
                 )
             )

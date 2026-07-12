@@ -139,6 +139,21 @@ def test_default_runs_converge_over_bounded_wishlist(tmp_path) -> None:
         assert tuple(rows) == (25, 100, 100)
 
 
+def test_valid_empty_review_sync_remains_visible_as_completed_attempt(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 0)
+        result = sync_wishlist_reviews(
+            storage, account_id=account_id, client=Client(), clock=Clock()
+        )
+        assert result.candidate_count == 0 and result.run.status == "complete"
+        snapshot = storage.read_wishlist_recommendation_snapshot(
+            account_id=account_id, country="US", now=NOW
+        )
+        assert len(snapshot.review_attempts) == 1
+        assert snapshot.review_attempts[0].status == "complete"
+        assert snapshot.review_demand == ()
+
+
 def test_explicit_limit_refreshes_prefix_and_preserves_full_demand(tmp_path) -> None:
     with Storage(tmp_path / "state.sqlite3") as storage:
         account_id = setup_wishlist(storage, 4)
@@ -387,6 +402,77 @@ def test_wishlist_removal_prunes_current_review_without_fk_rollback(tmp_path) ->
         assert storage.get_app(100) is not None
         storage._prune_reviews("2026-07-20T12:00:00Z")  # noqa: SLF001
         assert storage.get_app(100) is None
+
+
+def test_readded_wishlist_subject_is_not_skipped_without_current_review(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 1)
+        sync_wishlist_reviews(
+            storage, account_id=account_id, client=Client(), clock=Clock()
+        )
+        empty = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(minutes=5),
+        )
+        storage.complete_wishlist_snapshot(
+            empty.id,
+            (),
+            item_list_retrieved_at=NOW + timedelta(minutes=5),
+            item_count_retrieved_at=NOW + timedelta(minutes=5),
+            item_list_reported_count=0,
+            item_count_reported_count=0,
+            completed_at=NOW + timedelta(minutes=5),
+        )
+        restored = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account_id,
+            started_at=NOW + timedelta(minutes=10),
+        )
+        storage.complete_wishlist_snapshot(
+            restored.id,
+            (WishlistObservation(100, 0, 100, NOW + timedelta(minutes=10)),),
+            item_list_retrieved_at=NOW + timedelta(minutes=10),
+            item_count_retrieved_at=NOW + timedelta(minutes=10),
+            item_list_reported_count=1,
+            item_count_reported_count=1,
+            completed_at=NOW + timedelta(minutes=10),
+        )
+        client = Client()
+        result = sync_wishlist_reviews(
+            storage,
+            account_id=account_id,
+            client=client,
+            clock=Clock(NOW + timedelta(minutes=11)),
+        )
+        assert result.targeted_count == 1 and client.calls == [100]
+
+
+def test_prune_preserves_promoting_run_until_fresh_current_expires(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 1)
+        sync_wishlist_reviews(
+            storage, account_id=account_id, max_items=1, client=Client(), clock=Clock()
+        )
+        run_id = storage._connection.execute(  # noqa: SLF001
+            "SELECT promoted_sync_run_id FROM review_current"
+        ).fetchone()[0]
+        storage._connection.execute(  # noqa: SLF001
+            "UPDATE sync_runs SET started_at='2026-07-01T00:00:00Z' WHERE id=?",
+            (run_id,),
+        )
+        storage._connection.commit()  # noqa: SLF001
+        storage._prune_reviews("2026-07-11T12:00:00Z")  # noqa: SLF001
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT promoted_sync_run_id FROM review_current"
+        ).fetchone()[0] == run_id
+        storage._connection.commit()  # noqa: SLF001
+        storage.delete_steam_account_data(account_id)
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM review_current"
+        ).fetchone()[0] == 0
 
 
 def test_full_steam_deletion_removes_all_review_lineage(tmp_path) -> None:

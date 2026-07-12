@@ -255,7 +255,10 @@ def _deal(
     not_found = ingest_attempts.get("cheapshark") if ladder_not_found else None
     if selected is None:
         if retained_facts and deal["bucket"] == "noncomparable":
-            fact = retained_facts[0]
+            fact = next(
+                (value for value in retained_facts if value["fresh"]),
+                retained_facts[0],
+            )
             return DealDimension(
                 "deal-evidence/0.1",
                 "ready",

@@ -64,14 +64,10 @@ def sync_wishlist_reviews(
         raise ValueError(f"max_items must be between 1 and {MAX_REVIEW_ITEMS}")
     limit = DEFAULT_REVIEW_MAX_ITEMS if max_items is None else max_items
     started = clock()
-    candidates = storage.review_sync_candidates(
-        account_id, now=started, skip_fresh_terminal=max_items is None
-    )
-    targeted = candidates[:limit]
-    run = storage.begin_review_sync(
+    run, candidates, targeted = storage.begin_review_sync(
         account_id=account_id,
-        candidates=candidates,
-        targeted=targeted,
+        max_items=limit,
+        skip_fresh_terminal=max_items is None,
         started_at=started,
         disclosure_version=REVIEW_DISCLOSURE_VERSION,
     )

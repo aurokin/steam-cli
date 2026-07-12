@@ -201,6 +201,9 @@ missing or unsynchronized capability.
 ### AUR-642 aggregate reviews and wishlist fit
 
 The first persistent review sync requires the versioned M4 review disclosure.
+That consent record is durable local configuration until review-provider or
+account deletion; the seven-day cache window applies to acquired evidence and
+attempt lineage, not to the user's disclosure choice.
 Current aggregate summaries are fresh for 24 hours and usable as stale,
 explicitly labeled optional evidence until their seven-day hard expiry.
 Account-scoped demand, observations, attempts, and consent expire or are
