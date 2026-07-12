@@ -193,6 +193,11 @@ class FixedHttpsTransport:
             response_headers = {
                 key.lower(): value for key, value in response.getheaders()
             }
+            # Provider status is authoritative even when an error response uses
+            # an unsupported encoding or contains a malformed/oversized body.
+            # Do not read or decode such bodies: they are neither useful nor
+            # safe to retain, and doing so could mask retry metadata.
+            _raise_for_status(HttpResponse(response.status, b"", response_headers))
             while True:
                 chunk = response.read(64 * 1024)
                 if not chunk:
@@ -832,6 +837,24 @@ def _languages(value: object) -> LanguageDeclarations:
 class _BoundedHTMLParser(HTMLParser):
     _BREAK_TAGS = frozenset({"br", "div", "li", "ol", "p", "tr", "ul"})
     _SKIP_TAGS = frozenset({"script", "style", "template"})
+    _VOID_TAGS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -848,18 +871,21 @@ class _BoundedHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self._token()
-        self.depth += 1
-        if self.depth > MAX_HTML_DEPTH:
-            raise _invalid()
         lowered = tag.casefold()
+        if lowered not in self._VOID_TAGS:
+            self.depth += 1
+            if self.depth > MAX_HTML_DEPTH:
+                raise _invalid()
         if lowered in self._SKIP_TAGS:
             self.skip_depth += 1
         elif not self.skip_depth and lowered in self._BREAK_TAGS:
             self.parts.append("\n")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
-        self.handle_endtag(tag)
+        self._token()
+        lowered = tag.casefold()
+        if not self.skip_depth and lowered in self._BREAK_TAGS:
+            self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         self._token()
@@ -868,7 +894,8 @@ class _BoundedHTMLParser(HTMLParser):
             self.skip_depth -= 1
         elif not self.skip_depth and lowered in self._BREAK_TAGS:
             self.parts.append("\n")
-        self.depth = max(0, self.depth - 1)
+        if lowered not in self._VOID_TAGS:
+            self.depth = max(0, self.depth - 1)
 
     def handle_data(self, data: str) -> None:
         self._token()
@@ -913,7 +940,13 @@ class _LanguageParser(_BoundedHTMLParser):
 
 
 def sanitize_html(value: str) -> str:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_HTML_FIELD_BYTES:
+    if not isinstance(value, str):
+        raise _invalid()
+    try:
+        encoded_length = len(value.encode("utf-8", errors="strict"))
+    except UnicodeError:
+        raise _invalid() from None
+    if encoded_length > MAX_HTML_FIELD_BYTES:
         raise _invalid()
     parser = _BoundedHTMLParser()
     _feed_parser(parser, value)
@@ -962,11 +995,28 @@ def _load_json(body: bytes) -> object:
 
     try:
         text = body.decode("utf-8", errors="strict")
-        return json.loads(
+        value = json.loads(
             text, object_pairs_hook=unique_object, parse_constant=reject_constant
         )
+        _validate_json_unicode(value)
+        return value
     except (UnicodeError, ValueError, RecursionError):
         raise _invalid() from None
+
+
+def _validate_json_unicode(value: object) -> None:
+    """Reject JSON strings that cannot be represented as valid UTF-8."""
+    if isinstance(value, str):
+        value.encode("utf-8", errors="strict")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_unicode(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key.encode("utf-8", errors="strict")
+            _validate_json_unicode(item)
 
 
 def _decode_content(body: bytes, headers: Mapping[str, str]) -> bytes:

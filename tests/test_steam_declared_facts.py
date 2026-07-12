@@ -194,6 +194,56 @@ def test_rate_limit_honors_bounded_retry_after_case_insensitively() -> None:
     assert raised.value.retry_after_seconds == 45
 
 
+@pytest.mark.parametrize(
+    ("status", "code"), [(429, "RATE_LIMITED"), (503, "PROVIDER_UNAVAILABLE")]
+)
+def test_fixed_transport_classifies_retryable_status_before_reading_body(
+    monkeypatch: pytest.MonkeyPatch, status: int, code: str
+) -> None:
+    class ErrorResponse:
+        def __init__(self) -> None:
+            self.status = status
+            self.read_called = False
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return [("Content-Encoding", "unsupported"), ("Retry-After", "17")]
+
+        def read(self, size: int) -> bytes:
+            self.read_called = True
+            raise AssertionError("provider error bodies must not be read")
+
+    response = ErrorResponse()
+
+    class Connection:
+        def __init__(self, host: str, *, timeout: float) -> None:
+            pass
+
+        def request(
+            self, method: str, path: str, *, headers: Mapping[str, str]
+        ) -> None:
+            pass
+
+        def getresponse(self) -> ErrorResponse:
+            return response
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(subject.http.client, "HTTPSConnection", Connection)
+
+    with pytest.raises(SteamDeclaredFactsError) as raised:
+        subject.FixedHttpsTransport().request(
+            host=subject.STEAM_STORE_HOST,
+            path="/api/appdetails?appids=400&cc=US&l=english",
+            headers={},
+            timeout=1.0,
+        )
+
+    assert raised.value.code == code
+    assert raised.value.retry_after_seconds == 17
+    assert response.read_called is False
+
+
 @pytest.mark.parametrize("retry_after", ["-1", "86401", "1.5", "999999", "soon"])
 def test_invalid_retry_after_is_not_retained(retry_after: str) -> None:
     client, _ = client_for(HttpResponse(429, b"", {"retry-after": retry_after}))
@@ -229,6 +279,32 @@ def test_json_and_envelope_are_strict(body: bytes) -> None:
     client, _ = client_for(HttpResponse(200, body, JSON_HEADERS))
     with pytest.raises(SteamDeclaredFactsError, match="PROVIDER_RESPONSE_INVALID"):
         client.fetch(400, country="US", language="english")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        b'"minimum":"\\ud800"',
+        b'"minimum":"\\udfff"',
+        b'"\\ud800":"discarded"',
+    ],
+)
+def test_escaped_lone_surrogates_are_typed_provider_errors(field: bytes) -> None:
+    body = (
+        b'{"400":{"success":true,"data":{"steam_appid":400,'
+        b'"platforms":{"windows":true,"mac":false,"linux":true},'
+        b'"pc_requirements":{'
+        + field
+        + b'},"mac_requirements":{},"linux_requirements":{},'
+        b'"supported_languages":"English","categories":[]}}}'
+    )
+    client, _ = client_for(HttpResponse(200, body, JSON_HEADERS))
+
+    with pytest.raises(SteamDeclaredFactsError) as raised:
+        client.fetch(400, country="US", language="english")
+
+    assert raised.value.code == "PROVIDER_RESPONSE_INVALID"
+    assert raised.value.retryable is False
 
 
 def valid_data(**updates: object) -> bytes:
@@ -314,6 +390,13 @@ def test_sanitizer_does_not_double_unescape_encoded_markup() -> None:
     assert sanitize_html("&lt;script&gt;kept as text&lt;/script&gt;") == (
         "<script>kept as text</script>"
     )
+
+
+def test_sanitizer_void_elements_do_not_consume_nesting_depth() -> None:
+    value = "<div>" * subject.MAX_HTML_DEPTH + "<img><input><br>Safe"
+    value += "</div>" * subject.MAX_HTML_DEPTH
+
+    assert sanitize_html(value) == "Safe"
 
 
 @pytest.mark.parametrize(
