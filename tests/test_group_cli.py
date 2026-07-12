@@ -272,6 +272,32 @@ def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
     assert value["completeness"]["stale_capabilities"] == ["owned.visible.read"]
 
 
+def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    path = tmp_path / "steam-agent.sqlite3"
+    with Storage(path) as storage:
+        storage._connection.execute(  # noqa: SLF001
+            "UPDATE sync_runs SET promoted=0 WHERE capability='owned.visible.read'"
+        )
+        storage._connection.commit()  # noqa: SLF001
+    refs = (
+        cli.MemberRef("account", "primary"),
+        cli.MemberRef("synthetic", "guest"),
+    )
+    with Storage(path, readonly=True) as storage:
+        ownership, missing, stale, any_evidence = cli._group_ownership_by_app(  # noqa: SLF001
+            storage, refs=refs, appids=(400,)
+        )
+
+    assert ownership[400][0].state == "unknown"
+    assert missing is False
+    assert stale is True
+    assert any_evidence is False
+
+
 def test_group_with_only_unsynced_accounts_is_unavailable(
     tmp_path: Path, capsys: object
 ) -> None:

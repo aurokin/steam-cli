@@ -2548,6 +2548,7 @@ def _group_ownership_by_app(
         authoritative = (
             snapshot.latest is not None
             and snapshot.latest.status == "complete"
+            and snapshot.latest.promoted
             and age is not None
             and 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
         )
