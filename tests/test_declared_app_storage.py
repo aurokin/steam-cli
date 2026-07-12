@@ -17,6 +17,7 @@ from steam_agent.storage import Machine, Storage
 T0 = "2026-07-10T12:00:00Z"
 T1 = "2026-07-10T12:01:00Z"
 T2 = "2026-07-10T12:02:00Z"
+T3 = "2026-07-10T12:03:00Z"
 FIXTURES = Path(__file__).parent / "fixtures" / "steam_declared_facts"
 
 
@@ -582,8 +583,8 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
     configured: tuple[Storage, int],
 ) -> None:
     storage, account_id = configured
-    first, _, _ = begin(storage, account_id, [400], at=T0)
     future = "2100-07-11T12:01:00Z"
+    first, _, _ = begin(storage, account_id, [400], at=future)
     storage.record_declared_app_result(
         first.id,
         account_id=account_id,
@@ -598,6 +599,9 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
 
     assert candidates == (400,)
     assert targeted == (400,)
+    assert storage._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM sync_runs WHERE id=?", (first.id,)
+    ).fetchone()[0] == 0
     storage.record_declared_app_result(
         second.id,
         account_id=account_id,
@@ -607,6 +611,28 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
         observed_at=T2,
     )
     storage.finish_declared_app_sync(second.id, completed_at=T2)
+    failure, _, targeted = storage.begin_declared_app_sync(
+        account_id=account_id,
+        machine_id="desktop",
+        demanded_appids=[400],
+        country="US",
+        language="english",
+        max_items=1,
+        skip_fresh_terminal=False,
+        started_at=T3,
+        disclosure_version="m5-v1",
+    )
+    assert targeted == (400,)
+    storage.record_declared_app_result(
+        failure.id,
+        account_id=account_id,
+        appid=400,
+        state="failed",
+        error_code="NETWORK_ERROR",
+        observed_at=T3,
+    )
+    storage.finish_declared_app_sync(failure.id, completed_at=T3)
+
     current = storage._connection.execute(  # noqa: SLF001
         """SELECT observed_at,promoted_sync_run_id FROM declared_app_current
            WHERE appid=400 AND country='US' AND language='english'"""
@@ -615,6 +641,77 @@ def test_future_dated_current_does_not_suppress_refresh_after_clock_correction(
         "observed_at": T2,
         "promoted_sync_run_id": second.id,
     }
+    snapshot = storage.read_declared_app_snapshot(
+        account_id=account_id,
+        machine_id="desktop",
+        country="US",
+        language="english",
+        appids=[400],
+        as_of=T3,
+    )
+    assert snapshot["items"][0]["observed_at"] == T2
+    assert snapshot["latest_demand"][0]["sync_run_id"] == failure.id
+    assert snapshot["latest_demand"][0]["state"] == "failed"
+    assert storage._connection.execute(  # noqa: SLF001
+        """SELECT COUNT(*) FROM declared_app_sync_demand
+           WHERE appid=400 AND country='US' AND language='english'
+             AND observed_at>?""",
+        (T3,),
+    ).fetchone()[0] == 0
+    assert storage._connection.execute(  # noqa: SLF001
+        """SELECT COUNT(*) FROM declared_app_observations
+           WHERE appid=400 AND country='US' AND language='english'
+             AND observed_at>?""",
+        (T3,),
+    ).fetchone()[0] == 0
+
+
+def test_future_quarantine_is_exact_and_preserves_other_subjects(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    future = "2100-07-11T12:01:00Z"
+    broad, _, _ = begin(storage, account_id, [400, 620], at=future)
+    for appid in (400, 620):
+        storage.record_declared_app_result(
+            broad.id,
+            account_id=account_id,
+            appid=appid,
+            state="ready",
+            facts=payload(appid),
+            observed_at=future,
+        )
+    storage.finish_declared_app_sync(broad.id, completed_at=future)
+
+    corrective, _, targeted = begin(storage, account_id, [400], at=T2)
+
+    assert targeted == (400,)
+    assert storage._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM sync_runs WHERE id=?", (broad.id,)
+    ).fetchone()[0] == 1
+    remaining = storage._connection.execute(  # noqa: SLF001
+        """SELECT appid FROM declared_app_sync_demand
+           WHERE sync_run_id=? ORDER BY appid""",
+        (broad.id,),
+    ).fetchall()
+    assert [int(row[0]) for row in remaining] == [620]
+    assert storage._connection.execute(  # noqa: SLF001
+        """SELECT COUNT(*) FROM declared_app_observations
+           WHERE sync_run_id=? AND appid=620""",
+        (broad.id,),
+    ).fetchone()[0] == 1
+    assert storage._connection.execute(  # noqa: SLF001
+        "SELECT COUNT(*) FROM declared_app_current WHERE appid=400"
+    ).fetchone()[0] == 0
+    other_current = storage._connection.execute(  # noqa: SLF001
+        """SELECT observed_at,promoted_sync_run_id FROM declared_app_current
+           WHERE appid=620 AND country='US' AND language='english'"""
+    ).fetchone()
+    assert dict(other_current) == {
+        "observed_at": future,
+        "promoted_sync_run_id": broad.id,
+    }
+    storage.finish_declared_app_sync(corrective.id, completed_at=T2)
 
 
 def test_expired_declared_rows_are_not_exposed_by_cache_reads(
