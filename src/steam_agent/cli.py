@@ -1813,15 +1813,20 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
         appids = tuple(sorted(set(supplied_appids)))
         if len(appids) > 10_000:
             raise ValueError("compatibility query exceeds the bounded AppID maximum")
-        if re.fullmatch(r"[A-Z]{2}", args.country) is None:
-            raise ValueError("country must be an uppercase ISO-style code")
-        if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", args.language) is None:
-            raise ValueError("language is invalid")
+        # Compatibility facts use the same closed request-context vocabulary
+        # as their provider adapter.  Accepting an arbitrary language slug here
+        # would create a cache key the sync boundary can never populate.
+        SteamDeclaredFactsRequestContext(args.country, args.language)
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", args.account) is None:
+            raise ValueError("account alias is invalid")
         requirements = tuple(_compatibility_requirement(item) for item in args.require)
         overrides = tuple(
             _compatibility_override(item, requested=set(appids), applied_at=now)
             for item in args.override
         )
+        override_keys = tuple((item.appid, item.gate) for item in overrides)
+        if len(override_keys) != len(set(override_keys)):
+            raise ValueError("compatibility overrides must be unique")
     except ValueError:
         return _emit_error(
             args,
@@ -1876,11 +1881,14 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
                 appids,
                 now,
             )
-        query = assess_compatibility_snapshot(
+        # Reconstruct once without caller overrides.  That keeps malformed
+        # persisted evidence classified as DATABASE_ERROR while giving us the
+        # exact evaluated gate set against which to validate request overrides.
+        query_without_overrides = assess_compatibility_snapshot(
             snapshot,
             target=target,
             requirements=requirements,
-            overrides=overrides,
+            overrides=(),
         )
     except (sqlite3.DatabaseError, StorageError):
         return _emit_error(
@@ -1908,6 +1916,46 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
                 "the current steam-agent version, then retry the assessment."
             ),
         )
+
+    evaluated_gates = {
+        (result.appid, gate.name)
+        for result in query_without_overrides.assessment.results
+        for gate in result.gates
+    }
+    if any((item.appid, item.gate) not in evaluated_gates for item in overrides):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="A compatibility override names a gate that was not evaluated.",
+            remediation=(
+                "Use --explain without overrides to inspect the gates evaluated "
+                "for each requested AppID, then name one of those exact gates."
+            ),
+            exit_code=2,
+        )
+    if overrides:
+        try:
+            query = assess_compatibility_snapshot(
+                snapshot,
+                target=target,
+                requirements=requirements,
+                overrides=overrides,
+            )
+        except ValueError:
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="A compatibility override is invalid for this assessment.",
+                remediation=(
+                    "Use --explain without overrides to inspect the evaluated "
+                    "gates, then provide unique documented override expressions."
+                ),
+                exit_code=2,
+            )
+    else:
+        query = query_without_overrides
 
     # The process envelope reports completeness for the active M5 query
     # contract.  Keep future ready/operations evidence and Deck-inapplicable

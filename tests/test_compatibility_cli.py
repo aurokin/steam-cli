@@ -592,6 +592,137 @@ def test_assess_malformed_request_is_not_misclassified_as_corrupt_cache(
     assert "Resync" not in value["error"]["remediation"]
 
 
+@pytest.mark.parametrize("language", ["en", "klingon"])
+def test_assess_rejects_unsupported_language_before_opening_cache(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    language: str,
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "Storage", forbid)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        language,
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_assess_rejects_malformed_account_alias_before_opening_cache(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "Storage", forbid)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "has space",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_assess_rejects_override_for_gate_not_evaluated(
+    tmp_path: Path, capsys: object
+) -> None:
+    configure(tmp_path)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--override",
+        "400:manual-check:nonexistent_gate=pass",
+    )
+
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+    assert "not evaluated" in value["error"]["message"]
+
+
+def test_assess_corrupt_cache_precedes_semantic_override_validation(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    current = snapshot.system_profile.current
+    assert current is not None
+    corrupt = replace(
+        snapshot,
+        system_profile=replace(
+            snapshot.system_profile,
+            current=replace(current, observed_at="not-a-timestamp"),
+        ),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        Storage,
+        "read_compatibility_snapshot",
+        lambda *_args, **_kwargs: corrupt,
+    )
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--override",
+        "400:manual-check:nonexistent_gate=pass",
+    )
+
+    assert code == 1
+    assert stderr == ""
+    assert value["error"]["code"] == "DATABASE_ERROR"
+    assert "Resync" in value["error"]["remediation"]
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
