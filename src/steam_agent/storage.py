@@ -1670,6 +1670,54 @@ class Storage:
             for row in rows
         )
 
+    def read_group_family_for_appids(
+        self,
+        recipient: MemberRef,
+        *,
+        appids: list[int] | tuple[int, ...],
+    ) -> tuple[GroupFamilyAssertion, ...]:
+        """Read only explicitly bounded family edges for one participant."""
+
+        selected = _catalog_appids(appids)
+        if not selected or len(selected) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("group family AppIDs must be non-empty and bounded")
+        profile = self.get_group_profile(recipient)
+        if profile is None or profile.id is None:
+            return ()
+        rows: list[sqlite3.Row] = []
+        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
+            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self._connection.execute(
+                    f"""SELECT f.appid, f.state, f.updated_at, source.kind,
+                               COALESCE(source.alias, a.alias) AS source_alias
+                        FROM group_family_current f
+                        JOIN group_profiles source ON source.id=f.source_profile_id
+                        LEFT JOIN accounts a ON a.id=source.account_id
+                        WHERE f.recipient_profile_id=?
+                          AND f.appid IN ({placeholders})""",
+                    (profile.id, *chunk),
+                )
+            )
+        return tuple(
+            GroupFamilyAssertion(
+                recipient,
+                MemberRef(row["kind"], row["source_alias"]),
+                int(row["appid"]),
+                row["state"],
+                row["updated_at"],
+            )
+            for row in sorted(
+                rows,
+                key=lambda row: (
+                    int(row["appid"]),
+                    str(row["kind"]),
+                    str(row["source_alias"]).casefold(),
+                ),
+            )
+        )
+
     def set_group_app_assertion(
         self,
         ref: MemberRef,
@@ -1767,6 +1815,52 @@ class Storage:
                 row["updated_at"],
             )
             for row in rows
+        )
+
+    def read_group_app_assertions_for_appids(
+        self,
+        ref: MemberRef,
+        *,
+        appids: list[int] | tuple[int, ...],
+    ) -> tuple[GroupAppAssertion, ...]:
+        """Read only explicitly bounded app assertions for one participant."""
+
+        selected = _catalog_appids(appids)
+        if not selected or len(selected) > _DECLARED_APP_MAX_DEMAND:
+            raise ValueError("group assertion AppIDs must be non-empty and bounded")
+        profile = self.get_group_profile(ref)
+        if profile is None or profile.id is None:
+            return ()
+        rows: list[sqlite3.Row] = []
+        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
+            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self._connection.execute(
+                    f"""SELECT appid, fact_kind, slug, state,
+                               value_integer, updated_at
+                        FROM group_app_assertion_current
+                        WHERE profile_id=? AND appid IN ({placeholders})""",
+                    (profile.id, *chunk),
+                )
+            )
+        return tuple(
+            GroupAppAssertion(
+                ref,
+                int(row["appid"]),
+                _group_fact_name(row["fact_kind"], row["slug"]),
+                row["state"],
+                row["value_integer"],
+                row["updated_at"],
+            )
+            for row in sorted(
+                rows,
+                key=lambda row: (
+                    int(row["appid"]),
+                    str(row["fact_kind"]),
+                    str(row["slug"]),
+                ),
+            )
         )
 
     def _group_profile_row(self, ref: MemberRef) -> sqlite3.Row | None:

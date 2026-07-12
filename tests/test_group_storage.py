@@ -247,6 +247,36 @@ def test_family_edge_requires_current_disclosure_from_source_profile(tmp_path) -
         assert storage.read_group_family(GUEST) == (edge,)
 
 
+def test_group_fact_reads_are_bounded_to_requested_appids(tmp_path) -> None:
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        synthetic(storage, "guest")
+        synthetic(storage, "owner")
+        for appid in (10, 20):
+            storage.set_group_family(
+                GUEST,
+                source=OWNER,
+                appid=appid,
+                state="available",
+                updated_at=T0,
+            )
+            storage.set_group_app_assertion(
+                GUEST,
+                appid=appid,
+                fact="trait:user:cozy",
+                value="present",
+                updated_at=T0,
+            )
+
+        assert [
+            item.appid
+            for item in storage.read_group_family_for_appids(GUEST, appids=[10])
+        ] == [10]
+        assert [
+            item.appid
+            for item in storage.read_group_app_assertions_for_appids(GUEST, appids=[10])
+        ] == [10]
+
+
 @pytest.mark.parametrize(
     ("fact", "value", "state", "stored"),
     (

@@ -2265,6 +2265,16 @@ def _group_ref(raw: str) -> MemberRef:
     return MemberRef(kind, alias)  # type: ignore[arg-type]
 
 
+_GROUP_BACKUP_RETENTION_WARNING = (
+    "Replicas, snapshots, and user-controlled backups may retain group data "
+    "after local deletion."
+)
+
+
+def _group_privacy_context(**values: Any) -> dict[str, Any]:
+    return {**values, "backup_retention_warning": _GROUP_BACKUP_RETENTION_WARNING}
+
+
 def _group_invalid(args: argparse.Namespace, command: str, message: str) -> int:
     return _emit_error(
         args,
@@ -2314,6 +2324,7 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                     return _emit_success(
                         args,
                         command=command,
+                        context=_group_privacy_context(),
                         data={
                             "profile": {
                                 "ordinal": 0,
@@ -2331,6 +2342,7 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                     return _emit_success(
                         args,
                         command=command,
+                        context=_group_privacy_context(),
                         data={
                             "profile": {
                                 "ordinal": 0,
@@ -2348,6 +2360,7 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                     return _emit_success(
                         args,
                         command=command,
+                        context=_group_privacy_context(),
                         data={
                             "profiles": [
                                 {
@@ -2372,6 +2385,7 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                 return _emit_success(
                     args,
                     command=command,
+                    context=_group_privacy_context(),
                     completeness_value=completeness(
                         CompletenessStatus.COMPLETE,
                         warnings=[
@@ -2459,7 +2473,12 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
                             ref, appid=appid, fact=args.fact
                         ),
                     }
-            return _emit_success(args, command=command, data=data)
+            return _emit_success(
+                args,
+                command=command,
+                context=_group_privacy_context(),
+                data=data,
+            )
     except (AccountConflict, StorageError, TypeError, ValueError):
         return _group_invalid(args, command, "The group profile operation is invalid.")
 
@@ -2914,13 +2933,18 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 )
             )
             family_by_member = (
-                {member: storage.read_group_family(member) for member in members}
+                {
+                    member: storage.read_group_family_for_appids(member, appids=appids)
+                    for member in members
+                }
                 if declared is not None
                 else {}
             )
             assertions_by_member = (
                 {
-                    member: storage.read_group_app_assertions(member)
+                    member: storage.read_group_app_assertions_for_appids(
+                        member, appids=appids
+                    )
                     for member in members
                 }
                 if declared is not None
@@ -2983,15 +3007,15 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
         return _emit_success(
             args,
             command=command,
-            context={
-                "account_context": True,
-                "machine_context": True,
-                "country": country,
-                "language": args.language,
-                "cache_only": True,
-                "member_count": len(members),
-                "copy_source_count": len(source_refs),
-            },
+            context=_group_privacy_context(
+                account_context=True,
+                machine_context=True,
+                country=country,
+                language=args.language,
+                cache_only=True,
+                member_count=len(members),
+                copy_source_count=len(source_refs),
+            ),
             completeness_value=_group_query_completeness(
                 missing_declared=missing_declared,
                 stale_declared=stale_declared,
@@ -3119,10 +3143,24 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_any_evidence,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
             family_by_member = {
-                member: storage.read_group_family(member) for member in members
+                member: (
+                    storage.read_group_family_for_appids(
+                        member, appids=candidate_appids
+                    )
+                    if candidate_appids
+                    else ()
+                )
+                for member in members
             }
             assertions_by_member = {
-                member: storage.read_group_app_assertions(member) for member in members
+                member: (
+                    storage.read_group_app_assertions_for_appids(
+                        member, appids=candidate_appids
+                    )
+                    if candidate_appids
+                    else ()
+                )
+                for member in members
             }
             evaluations = {
                 appid: _evaluate_group_app(
@@ -3247,17 +3285,17 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
         return _emit_success(
             args,
             command=command,
-            context={
-                "account_context": True,
-                "machine_context": True,
-                "country": country,
-                "language": args.language,
-                "scope": args.scope,
-                "cache_only": True,
-                "network_used": False,
-                "member_count": len(members),
-                "copy_source_count": len(source_refs),
-            },
+            context=_group_privacy_context(
+                account_context=True,
+                machine_context=True,
+                country=country,
+                language=args.language,
+                scope=args.scope,
+                cache_only=True,
+                network_used=False,
+                member_count=len(members),
+                copy_source_count=len(source_refs),
+            ),
             completeness_value=_group_query_completeness(
                 missing_declared=missing_declared,
                 stale_declared=len(stale_declared_appids),

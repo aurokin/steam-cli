@@ -162,6 +162,10 @@ def test_profile_mutations_require_disclosure_and_destructive_confirmation(
         "kind": "synthetic",
         "storage_acknowledged": True,
     }
+    assert (
+        "backups may retain group data"
+        in value["context"]["backup_retention_warning"].casefold()
+    )
     assert "guest" not in json.dumps(value).casefold()
 
     code, value, _ = invoke(tmp_path, capsys, "profiles", "delete", "synthetic:Guest")
@@ -223,6 +227,10 @@ def test_group_ownership_uses_visible_positive_and_synthetic_assertions_only(
     assert "guest" not in rendered
     assert "765611" not in rendered
     assert "steam_web_api" not in rendered
+    assert (
+        "backups may retain group data"
+        in value["context"]["backup_retention_warning"].casefold()
+    )
 
 
 def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
