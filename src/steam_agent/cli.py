@@ -2263,7 +2263,8 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
         and not owned_scope_stale
         else (
             CompletenessStatus.UNAVAILABLE
-            if missing == len(items) or (owned_scope_missing and not candidates)
+            if (items and missing == len(items))
+            or (owned_scope_missing and not candidates)
             else CompletenessStatus.PARTIAL
         )
     )
@@ -2594,7 +2595,11 @@ def _group_ownership_by_app(
     synthetic_states = {
         ref: {
             assertion.appid: assertion.state
-            for assertion in storage.read_group_ownership_for_appids(ref, appids=appids)
+            for assertion in (
+                storage.read_group_ownership_for_appids(ref, appids=appids)
+                if appids
+                else ()
+            )
         }
         for ref in refs
         if ref.kind == "synthetic"

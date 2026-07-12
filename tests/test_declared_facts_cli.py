@@ -651,6 +651,7 @@ def test_played_free_rows_do_not_enter_m6_known_or_library_scope(
     )
     assert code == 0
     assert queried["data"]["candidate_count"] == 0
+    assert queried["completeness"]["status"] == "complete"
 
 
 def test_contract_drift_disables_transport_until_retry_time(

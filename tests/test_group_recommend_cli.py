@@ -97,6 +97,43 @@ def test_preference_seed_bound_is_rejected_before_storage(
     assert value["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_empty_bounded_recommendation_scope_returns_empty_success(
+    tmp_path: Path, capsys: object
+) -> None:
+    setup(tmp_path)
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "recommend",
+        "--scope",
+        "wishlist",
+        "--limit",
+        "10",
+        "--member",
+        "synthetic:alpha",
+        "--member",
+        "synthetic:beta",
+        "--context-account",
+        "primary",
+        "--context-machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+        "--objective",
+        "min-copies",
+    )
+
+    assert code == 0
+    assert value["data"]["candidate_count"] == 0
+    assert value["data"]["results"] == []
+
+
 def invoke(tmp_path: Path, capsys: object, *arguments: str):
     code = cli.main(["--data-dir", str(tmp_path), *arguments])
     captured = capsys.readouterr()  # type: ignore[attr-defined]
