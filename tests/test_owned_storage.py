@@ -138,6 +138,107 @@ def test_v18_upgrade_backfills_empty_ready_achievement_projection(
         ).fetchone()[0] == 0
 
 
+def test_v19_upgrade_repairs_unpromoted_empty_achievement_projection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v19-invalid-achievement-projection.sqlite3"
+    with sqlite3.connect(path) as connection:
+        _apply_migrations_through(connection, 19)
+        account_id = int(
+            connection.execute(
+                """INSERT INTO accounts(
+                       alias, provider, provider_account_id, source_kind,
+                       created_at, updated_at
+                   ) VALUES ('primary', 'steam', '76561198000000000',
+                             'upgrade-test', ?, ?)""",
+                (T0, T0),
+            ).lastrowid
+        )
+        connection.executemany(
+            """INSERT INTO steam_apps(appid, name, app_type, updated_at)
+               VALUES (?, ?, 'game', ?)""",
+            ((10, "Empty Game", T0), (20, "Nonempty Game", T0)),
+        )
+        valid_empty_run = int(
+            connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, completed_at,
+                       status, promoted, records_seen
+                   ) VALUES ('steam_web_api', 'achievements.read', ?, ?, ?,
+                             'complete', 1, 1)""",
+                (account_id, T0, T1),
+            ).lastrowid
+        )
+        invalid_newer_run = int(
+            connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, completed_at,
+                       status, promoted, records_seen, error_code
+                   ) VALUES ('steam_web_api', 'achievements.read', ?, ?, ?,
+                             'failed', 0, 1, 'SYNC_INTERRUPTED')""",
+                (account_id, T2, T3),
+            ).lastrowid
+        )
+        valid_nonempty_run = int(
+            connection.execute(
+                """INSERT INTO sync_runs(
+                       provider, capability, account_id, started_at, completed_at,
+                       status, promoted, records_seen
+                   ) VALUES ('steam_web_api', 'achievements.read', ?, ?, ?,
+                             'complete', 1, 1)""",
+                (account_id, T0, T1),
+            ).lastrowid
+        )
+        connection.executemany(
+            """INSERT INTO achievement_sync_demand(
+                   sync_run_id, account_id, appid, ordinal, targeted, evaluated,
+                   state, observed_at
+               ) VALUES (?, ?, ?, 0, 1, 1, 'ready', ?)""",
+            (
+                (valid_empty_run, account_id, 10, T0),
+                (invalid_newer_run, account_id, 10, T2),
+                (valid_nonempty_run, account_id, 20, T0),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO achievement_player_current(
+                   account_id, appid, api_name, achieved, unlock_time_unix,
+                   observed_at, promoted_sync_run_id
+               ) VALUES (?, 20, 'KEEP', 1, 1, ?, ?)""",
+            (account_id, T0, valid_nonempty_run),
+        )
+        # Reproduce the marker written by the original version 019.
+        connection.executemany(
+            """INSERT INTO achievement_player_projection(
+                   account_id, appid, observed_at, promoted_sync_run_id
+               ) VALUES (?, ?, ?, ?)""",
+            (
+                (account_id, 10, T2, invalid_newer_run),
+                (account_id, 20, T0, valid_nonempty_run),
+            ),
+        )
+        connection.commit()
+
+    with Storage(path) as storage:
+        projections = storage._connection.execute(
+            """SELECT appid, observed_at, promoted_sync_run_id
+               FROM achievement_player_projection
+               WHERE account_id=? ORDER BY appid""",
+            (account_id,),
+        ).fetchall()
+        assert [tuple(row) for row in projections] == [
+            (10, T0, valid_empty_run),
+            (20, T0, valid_nonempty_run),
+        ]
+        player = storage._connection.execute(
+            """SELECT api_name, promoted_sync_run_id
+               FROM achievement_player_current
+               WHERE account_id=? AND appid=20""",
+            (account_id,),
+        ).fetchone()
+        assert tuple(player) == ("KEEP", valid_nonempty_run)
+
+
 def _owned(
     appid: int,
     at: str,
@@ -202,7 +303,7 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (19,)
+        ).fetchone() == (20,)
 
 
 def test_populated_v5_upgrade_backfills_steam_application_identities(
@@ -241,7 +342,7 @@ def test_populated_v5_upgrade_backfills_steam_application_identities(
         assert storage.get_account("primary") is not None
         assert storage._connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 19
+        ).fetchone()[0] == 20
 
 
 def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
@@ -415,7 +516,7 @@ def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
         ).fetchone()[0] == 2
         assert storage._connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 19
+        ).fetchone()[0] == 20
 
 
 def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
