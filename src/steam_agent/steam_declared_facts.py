@@ -242,7 +242,9 @@ class DeclaredText:
     text: str | None
 
     def __post_init__(self) -> None:
-        if self.state not in {"declared", "undeclared", "unknown"}:
+        if not isinstance(self.state, str) or self.state not in {
+            "declared", "undeclared", "unknown"
+        }:
             raise ValueError("invalid declared-text state")
         if (self.state == "declared") != (self.text is not None):
             raise ValueError("declared text and state disagree")
@@ -260,12 +262,16 @@ class RequirementDeclaration:
     recommended: str | None
 
     def __post_init__(self) -> None:
-        if self.platform not in {"windows", "macos", "linux"}:
+        if not isinstance(self.platform, str) or self.platform not in {
+            "windows", "macos", "linux"
+        }:
             raise ValueError("invalid requirement platform")
         has_text = self.minimum is not None or self.recommended is not None
         if (self.state == "declared") != has_text:
             raise ValueError("requirement declaration and state disagree")
-        if self.state not in {"declared", "undeclared", "unknown"}:
+        if not isinstance(self.state, str) or self.state not in {
+            "declared", "undeclared", "unknown"
+        }:
             raise ValueError("invalid requirement state")
         for value in (self.minimum, self.recommended):
             if value is not None and (
@@ -289,7 +295,9 @@ class PlatformDeclarations:
             not isinstance(value, bool) for value in values
         ):
             raise ValueError("declared platforms require booleans")
-        if self.state not in {"declared", "unknown"}:
+        if not isinstance(self.state, str) or self.state not in {
+            "declared", "unknown"
+        }:
             raise ValueError("invalid platform state")
 
 
@@ -299,7 +307,9 @@ class LanguageDeclaration:
     full_audio: bool
 
     def __post_init__(self) -> None:
-        if self.code not in set(_LANGUAGE_NAMES.values()) or not isinstance(
+        if not isinstance(self.code, str) or self.code not in set(
+            _LANGUAGE_NAMES.values()
+        ) or not isinstance(
             self.full_audio, bool
         ):
             raise ValueError("invalid language declaration")
@@ -312,7 +322,9 @@ class LanguageDeclarations:
     unrecognized_count: int
 
     def __post_init__(self) -> None:
-        if self.state not in {"declared", "undeclared", "unknown"}:
+        if not isinstance(self.state, str) or self.state not in {
+            "declared", "undeclared", "unknown"
+        }:
             raise ValueError("invalid language state")
         if self.state != "declared" and self.items:
             raise ValueError("non-declared languages carry items")
@@ -337,7 +349,9 @@ class CategoryDeclarations:
     unknown_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if self.state not in {"declared", "undeclared", "unknown"}:
+        if not isinstance(self.state, str) or self.state not in {
+            "declared", "undeclared", "unknown"
+        }:
             raise ValueError("invalid category state")
         if self.state != "declared" and (self.known_slugs or self.unknown_ids):
             raise ValueError("non-declared categories carry values")
@@ -405,7 +419,10 @@ class SteamDeclaredFacts:
             "windows",
         ):
             raise ValueError("requirements must contain each platform in order")
-        if self.controller_support not in {None, "full", "partial"}:
+        if self.controller_support is not None and (
+            not isinstance(self.controller_support, str)
+            or self.controller_support not in {"full", "partial"}
+        ):
             raise ValueError("invalid controller support")
         if (
             self.source_locator != "steam_store_appdetails"
@@ -426,7 +443,9 @@ class SteamDeclaredFactsResult:
 
     def __post_init__(self) -> None:
         _validate_appid(self.appid)
-        if self.state not in {"ready", "not_found"} or (
+        if not isinstance(self.state, str) or self.state not in {
+            "ready", "not_found"
+        } or (
             self.state == "ready"
         ) != (self.facts is not None):
             raise ValueError("declared-fact result is invalid")

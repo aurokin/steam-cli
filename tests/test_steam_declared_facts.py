@@ -12,6 +12,7 @@ import steam_agent.steam_declared_facts as subject
 from steam_agent.steam_declared_facts import (
     CATEGORY_SLUGS,
     CategoryDeclarations,
+    DeclaredText,
     HttpResponse,
     LanguageDeclaration,
     LanguageDeclarations,
@@ -456,6 +457,8 @@ def test_category_map_is_exhaustive_for_accepted_accessibility_ids() -> None:
 
 
 def test_value_object_invariants_reject_contradictions() -> None:
+    with pytest.raises(ValueError):
+        DeclaredText([], None)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         PlatformDeclarations("unknown", False, None, None)
     with pytest.raises(ValueError):
