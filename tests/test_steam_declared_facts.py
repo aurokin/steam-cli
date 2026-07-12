@@ -35,6 +35,12 @@ FIXTURES = Path(__file__).parent / "fixtures" / "steam_declared_facts"
 JSON_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
 
 
+def test_provisional_multiplayer_mapping_keeps_only_probe_verified_ids() -> None:
+    assert CATEGORY_SLUGS[48] == "lan_co_op"
+    assert CATEGORY_SLUGS[49] == "pvp"
+    assert 47 not in MULTIPLAYER_CATEGORY_SLUGS
+
+
 class FakeTransport:
     def __init__(self, response: HttpResponse) -> None:
         self.response = response
