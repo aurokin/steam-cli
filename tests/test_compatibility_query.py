@@ -466,6 +466,52 @@ def test_unevaluated_declared_skip_does_not_stale_last_good(error_code: str) -> 
     assert native.original_freshness == "fresh"
 
 
+def test_not_found_cache_skip_preserves_retained_last_good_conflict() -> None:
+    snapshot = dict(
+        declared(
+            10,
+            observed_at=NOW - timedelta(days=8),
+            demand_state="unevaluated",
+            demand_at=NOW,
+            evaluated=False,
+        )
+    )
+    demand = dict(snapshot["latest_demand"][0])
+    demand["error_code"] = "NOT_FOUND_CACHE"
+    snapshot["latest_demand"] = (demand,)
+
+    item = result(snapshot=snapshot)
+    native = next(gate for gate in item.gates if gate.name == "declared_native_build")
+
+    assert native.original == "unknown"
+    assert "declared_native_build" in item.conflicts
+
+
+@pytest.mark.parametrize(
+    ("current_run_id", "demand_run_id", "expected_freshness"),
+    [(10, 11, "stale"), (10, 9, "fresh"), (None, None, "stale")],
+)
+def test_equal_timestamp_failed_refresh_uses_safe_run_lineage_tiebreaker(
+    current_run_id: int | None,
+    demand_run_id: int | None,
+    expected_freshness: str,
+) -> None:
+    snapshot = dict(
+        declared(10, observed_at=NOW, demand_state="failed", demand_at=NOW)
+    )
+    item_row = dict(snapshot["items"][0])
+    item_row["promoted_sync_run_id"] = current_run_id
+    snapshot["items"] = (item_row,)
+    demand = dict(snapshot["latest_demand"][0])
+    demand["sync_run_id"] = demand_run_id
+    snapshot["latest_demand"] = (demand,)
+
+    item = result(snapshot=snapshot)
+    native = next(gate for gate in item.gates if gate.name == "declared_native_build")
+
+    assert native.original_freshness == expected_freshness
+
+
 def test_newer_evaluated_failure_never_upgrades_expired_last_good() -> None:
     item = result(
         snapshot=declared(

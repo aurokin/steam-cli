@@ -279,6 +279,61 @@ def test_contract_drift_fails_run_sets_global_cooldown_and_is_not_negative_cache
     )
 
 
+def test_terminal_cache_precedes_cooldown_but_expired_negative_does_not(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    ready, _, _ = begin(storage, account_id, [400], at=T0)
+    storage.record_declared_app_result(
+        ready.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=T1,
+    )
+    storage.finish_declared_app_sync(ready.id, completed_at=T1)
+    missing, _, _ = begin(storage, account_id, [570], at=T0)
+    storage.record_declared_app_result(
+        missing.id,
+        account_id=account_id,
+        appid=570,
+        state="not_found",
+        observed_at=T0,
+    )
+    storage.finish_declared_app_sync(missing.id, completed_at=T0)
+    drift, _, _ = begin(storage, account_id, [620], at=T1)
+    storage.record_declared_app_result(
+        drift.id,
+        account_id=account_id,
+        appid=620,
+        state="failed",
+        error_code="PROVIDER_RESPONSE_INVALID",
+        observed_at=T1,
+    )
+    storage.finish_declared_app_sync(drift.id, completed_at=T1)
+
+    cached, candidates, targeted = begin(storage, account_id, [400, 570], at=T2)
+    assert candidates == ()
+    assert targeted == ()
+    assert [row["error_code"] for row in demand_rows(storage, cached.id)] == [
+        "FRESH_LAST_GOOD",
+        "NOT_FOUND_CACHE",
+    ]
+
+    after_negative_expiry, candidates, targeted = begin(
+        storage,
+        account_id,
+        [570],
+        at="2026-07-11T12:00:01Z",
+    )
+    assert candidates == ()
+    assert targeted == ()
+    assert demand_rows(storage, after_negative_expiry.id)[0]["error_code"] == (
+        "PROVIDER_COOLDOWN"
+    )
+
+
 def test_success_false_is_bounded_negative_cache(
     configured: tuple[Storage, int],
 ) -> None:

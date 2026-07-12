@@ -471,7 +471,15 @@ def _declared(
     )
     # A newer exact not-found result and retained last-good declarations are
     # intentionally contradictory, never silently merged into current truth.
-    if demand is not None and demand.get("evaluated") is True and demand.get("state") == "not_found":
+    cached_not_found = (
+        demand is not None
+        and demand.get("evaluated") is False
+        and demand.get("error_code") == "NOT_FOUND_CACHE"
+    )
+    if demand is not None and (
+        (demand.get("evaluated") is True and demand.get("state") == "not_found")
+        or cached_not_found
+    ):
         demand_at = _parse_time(demand.get("observed_at"))
         if demand_at is not None and (observed is None or demand_at >= observed):
             conflict = True
@@ -483,7 +491,23 @@ def _declared(
         demand_at = _parse_time(demand.get("observed_at")) or _parse_time(
             demand.get("started_at")
         )
-        if demand_at is not None and observed is not None and demand_at > observed:
+        current_run_id = item.get("promoted_sync_run_id")
+        demand_run_id = demand.get("sync_run_id")
+        same_time_is_newer_or_ambiguous = (
+            demand_at == observed
+            and (
+                not isinstance(current_run_id, int)
+                or isinstance(current_run_id, bool)
+                or not isinstance(demand_run_id, int)
+                or isinstance(demand_run_id, bool)
+                or demand_run_id > current_run_id
+            )
+        )
+        if (
+            demand_at is not None
+            and observed is not None
+            and (demand_at > observed or same_time_is_newer_or_ambiguous)
+        ):
             if freshness == "fresh":
                 freshness = "stale"
     return facts, observed, freshness, conflict
