@@ -24,6 +24,9 @@ keeps later product and provider choices open until evidence supports them.
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
 | D018 | M2 credential storage boundary | [Accepted: native `keyring` with explicit protected-file fallback](0003-credential-storage.md) | Moderate | Native backend probes, file-safety tests, redaction tests, and M2 capability review |
 | D019 | Preconfigure optional provider API keys before adapter milestones | Implemented; GG.deals active in M3, other adapters remain gated | Easy | Hidden-input tests, provider-isolated references, non-retaining fixed-host probes, and provider terms review |
+| D020 | Explicit feedback, durable rules, and temporary constraint precedence | [Accepted for M4](0007-explicit-feedback-and-constraints.md) | Costly once agents write state | Mutation/clear/snooze, three-valued gate, override, isolation, and deletion tests |
+| D021 | Recommendation recipe and explanation semantics | [Accepted for M4](0008-versioned-recommendation-recipes.md) | Costly once rankings are consumed | Golden factors, hard-gate, overflow, tie, input-order, and eval scenarios |
+| D022 | Activity/achievement purpose and retention | [Accepted bounded M4 slice](0009-m4-activity-retention.md) | Costly for privacy | Disclosure, live privacy/no-stats evidence, LKG/expiry, bounded demand, and deletion tests |
 
 ## When to create an ADR
 

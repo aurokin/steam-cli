@@ -8,7 +8,10 @@
 - M3 wishlist and deal evidence is accepted. Preserve its read-only boundary,
   explicit country/store context, cache-only query, attributed evidence,
   typed fallback states, and retention rules in `docs/design/m3-execution.md`.
-- Keep recommendation, compatibility, artwork, and action capabilities in
+- M4 next-to-play and preference is active. Keep explicit feedback separate
+  from behavioral inference, queries cache-only, hard gates three-valued, and
+  recipes deterministic under `docs/design/m4-execution.md`.
+- Keep compatibility, artwork, group/discovery, and action capabilities in
   design until their Linear milestone is explicitly activated.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
@@ -31,6 +34,7 @@
 | M1 implementation scope and Linear work graph | `docs/design/m1-execution.md` |
 | M2 implementation scope and acceptance evidence | `docs/design/m2-execution.md` |
 | M3 implementation scope and acceptance evidence | `docs/design/m3-execution.md` |
+| M4 implementation scope and acceptance evidence | `docs/design/m4-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions

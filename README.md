@@ -21,8 +21,10 @@ and bounded catalog queries, truthful freshness, and transactional deletion are
 available. **M3 wishlist and deal evidence is implemented and accepted:**
 provisional wishlist synchronization, bounded US price-summary synchronization,
 provider-scoped deletion, and the cache-only attributed deal query are
-available. Recommendations, compatibility, artwork, and Steam actions remain
-proposed design work behind later activation checkpoints.
+available. **M4 next-to-play and preference is active:** explicit feedback,
+activity/achievement evidence, deterministic play recipes, and wishlist-fit
+joins are in acceptance work. Compatibility, artwork, group discovery, and
+Steam actions remain proposed behind later activation checkpoints.
 
 ## Install and develop
 
@@ -295,6 +297,7 @@ are added.
 - [M1 execution plan and Linear work graph](docs/design/m1-execution.md)
 - [M2 truthful account inventory execution and evidence](docs/design/m2-execution.md)
 - [M3 wishlist and deal evidence execution](docs/design/m3-execution.md)
+- [M4 next-to-play and preference execution](docs/design/m4-execution.md)
 - [Decision register](docs/adr/README.md)
 - [Original research handoff](steam-library-agent-research-handoff.md)
 
