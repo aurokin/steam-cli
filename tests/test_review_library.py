@@ -284,12 +284,22 @@ def test_review_projection_is_global_but_account_demand_isolated_and_pruned(tmp_
         # The most recent promoting account may be deleted first without
         # cascading shared public current evidence needed by the other account.
         storage.delete_steam_account_data(second)
+        row = storage._connection.execute(  # noqa: SLF001
+            """SELECT r.account_id FROM review_current c
+               JOIN sync_runs r ON r.id=c.promoted_sync_run_id"""
+        ).fetchone()
+        assert row[0] == first
         assert storage._connection.execute(  # noqa: SLF001
-            "SELECT COUNT(*) FROM review_current"
-        ).fetchone()[0] == 1
+            """SELECT COUNT(*) FROM sync_runs
+               WHERE capability='reviews.aggregate.read' AND account_id=?""",
+            (second,),
+        ).fetchone()[0] == 0
         storage.delete_steam_account_data(first)
         assert storage._connection.execute(  # noqa: SLF001
             "SELECT COUNT(*) FROM review_current"
+        ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM review_observations"
         ).fetchone()[0] == 0
 
 
@@ -377,3 +387,25 @@ def test_wishlist_removal_prunes_current_review_without_fk_rollback(tmp_path) ->
         assert storage.get_app(100) is not None
         storage._prune_reviews("2026-07-20T12:00:00Z")  # noqa: SLF001
         assert storage.get_app(100) is None
+
+
+def test_full_steam_deletion_removes_all_review_lineage(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 1)
+        sync_wishlist_reviews(
+            storage, account_id=account_id, max_items=1, client=Client(), clock=Clock()
+        )
+        deletion = storage.delete_all_steam_account_data()
+        assert deletion.accounts_removed == 1
+        for table in (
+            "review_current",
+            "review_observations",
+            "review_sync_demand",
+        ):
+            assert storage._connection.execute(  # noqa: SLF001
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert storage._connection.execute(  # noqa: SLF001
+            """SELECT COUNT(*) FROM sync_runs
+               WHERE capability='reviews.aggregate.read'"""
+        ).fetchone()[0] == 0

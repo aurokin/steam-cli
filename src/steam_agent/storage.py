@@ -2881,58 +2881,9 @@ class Storage:
                 ).fetchone()[0]
             )
             if account_id is not None:
-                promoted_appids = tuple(
-                    int(row[0])
-                    for row in self._connection.execute(
-                        """SELECT c.appid FROM review_current c
-                           JOIN sync_runs r ON r.id=c.promoted_sync_run_id
-                           WHERE r.account_id=?""",
-                        (account_id,),
-                    )
+                target_current_removed = self._rehome_review_current_for_account(
+                    account_id
                 )
-                for appid in promoted_appids:
-                    replacement = self._connection.execute(
-                        """SELECT o.* FROM review_observations o
-                           JOIN sync_runs r ON r.id=o.sync_run_id
-                           JOIN review_sync_demand d
-                             ON d.sync_run_id=o.sync_run_id AND d.appid=o.appid
-                           WHERE o.appid=? AND r.account_id<>? AND d.state='ready'
-                           ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
-                        (appid, account_id),
-                    ).fetchone()
-                    if replacement is None:
-                        target_current_removed += self._connection.execute(
-                            "DELETE FROM review_current WHERE appid=?", (appid,)
-                        ).rowcount
-                    else:
-                        self._connection.execute(
-                            """UPDATE review_current SET
-                                 provider='steam_store', review_score=?,
-                                 total_positive=?, total_negative=?, total_reviews=?,
-                                 request_filter=?, language=?, day_range=?,
-                                 review_type=?, purchase_type=?, num_per_page=?,
-                                 off_topic_activity_filtered=?, source_locator=?,
-                                 human_reference_url=?, observed_at=?,
-                                 promoted_sync_run_id=? WHERE appid=?""",
-                            (
-                                replacement["review_score"],
-                                replacement["total_positive"],
-                                replacement["total_negative"],
-                                replacement["total_reviews"],
-                                replacement["request_filter"],
-                                replacement["language"],
-                                replacement["day_range"],
-                                replacement["review_type"],
-                                replacement["purchase_type"],
-                                replacement["num_per_page"],
-                                replacement["off_topic_activity_filtered"],
-                                replacement["source_locator"],
-                                replacement["human_reference_url"],
-                                replacement["observed_at"],
-                                replacement["sync_run_id"],
-                                appid,
-                            ),
-                        )
             runs = self._connection.execute(
                 "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read'" + where,
                 parameters,
@@ -2967,6 +2918,64 @@ class Storage:
         except BaseException:
             self._rollback_or_reopen()
             raise
+
+    def _rehome_review_current_for_account(self, account_id: int) -> int:
+        """Remove target-sourced current rows or promote another ready source."""
+
+        removed = 0
+        promoted_appids = tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """SELECT c.appid FROM review_current c
+                   JOIN sync_runs r ON r.id=c.promoted_sync_run_id
+                   WHERE r.account_id=?""",
+                (account_id,),
+            )
+        )
+        for appid in promoted_appids:
+            replacement = self._connection.execute(
+                """SELECT o.* FROM review_observations o
+                   JOIN sync_runs r ON r.id=o.sync_run_id
+                   JOIN review_sync_demand d
+                     ON d.sync_run_id=o.sync_run_id AND d.appid=o.appid
+                   WHERE o.appid=? AND r.account_id<>? AND d.state='ready'
+                   ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
+                (appid, account_id),
+            ).fetchone()
+            if replacement is None:
+                removed += self._connection.execute(
+                    "DELETE FROM review_current WHERE appid=?", (appid,)
+                ).rowcount
+                continue
+            self._connection.execute(
+                """UPDATE review_current SET
+                     provider='steam_store', review_score=?,
+                     total_positive=?, total_negative=?, total_reviews=?,
+                     request_filter=?, language=?, day_range=?,
+                     review_type=?, purchase_type=?, num_per_page=?,
+                     off_topic_activity_filtered=?, source_locator=?,
+                     human_reference_url=?, observed_at=?,
+                     promoted_sync_run_id=? WHERE appid=?""",
+                (
+                    replacement["review_score"],
+                    replacement["total_positive"],
+                    replacement["total_negative"],
+                    replacement["total_reviews"],
+                    replacement["request_filter"],
+                    replacement["language"],
+                    replacement["day_range"],
+                    replacement["review_type"],
+                    replacement["purchase_type"],
+                    replacement["num_per_page"],
+                    replacement["off_topic_activity_filtered"],
+                    replacement["source_locator"],
+                    replacement["human_reference_url"],
+                    replacement["observed_at"],
+                    replacement["sync_run_id"],
+                    appid,
+                ),
+            )
+        return removed
 
     def _finish_simple_sync(self, sync_run_id: int, capability: str, *, error_code: str, completed_at: str | datetime) -> SyncRun:
         timestamp = _timestamp(completed_at)
@@ -5468,6 +5477,12 @@ class Storage:
                 catalog_evidence_removed,
                 catalog_appids,
             ) = self._delete_account_catalog_scope(account_id)
+            self._rehome_review_current_for_account(account_id)
+            self._connection.execute(
+                """DELETE FROM sync_runs
+                   WHERE capability='reviews.aggregate.read' AND account_id=?""",
+                (account_id,),
+            )
             cursor = self._connection.execute(
                 "DELETE FROM accounts WHERE id = ? AND provider = 'steam'",
                 (account_id,),
@@ -5838,6 +5853,9 @@ class Storage:
                 "DELETE FROM accounts WHERE provider = 'steam'"
             )
             self._connection.execute("DELETE FROM review_current")
+            self._connection.execute(
+                "DELETE FROM sync_runs WHERE capability='reviews.aggregate.read'"
+            )
             self._connection.execute("DELETE FROM achievement_schema_current")
             self._connection.execute("DELETE FROM achievement_schema_status")
             catalog_runs_cursor = self._connection.execute(
