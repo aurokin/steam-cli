@@ -1911,10 +1911,7 @@ def _compatibility_target(
         machine_id = context_machine
         if machine_id is None:
             machines = storage.list_machines()
-            local = next((item for item in machines if item.id == "local"), None)
-            if local is not None:
-                machine_id = local.id
-            elif len(machines) == 1:
+            if len(machines) == 1:
                 machine_id = machines[0].id
             else:
                 raise ValueError("Deck assessment requires an explicit machine context")

@@ -523,6 +523,43 @@ def test_deck_target_uses_the_only_configured_nonlocal_machine_context(
     assert value["context"]["evidence_machine"] == "desktop"
 
 
+def test_deck_target_requires_context_when_multiple_machines_exist(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Private desktop", "linux", "x86_64"),
+            observed_at=NOW,
+        )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    common = (
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "valve:steam-deck",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+
+    code, value, stderr = invoke(tmp_path, capsys, *common)
+    assert code == 2
+    assert stderr == ""
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+    code, value, stderr = invoke(
+        tmp_path, capsys, *common, "--context-machine", "desktop"
+    )
+    assert code == 0
+    assert stderr == ""
+    assert value["context"]["evidence_machine"] == "desktop"
+
+
 def test_assess_missing_account_is_typed_without_identity_disclosure(
     tmp_path: Path, capsys: object
 ) -> None:

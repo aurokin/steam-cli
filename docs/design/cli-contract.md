@@ -427,7 +427,7 @@ M5 keeps collection and assessment as separate process boundaries:
 steam-agent sync system --machine MACHINE [--acknowledge-local-storage]
 steam-agent system query --machine MACHINE
 steam-agent sync compatibility --scope library --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
-steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck --country CC --language LANG [--require KIND:NAME] [--override APPID:NAME:GATE=pass|fail|unknown] [--explain] [--format json|table]
+steam-agent compatibility assess APPID... --account ALIAS --target machine:MACHINE|valve:steam-deck [--context-machine MACHINE] --country CC --language LANG [--require KIND:NAME] [--override APPID:NAME:GATE=pass|fail|unknown] [--explain] [--format json|table]
 ```
 
 `sync system` is an explicit local observation and requires the current
@@ -459,6 +459,11 @@ both original and effective state, and no override is persisted. `--explain`
 adds gate details. Returned Steam, SteamDB, ProtonDB, and PCGamingWiki URLs are
 typed `manual_only` references with `automation_supported=false`; the command
 does not open or read them.
+
+For Steam Deck, `--context-machine` selects the account/machine-scoped sync
+attempt lineage without applying that machine's system or installed facts. It
+is inferred only when exactly one machine exists and is required for a
+multi-machine store. A machine target always uses its own machine as context.
 
 M5 cannot prove a title playable now because update, process, launcher,
 network, and entitlement-session state are outside this milestone. A fresh

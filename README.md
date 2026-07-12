@@ -291,7 +291,7 @@ uv run steam-agent sync system --machine local --acknowledge-local-storage
 uv run steam-agent system query --machine local
 uv run steam-agent sync compatibility --scope library --account primary --machine local --country US --language english --acknowledge-local-storage
 uv run steam-agent compatibility assess APPID --account primary --target machine:local --country US --language english
-uv run steam-agent compatibility assess APPID --account primary --target valve:steam-deck --country US --language english --explain
+uv run steam-agent compatibility assess APPID --account primary --target valve:steam-deck --context-machine local --country US --language english --explain
 ```
 
 `sync compatibility` uses a narrow, disableable provisional Steam storefront
@@ -310,6 +310,10 @@ fresh known-not-installed fact can safely fail it; client/update/launcher state
 belongs to the later actions milestone. See the
 [M5 execution plan](docs/design/m5-execution.md) for the active acceptance
 boundary.
+
+For Steam Deck, `--context-machine` selects declared-fact attempt lineage and
+is required when multiple machines are configured; it does not apply that
+machine's hardware or installed state to the Deck assessment.
 
 The current working direction is:
 
