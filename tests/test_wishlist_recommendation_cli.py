@@ -239,6 +239,36 @@ def test_review_sync_requires_current_disclosure_and_retains_no_body(
         warning["code"] == "REVIEW_CLOCK_REGRESSION"
         for warning in future["completeness"]["warnings"]
     )
+    deleted = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "data",
+            "delete",
+            "--provider",
+            "steam-store-reviews",
+            "--account",
+            "primary",
+            "--yes",
+        ],
+        capsys,
+    )
+    assert deleted["data"]["current_removed"] == 1
+    after_delete = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "recommendations",
+            "wishlist",
+            "--account",
+            "primary",
+            "--country",
+            "US",
+        ],
+        capsys,
+    )
+    assert after_delete["data"]["ranked"][0]["review"] is None
+    assert after_delete["data"]["review_snapshot"]["state"] == "not_synced"
 
 
 def test_wishlist_query_is_cache_only_and_direct_feedback_changes_fit(
