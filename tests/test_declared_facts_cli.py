@@ -374,6 +374,27 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
         "--acknowledge-local-storage",
     )
 
+    code, same_context, _ = invoke(
+        tmp_path,
+        capsys,
+        "discovery",
+        "query",
+        "--scope",
+        "known",
+        "--limit",
+        "10",
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0
+    assert same_context["data"]["candidate_count"] == 1
+
     code, result, _ = invoke(
         tmp_path,
         capsys,

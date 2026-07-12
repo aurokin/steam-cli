@@ -114,7 +114,7 @@ def test_populated_v8_upgrades_to_catalog_schema_without_rewriting_identity(
             storage._connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-            == 24
+            == 25
         )
         assert (
             storage._connection.execute(
@@ -405,9 +405,7 @@ def test_other_account_refresh_cannot_freshen_or_reclassify_subject_fact(
     assert primary_snapshot.facts[0].classification == "game"
     assert primary_snapshot.facts[0].observed_at == T_OLD
     assert primary_completeness["status"] == "partial"
-    assert primary_completeness["stale_capabilities"] == [
-        "catalog.application.read"
-    ]
+    assert primary_completeness["stale_capabilities"] == ["catalog.application.read"]
     assert other_snapshot.facts[0].promoted_sync_run_id == other_run
     assert other_snapshot.facts[0].classification == "non_game"
     assert other_snapshot.facts[0].observed_at == T0
@@ -503,19 +501,16 @@ def test_running_catalog_refresh_keeps_fresh_last_good_complete(
     monkeypatch.setattr(
         cli,
         "_utc_now",
-        lambda: datetime.fromisoformat(T1.replace("Z", "+00:00"))
-        + timedelta(minutes=1),
+        lambda: (
+            datetime.fromisoformat(T1.replace("Z", "+00:00")) + timedelta(minutes=1)
+        ),
     )
-    value, metadata = cli._catalog_completeness(
-        snapshot, demanded_appids={10}
-    )
+    value, metadata = cli._catalog_completeness(snapshot, demanded_appids={10})
 
     assert snapshot.latest is not None and snapshot.latest.id == running
     assert value["status"] == "complete"
     assert value["stale_capabilities"] == []
-    assert [warning["code"] for warning in value["warnings"]] == [
-        "SYNC_IN_PROGRESS"
-    ]
+    assert [warning["code"] for warning in value["warnings"]] == ["SYNC_IN_PROGRESS"]
     assert metadata["last_attempt_status"] == "running"
 
 
@@ -590,12 +585,9 @@ def test_per_app_failed_attempt_degrades_multi_app_catalog_slice(
     monkeypatch.setattr(
         cli,
         "_utc_now",
-        lambda: datetime.fromisoformat(T0.replace("Z", "+00:00"))
-        + timedelta(hours=1),
+        lambda: datetime.fromisoformat(T0.replace("Z", "+00:00")) + timedelta(hours=1),
     )
-    value, metadata = cli._catalog_completeness(
-        snapshot, demanded_appids={10, 20}
-    )
+    value, metadata = cli._catalog_completeness(snapshot, demanded_appids={10, 20})
 
     assert snapshot.latest is None
     assert [(fact.appid, fact.promoted_sync_run_id) for fact in snapshot.facts] == [
@@ -663,19 +655,16 @@ def test_per_app_running_attempt_keeps_fresh_multi_app_slice_complete(
     monkeypatch.setattr(
         cli,
         "_utc_now",
-        lambda: datetime.fromisoformat(T1.replace("Z", "+00:00"))
-        + timedelta(minutes=1),
+        lambda: (
+            datetime.fromisoformat(T1.replace("Z", "+00:00")) + timedelta(minutes=1)
+        ),
     )
-    value, metadata = cli._catalog_completeness(
-        snapshot, demanded_appids={10, 20}
-    )
+    value, metadata = cli._catalog_completeness(snapshot, demanded_appids={10, 20})
 
     assert snapshot.latest is None
     assert value["status"] == "complete"
     assert value["stale_capabilities"] == []
-    assert [warning["code"] for warning in value["warnings"]] == [
-        "SYNC_IN_PROGRESS"
-    ]
+    assert [warning["code"] for warning in value["warnings"]] == ["SYNC_IN_PROGRESS"]
     assert [
         (attempt["sync_run_id"], attempt["status"], attempt["appids"])
         for attempt in metadata["relevant_attempts"]

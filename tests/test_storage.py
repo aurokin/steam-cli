@@ -49,7 +49,9 @@ def evidence(appid: int, at: str) -> EvidenceInput:
     )
 
 
-def observation(appid: int, at: str, *, name: str | None = None) -> InstalledObservation:
+def observation(
+    appid: int, at: str, *, name: str | None = None
+) -> InstalledObservation:
     return InstalledObservation(
         appid=appid,
         name=name or f"Game {appid}",
@@ -174,21 +176,25 @@ def test_observation_write_rolls_back_on_late_failure(storage: Storage) -> None:
 
     assert storage.get_app(10) is None
     assert storage.get_sync_run(run.id).records_seen == 0
-    assert storage._connection.execute(  # noqa: SLF001 - transaction assertion
-        "SELECT COUNT(*) FROM evidence"
-    ).fetchone()[0] == 0
-    assert storage._connection.execute(  # noqa: SLF001 - transaction assertion
-        "SELECT COUNT(*) FROM installed_observations WHERE sync_run_id = ?",
-        (run.id,),
-    ).fetchone()[0] == 0
+    assert (
+        storage._connection.execute(  # noqa: SLF001 - transaction assertion
+            "SELECT COUNT(*) FROM evidence"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        storage._connection.execute(  # noqa: SLF001 - transaction assertion
+            "SELECT COUNT(*) FROM installed_observations WHERE sync_run_id = ?",
+            (run.id,),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_finishing_with_identical_arguments_is_idempotent(storage: Storage) -> None:
     run_id = completed_scan(storage, [10], T0, T1)
     first = storage.get_sync_run(run_id)
-    second = storage.finish_installed_sync(
-        run_id, status="complete", completed_at=T1
-    )
+    second = storage.finish_installed_sync(run_id, status="complete", completed_at=T1)
     assert second == first
 
 
@@ -222,9 +228,7 @@ def test_naive_timestamps_are_rejected(tmp_path: Path) -> None:
 
 
 def test_migration_resource_is_packaged_and_applied_once(tmp_path: Path) -> None:
-    migration = resources.files("steam_agent").joinpath(
-        "migrations", "001_initial.sql"
-    )
+    migration = resources.files("steam_agent").joinpath("migrations", "001_initial.sql")
     assert migration.is_file()
     assert "CREATE TABLE installed_current" in migration.read_text(encoding="utf-8")
 
@@ -245,9 +249,31 @@ def test_migration_resource_is_packaged_and_applied_once(tmp_path: Path) -> None
             )
         }
     assert versions == [
-        (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,),
-            (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,), (20,), (21,),
-            (22,), (23,), (24,)
+        (1,),
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+        (6,),
+        (7,),
+        (8,),
+        (9,),
+        (10,),
+        (11,),
+        (12,),
+        (13,),
+        (14,),
+        (15,),
+        (16,),
+        (17,),
+        (18,),
+        (19,),
+        (20,),
+        (21,),
+        (22,),
+        (23,),
+        (24,),
+        (25,),
     ]
     assert {"machines", "steam_apps", "sync_runs", "evidence"} <= tables
     assert {"installed_observations", "installed_current", "accounts"} <= tables
@@ -280,9 +306,7 @@ def test_machine_projections_are_isolated_and_ordered(tmp_path: Path) -> None:
                 observation(appid, T0),
                 evidence(appid, T0),
             )
-        database.finish_installed_sync(
-            desktop.id, status="complete", completed_at=T1
-        )
+        database.finish_installed_sync(desktop.id, status="complete", completed_at=T1)
 
         deck = database.begin_sync(
             provider="local_steam",
@@ -336,9 +360,7 @@ def test_machine_projections_are_isolated_and_ordered(tmp_path: Path) -> None:
 def test_promoted_metadata_is_isolated_per_machine(tmp_path: Path) -> None:
     path = tmp_path / "metadata.sqlite3"
     with Storage(path) as database:
-        database.upsert_machine(
-            Machine("desktop", "Desktop", "linux"), observed_at=T0
-        )
+        database.upsert_machine(Machine("desktop", "Desktop", "linux"), observed_at=T0)
         database.upsert_machine(Machine("deck", "Deck", "linux"), observed_at=T0)
 
         desktop = database.begin_sync(
@@ -352,9 +374,7 @@ def test_promoted_metadata_is_isolated_per_machine(tmp_path: Path) -> None:
             observation(10, T0, name="Desktop Name"),
             evidence(10, T0),
         )
-        database.finish_installed_sync(
-            desktop.id, status="complete", completed_at=T1
-        )
+        database.finish_installed_sync(desktop.id, status="complete", completed_at=T1)
 
         deck = database.begin_sync(
             provider="local_steam",
@@ -387,9 +407,7 @@ def test_installed_snapshot_does_not_mix_projection_and_sync_metadata(
 ) -> None:
     path = tmp_path / "snapshot.sqlite3"
     with Storage(path) as setup:
-        setup.upsert_machine(
-            Machine("desktop", "Desktop", "linux"), observed_at=T0
-        )
+        setup.upsert_machine(Machine("desktop", "Desktop", "linux"), observed_at=T0)
         original_run = completed_scan(setup, [10], T0, T1)
 
     writer_ready = Event()
@@ -508,16 +526,68 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(initialize, range(workers)))
 
-    assert results == [
-        (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    ] * workers
+    assert (
+        results
+        == [
+            (
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+            )
+        ]
+        * workers
+    )
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
-                (11,), (12,), (13,), (14,), (15,), (16,), (17,), (18,), (19,), (20,), (21,),
-                (22,), (23,), (24,)
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+            (5,),
+            (6,),
+            (7,),
+            (8,),
+            (9,),
+            (10,),
+            (11,),
+            (12,),
+            (13,),
+            (14,),
+            (15,),
+            (16,),
+            (17,),
+            (18,),
+            (19,),
+            (20,),
+            (21,),
+            (22,),
+            (23,),
+            (24,),
+            (25,),
         ]
 
 
@@ -561,9 +631,12 @@ def test_readonly_storage_requires_current_schema(tmp_path: Path) -> None:
 def test_readonly_storage_rejects_uncheckpointed_wal(tmp_path: Path) -> None:
     database_path = tmp_path / "steam-agent.sqlite3"
     with Storage(database_path) as writer:
-        assert writer._connection.execute(  # noqa: SLF001 - boundary setup
-            "PRAGMA journal_mode=WAL"
-        ).fetchone()[0] == "wal"
+        assert (
+            writer._connection.execute(  # noqa: SLF001 - boundary setup
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            == "wal"
+        )
         writer._connection.execute(  # noqa: SLF001 - keep live WAL content
             "INSERT INTO machines(id,name,platform,created_at,updated_at) "
             "VALUES ('wal-machine','WAL','linux',?,?)",
@@ -580,9 +653,12 @@ def test_readonly_storage_rejects_clean_persistent_wal_without_sidecars(
 ) -> None:
     database_path = tmp_path / "steam-agent.sqlite3"
     with Storage(database_path) as storage:
-        assert storage._connection.execute(  # noqa: SLF001 - boundary setup
-            "PRAGMA journal_mode=WAL"
-        ).fetchone()[0] == "wal"
+        assert (
+            storage._connection.execute(  # noqa: SLF001 - boundary setup
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            == "wal"
+        )
     assert not Path(f"{database_path}-wal").exists()
     files_before = {path.name for path in tmp_path.iterdir()}
 
@@ -595,9 +671,12 @@ def test_readonly_storage_rejects_clean_persistent_wal_without_sidecars(
     with Storage(database_path):
         pass
     with Storage(database_path, readonly=True) as readonly:
-        assert readonly._connection.execute(  # noqa: SLF001
-            "PRAGMA journal_mode"
-        ).fetchone()[0] == "delete"
+        assert (
+            readonly._connection.execute(  # noqa: SLF001
+                "PRAGMA journal_mode"
+            ).fetchone()[0]
+            == "delete"
+        )
 
 
 def test_one_writable_open_normalizes_clean_wal_with_empty_sidecars(
@@ -605,9 +684,12 @@ def test_one_writable_open_normalizes_clean_wal_with_empty_sidecars(
 ) -> None:
     database_path = tmp_path / "steam-agent.sqlite3"
     with Storage(database_path) as storage:
-        assert storage._connection.execute(  # noqa: SLF001 - boundary setup
-            "PRAGMA journal_mode=WAL"
-        ).fetchone()[0] == "wal"
+        assert (
+            storage._connection.execute(  # noqa: SLF001 - boundary setup
+                "PRAGMA journal_mode=WAL"
+            ).fetchone()[0]
+            == "wal"
+        )
     Path(f"{database_path}-wal").touch()
     Path(f"{database_path}-shm").touch()
 
@@ -615,6 +697,9 @@ def test_one_writable_open_normalizes_clean_wal_with_empty_sidecars(
         pass
 
     with Storage(database_path, readonly=True) as readonly:
-        assert readonly._connection.execute(  # noqa: SLF001
-            "PRAGMA journal_mode"
-        ).fetchone()[0] == "delete"
+        assert (
+            readonly._connection.execute(  # noqa: SLF001
+                "PRAGMA journal_mode"
+            ).fetchone()[0]
+            == "delete"
+        )

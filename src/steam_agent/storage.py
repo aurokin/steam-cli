@@ -3386,6 +3386,7 @@ class Storage:
         skip_fresh_terminal: bool,
         started_at: str | datetime,
         disclosure_version: str,
+        explicit_appids: list[int] | tuple[int, ...] = (),
     ) -> tuple[SyncRun, tuple[int, ...], tuple[int, ...]]:
         """Schedule one bounded, account-authorized public-fact refresh."""
 
@@ -3394,10 +3395,13 @@ class Storage:
         )
 
         demanded = _catalog_appids(demanded_appids)
+        explicit = set(_catalog_appids(explicit_appids))
         if not demanded:
             raise ValueError("declared-app demand cannot be empty")
         if len(demanded) > _DECLARED_APP_MAX_DEMAND:
             raise ValueError("declared-app demand exceeds the bounded maximum")
+        if not explicit.issubset(demanded):
+            raise ValueError("explicit declared-app demand must be selected")
         SteamDeclaredFactsRequestContext(country, language)
         if (
             not isinstance(max_items, int)
@@ -3612,8 +3616,8 @@ class Storage:
                     """INSERT INTO declared_app_sync_demand(
                            sync_run_id, account_id, machine_id, appid,
                            country, language, ordinal, targeted, state,
-                           error_code, retry_at, observed_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           error_code, retry_at, observed_at, explicit
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         run_id,
                         account_id,
@@ -3627,6 +3631,7 @@ class Storage:
                         skip_code,
                         (cooldown_until if skip_code == "PROVIDER_COOLDOWN" else None),
                         None if targeted_value else timestamp,
+                        int(appid in explicit),
                     ),
                 )
             self._connection.commit()
@@ -3945,6 +3950,45 @@ class Storage:
         except BaseException:
             self._rollback_or_reopen()
             raise
+
+    def read_explicit_declared_appids(
+        self,
+        *,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        as_of: str | datetime | None = None,
+    ) -> tuple[int, ...]:
+        """Return retained explicit demand only for one private request context."""
+
+        from steam_agent.steam_declared_facts import SteamDeclaredFactsRequestContext
+
+        SteamDeclaredFactsRequestContext(country, language)
+        self._require_steam_account(account_id)
+        if self.get_machine(machine_id) is None:
+            raise ValueError("declared-app machine is not configured")
+        cutoff = _timestamp(
+            datetime.fromisoformat(
+                _timestamp(
+                    datetime.now(timezone.utc) if as_of is None else as_of
+                ).replace("Z", "+00:00")
+            )
+            - timedelta(days=30)
+        )
+        return tuple(
+            int(row[0])
+            for row in self._connection.execute(
+                """SELECT DISTINCT d.appid
+                   FROM declared_app_sync_demand d
+                   JOIN sync_runs r ON r.id=d.sync_run_id
+                   WHERE d.account_id=? AND d.machine_id=?
+                     AND d.country=? AND d.language=? AND d.explicit=1
+                     AND r.started_at>=?
+                   ORDER BY d.appid""",
+                (account_id, machine_id, country, language, cutoff),
+            )
+        )
 
     def _read_declared_app_snapshot(
         self,

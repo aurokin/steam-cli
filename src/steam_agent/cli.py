@@ -1843,6 +1843,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 skip_fresh_terminal=True,
                 started_at=started_at,
                 disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
+                explicit_appids=(demanded_selection if app_facts_command else ()),
             )
         except ValueError:
             return _emit_error(
@@ -2035,6 +2036,8 @@ def _declared_scope_appids(
     *,
     account_id: int,
     machine_id: str,
+    country: str,
+    language: str,
     scope: str,
     explicit: Sequence[int],
 ) -> tuple[int, ...]:
@@ -2049,11 +2052,19 @@ def _declared_scope_appids(
     installed = {
         game.appid for game in storage.read_installed_snapshot(machine_id).games
     }
+    prior_explicit = set(
+        storage.read_explicit_declared_appids(
+            account_id=account_id,
+            machine_id=machine_id,
+            country=country,
+            language=language,
+        )
+    )
     scoped = {
         "library": owned,
         "wishlist": wishlist,
         "installed": installed,
-        "known": owned | wishlist | installed,
+        "known": owned | wishlist | installed | prior_explicit,
         "appids": set(),
     }[scope]
     return tuple(sorted(scoped | set(explicit)))
@@ -2130,6 +2141,8 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             storage,
             account_id=account.id,
             machine_id=machine.id,
+            country=country,
+            language=args.language,
             scope=args.scope,
             explicit=explicit,
         )
@@ -3073,6 +3086,8 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 storage,
                 account_id=context_account.id,
                 machine_id=machine.id,
+                country=country,
+                language=args.language,
                 scope=args.scope,
                 explicit=explicit,
             )

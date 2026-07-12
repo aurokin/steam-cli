@@ -133,9 +133,12 @@ def test_v18_upgrade_backfills_empty_ready_achievement_projection(
             (account_id,),
         ).fetchone()
         assert tuple(projection) == (T0, run_id)
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM achievement_player_current"
-        ).fetchone()[0] == 0
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM achievement_player_current"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_v19_upgrade_repairs_unpromoted_empty_achievement_projection(
@@ -303,7 +306,7 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (24,)
+        ).fetchone() == (25,)
 
 
 def test_populated_v5_upgrade_backfills_steam_application_identities(
@@ -340,9 +343,12 @@ def test_populated_v5_upgrade_backfills_steam_application_identities(
             ("20", 20, "application"),
         ]
         assert storage.get_account("primary") is not None
-        assert storage._connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 24
+        assert (
+            storage._connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            == 25
+        )
 
 
 def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
@@ -407,14 +413,14 @@ def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
                     (
                         f"GetOwnedGames:app:{appid}",
                         T0,
-                            json.dumps(
-                                {
-                                    "include_appinfo": True,
-                                    "include_played_free_games": False,
-                                }
-                            ),
-                            json.dumps({"appid": appid}),
-                            f"hash-{appid}",
+                        json.dumps(
+                            {
+                                "include_appinfo": True,
+                                "include_played_free_games": False,
+                            }
+                        ),
+                        json.dumps({"appid": appid}),
+                        f"hash-{appid}",
                     ),
                 ).lastrowid
             )
@@ -499,24 +505,42 @@ def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
         assert provenance.base_include_played_free_games is None
         assert provenance.expanded_include_played_free_games is False
         assert provenance.classification_method == "legacy_single_snapshot"
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM game_entities"
-        ).fetchone()[0] == 3
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM evidence WHERE account_id = ?", (account_id,)
-        ).fetchone()[0] == 2
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_observations"
-        ).fetchone()[0] == 2
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_sync_metadata"
-        ).fetchone()[0] == 1
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM sync_runs WHERE account_id = ?", (account_id,)
-        ).fetchone()[0] == 2
-        assert storage._connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 24
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM game_entities"
+            ).fetchone()[0]
+            == 3
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM evidence WHERE account_id = ?", (account_id,)
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_observations"
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_sync_metadata"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM sync_runs WHERE account_id = ?", (account_id,)
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            == 25
+        )
 
 
 def test_owned_snapshot_requires_reviewed_consent(tmp_path: Path) -> None:
@@ -570,11 +594,12 @@ def test_complete_owned_snapshot_preserves_basis_provenance_and_account_name(
         assert snapshot.latest_complete_provenance is not None
         assert snapshot.latest_complete_provenance.sync_run_id == run_id
         assert snapshot.latest_complete_provenance.provider == "steam_web_api"
-        assert snapshot.latest_complete_provenance.support_level == "official_documented"
+        assert (
+            snapshot.latest_complete_provenance.support_level == "official_documented"
+        )
         assert snapshot.latest_complete_provenance.include_appinfo is True
         assert (
-            snapshot.latest_complete_provenance.base_include_played_free_games
-            is False
+            snapshot.latest_complete_provenance.base_include_played_free_games is False
         )
         assert snapshot.latest_complete_provenance.base_reported_count == 1
         assert (
@@ -681,18 +706,28 @@ def test_older_complete_owned_sync_cannot_replace_newer_completion(
             "playtime_forever_minutes",
         }
         assert storage.get_app(10) is None
-        assert storage._connection.execute(
-            "SELECT 1 FROM external_game_identities WHERE external_id = '10'"
-        ).fetchone() is None
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_observations"
-        ).fetchone()[0] == 1
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_sync_metadata"
-        ).fetchone()[0] == 1
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM evidence"
-        ).fetchone()[0] == 1
+        assert (
+            storage._connection.execute(
+                "SELECT 1 FROM external_game_identities WHERE external_id = '10'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_observations"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_sync_metadata"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+            == 1
+        )
 
 
 @pytest.mark.parametrize("status", ["partial", "failed"])
@@ -724,15 +759,22 @@ def test_incomplete_owned_sync_preserves_last_good(tmp_path: Path, status: str) 
         games = storage.list_owned(account_id)
         assert [game.appid for game in games] == [10]
         assert games[0].promoted_sync_run_id == original
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_observations"
-        ).fetchone()[0] == 1
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM owned_sync_metadata"
-        ).fetchone()[0] == 1
-        assert storage._connection.execute(
-            "SELECT COUNT(*) FROM evidence"
-        ).fetchone()[0] == 1
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_observations"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute(
+                "SELECT COUNT(*) FROM owned_sync_metadata"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            storage._connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+            == 1
+        )
 
 
 def test_explicit_complete_empty_owned_snapshot_clears_projection(
@@ -862,9 +904,12 @@ def test_atomic_owned_completion_rolls_back_payload_and_promotion(
             "owned_sync_metadata",
             "evidence",
         ):
-            assert storage._connection.execute(
-                f"SELECT COUNT(*) FROM {table}"
-            ).fetchone()[0] == 0
+            assert (
+                storage._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
+                    0
+                ]
+                == 0
+            )
         storage.finish_owned_sync(
             run.id,
             status="failed",
@@ -939,9 +984,12 @@ def test_joined_library_snapshot_reads_both_projections(tmp_path: Path) -> None:
         assert joined.owned.stable_game_ids_by_appid == (
             (10, steam_application_stable_id(10)),
         )
-        assert storage._connection.execute(
-            "SELECT account_id FROM evidence WHERE capability = 'installed'"
-        ).fetchone()[0] is None
+        assert (
+            storage._connection.execute(
+                "SELECT account_id FROM evidence WHERE capability = 'installed'"
+            ).fetchone()[0]
+            is None
+        )
 
 
 def test_stable_identity_lookup_occurs_inside_library_read_transaction(
@@ -955,9 +1003,7 @@ def test_stable_identity_lookup_occurs_inside_library_read_transaction(
         original = Storage._stable_game_ids_for_appids
         observed_transaction: list[bool] = []
 
-        def checked(
-            instance: Storage, appids: set[int]
-        ) -> tuple[tuple[int, str], ...]:
+        def checked(instance: Storage, appids: set[int]) -> tuple[tuple[int, str], ...]:
             observed_transaction.append(instance._connection.in_transaction)
             return original(instance, appids)
 
