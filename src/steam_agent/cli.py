@@ -105,6 +105,7 @@ from steam_agent.wishlist_recommendation_query import (
 from steam_agent.system_profile import (
     SYSTEM_PROFILE_DISCLOSURE_VERSION,
     SystemProfileError,
+    canonical_architecture,
     collect_system_profile,
     query_system_profile,
     sync_system_profile,
@@ -1155,7 +1156,13 @@ def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
                 data=result,
             )
 
-        candidate = machine_for(machine_id)
+        detected_machine = machine_for(machine_id)
+        candidate = type(detected_machine)(
+            detected_machine.id,
+            detected_machine.name,
+            detected_machine.platform,
+            canonical_architecture(detected_machine.architecture),
+        )
         existing = storage.get_machine(machine_id)
         if existing is not None and not _machine_profile_identity_matches(
             existing.platform,
@@ -1273,15 +1280,18 @@ def _machine_profile_identity_matches(
     )
 
     def canonical(value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.casefold().replace("-", "_")
-        return {"amd64": "x86_64", "aarch64": "arm64"}.get(normalized, normalized)
+        return canonical_architecture(value)
 
     stored_arch = canonical(stored_architecture)
     candidate_arch = canonical(candidate_architecture)
     return platform_matches and (
-        stored_arch is None or candidate_arch is None or stored_arch == candidate_arch
+        stored_architecture is None
+        or candidate_architecture is None
+        or (
+            stored_arch is not None
+            and candidate_arch is not None
+            and stored_arch == candidate_arch
+        )
     )
 
 
@@ -3379,11 +3389,16 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
     if args.data_command != "delete":
         raise AssertionError("unhandled data command")
     if not args.yes:
+        deletion_subject = (
+            "Local system-profile data"
+            if args.provider == "local-system"
+            else "Steam Web API data"
+        )
         return _emit_error(
             args,
             command="data.delete",
             code=ErrorCode.CONFIRMATION_REQUIRED,
-            message="Steam Web API data deletion requires --yes.",
+            message=f"{deletion_subject} deletion requires --yes.",
         )
     if args.provider == "local-system":
         if args.machine is None or args.account is not None or args.all:
@@ -5054,9 +5069,22 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
                 )
         for section in ("graphics", "storage", "gamepad", "vr"):
             item = profile[section]
+            section_freshness = envelope["data"]["freshness"].get(
+                section, "unknown"
+            )
+            if section == "storage":
+                storage_states = [
+                    envelope["data"]["freshness"].get(name, "unknown")
+                    for name in ("storage_capacity", "storage_available")
+                ]
+                section_freshness = (
+                    "stale" if "stale" in storage_states
+                    else "unknown" if "unknown" in storage_states
+                    else "fresh"
+                )
             _print_table_fields(
                 section, "summary", item["state"], item.get("value", ""),
-                envelope["data"]["freshness"].get(section, "unknown"),
+                section_freshness,
             )
         return
     if command == "recommendations.wishlist":

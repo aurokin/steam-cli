@@ -2201,6 +2201,30 @@ class Storage:
                 started - timedelta(days=30)
             )
             self._connection.execute(
+                """CREATE TEMP TABLE IF NOT EXISTS
+                   expired_system_profile_evidence_ids(
+                     evidence_id INTEGER PRIMARY KEY
+                   )"""
+            )
+            self._connection.execute(
+                "DELETE FROM expired_system_profile_evidence_ids"
+            )
+            self._connection.execute(
+                """INSERT OR IGNORE INTO expired_system_profile_evidence_ids(evidence_id)
+                   SELECT observations.evidence_id
+                   FROM system_profile_observations AS observations
+                   JOIN sync_runs AS runs ON runs.id=observations.sync_run_id
+                   WHERE runs.capability='system_profile.read'
+                     AND runs.machine_id=?
+                     AND runs.completed_at IS NOT NULL
+                     AND runs.completed_at < ?
+                     AND runs.id NOT IN (
+                       SELECT promoted_sync_run_id FROM system_profile_current
+                       WHERE machine_id=?
+                     )""",
+                (machine_id, cutoff, machine_id),
+            )
+            self._connection.execute(
                 """DELETE FROM sync_runs
                    WHERE capability='system_profile.read' AND machine_id=?
                      AND completed_at IS NOT NULL AND completed_at < ?
@@ -2209,6 +2233,25 @@ class Storage:
                        WHERE machine_id=?
                      )""",
                 (machine_id, cutoff, machine_id),
+            )
+            self._connection.execute(
+                """DELETE FROM evidence
+                   WHERE id IN (
+                     SELECT evidence_id FROM expired_system_profile_evidence_ids
+                   )
+                   AND provider='local_system'
+                   AND capability='system_profile.read'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM system_profile_observations
+                     WHERE system_profile_observations.evidence_id=evidence.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM system_profile_current
+                     WHERE system_profile_current.evidence_id=evidence.id
+                   )"""
+            )
+            self._connection.execute(
+                "DELETE FROM expired_system_profile_evidence_ids"
             )
             cursor = self._connection.execute(
                 """INSERT INTO sync_runs(
@@ -2232,6 +2275,7 @@ class Storage:
         disclosure_version: str,
     ) -> SyncRun:
         from steam_agent.system_profile import (
+            canonical_architecture,
             system_profile_is_complete,
             validate_system_profile,
         )
@@ -2262,11 +2306,9 @@ class Storage:
                 "windows": "windows", "linux": "linux", "unknown": profile_family,
             }.get(machine.platform.casefold())
             profile_architecture = validated["cpu"]["architecture"]["value"]
-            stored_architecture = None if machine.architecture is None else {
-                "amd64": "x86_64", "aarch64": "arm64",
-            }.get(machine.architecture.casefold(), machine.architecture.casefold())
+            stored_architecture = canonical_architecture(machine.architecture)
             if stored_family != profile_family or (
-                stored_architecture is not None
+                machine.architecture is not None
                 and stored_architecture != profile_architecture
             ):
                 raise InvalidSyncTransition(
@@ -2403,12 +2445,20 @@ class Storage:
                     (machine_id,),
                 ).fetchone()[0]
             )
-            evidence_ids = tuple(
-                int(row[0])
-                for row in self._connection.execute(
-                    "SELECT evidence_id FROM system_profile_observations WHERE machine_id=?",
-                    (machine_id,),
-                )
+            self._connection.execute(
+                """CREATE TEMP TABLE IF NOT EXISTS
+                   deleted_system_profile_evidence_ids(
+                     evidence_id INTEGER PRIMARY KEY
+                   )"""
+            )
+            self._connection.execute(
+                "DELETE FROM deleted_system_profile_evidence_ids"
+            )
+            self._connection.execute(
+                """INSERT OR IGNORE INTO deleted_system_profile_evidence_ids(evidence_id)
+                   SELECT evidence_id FROM system_profile_observations
+                   WHERE machine_id=?""",
+                (machine_id,),
             )
             self._connection.execute(
                 "DELETE FROM system_profile_current WHERE machine_id=?", (machine_id,)
@@ -2421,12 +2471,25 @@ class Storage:
                 "DELETE FROM machine_data_consents WHERE machine_id=? AND consent_kind='system_profile'",
                 (machine_id,),
             )
-            evidence_removed = 0
-            if evidence_ids:
-                placeholders = ",".join("?" for _ in evidence_ids)
-                evidence_removed = self._connection.execute(
-                    f"DELETE FROM evidence WHERE id IN ({placeholders})", evidence_ids
-                ).rowcount
+            evidence_removed = self._connection.execute(
+                """DELETE FROM evidence
+                   WHERE id IN (
+                     SELECT evidence_id FROM deleted_system_profile_evidence_ids
+                   )
+                   AND provider='local_system'
+                   AND capability='system_profile.read'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM system_profile_observations
+                     WHERE system_profile_observations.evidence_id=evidence.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM system_profile_current
+                     WHERE system_profile_current.evidence_id=evidence.id
+                   )"""
+            ).rowcount
+            self._connection.execute(
+                "DELETE FROM deleted_system_profile_evidence_ids"
+            )
             self._connection.commit()
         except BaseException:
             self._rollback_or_reopen()

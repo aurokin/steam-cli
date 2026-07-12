@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import namedtuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -11,12 +12,14 @@ from steam_agent.system_profile import (
     SYSTEM_PROFILE_DISCLOSURE_VERSION,
     CollectedSystemProfile,
     collect_system_profile,
+    canonical_architecture,
     fact,
     query_system_profile,
     sync_system_profile,
     unknown,
     validate_system_profile,
 )
+import steam_agent.system_profile as system_profile_module
 from steam_agent.storage import InvalidSyncTransition, Machine, Storage
 
 
@@ -70,6 +73,56 @@ def configured(tmp_path: Path, machine: str = "local") -> Storage:
         backups_acknowledged=True,
     )
     return storage
+
+
+def insert_raw_system_history(
+    storage: Storage,
+    *,
+    machine: str,
+    count: int,
+    first_at: datetime,
+) -> None:
+    encoded_profile = json.dumps(profile(), sort_keys=True, separators=(",", ":"))
+    with storage._connection:  # noqa: SLF001 - bulk fixture for SQLite-bound regression
+        for index in range(count):
+            observed = (first_at + timedelta(seconds=index)).isoformat().replace(
+                "+00:00", "Z"
+            )
+            evidence_id = int(
+                storage._connection.execute(  # noqa: SLF001
+                    """INSERT INTO evidence(
+                           provider,capability,source_kind,source_locator,retrieved_at,
+                           support_level,context_json,payload_json,content_hash
+                       ) VALUES (
+                           'local_system','system_profile.read','test',?,?,'core',
+                           ?,?,?
+                       )""",
+                    (
+                        f"test:{machine}:{index}", observed,
+                        json.dumps({"machine_alias": machine}),
+                        json.dumps({"normalized": True, "ordinal": index}),
+                        f"test-hash-{machine}-{index}",
+                    ),
+                ).lastrowid
+            )
+            run_id = int(
+                storage._connection.execute(  # noqa: SLF001
+                    """INSERT INTO sync_runs(
+                           provider,capability,machine_id,started_at,completed_at,
+                           status,promoted,records_seen
+                       ) VALUES (
+                           'local_system','system_profile.read',?,?,?,
+                           'complete',0,1
+                       )""",
+                    (machine, observed, observed),
+                ).lastrowid
+            )
+            storage._connection.execute(  # noqa: SLF001
+                """INSERT INTO system_profile_observations(
+                       sync_run_id,machine_id,evidence_id,schema_id,profile_json,observed_at
+                   ) VALUES (?, ?, ?, 'system-profile/0.1', ?, ?)""",
+                (run_id, machine, evidence_id, encoded_profile, observed),
+            )
 
 
 def test_linux_collector_normalizes_only_allowlisted_fixture_facts() -> None:
@@ -168,11 +221,110 @@ def test_windows_collector_never_requests_stable_device_identity() -> None:
         disk_usage=lambda _path: Usage(1000, 600, 400),
     )
     command = " ".join(calls[0]).casefold()
+    assert calls[0][0] == r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     assert all(word.casefold() not in command for word in (
         "PNPDeviceID", "DeviceID", "SystemName", "SerialNumber"
     ))
     assert result.profile["graphics"]["value"][0]["adapter_id"] == "gpu-0"  # type: ignore[index]
     assert result.profile["graphics"]["value"][0]["vendor_id"] is None  # type: ignore[index]
+    assert result.profile["graphics"]["value"][0]["memory"] == {  # type: ignore[index]
+        "kind": "unknown", "bytes": None,
+    }
+
+
+def test_command_allowlist_accepts_only_exact_fixed_argv() -> None:
+    allowed = system_profile_module._command_is_allowlisted  # noqa: SLF001
+    assert allowed(("/usr/bin/sw_vers", "-productVersion"))
+    assert allowed(("/usr/sbin/sysctl", "-n", "hw.memsize"))
+    assert not allowed(("/usr/bin/sw_vers", "--help"))
+    assert not allowed(("/usr/sbin/sysctl", "-n", "kern.hostname"))
+    assert not allowed(("/usr/sbin/system_profiler", "SPHardwareDataType", "-json"))
+    assert not allowed(("powershell.exe", "-NoProfile"))
+
+
+def test_subprocess_reader_caps_output_without_communicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Output:
+        requested: int | None = None
+
+        def read(self, size: int) -> bytes:
+            self.requested = size
+            return b"x" * size
+
+        def close(self) -> None:
+            pass
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = Output()
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float) -> int:
+            assert timeout <= 0.5
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("fixed", timeout)
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(
+        system_profile_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    result = system_profile_module._bounded_run(  # noqa: SLF001
+        ("/usr/bin/sw_vers", "-productVersion"), 0.1, 32
+    )
+    assert result is None
+    assert process.stdout.requested == 33
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("AMD64", "x86_64"), ("x64", "x86_64"), ("i486", "x86"),
+        ("i686", "x86"), ("AARCH64", "arm64"), ("armv7l", "armv7"),
+        ("ppc64le", "ppc64le"), ("riscv64", "riscv64"),
+    ],
+)
+def test_architecture_aliases_are_canonical(value: str, expected: str) -> None:
+    assert canonical_architecture(value) == expected
+
+
+@pytest.mark.parametrize(
+    "canary",
+    [
+        "GPU(/home/alice/private)",
+        "model=/Users/alice/Games",
+        r"driver=C:\Users\alice\driver.dll",
+        r"share=(\\server\private\games)",
+        "prefix,/tmp/private-file",
+        "device=/dev/disk9",
+    ],
+)
+def test_validator_rejects_embedded_and_punctuated_paths(canary: str) -> None:
+    candidate = profile()
+    candidate["os"]["name"]["value"] = canary  # type: ignore[index]
+    with pytest.raises(ValueError, match="private"):
+        validate_system_profile(candidate)
+
+
+def test_every_fact_requires_evidence_and_non_known_reason() -> None:
+    missing_evidence = profile()
+    missing_evidence["os"]["name"]["evidence_refs"] = []  # type: ignore[index]
+    with pytest.raises(ValueError, match="evidence"):
+        validate_system_profile(missing_evidence)
+
+    missing_reason = profile()
+    del missing_reason["graphics"]["reason_code"]  # type: ignore[index]
+    with pytest.raises(ValueError, match="reason"):
+        validate_system_profile(missing_reason)
 
 
 @pytest.mark.parametrize(
@@ -290,6 +442,89 @@ def test_new_sync_recovers_abandoned_attempt(tmp_path: Path) -> None:
         assert recovered.status == "failed"
         assert recovered.error_code == "SYNC_ABANDONED"
         assert storage.get_sync_run(current.id).status == "running"
+
+
+def test_history_pruning_removes_generic_evidence_without_touching_current(
+    tmp_path: Path,
+) -> None:
+    with configured(tmp_path) as storage:
+        current = storage.begin_system_profile_sync(
+            machine_id="local", disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            started_at="2026-07-11T12:00:00Z",
+        )
+        storage.complete_system_profile_sync(
+            current.id, profile=profile(name="current"),
+            observed_at="2026-07-11T12:00:00Z",
+            completed_at="2026-07-11T12:01:00Z",
+            disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+        )
+        insert_raw_system_history(
+            storage, machine="local", count=1105,
+            first_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        )
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM evidence WHERE capability='system_profile.read'"
+        ).fetchone()[0] == 1106
+        latest = storage.begin_system_profile_sync(
+            machine_id="local", disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            started_at="2026-07-12T12:00:00Z",
+        )
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM evidence WHERE capability='system_profile.read'"
+        ).fetchone()[0] == 1
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM system_profile_observations"
+        ).fetchone()[0] == 1
+        assert storage.read_system_profile_snapshot("local")["profile"] == profile(
+            name="current"
+        )
+        storage.finish_system_profile_sync_failed(
+            latest.id, status="failed", error_code="TEST_DONE", completed_at=T1
+        )
+
+
+def test_storage_promotion_normalizes_machine_architecture_alias(tmp_path: Path) -> None:
+    with configured(tmp_path) as storage:
+        storage.upsert_machine(
+            Machine("local", "local", "linux", "AMD64"), observed_at=T0
+        )
+        run = storage.begin_system_profile_sync(
+            machine_id="local", disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            started_at=T0,
+        )
+        completed = storage.complete_system_profile_sync(
+            run.id, profile=profile(), observed_at=T0, completed_at=T1,
+            disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+        )
+        assert completed.promoted is True
+
+
+def test_bulk_delete_is_set_based_and_preserves_unrelated_evidence(tmp_path: Path) -> None:
+    with configured(tmp_path) as storage:
+        insert_raw_system_history(
+            storage, machine="local", count=1105,
+            first_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        with storage._connection:  # noqa: SLF001 - unrelated evidence canary
+            unrelated_id = int(
+                storage._connection.execute(  # noqa: SLF001
+                    """INSERT INTO evidence(
+                           provider,capability,source_kind,source_locator,retrieved_at,
+                           support_level,context_json,payload_json,content_hash
+                       ) VALUES (
+                           'another_provider','system_profile.read','test','unrelated',?,
+                           'core','{}','{}','unrelated-hash'
+                       )""",
+                    (T0,),
+                ).lastrowid
+            )
+        deletion = storage.delete_system_profile_data("local")
+        assert deletion["observations_removed"] == 1105
+        assert deletion["sync_runs_removed"] == 1105
+        assert deletion["evidence_removed"] == 1105
+        assert storage._connection.execute(  # noqa: SLF001
+            "SELECT 1 FROM evidence WHERE id=?", (unrelated_id,)
+        ).fetchone() is not None
 
 
 def test_profiles_are_isolated_and_delete_preserves_machine(tmp_path: Path) -> None:

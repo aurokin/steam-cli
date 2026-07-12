@@ -16,6 +16,8 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from steam_agent.storage import Storage, SyncRun
@@ -56,7 +58,15 @@ _FORBIDDEN_KEY_PARTS = (
     "home_path",
     "filesystem_path",
 )
-_PATH = re.compile(r"(?:^|\s)(?:/[A-Za-z]|[A-Za-z]:\\|\\\\)")
+_PATH = re.compile(
+    r"(?:"
+    r"(?:^|[\s=(:,;\[{'\"`])/(?!/)[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*"
+    r"|/(?:Users|home|private|tmp|var|etc|dev|Volumes|mnt|media|root)(?:[/\\]|$)"
+    r"|(?:^|[\s=(:,;\[{'\"`])[A-Za-z]:[\\/]"
+    r"|(?:^|[\s=(:,;\[{'\"`])(?:\\\\|//)[A-Za-z0-9._~-]"
+    r")",
+    re.IGNORECASE,
+)
 _IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _MAC = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
 _UUID = re.compile(
@@ -65,6 +75,16 @@ _UUID = re.compile(
 _EVIDENCE_REF = re.compile(r"[a-z0-9_-]{1,32}:[a-z0-9_.-]{1,64}\Z")
 _MAX_COMMAND_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT_SECONDS = 4.0
+_WINDOWS_POWERSHELL = (
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+)
+_WINDOWS_GPU_COMMAND = (
+    _WINDOWS_POWERSHELL,
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress",
+)
 
 Clock = Callable[[], datetime]
 Reader = Callable[[Path, int], str | None]
@@ -134,7 +154,7 @@ def collect_system_profile(
     """Collect one normalized profile with injectable, bounded OS boundaries."""
 
     system_name = (system or platform.system()).casefold()
-    architecture = _canonical_architecture(machine_architecture or platform.machine())
+    architecture = canonical_architecture(machine_architecture or platform.machine())
     read = reader or _bounded_read
     run = runner or _bounded_run
     usage = disk_usage or shutil.disk_usage
@@ -286,10 +306,7 @@ def _collect_windows(
     else:
         cpu["features"] = unknown("not_reported", "windows:native-cpu")
     gpu_json = runner(
-        (
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress",
-        ),
+        _WINDOWS_GPU_COMMAND,
         _COMMAND_TIMEOUT_SECONDS,
         _MAX_COMMAND_OUTPUT,
     )
@@ -556,24 +573,76 @@ def _bounded_read(path: Path, limit: int) -> str | None:
 
 
 def _bounded_run(argv: Sequence[str], timeout: float, output_limit: int) -> str | None:
-    allowed = {
-        "/usr/bin/sw_vers", "/usr/sbin/sysctl", "/usr/sbin/system_profiler", "powershell.exe"
-    }
-    if not argv or argv[0] not in allowed or not 0 < timeout <= _COMMAND_TIMEOUT_SECONDS:
+    command = tuple(argv)
+    if not _command_is_allowlisted(command) or not 0 < timeout <= _COMMAND_TIMEOUT_SECONDS:
         raise ValueError("command is not allowlisted")
     if not 1 <= output_limit <= _MAX_COMMAND_OUTPUT:
         raise ValueError("command output limit is invalid")
     try:
-        completed = subprocess.run(
-            tuple(argv), shell=False, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen(
+            command, shell=False, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False,
+            bufsize=0,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         return None
-    if completed.returncode != 0 or len(completed.stdout) > output_limit:
+    assert process.stdout is not None
+    captured: list[bytes] = []
+    read_done = threading.Event()
+
+    def read_bounded() -> None:
+        try:
+            captured.append(process.stdout.read(output_limit + 1))
+        finally:
+            read_done.set()
+
+    reader = threading.Thread(target=read_bounded, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
+    oversized = False
+    while process.poll() is None and time.monotonic() < deadline:
+        if read_done.wait(0.01) and captured and len(captured[0]) > output_limit:
+            oversized = True
+            break
+    timed_out = process.poll() is None and time.monotonic() >= deadline
+    if oversized or timed_out:
+        process.kill()
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            return None
+    reader.join(timeout=0.5)
+    try:
+        process.stdout.close()
+    except OSError:
+        pass
+    if reader.is_alive() or oversized or timed_out or process.returncode != 0:
         return None
-    return completed.stdout.decode("utf-8", errors="replace").strip() or None
+    payload = captured[0] if captured else b""
+    if len(payload) > output_limit:
+        return None
+    return payload.decode("utf-8", errors="replace").strip() or None
+
+
+def _command_is_allowlisted(argv: tuple[str, ...]) -> bool:
+    if argv in {
+        ("/usr/bin/sw_vers", "-productVersion"),
+        ("/usr/bin/sw_vers", "-buildVersion"),
+        ("/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"),
+        _WINDOWS_GPU_COMMAND,
+    }:
+        return True
+    return (
+        len(argv) == 3
+        and argv[:2] == ("/usr/sbin/sysctl", "-n")
+        and argv[2] in {
+            "machdep.cpu.brand_string", "hw.physicalcpu", "hw.logicalcpu", "hw.memsize"
+        }
+    )
 
 
 def _parse_os_release(value: str) -> dict[str, str]:
@@ -647,7 +716,9 @@ def _parse_windows_displays(value: str | None) -> list[dict[str, Any]]:
         result.append({
             "adapter_id": f"gpu-{index}", "name": name,
             "vendor_id": None, "device_id": None,
-            "memory": {"kind": "dedicated", "bytes": _positive_int(row.get("AdapterRAM"))},
+            # Win32_VideoController.AdapterRAM is often truncated or otherwise
+            # unreliable; do not turn it into compatibility evidence.
+            "memory": {"kind": "unknown", "bytes": None},
             "driver_version": _safe_text(row.get("DriverVersion")), "apis": [],
         })
     return result
@@ -660,15 +731,18 @@ def _validate_fact(value: Any) -> None:
     if not set(value) <= allowed or "evidence_refs" not in value:
         raise ValueError("fact wrapper fields are invalid")
     refs = value["evidence_refs"]
-    if not isinstance(refs, list) or refs != sorted(set(refs)) or any(
+    if not isinstance(refs, list) or not refs or refs != sorted(set(refs)) or any(
         not isinstance(ref, str) or _EVIDENCE_REF.fullmatch(ref) is None for ref in refs
     ):
         raise ValueError("fact evidence references are invalid")
     if value["state"] == "known":
         if "value" not in value or value["value"] is None or "reason_code" in value:
             raise ValueError("known fact is invalid")
-    elif "value" in value:
-        raise ValueError("unknown fact cannot contain a value")
+    else:
+        if "value" in value:
+            raise ValueError("unknown fact cannot contain a value")
+        if "reason_code" not in value:
+            raise ValueError("non-known fact requires a reason code")
     reason = value.get("reason_code")
     if reason is not None and (
         not isinstance(reason, str)
@@ -807,15 +881,15 @@ def _nested_fact_known(profile: Mapping[str, Any], section: str, field_name: str
     return isinstance(section_value, Mapping) and isinstance(section_value.get(field_name), Mapping) and section_value[field_name].get("state") == "known"
 
 
-def _canonical_architecture(value: str | None) -> str | None:
+def canonical_architecture(value: str | None) -> str | None:
     if not value:
         return None
     normalized = value.strip().casefold().replace("-", "_")
     canonical = {
         "amd64": "x86_64", "x64": "x86_64", "x86_64": "x86_64",
-        "i386": "x86", "i686": "x86", "x86": "x86",
+        "i386": "x86", "i486": "x86", "i586": "x86", "i686": "x86", "x86": "x86",
         "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7",
-        "ppc64le": "ppc64le", "riscv64": "riscv64",
+        "armv7": "armv7", "ppc64le": "ppc64le", "riscv64": "riscv64",
     }.get(normalized)
     return canonical
 

@@ -117,6 +117,10 @@ def test_stale_profile_is_partial_in_json_and_table(
     table = capsys.readouterr()
     assert code == 0 and table.err == ""
     assert table.out.startswith("COMPLETENESS\tpartial\n")
+    storage_row = next(
+        line for line in table.out.splitlines() if line.startswith("storage\tsummary\t")
+    )
+    assert storage_row.endswith("\tstale")
 
 
 def test_machine_alias_platform_conflict_is_typed_and_does_not_collect(
@@ -136,6 +140,24 @@ def test_machine_alias_platform_conflict_is_typed_and_does_not_collect(
         assert storage.get_machine("local") == Machine("local", "Existing", "windows", "x86_64")
 
 
+def test_machine_alias_architecture_aliases_do_not_conflict(
+    tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = setup(monkeypatch)
+    monkeypatch.setattr(
+        cli, "machine_for", lambda alias: Machine(alias, alias, "linux", "x64")
+    )
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("local", "Existing", "linux", "AMD64"), observed_at=NOW
+        )
+    code, result, _ = invoke(
+        tmp_path, capsys, "sync", "system", "--acknowledge-local-storage"
+    )
+    assert code == 0 and result["data"]["sync_status"] == "complete"
+    assert calls == [1]
+
+
 def test_machine_deletion_requires_confirmation_and_preserves_machine(
     tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +168,9 @@ def test_machine_deletion_requires_confirmation_and_preserves_machine(
         "--machine", "local",
     )
     assert code == 1 and blocked["error"]["code"] == "CONFIRMATION_REQUIRED"
+    assert blocked["error"]["message"] == (
+        "Local system-profile data deletion requires --yes."
+    )
     code, deleted, _ = invoke(
         tmp_path, capsys, "data", "delete", "--provider", "local-system",
         "--machine", "local", "--yes",
