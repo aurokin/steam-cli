@@ -97,8 +97,9 @@ def test_ambiguous_interval_comparison_has_safe_boundaries() -> None:
     assert below.memory.state == "fail"
     assert between.memory.state == "unknown"
     assert upper.memory.state == "pass"
-    # Opaque/missing CPU and GPU keep the aggregate unknown; no performance claim.
-    assert upper.overall == "unknown"
+    # Omitted opaque model constraints are not applicable; this is still no
+    # performance claim because present CPU/GPU prose remains unknown.
+    assert upper.overall == "pass"
 
 
 def test_decisive_capacity_failure_precedes_unknown_prose() -> None:
@@ -193,7 +194,8 @@ def test_missing_fields_are_unknown_not_authoritative_absence() -> None:
         SystemCapacity(64 << 30, 1 << 40, "x86_64"), parsed
     )
     assert parsed.memory.state == parsed.cpu.state == "missing"
-    assert compared.memory.state == compared.cpu.state == "unknown"
+    assert compared.memory.state == "unknown"
+    assert compared.cpu.state == "pass"
     assert compared.overall == "unknown"
 
 

@@ -40,7 +40,18 @@ def system(
             "os": {"family": {"state": "known", "value": platform}},
             "cpu": {"architecture": {"state": "known", "value": "x86_64"}},
             "memory": {"total_bytes": {"state": "known", "value": 16 << 30}},
-            "storage": {"state": "known", "value": {"available_bytes": 50 << 30}},
+            "storage": {
+                "state": "known",
+                "value": [
+                    {
+                        "role": "system",
+                        "capacity_bytes": 100 << 30,
+                        "available_bytes": 50 << 30,
+                        "filesystem": None,
+                        "medium": "unknown",
+                    }
+                ],
+            },
             "graphics": {"state": "known", "value": {"models": ["PRIVATE GPU"]}},
         },
         observed_at,
@@ -100,6 +111,7 @@ def declared(
     payload: Mapping[str, Any] | None = None,
     demand_state: str = "ready",
     demand_at: datetime | None = None,
+    evaluated: bool | None = None,
 ) -> Mapping[str, Any]:
     return {
         "items": (
@@ -112,7 +124,9 @@ def declared(
         "latest_demand": (
             {
                 "appid": appid,
-                "evaluated": demand_state != "unattempted",
+                "evaluated": (
+                    demand_state != "unattempted" if evaluated is None else evaluated
+                ),
                 "state": demand_state,
                 "observed_at": (demand_at or observed_at).isoformat(),
             },
@@ -164,6 +178,39 @@ def test_every_requested_appid_is_retained_without_any_snapshot() -> None:
     assert tuple(item.appid for item in query.assessment.results) == (10, 20, 30)
     assert all(item.compatibility == "unknown" for item in query.assessment.results)
     assert tuple(appid for appid, _ in query.references) == (10, 20, 30)
+
+
+def test_ten_thousand_subject_join_is_bounded_and_retains_every_subject() -> None:
+    requested = tuple(range(1, 10_001))
+    snapshot = {
+        "items": tuple({"appid": appid, "facts": None} for appid in requested),
+        "latest_demand": tuple(
+            {
+                "appid": appid,
+                "evaluated": False,
+                "state": "unevaluated",
+                "observed_at": NOW.isoformat(),
+            }
+            for appid in requested
+        ),
+    }
+    query = reconstruct_compatibility(
+        requested,
+        target=WINDOWS,
+        generated_at=NOW,
+        system=None,
+        declared_snapshot=snapshot,
+    )
+    assert len(query.assessment.results) == 10_000
+    assert query.assessment.requested_appids == requested
+    with pytest.raises(ValueError, match="supported bound"):
+        reconstruct_compatibility(
+            tuple(range(1, 100_002)),
+            target=WINDOWS,
+            generated_at=NOW,
+            system=None,
+            declared_snapshot=None,
+        )
 
 
 def test_windows_declared_false_is_effective_failure() -> None:
@@ -262,6 +309,24 @@ def test_missing_notice_state_is_attributed_unknown_not_absence() -> None:
     assert drm.presence == "unknown"
     assert drm.evidence.source == "steam_store_appdetails"
     assert drm.evidence.evidence_ids
+
+
+def test_unknown_runtime_notices_are_facts_but_not_mandatory_blockers() -> None:
+    payload = dict(facts(10))
+    payload.pop("drm_notice")
+    payload.pop("external_account_notice")
+    item = result(
+        snapshot=declared(10, payload=payload),
+        minimum_evaluator=SafeMinimumEvaluator(),
+    )
+    risks = {risk.name: risk for risk in item.runtime_risks}
+    assert {name: risk.presence for name, risk in risks.items()} == {
+        "declared-drm": "unknown",
+        "external-account": "unknown",
+    }
+    risk_gates = [gate for gate in item.gates if gate.name.startswith("runtime:")]
+    assert all(gate.mandatory is False for gate in risk_gates)
+    assert item.compatibility == "compatible"
 
 
 def test_owned_absence_is_unknown_not_nonownership() -> None:
@@ -380,6 +445,39 @@ def test_newer_failed_declared_demand_marks_retained_current_stale() -> None:
     native = next(gate for gate in item.gates if gate.name == "declared_native_build")
     assert native.original == "pass"
     assert native.original_freshness == "stale"
+
+
+@pytest.mark.parametrize("error_code", ["FRESH_LAST_GOOD", "MAX_ITEMS_LIMIT"])
+def test_unevaluated_declared_skip_does_not_stale_last_good(error_code: str) -> None:
+    snapshot = dict(
+        declared(
+            10,
+            observed_at=NOW - timedelta(hours=1),
+            demand_state="unevaluated",
+            demand_at=NOW,
+            evaluated=False,
+        )
+    )
+    demand = dict(snapshot["latest_demand"][0])
+    demand["error_code"] = error_code
+    snapshot["latest_demand"] = (demand,)
+    item = result(snapshot=snapshot)
+    native = next(gate for gate in item.gates if gate.name == "declared_native_build")
+    assert native.original_freshness == "fresh"
+
+
+def test_newer_evaluated_failure_never_upgrades_expired_last_good() -> None:
+    item = result(
+        snapshot=declared(
+            10,
+            observed_at=NOW - timedelta(days=31),
+            demand_state="failed",
+            demand_at=NOW,
+        )
+    )
+    native = next(gate for gate in item.gates if gate.name == "declared_native_build")
+    assert native.original_freshness == "expired"
+    assert native.effective == "unknown"
 
 
 def test_target_key_and_platform_conflicts_are_preserved_as_conflicts() -> None:
@@ -521,6 +619,89 @@ def test_default_bounded_parser_can_detect_a_decisive_memory_failure() -> None:
     assert minimum.effective == "fail"
     assert item.compatibility == "incompatible"
     assert "Opaque" not in json.dumps(asdict(item), default=str)
+
+
+def test_default_evaluator_has_compatible_path_when_opaque_models_are_absent() -> None:
+    payload = {
+        **facts(10),
+        "requirements": [
+            {
+                "platform": "windows",
+                "state": "declared",
+                "minimum": (
+                    "Memory: 8 GiB RAM\nStorage: 10 GiB available space\n"
+                    "Architecture: x86_64"
+                ),
+                "recommended": None,
+            }
+        ],
+    }
+    item = result(snapshot=declared(10, payload=payload))
+    assert item.compatibility == "compatible"
+    assert next(g for g in item.gates if g.name == "meets_minimum").effective == "pass"
+
+
+def test_real_system_storage_role_is_used_but_not_a_compatibility_failure_for_installed_app() -> None:
+    base = system()
+    profile = dict(base.profile or {})
+    profile["storage"] = {
+        "state": "known",
+        "value": [
+            {
+                "role": "system",
+                "capacity_bytes": 100 << 30,
+                "available_bytes": 1 << 30,
+                "filesystem": None,
+                "medium": "unknown",
+            }
+        ],
+    }
+    real_system = SystemSnapshot(
+        base.target_key, profile, base.observed_at, base.snapshot_id
+    )
+    payload = {
+        **facts(10),
+        "requirements": [
+            {
+                "platform": "windows",
+                "state": "declared",
+                "minimum": (
+                    "Memory: 8 GiB RAM\nStorage: 20 GiB available space\n"
+                    "Architecture: x86_64"
+                ),
+                "recommended": None,
+            }
+        ],
+    }
+    uninstalled = result(
+        snapshot=declared(10, payload=payload), system_snapshot=real_system
+    )
+    assert next(
+        gate for gate in uninstalled.gates if gate.name == "meets_minimum"
+    ).effective == "fail"
+    installed = result(
+        snapshot=declared(10, payload=payload),
+        system_snapshot=real_system,
+        installed={10: local("installed_projection")},
+    )
+    minimum = next(
+        gate for gate in installed.gates if gate.name == "meets_minimum"
+    )
+    assert minimum.effective == "pass"
+    assert installed.compatibility == "compatible"
+    stale_install = result(
+        snapshot=declared(10, payload=payload),
+        system_snapshot=real_system,
+        installed={
+            10: local(
+                "installed_projection",
+                observed_at=NOW - timedelta(minutes=16),
+            )
+        },
+    )
+    assert next(
+        gate for gate in stale_install.gates if gate.name == "meets_minimum"
+    ).effective == "fail"
 
 
 def test_default_minimum_parser_rejects_non_english_context() -> None:

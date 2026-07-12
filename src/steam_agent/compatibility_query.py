@@ -161,6 +161,7 @@ class MinimumEvaluation:
 
     architecture: PrimitiveEvidence
     meets_minimum: PrimitiveEvidence
+    meets_minimum_without_storage: PrimitiveEvidence | None = None
 
 
 class MinimumEvaluator(Protocol):
@@ -230,15 +231,29 @@ class ConservativeMinimumEvaluator:
             ),
             system_profile_freshness,
         )
+        minimum_state, minimum_reason = _minimum_overall(
+            comparison, ignore_storage=False
+        )
         minimum = _comparison_evidence(
-            comparison.overall,
-            _overall_reason(comparison),
+            minimum_state,
+            minimum_reason,
             appid,
             observed,
             minimum_freshness,
             "minimum-overall",
         )
-        return MinimumEvaluation(architecture, minimum)
+        without_storage_state, without_storage_reason = _minimum_overall(
+            comparison, ignore_storage=True
+        )
+        without_storage = _comparison_evidence(
+            without_storage_state,
+            without_storage_reason,
+            appid,
+            observed,
+            _worst_freshness(declared_freshness, system_profile_freshness),
+            "minimum-overall-without-storage",
+        )
+        return MinimumEvaluation(architecture, minimum, without_storage)
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +412,17 @@ def _candidate(
         )
         if not isinstance(evaluated, MinimumEvaluation):
             raise ValueError("minimum evaluator returned an invalid result")
-        architecture, minimum = evaluated.architecture, evaluated.meets_minimum
+        architecture = evaluated.architecture
+        minimum = (
+            evaluated.meets_minimum_without_storage
+            if installed is not None
+            and installed.presence == "present"
+            and _local_freshness(
+                installed, generated_at, installed_kind=True
+            ) == "fresh"
+            and evaluated.meets_minimum_without_storage is not None
+            else evaluated.meets_minimum
+        )
     features = _features(
         facts, declared_at, declared_freshness, appid, conflict
     )
@@ -450,12 +475,17 @@ def _declared(
         demand_at = _parse_time(demand.get("observed_at"))
         if demand_at is not None and (observed is None or demand_at >= observed):
             conflict = True
-    elif demand is not None and demand.get("state") not in {None, "ready"}:
+    elif (
+        demand is not None
+        and demand.get("evaluated") is True
+        and demand.get("state") not in {None, "ready", "not_found"}
+    ):
         demand_at = _parse_time(demand.get("observed_at")) or _parse_time(
             demand.get("started_at")
         )
         if demand_at is not None and observed is not None and demand_at > observed:
-            freshness = "stale" if freshness != "unknown" else "unknown"
+            if freshness == "fresh":
+                freshness = "stale"
     return facts, observed, freshness, conflict
 
 
@@ -782,12 +812,18 @@ def _system_capacity(profile: Mapping[str, Any] | None) -> SystemCapacity:
     architecture = _fact_value(_nested(profile, "cpu", "architecture"))
     storage_value = _fact_value(profile.get("storage"))
     storage_available: int | None = None
-    if isinstance(storage_value, list):
+    if isinstance(storage_value, (list, tuple)):
         primary = [
             item
             for item in storage_value
             if isinstance(item, Mapping) and item.get("role") == "steam_primary"
         ]
+        if not primary:
+            primary = [
+                item
+                for item in storage_value
+                if isinstance(item, Mapping) and item.get("role") == "system"
+            ]
         if len(primary) == 1 and isinstance(primary[0].get("available_bytes"), int):
             storage_available = primary[0]["available_bytes"]
     return SystemCapacity(
@@ -841,6 +877,36 @@ def _overall_reason(comparison: Any) -> str:
     if any(component.state == "fail" for component in components):
         return "at_least_one_minimum_capacity_component_failed"
     return "minimum_components_not_all_safely_comparable"
+
+
+def _minimum_overall(
+    comparison: Any, *, ignore_storage: bool
+) -> tuple[Literal["pass", "fail", "unknown"], str]:
+    """Separate install-space readiness from compatibility for installed apps."""
+
+    if not ignore_storage:
+        return comparison.overall, _overall_reason(comparison)
+    components = (
+        comparison.memory,
+        comparison.architecture,
+        comparison.cpu,
+        comparison.gpu,
+    )
+    state: Literal["pass", "fail", "unknown"] = (
+        "fail"
+        if any(component.state == "fail" for component in components)
+        else "unknown"
+        if any(component.state == "unknown" for component in components)
+        else "pass"
+    )
+    reason = (
+        "installed_app_storage_is_readiness_not_compatibility"
+        if state == "pass"
+        else "at_least_one_non_storage_minimum_component_failed"
+        if state == "fail"
+        else "non_storage_minimum_components_not_all_safely_comparable"
+    )
+    return state, reason
 
 
 def _worst_freshness(*values: Freshness) -> Freshness:
@@ -1015,12 +1081,13 @@ def _declared_maps(
 def _indexed_rows(value: object, requested: tuple[int, ...], name: str) -> dict[int, Mapping[str, Any]]:
     if not isinstance(value, (list, tuple)) or len(value) > MAX_APPIDS:
         raise ValueError(f"{name} must be a bounded sequence")
+    requested_set = set(requested)
     result: dict[int, Mapping[str, Any]] = {}
     for row in value:
         if not isinstance(row, Mapping):
             raise ValueError(f"{name} contains an invalid row")
         appid = row.get("appid")
-        if appid not in requested or appid in result:
+        if appid not in requested_set or appid in result:
             raise ValueError(f"{name} has an unexpected or duplicate AppID")
         result[appid] = row  # type: ignore[index]
     return result
@@ -1035,8 +1102,9 @@ def _local_map(
         return {}
     if not isinstance(values, Mapping) or len(values) > MAX_APPIDS:
         raise ValueError(f"{name} observations must be a bounded mapping")
+    requested_set = set(requested)
     for appid, value in values.items():
-        if appid not in requested or not isinstance(value, LocalObservation):
+        if appid not in requested_set or not isinstance(value, LocalObservation):
             raise ValueError(f"{name} observation subject is invalid")
     return values
 

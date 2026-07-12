@@ -471,7 +471,9 @@ def _assess(
             )
         else:
             evidence = risk.evidence
-        raw.append((f"runtime:{risk.name}", evidence, True))
+        # Unknown notice state remains an attributed output fact, but absence
+        # of notice metadata is not itself a mandatory compatibility blocker.
+        raw.append((f"runtime:{risk.name}", evidence, risk.presence != "unknown"))
 
     feature_map = {(item.kind, item.name): item.support for item in candidate.features}
     for requirement in requirements:
@@ -679,7 +681,13 @@ class MinimumComparison:
 
 
 def compare_minimum_requirements(machine: MachineCapacity, requirement: MinimumRequirements) -> MinimumComparison:
-    """Compare only exact bounded quantities; opaque CPU/GPU names stay unknown."""
+    """Legacy exact-DTO comparator retained for compatibility-engine evals.
+
+    Production query reconstruction uses the bounded parser in
+    :mod:`steam_agent.requirement_parser`; this helper must not be used to
+    interpret storefront prose. It compares only exact bounded quantities;
+    opaque CPU/GPU names stay unknown.
+    """
 
     if not isinstance(machine, MachineCapacity) or not isinstance(requirement, MinimumRequirements):
         raise ValueError("machine and requirement must be normalized DTOs")

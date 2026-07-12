@@ -399,5 +399,10 @@ def _compare_architecture(
 
 
 def _opaque_comparison(fact: RequirementFact, component: str) -> ComponentComparison:
+    # An omitted opaque model constraint contributes no comparable requirement.
+    # This is not a performance claim: any *present* CPU/GPU prose remains
+    # unknown because this parser never orders model names.
+    if fact.state == "missing":
+        return ComponentComparison("pass", f"{component}_requirement_not_declared")
     reason = fact.reason or f"{component}_comparison_not_supported"
     return ComponentComparison("unknown", reason)
