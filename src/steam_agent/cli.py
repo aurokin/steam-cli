@@ -142,6 +142,7 @@ from steam_agent.groups import (
     FamilyEdge,
     GroupCandidate,
     MAX_SEEDS_PER_MEMBER,
+    MAX_SOURCES,
     MemberPreference,
     MemberRef,
     OwnershipFact,
@@ -2831,6 +2832,12 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
         summarize_ownership(members, ())
         if len(extra_sources) != len(set(extra_sources)):
             raise ValueError("copy sources must be unique")
+        member_sources = {CopySourceRef.for_member(member) for member in members}
+        if (
+            any(source in member_sources for source in extra_sources)
+            or len(member_sources) + len(extra_sources) > MAX_SOURCES
+        ):
+            raise ValueError("copy sources must be bounded and distinct from members")
         country = args.country.upper()
         SteamDeclaredFactsRequestContext(country, args.language)
         host = None if getattr(args, "host", None) is None else _group_ref(args.host)

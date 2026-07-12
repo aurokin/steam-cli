@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
+import pytest
+
 import steam_agent.cli as cli
 from steam_agent.storage import Machine, OwnedObservation, Storage
 
@@ -296,6 +298,48 @@ def test_group_with_only_unsynced_accounts_is_unavailable(
     assert code == 0
     assert value["completeness"]["status"] == "unavailable"
     assert value["completeness"]["missing_capabilities"] == ["owned.visible.read"]
+
+
+@pytest.mark.parametrize(
+    "copy_sources",
+    [
+        ("synthetic:Alpha",),
+        tuple(f"synthetic:source{index}" for index in range(63)),
+    ],
+)
+def test_group_ownership_rejects_unbounded_or_member_copy_sources_before_storage(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_sources: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        cli, "Storage", lambda *_args, **_kwargs: pytest.fail("storage was opened")
+    )
+    arguments = [
+        "group",
+        "ownership",
+        "400",
+        "--member",
+        "synthetic:Alpha",
+        "--member",
+        "synthetic:Beta",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    ]
+    for source in copy_sources:
+        arguments.extend(("--copy-source", source))
+
+    code, value, _ = invoke(tmp_path, capsys, *arguments)
+
+    assert code == 2
+    assert value["error"]["code"] == "INVALID_ARGUMENT"
 
 
 def test_group_eligibility_combines_mode_copies_players_and_policy(
