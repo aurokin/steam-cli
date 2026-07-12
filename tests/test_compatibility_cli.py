@@ -306,6 +306,111 @@ def test_assess_is_cache_only_exact_and_does_not_persist_overrides(
     assert after == before
 
 
+def test_assess_envelope_reports_active_m5_scope_but_retains_future_and_deck_gaps(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = populated_snapshot(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        Storage,
+        "read_compatibility_snapshot",
+        lambda *_args, **_kwargs: snapshot,
+    )
+
+    common = (
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    code, machine, stderr = invoke(
+        tmp_path, capsys, *common, "--target", "machine:local"
+    )
+    assert code == 0 and stderr == ""
+    assert machine["completeness"] == {
+        "missing_capabilities": [],
+        "stale_capabilities": [],
+        "status": "complete",
+        "warnings": [],
+    }
+    assert machine["data"]["source_completeness"]["missing_capabilities"] == [
+        "operations.ready.read"
+    ]
+
+    code, deck, stderr = invoke(
+        tmp_path, capsys, *common, "--target", "valve:steam-deck"
+    )
+    assert code == 0 and stderr == ""
+    assert deck["completeness"]["status"] == "complete"
+    assert deck["completeness"]["warnings"] == []
+    assert deck["data"]["source_completeness"]["missing_capabilities"] == [
+        "library.installed.read",
+        "operations.ready.read",
+        "system_profile.read",
+    ]
+    assert deck["data"]["source_gaps"][0]["missing"] == [
+        "library.installed.read",
+        "operations.ready.read",
+        "system_profile.read",
+    ]
+
+
+def test_assess_opens_existing_cache_read_only_and_does_not_create_missing_store(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    real_storage = cli.Storage
+    readonly_flags: list[bool] = []
+
+    def open_storage(path: Path, *, readonly: bool = False):
+        readonly_flags.append(readonly)
+        return real_storage(path, readonly=readonly)
+
+    monkeypatch.setattr(cli, "Storage", open_storage)
+    code, _, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 0 and stderr == ""
+    assert readonly_flags == [True]
+
+    missing_dir = tmp_path / "missing"
+    code, missing, stderr = invoke(
+        missing_dir,
+        capsys,
+        "compatibility",
+        "assess",
+        "400",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+    )
+    assert code == 1 and stderr == ""
+    assert missing["error"]["code"] == "ACCOUNT_NOT_CONFIGURED"
+    assert not (missing_dir / "steam-agent.sqlite3").exists()
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

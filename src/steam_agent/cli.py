@@ -114,6 +114,7 @@ from steam_agent.steam_declared_facts import (
     DECLARED_FACTS_DISCLOSURE_VERSION,
     SteamDeclaredFactsClient,
     SteamDeclaredFactsError,
+    SteamDeclaredFactsRequestContext,
     declared_facts_payload,
 )
 from steam_agent.compatibility import (
@@ -1374,6 +1375,36 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
     command = "sync.compatibility"
     country = args.country.upper()
     started_at = _utc_now()
+    try:
+        # Validate the complete provider/scheduler contract before any
+        # dependency-specific early return.  Otherwise an unsynchronized owned
+        # library could make malformed arguments appear valid.
+        SteamDeclaredFactsRequestContext(country, args.language)
+        supplied_appids = tuple(args.appid)
+        if any(
+            isinstance(appid, bool)
+            or not isinstance(appid, int)
+            or not 1 <= appid <= (1 << 32) - 1
+            for appid in supplied_appids
+        ):
+            raise ValueError("AppIDs must be positive uint32 values")
+        demanded_selection = tuple(sorted(set(supplied_appids)))
+        if len(demanded_selection) > 10_000:
+            raise ValueError("compatibility demand exceeds the bounded maximum")
+        if (
+            isinstance(args.max_items, bool)
+            or not isinstance(args.max_items, int)
+            or not 1 <= args.max_items <= 100
+        ):
+            raise ValueError("max-items must be between 1 and 100")
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The compatibility synchronization arguments are invalid.",
+            exit_code=2,
+        )
     with Storage(database_path) as storage:
         try:
             account = storage.get_account(args.account)
@@ -1445,7 +1476,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             or owned_age > _OWNED_SYNC_FRESHNESS_SECONDS
         )
         owned_appids = {game.appid for game in owned.games}
-        demanded_appids = args.appid or sorted(owned_appids)
+        demanded_appids = demanded_selection or tuple(sorted(owned_appids))
         if any(appid not in owned_appids for appid in demanded_appids):
             return _emit_error(
                 args,
@@ -1621,14 +1652,16 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             language=args.language,
             appids=demanded_appids,
         )
-    status = {
-        "complete": CompletenessStatus.COMPLETE,
-        "partial": CompletenessStatus.PARTIAL,
-        "failed": CompletenessStatus.UNAVAILABLE,
-    }[finished.status]
-    has_last_good = any(item.get("facts") is not None for item in snapshot["items"])
-    if finished.status == "failed" and has_last_good:
+    source_gaps = _declared_sync_source_gaps(snapshot)
+    missing_declared = any(item["missing_capabilities"] for item in source_gaps)
+    stale_declared = any(item["stale_capabilities"] for item in source_gaps)
+    available_declared = any(item.get("facts") is not None for item in snapshot["items"])
+    if missing_declared and not available_declared:
+        status = CompletenessStatus.UNAVAILABLE
+    elif missing_declared or stale_declared or finished.status != "complete":
         status = CompletenessStatus.PARTIAL
+    else:
+        status = CompletenessStatus.COMPLETE
     warnings = []
     if finished.status != "complete":
         warnings.append(
@@ -1637,6 +1670,16 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 message=(
                     "Some demanded compatibility facts were not refreshed; "
                     "available last-good facts were preserved."
+                ),
+            )
+        )
+    elif missing_declared:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.PROVIDER_UNAVAILABLE,
+                message=(
+                    "Normalized declared facts are unavailable for some demanded "
+                    "AppIDs; per-AppID source gaps identify them."
                 ),
             )
         )
@@ -1667,15 +1710,12 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             status,
             missing_capabilities=(
                 ["compatibility.declared.read"]
-                if finished.status == "failed" and not has_last_good
+                if missing_declared
                 else []
             ),
             stale_capabilities=(
                 sorted(
-                    ({"compatibility.declared.read"}
-                     if finished.status == "partial" or (
-                         finished.status == "failed" and has_last_good
-                     ) else set())
+                    ({"compatibility.declared.read"} if stale_declared else set())
                     | ({"owned.visible.read"} if owned_dependency_stale else set())
                 )
             ),
@@ -1690,11 +1730,41 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             "targeted": list(targeted),
             "items": list(snapshot["items"]),
             "demand": list(snapshot["latest_demand"]),
+            "source_gaps": source_gaps,
             "schema_id": "declared-app-facts/0.1",
             "support_level": "provisional",
             "disclosure_version": DECLARED_FACTS_DISCLOSURE_VERSION,
         },
     )
+
+
+def _declared_sync_source_gaps(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Classify each demanded subject without letting one last-good mask another."""
+
+    gaps: list[dict[str, Any]] = []
+    for item, demand in zip(
+        snapshot["items"], snapshot["latest_demand"], strict=True
+    ):
+        missing: list[str] = []
+        stale: list[str] = []
+        has_facts = item.get("facts") is not None
+        if not has_facts:
+            missing.append("compatibility.declared.read")
+        elif not (
+            demand.get("state") == "ready"
+            or demand.get("error_code") == "FRESH_LAST_GOOD"
+        ):
+            # A newer unresolved, failed, or negative observation supersedes
+            # the freshness claim while retaining usable last-good facts.
+            stale.append("compatibility.declared.read")
+        gaps.append(
+            {
+                "appid": int(item["appid"]),
+                "missing_capabilities": missing,
+                "stale_capabilities": stale,
+            }
+        )
+    return gaps
 
 
 def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> int:
@@ -1726,7 +1796,14 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             _compatibility_override(item, requested=set(appids), applied_at=now)
             for item in args.override
         )
-        with Storage(database_path) as storage:
+        if not database_path.is_file() and not database_path.is_symlink():
+            return _emit_error(
+                args,
+                command=command,
+                code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                message="The requested account alias is not configured.",
+            )
+        with Storage(database_path, readonly=True) as storage:
             account = storage.get_account(args.account)
             if account is None:
                 return _emit_error(
@@ -1765,8 +1842,25 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             exit_code=2,
         )
 
-    missing = query.completeness.missing_capabilities
-    stale = query.completeness.stale_capabilities
+    # The process envelope reports completeness for the active M5 query
+    # contract.  Keep future ready/operations evidence and Deck-inapplicable
+    # local evidence explicit in data.source_completeness without presenting
+    # either as a failed M5 synchronization.
+    envelope_inapplicable = {"operations.ready.read"}
+    if target.kind == "valve_deck":
+        envelope_inapplicable.update(
+            {"system_profile.read", "library.installed.read"}
+        )
+    missing = tuple(
+        capability
+        for capability in query.completeness.missing_capabilities
+        if capability not in envelope_inapplicable
+    )
+    stale = tuple(
+        capability
+        for capability in query.completeness.stale_capabilities
+        if capability not in envelope_inapplicable
+    )
     warnings_out: list[WarningRecord] = []
     if missing:
         warnings_out.append(

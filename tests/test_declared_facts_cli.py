@@ -114,6 +114,8 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
         "library",
         "--appid",
         "400",
+        "--appid",
+        "400",
         "--machine",
         "desktop",
         "--country",
@@ -132,6 +134,8 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
         "library",
         "--appid",
         "400",
+        "--appid",
+        "400",
         "--machine",
         "desktop",
         "--country",
@@ -140,6 +144,7 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     )
     assert code == 0 and error == ""
     assert synced["completeness"]["status"] == "complete"
+    assert synced["data"]["candidates"] == [400]
     assert synced["data"]["items"][0]["facts"]["appid"] == 400
     assert calls == [400]
     encoded = json.dumps(synced)
@@ -293,6 +298,84 @@ def test_unsynced_owned_scope_is_truthfully_unavailable_without_provider_call(
     assert result["completeness"]["missing_capabilities"] == ["owned.visible.read"]
     assert result["completeness"]["warnings"][0]["code"] == "NOT_SYNCED"
     assert client.calls == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_arguments",
+    (
+        ("--appid", "0"),
+        ("--appid", "4294967296"),
+        ("--language", "not-a-steam-language"),
+        ("--max-items", "0"),
+        ("--max-items", "101"),
+    ),
+)
+def test_sync_validates_bounded_contract_before_unsynced_owned_return(
+    tmp_path: Path,
+    capsys,
+    invalid_arguments: tuple[str, str],
+) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage.upsert_machine(
+            Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
+        )
+        storage.configure_steam_account(
+            alias="primary",
+            steam_id64="76561198000000000",
+            configured_at=NOW,
+        )
+
+    arguments = [
+        "sync",
+        "compatibility",
+        "--scope",
+        "library",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        *invalid_arguments,
+    ]
+    # Replace the default when the invalid case is itself a language.
+    if invalid_arguments[0] == "--language":
+        del arguments[arguments.index("--language") : arguments.index("--language") + 2]
+    code, result, _ = invoke(tmp_path, capsys, *arguments)
+
+    assert code == 2
+    assert result["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_declared_sync_source_gaps_are_classified_per_appid() -> None:
+    gaps = cli._declared_sync_source_gaps(  # noqa: SLF001
+        {
+            "items": (
+                {"appid": 400, "facts": {"schema_id": "declared-app-facts/0.1"}},
+                {"appid": 620, "facts": None},
+                {"appid": 730, "facts": {"schema_id": "declared-app-facts/0.1"}},
+            ),
+            "latest_demand": (
+                {"appid": 400, "state": "ready", "error_code": None},
+                {"appid": 620, "state": "failed", "error_code": "RATE_LIMITED"},
+                {"appid": 730, "state": "failed", "error_code": "RATE_LIMITED"},
+            ),
+        }
+    )
+
+    assert gaps == [
+        {"appid": 400, "missing_capabilities": [], "stale_capabilities": []},
+        {
+            "appid": 620,
+            "missing_capabilities": ["compatibility.declared.read"],
+            "stale_capabilities": [],
+        },
+        {
+            "appid": 730,
+            "missing_capabilities": [],
+            "stale_capabilities": ["compatibility.declared.read"],
+        },
+    ]
 
 
 def test_stale_owned_last_good_makes_sync_partial(
