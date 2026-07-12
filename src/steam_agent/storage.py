@@ -2578,11 +2578,24 @@ class Storage:
             """SELECT w.appid
                FROM wishlist_current AS w
                WHERE w.account_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM review_sync_demand AS active
+                   JOIN sync_runs AS active_run ON active_run.id=active.sync_run_id
+                   WHERE active.account_id=w.account_id AND active.appid=w.appid
+                     AND active.targeted=1 AND active.state='running'
+                     AND active_run.status='running'
+                 )
                  AND (? = 0 OR NOT EXISTS (
                    SELECT 1 FROM review_sync_demand AS d
                    JOIN sync_runs AS r ON r.id = d.sync_run_id
                    WHERE d.account_id = w.account_id AND d.appid = w.appid
-                     AND d.evaluated = 1 AND d.state IN ('ready', 'failed')
+                     AND d.evaluated = 1
+                     AND (
+                       d.state = 'ready' OR (
+                         d.state = 'failed'
+                         AND d.error_code = 'PROVIDER_RESPONSE_INVALID'
+                       )
+                     )
                      AND d.observed_at >= ?
                      AND (
                        d.state = 'failed' OR EXISTS (

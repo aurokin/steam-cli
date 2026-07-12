@@ -229,6 +229,56 @@ def test_nonretryable_subject_failure_does_not_block_later_subjects(tmp_path) ->
         assert result.state_counts == {"ready": 2, "failed": 1}
 
 
+def test_default_convergence_retries_retryable_subject_after_cooldown(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 2)
+        with pytest.raises(ReviewSyncError, match="RATE_LIMITED"):
+            sync_wishlist_reviews(
+                storage,
+                account_id=account_id,
+                client=Client(fail_at=100),
+                clock=Clock(),
+            )
+        client = Client()
+        result = sync_wishlist_reviews(
+            storage,
+            account_id=account_id,
+            client=client,
+            clock=Clock(NOW + timedelta(minutes=2)),
+        )
+        assert result.targeted_count == 2
+        assert client.calls == [100, 101]
+
+
+def test_active_review_target_is_reserved_across_concurrent_schedulers(tmp_path) -> None:
+    with Storage(tmp_path / "state.sqlite3") as storage:
+        account_id = setup_wishlist(storage, 3)
+        first, first_candidates, first_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=1,
+            skip_fresh_terminal=False,
+            started_at=NOW,
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        second, second_candidates, second_targets = storage.begin_review_sync(
+            account_id=account_id,
+            max_items=1,
+            skip_fresh_terminal=False,
+            started_at=NOW + timedelta(seconds=1),
+            disclosure_version=REVIEW_DISCLOSURE_VERSION,
+        )
+        assert first_candidates == (100, 101, 102) and first_targets == (100,)
+        assert second_candidates == (101, 102) and second_targets == (101,)
+        storage.mark_remaining_reviews_unevaluated(
+            first.id, observed_at=NOW, error_code="TEST_CLEANUP"
+        )
+        storage.mark_remaining_reviews_unevaluated(
+            second.id, observed_at=NOW, error_code="TEST_CLEANUP"
+        )
+        storage.finish_review_sync(first.id, completed_at=NOW)
+        storage.finish_review_sync(second.id, completed_at=NOW)
+
+
 def test_retryable_failure_without_header_persists_default_restart_cooldown(
     tmp_path,
 ) -> None:
