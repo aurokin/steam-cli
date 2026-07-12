@@ -134,6 +134,36 @@ def test_fresh_legacy_projection_is_targeted_for_m6_upgrade(
     assert targeted == (400,)
 
 
+def test_future_explicit_demand_does_not_authorize_as_of_scope(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    future = "2027-07-12T12:00:00Z"
+    storage.begin_declared_app_sync(
+        account_id=account_id,
+        machine_id="desktop",
+        demanded_appids=[400],
+        explicit_appids=[400],
+        country="US",
+        language="english",
+        max_items=1,
+        skip_fresh_terminal=True,
+        started_at=future,
+        disclosure_version="m5-v1",
+    )
+
+    assert (
+        storage.read_explicit_declared_appids(
+            account_id=account_id,
+            machine_id="desktop",
+            country="US",
+            language="english",
+            as_of=T0,
+        )
+        == ()
+    )
+
+
 def test_scheduler_retains_complete_ordered_demand_and_cap_reason(
     configured: tuple[Storage, int],
 ) -> None:

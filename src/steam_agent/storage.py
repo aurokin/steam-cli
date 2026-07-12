@@ -3968,12 +3968,9 @@ class Storage:
         self._require_steam_account(account_id)
         if self.get_machine(machine_id) is None:
             raise ValueError("declared-app machine is not configured")
+        timestamp = _timestamp(datetime.now(timezone.utc) if as_of is None else as_of)
         cutoff = _timestamp(
-            datetime.fromisoformat(
-                _timestamp(
-                    datetime.now(timezone.utc) if as_of is None else as_of
-                ).replace("Z", "+00:00")
-            )
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             - timedelta(days=30)
         )
         return tuple(
@@ -3984,9 +3981,9 @@ class Storage:
                    JOIN sync_runs r ON r.id=d.sync_run_id
                    WHERE d.account_id=? AND d.machine_id=?
                      AND d.country=? AND d.language=? AND d.explicit=1
-                     AND r.started_at>=?
+                     AND r.started_at>=? AND r.started_at<=?
                    ORDER BY d.appid""",
-                (account_id, machine_id, country, language, cutoff),
+                (account_id, machine_id, country, language, cutoff, timestamp),
             )
         )
 
