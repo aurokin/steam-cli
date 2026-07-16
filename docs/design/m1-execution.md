@@ -1,6 +1,10 @@
 # M1 execution plan
 
-Status: implemented and accepted
+Status: historical acceptance record; implemented and accepted
+
+This file preserves M1 scope and evidence at acceptance time. Use the
+[user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
+behavior across M1–M7.
 
 Linear project: [Steam CLI — M1 Installed Library](https://linear.app/aurokin/project/steam-cli-m1-installed-library-e0f0bdc817cc)
 

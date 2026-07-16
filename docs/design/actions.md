@@ -1,10 +1,12 @@
 # Actions and automation boundaries
 
-Status: working safety and policy model, verified 2026-07-10
+Status: accepted M7 read/rank/inert-plan boundary; future action classes are
+proposed policy vocabulary. External policy references last verified 2026-07-10.
 
-The expanded product is an answerable game-state graph with an optional action
-planner. Read access does not imply permission to mutate Steam, and technical
-feasibility does not imply a supported automation contract.
+The current product observes bounded local state, ranks evidence, and returns
+inert human plans. Read access does not imply permission to mutate Steam, and
+technical feasibility does not imply a supported automation contract. The
+accepted boundary is [ADR 0013](../adr/0013-m7-read-only-operation-plans.md).
 
 Valve's [Steam Subscriber Agreement](https://store.steampowered.com/subscriber_agreement/),
 revised April 20, 2026, broadly restricts non-human-controlled automation
@@ -30,7 +32,11 @@ A single `support_level` is insufficient. Every capability declares:
 A documented Steamworks method may still be unusable because it is intended for
 the developer's running game rather than a general consumer administrator.
 
-## Operation classes
+## Policy vocabulary for future capabilities
+
+The table classifies possible effects so later proposals can be reviewed. Only
+the read-only observation, ranking, and inert-plan subset described in the next
+section is implemented and accepted.
 
 | Class | Examples | Initial behavior |
 | --- | --- | --- |
@@ -47,19 +53,23 @@ launch primitive, but remains opt-in and policy-reviewed. Older install,
 uninstall, validation, client-console, and command-line mechanisms are not a
 stable supported consumer administration API.
 
-## Initial action boundary
+## Accepted M7 action boundary
 
 - Read official Web APIs and read-only OS/local observations.
 - Never write Steam ACF/VDF/client files or manipulate internal IPC.
 - Never capture Steam passwords, Guard codes, session cookies, or client tokens.
-- For install/uninstall/update/move/verify, initially return a plan and the exact
+- For launch/install/uninstall/move/verify/backup, return a plan and the exact
   Steam UI destination/instructions.
 - Keep cloud conflicts, Workshop publishing/deletion, family changes, social
   messages, and financial operations human-controlled.
-- A plan must include capability/policy status, dry-run detail, account/machine,
-  idempotency key, expiration, confirmation class, rollback, and postcondition.
+- A plan must include prohibited-execution capability/policy status,
+  account/machine, deterministic plan identity, expiration, confirmation class,
+  risks, rollback guidance, and unknown postconditions.
 
-## Useful read-only local adapters
+## Proposed read-only extensions
+
+These adapters are not part of the accepted M7 surface unless the
+[CLI contract](cli-contract.md) names them explicitly.
 
 Versioned parsers may observe, with `unknown/stale` behavior:
 

@@ -1,6 +1,10 @@
 # M6 discovery, household, and groups execution plan
 
-Status: accepted 2026-07-12
+Status: historical acceptance record; accepted 2026-07-12
+
+This file preserves M6 scope and evidence at acceptance time. Use the
+[user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
+behavior across M1–M7.
 
 ## Outcome and sequence
 

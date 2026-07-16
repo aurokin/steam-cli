@@ -1,6 +1,10 @@
 # M2 truthful account inventory execution plan
 
-Status: accepted 2026-07-11
+Status: historical acceptance record; accepted 2026-07-11
+
+This file preserves M2 scope and evidence at acceptance time. Use the
+[user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
+behavior across M1–M7.
 
 This document turns the M2 outcome in Linear into bounded implementation and
 review gates. Product semantics and lifecycle rules remain canonical in the

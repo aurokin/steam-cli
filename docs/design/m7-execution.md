@@ -1,6 +1,10 @@
 # M7 local operations and safe plans execution plan
 
-Status: accepted 2026-07-15
+Status: historical acceptance record; accepted 2026-07-15
+
+This file preserves M7 scope and evidence at acceptance time. Use the
+[user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
+behavior across M1–M7.
 
 ## Outcome and sequence
 

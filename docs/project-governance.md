@@ -36,14 +36,13 @@ history, but must remain understandable when Linear is unavailable.
 
 ## Repository references from Linear
 
-Until the repository has a canonical remote, Linear uses backticked,
-repository-relative paths such as `docs/design/pricing-strategy.md`. These are
-temporarily non-clickable by design. Never store an absolute local path,
-`file://` URL, or editor-specific link in Linear.
+The canonical remote is `aurokin/steam-cli` on GitHub. Linear uses
+default-branch GitHub links for living documents and commit permalinks for
+immutable acceptance evidence. Retain the repository-relative path in issue
+text so a reference remains meaningful in every checkout.
 
-After a canonical remote exists, add default-branch links for living documents
-and commit permalinks for immutable acceptance evidence. Retain the relative
-path in issue text so the reference works in every checkout.
+Never store an absolute local path, `file://` URL, or editor-specific link in
+Linear. A link to a moving branch is not immutable acceptance evidence.
 
 ## Milestone lifecycle
 

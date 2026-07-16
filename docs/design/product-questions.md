@@ -1,10 +1,14 @@
 # Product questions
 
-Status: working design, 2026-07-10
+Status: working product vocabulary, not a current-support matrix.
 
 The product goal is not a collection of one-off reports. It is a composable
 evidence system that lets an agent choose a candidate set, apply hard
 constraints, rank eligible candidates, and explain the result.
+
+Question families include both supported and future questions so evidence terms
+stay consistent. Current support is listed in the [user guide](../user-guide.md)
+and exact implemented behavior in the [CLI contract](cli-contract.md).
 
 ## Question families
 

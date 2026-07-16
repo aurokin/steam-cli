@@ -1,6 +1,6 @@
 # Existing tool evaluation
 
-Status: repository survey, verified 2026-07-10
+Status: noncanonical research snapshot, verified 2026-07-10
 
 The useful existing projects are young live-API proxies or exporters. They offer
 interface, validation, and fixture ideas, but none has the durable temporal and

@@ -1,10 +1,12 @@
 # CLI and JSON contract
 
-Status: M1 through M7 accepted
+Status: canonical implemented M1–M7 process contract.
 
-The selected executable is `steam-agent`. This document separates the current
-M1 process contract from the longer-term vocabulary so agents do not mistake a
-design sketch for an available command.
+The selected executable is `steam-agent`. This document describes shared
+process behavior and the implemented command contracts that require detailed
+machine semantics; it is not an exhaustive command synopsis. `steam-agent
+COMMAND --help` is canonical for all executable syntax. Proposed commands and
+envelopes do not belong in this contract.
 
 ## Implemented M1 commands
 
@@ -304,7 +306,7 @@ remaining, missing, or unsynchronized evidence.
 | Code | Meaning |
 | --- | --- |
 | 0 | Command completed, including a partial sync or an informational unavailable doctor/capability result. Inspect `completeness.status`. |
-| 1 | Unexpected/internal operational failure. |
+| 1 | Operational, domain, or unexpected failure without a more specific exit code. Inspect the typed error envelope. |
 | 2 | Invalid arguments or an attempted secret on argv. |
 | 3 | `sync installed` could not find or read the selected Steam root. |
 
@@ -532,100 +534,3 @@ HTTPS references, rollback guidance, and unknown postconditions. Move requires
 exactly one destination ordinal from 1 through 1024; every other operation
 rejects that option. The command does not open a URL or Steam URI, spawn a
 process, access a client, modify files, or claim completion.
-
-## Exploratory future command shape
-
-A composable vocabulary scales better than one command per natural-language
-question:
-
-```text
-steam-agent sync <owned|recent|wishlist|catalog|store|prices|achievements|system|friends>
-steam-agent games get <appid>
-steam-agent games query --scope <owned|wishlist|store|family|group>
-steam-agent games compare <appid...>
-steam-agent group query --members <profiles...> --ownership all
-steam-agent achievements query --state near-complete
-steam-agent profile show|set|infer
-steam-agent evidence show <evidence-id>
-```
-
-Likely shared options:
-
-```text
---require FIELD=VALUE
---prefer FIELD=VALUE[:WEIGHT]
---avoid FIELD=VALUE[:WEIGHT]
---exclude FIELD=VALUE
---rank-by fit,deal,resume,finishability,group-fit
---unknown include|exclude|penalize
---freshness price=6h,metadata=7d
---explain
---fields ...
---limit ...
---format json|table
-```
-
-Agents should not need shell pipelines to recover facts hidden by human output.
-JSON output must be complete; table output may be abbreviated.
-
-## Future process goals
-
-- Data goes to stdout; diagnostics and progress go to stderr.
-- `--format json` never emits color, spinners, banners, or log text.
-- Timestamps are RFC 3339 UTC; money uses integer minor units plus currency.
-- Result order is deterministic, including tie-breakers.
-- Schema, ranking recipes, and normalization rules are versioned.
-- Pagination uses opaque cursors rather than offset assumptions.
-- Partial success remains represented explicitly in the envelope.
-- Secrets and raw authentication failures are redacted.
-
-Suggested typed errors include `PROFILE_PRIVATE`, `GAME_DETAILS_PRIVATE`,
-`WISHLIST_UNAVAILABLE`, `REGION_REQUIRED`, `STALE_CACHE`,
-`PROVIDER_RATE_LIMITED`, `AUTH_REQUIRED`, `UNSUPPORTED_CAPABILITY`, and
-`PROVISIONAL_PROVIDER_CHANGED`.
-
-## Future enriched-envelope sketch
-
-```json
-{
-  "schema_version": "0.1",
-  "generated_at": "2026-07-10T22:00:00Z",
-  "command": "games.query",
-  "context": {
-    "profile": "me",
-    "country": "US",
-    "currency": "USD",
-    "system_profile": "desktop",
-    "scopes": ["owned"]
-  },
-  "completeness": {
-    "status": "partial",
-    "missing_sources": ["wishlist"],
-    "warnings": [
-      {"code": "WISHLIST_UNAVAILABLE", "message": "Wishlist adapter unavailable"}
-    ]
-  },
-  "results": [],
-  "evidence": [],
-  "next_cursor": null
-}
-```
-
-A ranked result should expose `eligible`, constraint outcomes, each score
-dimension, reasons/tradeoffs, availability, price context, separate confidence
-dimensions, and evidence IDs. A derived evidence record points to upstream
-evidence and the rule/model version that produced it.
-
-## Future completeness rules
-
-An empty owned library is not the same as a private library. A missing price is
-not the same as a free game. An absent accessibility declaration is not proof a
-feature is unsupported. These states must survive normalization and serialization.
-
-Future `steam-agent capabilities` should report, for every capability:
-
-- supported, provisional, unavailable, or disabled
-- required credentials/consent without printing secrets
-- last successful sync and last error
-- source support level and known limitations
-- completeness/freshness that queries can currently promise

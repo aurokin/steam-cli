@@ -1,146 +1,139 @@
-# Provisional architecture
+# Architecture
 
-Status: option under evaluation, not an accepted ADR
+Status: accepted M1–M7 architecture, maintained as the implementation evolves.
 
-## Architectural shape
+Accepted decisions are recorded in the [ADR register](../adr/README.md). This
+document describes how those decisions fit together; it does not accept future
+providers or action executors.
+
+## System shape
 
 ```text
-provider adapters          local scanners          user-authored facts
-       |                         |                         |
-       +-------------------------+-------------------------+
+explicit local/provider sync       explicit local facts and preferences
+              |                                  |
+              +------------------+---------------+
                                  v
-                    immutable/raw observations
+                  validated, scoped observations
+                                 |
+                    transactional promotion
                                  v
-             normalized game/offer/operations graph
+                 SQLite last-good projections
+                                 |
+              cache-only joins, gates, and recipes
                                  v
-             constraints, set operations, ranking recipes
-                                 v
-               stable JSON envelope + optional human view
+             deterministic JSON + optional table view
+                                 |
+                 inert human operation plans
 ```
 
-The architecture separates acquisition from interpretation. Synchronization can
-fail or go stale without changing query semantics, and an agent can inspect why
-a derived answer exists.
+Acquisition is separate from interpretation. A provider or local scan can fail,
+go stale, or become inaccessible without silently changing query semantics.
+Queries can explain which promoted evidence, context, and versioned rule
+produced a result.
 
-The graph spans games/releases, external identities, products/offers, licenses,
-accounts/people, machines, installs, sessions, saves, mods, media, and evidence.
-Steam AppID remains a strong Steam identity but not the universal game key.
+## Acquisition and validation
 
-## Proposed components
+Local scanners and provider adapters are invoked only by explicit commands.
+Each adapter owns its authentication, pacing, response validation, support
+level, and request context. Core queries do not depend directly on provider
+response shapes.
 
-### Provider adapters
+An acquisition attempt is recorded independently from its last-good
+projection. Complete valid observations are promoted transactionally. Partial,
+failed, running, abandoned, malformed, or inaccessible attempts remain visible
+but do not replace complete usable data. This is the original M1 last-good rule
+applied consistently to later capabilities.
 
-Each adapter owns authentication, pacing, retries, raw response validation, and
-capability reporting. Core logic never depends directly on a provider response
-shape. Documented and provisional adapters are visibly different.
+Retention is capability-specific. Current adapters store bounded normalized
+fields and provenance rather than general raw-response archives. Credential
+probes discard response bodies and persist only coarse state. The
+[Steam data lifecycle policy](steam-data-lifecycle.md) and the capability ADRs
+it links are the canonical retention, acknowledgment, and deletion index.
 
-### Raw cache and observations
+## SQLite evidence store
 
-Raw responses are retained with timestamps and request context for debugging and
-renormalization. Sensitive raw data may use a separate retention policy. A sync
-writes a new observation set and only promotes it after validation.
+SQLite is the accepted local store; JSON is the stdout and interchange
+contract. Forward-only numbered migrations evolve the schema. Platform-native
+data directories keep the database outside the repository by default.
 
-### Normalized store
+The store represents multiple accounts, machines, locales, provider contexts,
+and evidence attempts even when a workflow exercises one of each. Steam AppID
+is a Steam application identity, not a package, bundle, edition, license kind,
+or universal cross-store game identity.
 
-SQLite is the leading option for the canonical cache because joins, group set
-operations, provenance, price snapshots, and migrations outgrow a collection of
-JSON files quickly. JSON remains the import/export and stdout contract.
+Key storage concepts are:
 
-Use platform-native data locations rather than a notes directory: config,
-durable data, disposable cache, and state/logs have different lifecycles. The
-[XDG Base Directory specification](https://specifications.freedesktop.org/basedir/latest/)
-is the Unix baseline; a cross-platform resolver should map macOS and Windows
-appropriately.
+- subjects such as accounts, machines, applications, and synthetic profiles;
+- scoped attempts with provider, retrieval time, support level, and context;
+- normalized observations and their evidence lineage;
+- promoted last-good projections used by queries;
+- explicit local feedback, rules, and group facts kept separate from inferred
+  behavior; and
+- versioned derived results that are returned, not persisted as hidden truth.
 
-Start with SQLite's rollback journal for the single-writer CLI. WAL is not a
-default requirement, and should only be enabled if concurrent interfaces need it
-and `doctor` can verify a safe SQLite build. SQLite documents a rare WAL-reset
-corruption issue fixed in 3.51.3 and selected backports, which makes a casual
-“always enable WAL” default inappropriate. See [SQLite WAL](https://sqlite.org/wal.html).
+Private paths and identifiers may exist in the local database when required for
+the capability, but normal query output redacts them.
 
-The schema should model more than `games(appid)`. Steam AppIDs include DLC,
-software, demos, and other item types; offers may be packages or bundles. Likely
-entity groups are:
+## Query and ranking layer
 
-- catalog items and relationships
-- people/accounts and system profiles
-- ownership/availability observations
-- installs and local launch observations
-- wishlist state and explicit user feedback
-- store metadata, reviews, tags, and accessibility declarations
-- offers, packages/bundles, price observations, and attributed history
-- evidence/claims plus derived assessments
+Cache-only commands do not acquire missing evidence or resolve credentials.
+Some use explicitly query-only SQLite connections; others may perform normal
+database migration or maintenance before reading the cache. Commands that rank
+candidates use these stages:
 
-Exact tables are deliberately deferred until sample payload probes exist.
+1. select an authorized candidate universe;
+2. evaluate hard gates with pass, fail, or unknown outcomes;
+3. apply a named, versioned deterministic ranking recipe; and
+4. return factors, tradeoffs, lineage, freshness, and completeness.
 
-### Query engine
+`unknown`, `false`, empty, inaccessible, and stale are distinct throughout the
+store and response. Subjective evidence cannot turn an unknown hard gate into a
+pass. Money uses integer minor units with currency and country context.
 
-Queries have four explicit stages:
+The [CLI contract](cli-contract.md) is canonical for command, envelope, schema,
+error, and exit behavior. The [product questions](product-questions.md) define
+the evidence distinctions required by user questions, not a promise that every
+question is currently implemented.
 
-1. Select candidate scope, such as owned, installed, wishlist, store, or a group.
-2. Evaluate hard constraints with three-valued outcomes.
-3. Rank eligible/conditional candidates with named, versioned dimensions.
-4. Attach reasons, tradeoffs, evidence, freshness, and completeness.
+## Interfaces and action boundary
 
-The first implementation need not contain embeddings or an LLM. Tags, set
-operations, explicit preferences, and deterministic scoring can establish the
-contract. Semantic retrieval can later produce candidate evidence without
-becoming the sole explanation.
+The CLI is the supported interface. Command dispatch and rendering live in
+`src/steam_agent/cli.py`; normalized result envelopes in `contracts.py`;
+storage and migrations in `storage.py` and `migrations/`; bounded adapters in
+the provider/local modules; and pure queries and ranking in their domain
+modules.
 
-### Interfaces
+M7 ends at local observation, storage ranking, and inert plans. Plans contain
+human instructions and typed official references but do not open them, spawn a
+client, touch Steam files, or claim an action completed. Read capability never
+implies mutation authority. See the accepted
+[action boundary](actions.md) and
+[ADR 0013](../adr/0013-m7-read-only-operation-plans.md).
 
-The CLI is the first interface. An MCP server, library API, or daemon may wrap
-the same application/query layer later; none should implement independent
-provider semantics.
+An MCP server, library API, daemon, semantic retriever, or another game-library
+adapter could reuse the application/query layer in the future. None is accepted
+merely by appearing here, and none should duplicate provider or truth-state
+semantics.
 
-An optional action planner sits above the same graph. Executors are separate,
-feature-gated adapters; a read provider never implicitly becomes authorized to
-mutate a client or account. See `actions.md`.
+## Security and privacy boundaries
 
-## Multi-profile from the start
+- Credentials enter through hidden input and use provider-scoped native keyring
+  entries or an explicit protected-file fallback.
+- Secrets, raw authentication failures, account identifiers, and personal
+  filesystem paths do not appear in normal output, fixtures, or logs.
+- Cache-only commands do not make network requests, resolve secrets, open URLs,
+  or collect new system state.
+- Account/machine/provider deletion is transactional and scoped; shared public
+  facts remain only when another retained subject needs them.
+- Local deletion cannot claim to erase user-controlled backups or revoke a key
+  at its provider.
 
-Group and “works on my computer” questions require multiple people and systems.
-Even if v1 syncs one Steam account and one machine, identity should not be baked
-in as global singleton columns. Profiles also make redaction, deletion, and
-data-export boundaries clearer.
+## Deliberate non-goals
 
-## Trust modes
-
-- **Core**: Web API key, public/visible account data, local manifests/system,
-  local price snapshots.
-- **Optional provider**: explicit third-party keys and terms acceptance.
-- **High trust**: SteamKit/SteamCMD or session-backed private data, isolated and
-  never required for core operation.
-
-## Non-goals for the first slice
-
-- Free-form natural-language querying inside the CLI.
-- Scraping SteamDB or bulk scraping Steam store pages.
-- A universal PC benchmark or guaranteed frame-rate prediction.
-- Automated purchasing, wishlist modification, or account mutation.
-- Agent browser ingestion of pages whose providers permit manual viewing only.
-- A black-box taste model with one unexplained score.
-- An MCP implementation before the CLI schema is exercised.
-
-## Language decision
-
-M1 uses Python 3.12+, uv, and Hatchling as accepted in
-[ADR 0001](../adr/0001-python-uv-packaging.md). The packaging spike completed
-the decision gate described below: the likely hard work is normalization,
-explainable ranking, data analysis, and iteration; isolated CLI installation is
-available through `uv tool install`, and Python has a Tier 1 MCP SDK. TypeScript
-remains a credible future alternative if MCP becomes the product, and Go may be
-worth reevaluating if a zero-runtime single binary becomes a requirement.
-
-The criteria used for that decision, and for any future reevaluation, were:
-
-- single-command install and cross-platform packaging
-- HTTP, SQLite, migrations, and VDF parsing maturity
-- typed JSON/schema ergonomics
-- startup time and binary/environment footprint
-- testability of adapters and CLI golden output
-- future library/MCP reuse without coupling the core to MCP
-
-References: [Python CLI packaging](https://packaging.python.org/en/latest/guides/creating-command-line-tools/),
-[uv tools](https://docs.astral.sh/uv/concepts/tools/), and
-[official MCP SDKs](https://modelcontextprotocol.io/docs/sdk).
+- Free-form natural-language interpretation inside the CLI.
+- SteamDB scraping or unreviewed browser/client automation.
+- A universal hardware benchmark or guaranteed frame-rate prediction.
+- Automated launch, install, move, uninstall, purchase, wishlist, social, or
+  account mutation.
+- Hidden preference inference that overwrites explicit feedback.
+- Treating manual-only references as approved automated-ingest sources.

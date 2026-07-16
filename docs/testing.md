@@ -27,6 +27,11 @@ and M7 common-question scenarios. Natural-language answer judging remains
 opt-in; deterministic evidence, gate, ordering, and truth-state oracles are
 part of CI.
 
+Repository documentation checks also require local Markdown links to resolve,
+every design document to declare its status near the top, and committed
+Markdown to omit personal home-directory paths. These checks make navigation
+and authority drift visible in the normal test gate.
+
 Live provider checks are intentionally not CI tests. Account contents, prices,
 provisional response shapes, credentials, and provider quotas are external and
 time-varying. Milestone acceptance records coarse live results separately and

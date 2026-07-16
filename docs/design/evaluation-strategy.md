@@ -1,6 +1,7 @@
 # Cross-milestone common-question evaluation strategy
 
-Status: working, non-blocking quality track 2026-07-11
+Status: working quality strategy; deterministic M4, M5, and M7 oracles are in
+normal CI, while model judging remains opt-in.
 
 ## Purpose and boundary
 
@@ -10,10 +11,9 @@ calling agent can then be evaluated on whether it uses that contract and gives
 a useful grounded answer. A fluent answer cannot compensate for a false CLI
 fact, and a model judge is not an oracle for either layer.
 
-This track does not block M4 implementation. M4 acceptance still requires its
-own deterministic tests for feedback, activity, hard gates, recipes, factors,
-uncertainty, and deletion. Natural-language model evaluation, real-user
-prompts, live-account runs, and judge calibration remain opt-in follow-up work.
+Accepted milestones rely first on deterministic product tests. Natural-language
+model evaluation, real-user prompts, live-account runs, and judge calibration
+remain opt-in follow-up work and cannot compensate for a contract failure.
 
 ## Evaluation layers
 
@@ -35,8 +35,9 @@ prompts, live-account runs, and judge calibration remain opt-in follow-up work.
    implement a judge or depend on a model API.
 
 The scenario corpus under [`evals/`](../../evals/) represents these layers
-explicitly. M3 and M4 cases are active descriptions of their accepted CLI and
-deterministic recipe behavior.
+explicitly. Normal CI schema- and privacy-validates every M3, M4, M5, and M7
+scenario. Executable deterministic CLI oracles cover M4, M5, and M7; M3 cases
+remain accepted contract descriptions without a corpus-level CLI runner.
 
 ## Metrics
 
@@ -94,12 +95,14 @@ verbosity limitations of
 [GDPval](https://openai.com/index/gdpval/) provides a useful precedent for
 blind comparison and task-specific rubrics while retaining expert review.
 
-## Initial adoption
+## Current implementation
 
 - Normal CI validates every scenario against `scenario-0.1.json`, including
   synthetic privacy canaries.
-- M4 implementation may promote a proposed scenario only after its exact CLI
-  and recipe contract is accepted and backed by normal product tests.
+- M4, M5, and M7 oracle modules execute installed command behavior against
+  deterministic scenarios; M3 scenarios are schema/privacy checked only.
+- A new executable scenario is added only after its exact CLI and recipe
+  contract is accepted and backed by normal product tests.
 - A future runner may materialize normalized fixtures through public storage
   APIs and execute an installed CLI. It must not make provider requests.
 - Generated traces, answers, judgments, and reports stay under

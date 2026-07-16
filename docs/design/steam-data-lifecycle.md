@@ -1,11 +1,11 @@
 # Steam account data lifecycle
 
-Status: accepted M2, M3, and M4 policy boundary
+Status: accepted M2–M4 account-data policy and lifecycle index for M5–M6.
 
 This document governs Steam account data obtained through Valve's Web API. It
-does not change the accepted M1 local installed-library contract. It is the
-privacy and retention gate for AUR-620 and for the later persistent
-owned-library slice in AUR-627. The M3 and M4 sections extend the same boundary
+does not change the accepted M1 local installed-library contract. It was the
+privacy and retention gate for AUR-620 and the persistent owned-library slice
+in AUR-627. The M3 and M4 sections extend the same boundary
 to the provisional wishlist, bounded price-summary and public-review demand,
 activity and achievement evidence, and cache-only deal and recommendation
 queries.
@@ -354,9 +354,30 @@ for background synchronization, another account, another Steam capability, or
 hosted processing. A material field, purpose, retention, or storage-location
 change requires a new policy version and acknowledgment.
 
-## Milestone gates
+## Later capability lifecycle policies
 
-### AUR-620 may close only when
+This document does not duplicate the capability-specific allowlists and
+retention rules accepted after M4:
+
+- M5 redacted system-profile collection, freshness, pruning, and machine-scoped
+  deletion are accepted in [ADR 0010](../adr/0010-m5-system-profile.md).
+- M5 declared compatibility evidence, bounded normalized retention, and demand
+  deletion are accepted in
+  [ADR 0011](../adr/0011-m5-layered-compatibility.md).
+- M6 synthetic profiles, group facts, expanded declared evidence, disclosure,
+  cascading deletion, and pruning are accepted in
+  [ADR 0012](../adr/0012-m6-bounded-discovery-and-groups.md).
+
+The [M5](m5-execution.md) and [M6](m6-execution.md) historical records preserve
+their acceptance evidence. Later work must update or supersede the relevant ADR
+rather than adding a conflicting lifecycle rule here.
+
+## Historical M2 acceptance gates
+
+Status: satisfied by the accepted M2 implementation. This section preserves
+the original gate evidence; it is not an open release checklist.
+
+### AUR-620 closed when
 
 - the account/credential capability contract is implemented and redacted;
 - probes retain no raw response body and make no request merely to list status;
@@ -369,7 +390,7 @@ For local development, this repository policy is the disclosure source. Public
 binary/package distribution remains blocked until a canonical privacy and
 as-is notice is published at the application domain and matches this policy.
 
-### AUR-627 may persist owned data only when
+### AUR-627 permitted owned persistence when
 
 - AUR-620 is accepted;
 - the normalized stored-field set and last-good promotion behavior are reviewed;
@@ -380,6 +401,6 @@ as-is notice is published at the application domain and matches this policy.
 - as-is, visibility, individually-private, empty, stale, and played-free-game
   limitations appear in the stable agent contract and user documentation.
 
-Until those gates pass, live owned responses may be used only for an explicit,
-redacted, memory-only capability probe. They must not be written to the durable
-evidence store.
+Before those gates passed, live owned responses could be used only for an
+explicit, redacted, memory-only capability probe and could not be written to
+the durable evidence store.

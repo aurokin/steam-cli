@@ -1,6 +1,7 @@
-# Historical pricing strategy
+# Pricing evidence strategy
 
-Status: working provider and outreach plan, reverified 2026-07-11
+Status: M3 fallback semantics accepted; provider/outreach plan working and last
+verified 2026-07-11.
 
 Historical pricing must work for a new installation. Local observations are
 supplemental evidence for outages, personalized prices, and recent changes; they

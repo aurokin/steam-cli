@@ -1,10 +1,11 @@
 # Architecture decision register
 
-Only decisions required by accepted M1–M7 slices are accepted.
-This register keeps later product and provider choices open until evidence
-supports them.
+Only decisions required by accepted M1–M7 slices are accepted. Linked ADRs are
+the canonical accepted records; rows without an accepted ADR remain proposed,
+optional, deferred, or narrower implementation facts. This register keeps later
+product and provider choices open until evidence supports them.
 
-| ID | Decision | State | Reversibility | Evidence needed before ADR |
+| ID | Decision | State | Reversibility | Accepted evidence or remaining gate |
 | --- | --- | --- | --- | --- |
 | D001 | Product boundary: evidence/ranking engine vs natural-language agent | Proposed direction | Costly to blur later | Exercise agent workflows against the CLI sketch |
 | D002 | Canonical store: SQLite with JSON interface | Implemented for M1; long-term scope open | Moderate | M1 proves migrations, idempotency, and per-machine last-good promotion; broader profile/group volumes and backup/concurrency remain |

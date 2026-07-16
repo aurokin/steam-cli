@@ -13,8 +13,10 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git.
 
-Each scenario keeps four concerns distinct: a deterministic CLI oracle, a
+Each scenario keeps four concerns distinct: expected deterministic behavior, a
 tool-use policy, a fact rubric, and an opt-in qualitative answer rubric. Normal
-CI validates the corpus without network access or a model API. See the
+CI schema- and privacy-validates every scenario without network access or a
+model API. Executable deterministic CLI oracles currently cover M4, M5, and M7;
+M3 scenarios are contract descriptions, not executed CLI oracles. See the
 [evaluation strategy](../docs/design/evaluation-strategy.md) for scoring,
 privacy, volatility, and future judge rules.
