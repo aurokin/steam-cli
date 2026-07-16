@@ -594,6 +594,7 @@ def test_app_facts_rechecks_bound_after_scope_expansion(
 def test_played_free_rows_do_not_enter_m6_known_or_library_scope(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW

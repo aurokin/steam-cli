@@ -36,7 +36,7 @@ the developer's running game rather than a general consumer administrator.
 | --- | --- | --- |
 | Inspect | Owned/installed/running/download state, local saves/screenshots, disk/system | Read official APIs or versioned local parsers |
 | Plan | Launch/install/uninstall/move/verify/update, backup, mod changes | Produce a short-lived plan with risks, size/bandwidth, target, and verification |
-| Open | Exact Steam/store/support/family/workshop UI | Return/open official UI for the human; do not claim the UI action completed |
+| Open | Exact Steam/store/support/family/workshop UI | Return a typed official UI reference for the human; do not invoke it or claim the UI action completed |
 | Execute local reversible | Local watchlist/feedback, save snapshot | Feature-gated, auditable, idempotent where possible |
 | Execute local costly/destructive | Install, move, uninstall, delete/restore saves or mods | Deferred until supported mechanism and policy basis; explicit confirmation |
 | Remote mutation | Wishlist, Workshop subscription, friend/invite/chat, family controls | Human UI initially |

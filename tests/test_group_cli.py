@@ -188,8 +188,9 @@ def test_profile_mutations_require_disclosure_and_destructive_confirmation(
 
 
 def test_group_ownership_uses_visible_positive_and_synthetic_assertions_only(
-    tmp_path: Path, capsys: object
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path, with_owned=True)
     create_profile(tmp_path, capsys, "synthetic:Guest")
     code, _, _ = invoke(

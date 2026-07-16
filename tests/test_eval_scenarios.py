@@ -20,6 +20,13 @@ def test_all_common_question_scenarios_validate_and_use_synthetic_canaries() -> 
     expected_initial_ids = {
         *(f"m3-d{index:02d}" for index in range(1, 8)),
         *(f"m4-r{index:02d}" for index in range(1, 11)),
+        *(f"m5-c{index:02d}" for index in range(1, 10)),
+        "m7-o01",
+        "m7-o02",
+        "m7-s03",
+        "m7-s04",
+        "m7-p05",
+        "m7-p06",
     }
 
     seen_ids: set[str] = set()

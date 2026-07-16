@@ -1,6 +1,6 @@
 # Architecture decision register
 
-Only decisions required by accepted M1–M6 and active M7 slices are accepted.
+Only decisions required by accepted M1–M7 slices are accepted.
 This register keeps later product and provider choices open until evidence
 supports them.
 
@@ -19,7 +19,7 @@ supports them.
 | D011 | Raw-response retention and deletion | M2–M4 accepted | Costly for privacy | M4 stores no activity, achievement, review-text, reviewer, or raw provider bodies and bounds normalized cache retention |
 | D012 | Ranking recipe semantics | M3 `deal-evidence/0.1` and M4 versioned recommendation recipes accepted | Costly once agents depend on it | Executable golden factors, gates, fallback, deterministic-order, and common-question eval scenarios |
 | D013 | Public binary/package name | [Accepted: `steam-agent`](0002-steam-agent-command-name.md) | Costly after release | Avoids the known `steam` client collision |
-| D014 | Read/plan/open/execute action boundary | Proposed direction | Costly and safety-critical | Steam policy review and action-specific capability probes |
+| D014 | Read/plan/open/execute action boundary | [Accepted M7 read/rank/inert-plan boundary](0013-m7-read-only-operation-plans.md); executors rejected | Costly and safety-critical | Cache-only and no-execution tripwires, deterministic plan evals, and Diffwarden review |
 | D015 | Provider-neutral game/offer/license identity graph | [M3 exact-AppID offer slice accepted](0006-m3-offer-identity.md); broader joins open | Costly | App/package/bundle/edition mismatch and ambiguity fixtures |
 | D016 | Browser reference access modes | M3 manual-only/API distinction accepted | Moderate | URL allowlist and no-follow tests; broader agent-read/open behavior remains open |
 | D017 | M1 installed-library process contract | Implemented contract for schema `0.1`; not an acceptance of future commands | Moderate | CLI golden tests, path-redaction tests, partial/failed promotion tests, and AUR-605 acceptance review |
@@ -31,6 +31,7 @@ supports them.
 | D023 | System-profile identity, minimization, and retention | [Accepted with M5](0010-m5-system-profile.md) | Costly for privacy and portability | Cross-platform fixtures, denylist canaries, consent, freshness, LKG, isolation, and deletion tests |
 | D024 | Compatibility evidence and precedence | [Accepted layered M5 boundary](0011-m5-layered-compatibility.md) | Costly once agents consume verdicts | Provisional shape fixtures, pure gate/eval oracles, target scoping, unknowns, overrides, and live redacted evidence |
 | D025 | Discovery/group evidence, copy matching, and ranking boundary | [Accepted with M6](0012-m6-bounded-discovery-and-groups.md) | Costly once multi-profile results are consumed | Schema migration, category ladders, Kleene sets, matching ranges, privacy/deletion, bounded-universe and ranking evals |
+| D026 | Local operational evidence and safe-plan surface | [Accepted with M7](0013-m7-read-only-operation-plans.md) | Moderate; schemas are versioned | Installed freshness/last-good, ranking truthfulness, official-reference allowlists, and no-I/O tests |
 
 ## When to create an ADR
 

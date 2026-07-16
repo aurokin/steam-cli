@@ -17,9 +17,9 @@
 - M6 discovery, household, and groups is accepted. Keep its candidate universe
   account/machine/locale scoped, its private reads bounded, and its missing-copy
   guarantees conservative under stale or unknown ownership.
-- M7 local operations and safe plans is active. It is read-only: observe, rank,
-  build plans, and emit human-open references only. Do not launch, install,
-  uninstall, mutate Steam state, or execute generated plans.
+- M7 local operations and safe plans is accepted. Preserve its read-only
+  observe/rank/inert-plan boundary and typed human-open references. Do not
+  launch, install, uninstall, mutate Steam state, or execute generated plans.
 - Do not turn proposed directions into accepted decisions without recording evidence in `docs/adr/README.md`.
 - Treat `steam-library-agent-research-handoff.md` as unverified source material, not a specification.
 - Preserve the M1 last-good rule: partial or failed scans must not replace a complete installed projection.
@@ -44,6 +44,7 @@
 | M4 implementation scope and acceptance evidence | `docs/design/m4-execution.md` |
 | M5 implementation scope and acceptance evidence | `docs/design/m5-execution.md` |
 | M6 implementation scope and acceptance evidence | `docs/design/m6-execution.md` |
+| M7 implementation scope and acceptance evidence | `docs/design/m7-execution.md` |
 | Open decisions and ADR threshold | `docs/adr/README.md` |
 
 ## Design Conventions

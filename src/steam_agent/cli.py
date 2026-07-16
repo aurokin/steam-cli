@@ -136,6 +136,7 @@ from steam_agent.compatibility_adapter import (
     assess_compatibility_snapshot,
     compatibility_query_data,
 )
+from steam_agent.compatibility_query import ConservativeMinimumEvaluator
 from steam_agent.groups import (
     CopySourceRef,
     FeatureSet,
@@ -153,6 +154,22 @@ from steam_agent.groups import (
     rank_candidates,
     score_preferences,
     summarize_ownership,
+)
+from steam_agent.operation_plans import PlanPrecondition, build_operation_plan
+from steam_agent.operations_observe import (
+    InstalledAttempt,
+    PromotedInstalledFact,
+    observe_local_operations,
+)
+from steam_agent.requirement_parser import (
+    DeclaredRequirementsText,
+    parse_declared_minimum,
+)
+from steam_agent.storage_ranking import (
+    ReclaimCandidate,
+    TravelCandidate,
+    rank_reclaim_space,
+    rank_travel_install,
 )
 
 
@@ -647,6 +664,55 @@ def build_parser() -> argparse.ArgumentParser:
     compatibility_assess.add_argument("--require", action="append", default=[])
     compatibility_assess.add_argument("--override", action="append", default=[])
     compatibility_assess.add_argument("--explain", action="store_true")
+
+    operations = commands.add_parser(
+        "operations", help="Observe local state and build inert human operation plans."
+    )
+    operations_commands = operations.add_subparsers(
+        dest="operations_command", required=True
+    )
+    operations_observe = operations_commands.add_parser(
+        "observe", help="Query cached local operational evidence."
+    )
+    _add_leaf_format(operations_observe)
+    operations_observe.add_argument("--machine", default="local")
+    operations_plan = operations_commands.add_parser(
+        "plan", help="Build a non-executable human Steam UI plan."
+    )
+    _add_leaf_format(operations_plan)
+    operations_plan.add_argument(
+        "operation",
+        choices=("launch", "install", "uninstall", "move", "verify", "backup"),
+    )
+    operations_plan.add_argument("appid", type=int)
+    operations_plan.add_argument("--account", required=True)
+    operations_plan.add_argument("--machine", required=True)
+    operations_plan.add_argument("--destination-library-ordinal", type=int)
+    operations_plan.add_argument("--expires-minutes", type=int, default=15)
+
+    storage_command = commands.add_parser(
+        "storage", help="Rank cached content-space and travel candidates."
+    )
+    storage_commands = storage_command.add_subparsers(
+        dest="storage_command", required=True
+    )
+    storage_rank = storage_commands.add_parser(
+        "rank", help="Run a deterministic read-only storage recipe."
+    )
+    _add_leaf_format(storage_rank)
+    storage_rank.add_argument(
+        "--recipe",
+        choices=("reclaim-space/0.1", "travel-install/0.1"),
+        required=True,
+    )
+    storage_rank.add_argument("--machine", required=True)
+    storage_rank.add_argument("--account")
+    storage_rank.add_argument("--country")
+    storage_rank.add_argument("--language")
+    storage_rank.add_argument("--target-bytes", type=int)
+    storage_rank.add_argument("--budget-bytes", type=int)
+    storage_rank.add_argument("--limit", type=int, required=True)
+    storage_rank.add_argument("--explain", action="store_true")
 
     feedback = commands.add_parser(
         "feedback", help="Manage explicit local game feedback."
@@ -1160,6 +1226,10 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_system(args, database_path)
     if args.command == "compatibility":
         return _dispatch_compatibility(args, database_path)
+    if args.command == "operations":
+        return _dispatch_operations(args, database_path)
+    if args.command == "storage":
+        return _dispatch_storage_rank(args, database_path)
     if args.command == "discovery":
         return _dispatch_discovery(args, database_path)
     if args.command in {"profiles", "ownership", "family", "fact"}:
@@ -3405,6 +3475,796 @@ def _declared_sync_source_gaps(snapshot: Mapping[str, Any]) -> list[dict[str, An
             }
         )
     return gaps
+
+
+def _installed_attempt(snapshot: Any) -> InstalledAttempt | None:
+    latest = snapshot.latest
+    if latest is None:
+        return None
+    return InstalledAttempt(
+        latest.status,
+        latest.completed_at or latest.started_at,
+        latest.id,
+    )
+
+
+def _operation_batch(snapshot: Any, *, appids: tuple[int, ...], now: datetime) -> Any:
+    current = {item.appid: item for item in snapshot.games}
+    facts: list[PromotedInstalledFact] = []
+    latest_complete = snapshot.latest_complete
+    for appid in appids:
+        item = current.get(appid)
+        if item is not None:
+            facts.append(
+                PromotedInstalledFact(
+                    appid=appid,
+                    presence="present",
+                    observed_at=item.observed_at,
+                    evidence_ids=(item.evidence_id,),
+                    promoted_sync_run_id=item.promoted_sync_run_id,
+                    build_id=item.build_id,
+                    size_on_disk_bytes=item.size_bytes,
+                    manifest_source_modified_at=item.manifest_mtime,
+                )
+            )
+        elif latest_complete is not None:
+            facts.append(
+                PromotedInstalledFact(
+                    appid=appid,
+                    presence="absent",
+                    observed_at=(
+                        latest_complete.completed_at or latest_complete.started_at
+                    ),
+                    evidence_ids=(f"sync-run:{latest_complete.id}",),
+                    promoted_sync_run_id=latest_complete.id,
+                )
+            )
+    return observe_local_operations(
+        requested_appids=appids,
+        installed_facts=tuple(facts),
+        generated_at=now,
+        latest_attempt=_installed_attempt(snapshot),
+    )
+
+
+def _operation_completeness(snapshot: Any, batch: Any) -> dict[str, Any]:
+    if snapshot.latest_complete is None:
+        return completeness(
+            CompletenessStatus.UNAVAILABLE,
+            missing_capabilities=["operations.local.read"],
+            warnings=[
+                WarningRecord(
+                    ErrorCode.NOT_SYNCED,
+                    "No complete installed snapshot exists for this machine.",
+                )
+            ],
+        )
+    successful_at = (
+        snapshot.latest_complete.completed_at or snapshot.latest_complete.started_at
+    )
+    successful_age = _seconds_old(successful_at, batch.generated_at)
+    degraded = (
+        snapshot.latest is None
+        or snapshot.latest.status != "complete"
+        or successful_age < 0
+        or successful_age > 15 * 60
+        or any(item.installed.freshness != "fresh" for item in batch.items)
+    )
+    if degraded:
+        return completeness(
+            CompletenessStatus.PARTIAL,
+            stale_capabilities=["operations.local.read"],
+            warnings=[
+                WarningRecord(
+                    ErrorCode.STALE_LAST_GOOD,
+                    "Operational results use stale, superseded, or uncertain local evidence.",
+                )
+            ],
+        )
+    return completeness(CompletenessStatus.COMPLETE)
+
+
+def _dispatch_operations(args: argparse.Namespace, database_path: Path) -> int:
+    if args.operations_command == "observe":
+        return _dispatch_operations_observe(args, database_path)
+    return _dispatch_operation_plan(args, database_path)
+
+
+def _dispatch_operations_observe(
+    args: argparse.Namespace, database_path: Path
+) -> int:
+    command = "operations.observe"
+    now = _utc_now()
+    if not database_path.is_file() and not database_path.is_symlink():
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.NOT_SYNCED,
+            message="Installed games have not been synchronized for this machine.",
+        )
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            if storage.get_machine(args.machine) is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The requested machine alias is not configured.",
+                    exit_code=2,
+                )
+            snapshot = storage.read_installed_snapshot(args.machine)
+        appids = tuple(item.appid for item in snapshot.games)
+        batch = _operation_batch(snapshot, appids=appids, now=now)
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.DATABASE_ERROR,
+            message="Cached local operational evidence is malformed.",
+        )
+    data = batch.to_dict()
+    data["snapshot"] = {
+        "last_attempt_status": (
+            None if snapshot.latest is None else snapshot.latest.status
+        ),
+        "last_successful_sync_at": (
+            None
+            if snapshot.latest_complete is None
+            else snapshot.latest_complete.completed_at
+            or snapshot.latest_complete.started_at
+        ),
+    }
+    return _emit_success(
+        args,
+        command=command,
+        generated_at=now,
+        context={"machine_id": args.machine, "cache_only": True},
+        completeness_value=_operation_completeness(snapshot, batch),
+        data=data,
+    )
+
+
+def _dispatch_storage_rank(args: argparse.Namespace, database_path: Path) -> int:
+    command = "storage.rank"
+    valid_target = (
+        isinstance(args.target_bytes, int)
+        and not isinstance(args.target_bytes, bool)
+        and 1 <= args.target_bytes <= (1 << 63) - 1
+    )
+    valid_budget = (
+        isinstance(args.budget_bytes, int)
+        and not isinstance(args.budget_bytes, bool)
+        and 1 <= args.budget_bytes <= (1 << 63) - 1
+    )
+    if (
+        isinstance(args.limit, bool)
+        or not 1 <= args.limit <= 10_000
+        or (
+            args.recipe == "reclaim-space/0.1"
+            and (
+                not valid_target
+                or args.budget_bytes is not None
+                or any(
+                    value is not None
+                    for value in (args.account, args.country, args.language)
+                )
+            )
+        )
+        or (
+            args.recipe == "travel-install/0.1"
+            and (
+                not valid_budget
+                or args.target_bytes is not None
+                or args.account is None
+                or args.country is None
+                or args.language != "english"
+            )
+        )
+    ):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The storage ranking arguments do not match the selected recipe.",
+            exit_code=2,
+        )
+    if not database_path.is_file() and not database_path.is_symlink():
+        return _emit_error(
+            args,
+            command=command,
+            code=(
+                ErrorCode.ACCOUNT_NOT_CONFIGURED
+                if args.recipe == "travel-install/0.1"
+                else ErrorCode.NOT_SYNCED
+            ),
+            message="The requested cached ranking evidence is unavailable.",
+        )
+    return (
+        _dispatch_reclaim_rank(args, database_path)
+        if args.recipe == "reclaim-space/0.1"
+        else _dispatch_travel_rank(args, database_path)
+    )
+
+
+def _dispatch_reclaim_rank(args: argparse.Namespace, database_path: Path) -> int:
+    command = "storage.rank"
+    now = _utc_now()
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            if storage.get_machine(args.machine) is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The requested machine alias is not configured.",
+                    exit_code=2,
+                )
+            snapshot = storage.read_installed_snapshot(args.machine)
+        batch = _operation_batch(
+            snapshot,
+            appids=tuple(item.appid for item in snapshot.games),
+            now=now,
+        )
+        names = {item.appid: item.name for item in snapshot.games}
+        ranked = rank_reclaim_space(
+            tuple(
+                ReclaimCandidate(
+                    appid=item.appid,
+                    name=names.get(item.appid),
+                    installed=item.installed.state,
+                    freshness=item.installed.freshness,
+                    size_bytes=(
+                        item.size_on_disk_bytes.value
+                        if item.size_on_disk_bytes.state == "known"
+                        and isinstance(item.size_on_disk_bytes.value, int)
+                        else None
+                    ),
+                    evidence_ids=item.installed.evidence_ids,
+                )
+                for item in batch.items
+            ),
+            target_bytes=args.target_bytes,
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The reclaim-space request or cached evidence is invalid.",
+            exit_code=2,
+        )
+    selected = ranked.results[: args.limit]
+    return _emit_success(
+        args,
+        command=command,
+        generated_at=now,
+        context={
+            "machine_id": args.machine,
+            "cache_only": True,
+            "recipe": ranked.recipe,
+        },
+        completeness_value=_operation_completeness(snapshot, batch),
+        data={
+            "schema": ranked.schema,
+            "recipe": ranked.recipe,
+            "constraints": {"target_bytes": ranked.target_bytes},
+            "results": [asdict(item) for item in selected],
+            "counts": {
+                "candidates": len(ranked.results),
+                "returned": len(selected),
+                "truncated": len(selected) < len(ranked.results),
+            },
+            "explain": bool(args.explain),
+        },
+    )
+
+
+def _machine_compatibility_target(machine: Any) -> CompatibilityTarget:
+    platform_name = {
+        "darwin": "macos",
+        "mac": "macos",
+        "macos": "macos",
+        "win32": "windows",
+        "windows": "windows",
+        "linux": "linux",
+    }.get(machine.platform.casefold())
+    if platform_name is None:
+        raise ValueError("machine platform is unsupported")
+    return CompatibilityTarget("machine", machine.id, platform_name)  # type: ignore[arg-type]
+
+
+def _declared_storage_interval(
+    facts: Mapping[str, Any] | None,
+    *,
+    platform_name: str,
+    observed_at: str | None,
+    now: datetime,
+) -> tuple[int | None, int | None]:
+    if facts is None or observed_at is None:
+        return None, None
+    age = _seconds_old(observed_at, now)
+    if age < 0 or age > _DECLARED_FACT_FRESHNESS_SECONDS:
+        return None, None
+    context = facts.get("context")
+    requirements = facts.get("requirements")
+    if (
+        not isinstance(context, Mapping)
+        or context.get("language") != "english"
+        or not isinstance(requirements, (list, tuple))
+    ):
+        return None, None
+    matches = [
+        item
+        for item in requirements
+        if isinstance(item, Mapping) and item.get("platform") == platform_name
+    ]
+    if (
+        len(matches) != 1
+        or matches[0].get("state") != "declared"
+        or not isinstance(matches[0].get("minimum"), str)
+    ):
+        return None, None
+    parsed = parse_declared_minimum(
+        DeclaredRequirementsText("minimum", matches[0]["minimum"])
+    )
+    interval = parsed.storage.interval if parsed.storage.state == "known" else None
+    return (
+        (None, None)
+        if interval is None
+        else (interval.lower_bytes, interval.upper_bytes)
+    )
+
+
+def _travel_compatibility_state(
+    assessment: Any,
+    *,
+    current: Any,
+    system_profile: Any,
+    target: CompatibilityTarget,
+    now: datetime,
+) -> str:
+    """Keep storage outside the compatibility gate for travel ranking.
+
+    M5's aggregate minimum gate includes coarse system free space. M7 cannot
+    map that space to the selected Steam library, so only exact platform or
+    architecture failures may exclude a travel candidate. Other aggregate
+    failures remain conditional and the request-local storage interval gate is
+    evaluated separately.
+    """
+
+    gates = {gate.name: gate for gate in assessment.gates}
+    execution = gates.get("effective_execution_support")
+    if (
+        execution is not None
+        and execution.effective == "fail"
+        and execution.original_freshness == "fresh"
+    ):
+        return "fail"
+    if (
+        execution is None
+        or execution.effective != "pass"
+        or execution.original_freshness != "fresh"
+        or current is None
+        or system_profile.current is None
+    ):
+        return "unknown"
+    system = system_profile.current
+    system_observed = datetime.fromisoformat(
+        system.observed_at.replace("Z", "+00:00")
+    )
+    system_age = (now - system_observed).total_seconds()
+    system_freshness = (
+        "fresh" if 0 <= system_age <= 30 * 24 * 60 * 60 else "expired"
+    )
+    latest = system_profile.latest
+    if (
+        system_freshness == "fresh"
+        and latest is not None
+        and latest.status != "complete"
+        and latest.id != system.promoted_sync_run_id
+    ):
+        system_freshness = "stale"
+    declared_observed = datetime.fromisoformat(
+        current.observed_at.replace("Z", "+00:00")
+    )
+    evaluated = ConservativeMinimumEvaluator().evaluate(
+        appid=assessment.appid,
+        platform=target.platform,
+        normalized_facts=current.facts,
+        system_profile=system.profile,
+        declared_observed_at=declared_observed,
+        declared_projection_identity=f"declared-run:{current.promoted_sync_run_id}",
+        system_observed_at=system_observed,
+        system_snapshot_id=system.evidence_id,
+        system_promoted_run_id=system.promoted_sync_run_id,
+        system_latest_attempt_id=None if latest is None else latest.id,
+        system_profile_freshness=system_freshness,  # type: ignore[arg-type]
+        storage_available_freshness="unknown",
+        generated_at=now,
+    )
+    non_storage = evaluated.meets_minimum_without_storage
+    if non_storage is not None and non_storage.freshness == "fresh":
+        return non_storage.state
+    return "unknown"
+
+
+def _dispatch_travel_rank(args: argparse.Namespace, database_path: Path) -> int:
+    command = "storage.rank"
+    now = _utc_now()
+    if re.fullmatch(r"[A-Za-z]{2}", args.country) is None:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="Travel ranking requires an ASCII alpha-2 country.",
+            exit_code=2,
+        )
+    country = args.country.upper()
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            account = storage.get_account(args.account)
+            if account is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            if storage.get_machine(args.machine) is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The requested machine alias is not configured.",
+                    exit_code=2,
+                )
+            snapshot = storage.read_travel_ranking_snapshot(
+                account.id, args.machine, country, args.language, now
+            )
+        target = _machine_compatibility_target(snapshot.machine)
+        compatibility = assess_compatibility_snapshot(snapshot, target=target)
+        assessments = {
+            item.appid: item for item in compatibility.assessment.results
+        }
+        declared = {
+            item.appid: item.current for item in snapshot.declared_apps.subjects
+        }
+        owned = {
+            item.appid: item
+            for item in snapshot.owned.games
+            if item.inclusion_basis == "visible_owned"
+        }
+        _, owned_stale, owned_authoritative = _owned_scope_state(
+            snapshot.owned, now=now
+        )
+        ownership_freshness = (
+            "fresh" if owned_authoritative else "stale" if owned_stale else "unknown"
+        )
+        installation = _operation_batch(
+            snapshot.installed,
+            appids=tuple(item.appid for item in snapshot.requested),
+            now=now,
+        )
+        installed_by_appid = {item.appid: item for item in installation.items}
+        candidates: list[TravelCandidate] = []
+        for requested in snapshot.requested:
+            appid = requested.appid
+            owned_item = owned[appid]
+            installed_item_value = installed_by_appid[appid]
+            assessment = assessments[appid]
+            current = declared.get(appid)
+            lower, upper = _declared_storage_interval(
+                None if current is None else current.facts,
+                platform_name=target.platform,
+                observed_at=None if current is None else current.observed_at,
+                now=now,
+            )
+            evidence_ids: list[int | str] = [owned_item.evidence_id]
+            evidence_ids.extend(installed_item_value.installed.evidence_ids)
+            if current is not None and current.promoted_sync_run_id is not None:
+                evidence_ids.append(f"declared-run:{current.promoted_sync_run_id}")
+            candidates.append(
+                TravelCandidate(
+                    appid=appid,
+                    name=owned_item.name,
+                    ownership="present",
+                    ownership_freshness=ownership_freshness,  # type: ignore[arg-type]
+                    installed=installed_item_value.installed.state,
+                    installed_freshness=installed_item_value.installed.freshness,
+                    compatibility=_travel_compatibility_state(
+                        assessment,
+                        current=current,
+                        system_profile=snapshot.system_profile,
+                        target=target,
+                        now=now,
+                    ),  # type: ignore[arg-type]
+                    storage_lower_bytes=lower,
+                    storage_upper_bytes=upper,
+                    evidence_ids=tuple(
+                        sorted(
+                            set(evidence_ids),
+                            key=lambda value: (type(value).__name__, str(value)),
+                        )
+                    ),
+                )
+            )
+        ranked = rank_travel_install(
+            tuple(candidates), budget_bytes=args.budget_bytes
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.DATABASE_ERROR,
+            message="Cached travel-ranking evidence is malformed or inconsistent.",
+        )
+    selected = ranked.results[: args.limit]
+    irrelevant = {"operations.ready.read", "account.visible_owned.read"}
+    missing: set[str] = (
+        {
+            item
+            for item in compatibility.completeness.missing_capabilities
+            if item not in irrelevant
+        }
+        if snapshot.requested
+        else set()
+    )
+    stale: set[str] = (
+        {
+            item
+            for item in compatibility.completeness.stale_capabilities
+            if item not in irrelevant
+        }
+        if snapshot.requested
+        else set()
+    )
+    if not owned_authoritative:
+        (stale if snapshot.owned.latest_complete is not None else missing).add(
+            "owned.visible.read"
+        )
+    if snapshot.requested and snapshot.installed.latest_complete is None:
+        missing.add("operations.local.read")
+    elif snapshot.requested and any(
+        item.installed.freshness != "fresh" for item in installation.items
+    ):
+        stale.add("operations.local.read")
+    completeness_value = completeness(
+        (
+            CompletenessStatus.UNAVAILABLE
+            if snapshot.owned.latest_complete is None
+            else CompletenessStatus.PARTIAL
+            if missing or stale
+            else CompletenessStatus.COMPLETE
+        ),
+        missing_capabilities=sorted(missing),
+        stale_capabilities=sorted(stale),
+        warnings=(
+            [
+                WarningRecord(
+                    ErrorCode.STALE_LAST_GOOD,
+                    "Travel-install results remain conditional where evidence is missing or stale.",
+                )
+            ]
+            if missing or stale
+            else []
+        ),
+    )
+    return _emit_success(
+        args,
+        command=command,
+        generated_at=now,
+        context={
+            "account_alias": args.account,
+            "machine_id": args.machine,
+            "country": country,
+            "language": args.language,
+            "cache_only": True,
+            "recipe": ranked.recipe,
+        },
+        completeness_value=completeness_value,
+        data={
+            "schema": ranked.schema,
+            "recipe": ranked.recipe,
+            "constraints": {"budget_bytes": ranked.budget_bytes},
+            "results": [asdict(item) for item in selected],
+            "counts": {
+                "candidates": len(ranked.results),
+                "returned": len(selected),
+                "truncated": len(selected) < len(ranked.results),
+            },
+            "explain": bool(args.explain),
+        },
+    )
+
+
+def _dispatch_operation_plan(args: argparse.Namespace, database_path: Path) -> int:
+    command = "operations.plan"
+    now = _utc_now()
+    if (
+        isinstance(args.appid, bool)
+        or not 1 <= args.appid <= (1 << 32) - 1
+        or isinstance(args.expires_minutes, bool)
+        or not 1 <= args.expires_minutes <= 24 * 60
+        or (args.operation == "move") != (
+            args.destination_library_ordinal is not None
+        )
+        or (
+            args.destination_library_ordinal is not None
+            and (
+                isinstance(args.destination_library_ordinal, bool)
+                or not 1 <= args.destination_library_ordinal <= 1024
+            )
+        )
+    ):
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.INVALID_ARGUMENT,
+            message="The operation plan arguments are invalid.",
+            exit_code=2,
+        )
+    if not database_path.is_file() and not database_path.is_symlink():
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+            message="The requested account alias is not configured.",
+        )
+    try:
+        with Storage(database_path, readonly=True) as storage:
+            account = storage.get_account(args.account)
+            if account is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.ACCOUNT_NOT_CONFIGURED,
+                    message="The requested account alias is not configured.",
+                )
+            if storage.get_machine(args.machine) is None:
+                return _emit_error(
+                    args,
+                    command=command,
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="The requested machine alias is not configured.",
+                    exit_code=2,
+                )
+            snapshot = storage.read_library_snapshot(account.id, args.machine)
+        installation = _operation_batch(
+            snapshot.installed, appids=(args.appid,), now=now
+        ).items[0].installed
+        _, _, owned_authoritative = _owned_scope_state(snapshot.owned, now=now)
+        owned_item = next(
+            (
+                item
+                for item in snapshot.owned.games
+                if item.appid == args.appid
+                and item.inclusion_basis == "visible_owned"
+            ),
+            None,
+        )
+        installed_precondition = PlanPrecondition(
+            "installed",
+            (
+                "pass"
+                if installation.state == "present" and installation.freshness == "fresh"
+                else "fail"
+                if installation.state == "absent" and installation.freshness == "fresh"
+                else "unknown"
+            ),
+            (
+                "fresh_manifest_presence"
+                if installation.state == "present" and installation.freshness == "fresh"
+                else "fresh_projection_absence"
+                if installation.state == "absent" and installation.freshness == "fresh"
+                else "installed_state_not_current"
+            ),
+        )
+        available: dict[str, PlanPrecondition] = {
+            "steam_client_available": PlanPrecondition(
+                "steam_client_available", "unknown", "client_not_observed"
+            ),
+            "installed": installed_precondition,
+            "launch_allowed": PlanPrecondition(
+                "launch_allowed", "unknown", "user_policy_not_observed"
+            ),
+            "license_available": PlanPrecondition(
+                "license_available",
+                "unknown",
+                (
+                    "visible_owned_does_not_establish_license"
+                    if owned_item is not None and owned_authoritative
+                    else "license_not_currently_established"
+                ),
+            ),
+            "not_installed": PlanPrecondition(
+                "not_installed",
+                (
+                    "pass"
+                    if installation.state == "absent"
+                    and installation.freshness == "fresh"
+                    else "fail"
+                    if installation.state == "present"
+                    and installation.freshness == "fresh"
+                    else "unknown"
+                ),
+                (
+                    "fresh_projection_absence"
+                    if installation.state == "absent"
+                    and installation.freshness == "fresh"
+                    else "already_installed"
+                    if installation.state == "present"
+                    and installation.freshness == "fresh"
+                    else "installed_state_not_current"
+                ),
+            ),
+            "storage_available": PlanPrecondition(
+                "storage_available", "unknown", "steam_library_capacity_not_observed"
+            ),
+            "data_protection_reviewed": PlanPrecondition(
+                "data_protection_reviewed", "unknown", "save_mod_cloud_state_unknown"
+            ),
+            "destination_available": PlanPrecondition(
+                "destination_available", "unknown", "destination_capacity_not_observed"
+            ),
+            "backup_destination_available": PlanPrecondition(
+                "backup_destination_available", "unknown", "destination_not_observed"
+            ),
+        }
+        required = {
+            "launch": ("steam_client_available", "installed", "launch_allowed"),
+            "install": (
+                "steam_client_available",
+                "license_available",
+                "not_installed",
+                "storage_available",
+            ),
+            "uninstall": (
+                "steam_client_available",
+                "installed",
+                "data_protection_reviewed",
+            ),
+            "move": (
+                "steam_client_available",
+                "installed",
+                "destination_available",
+            ),
+            "verify": ("steam_client_available", "installed"),
+            "backup": ("installed", "backup_destination_available"),
+        }[args.operation]
+        plan = build_operation_plan(
+            operation=args.operation,
+            appid=args.appid,
+            account_alias=args.account,
+            machine_id=args.machine,
+            generated_at=now,
+            preconditions=tuple(available[name] for name in required),
+            destination_library_ordinal=args.destination_library_ordinal,
+            ttl_seconds=args.expires_minutes * 60,
+        )
+    except ValueError:
+        return _emit_error(
+            args,
+            command=command,
+            code=ErrorCode.DATABASE_ERROR,
+            message="Cached evidence could not be reconstructed into a safe plan.",
+        )
+    return _emit_success(
+        args,
+        command=command,
+        generated_at=now,
+        context={
+            "account_alias": args.account,
+            "machine_id": args.machine,
+            "cache_only": True,
+            "execution_authorized": False,
+        },
+        completeness_value=completeness(
+            CompletenessStatus.PARTIAL
+            if plan.precondition_summary != "all_pass"
+            else CompletenessStatus.COMPLETE,
+        ),
+        data={"plan": asdict(plan)},
+    )
 
 
 def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> int:
@@ -7446,6 +8306,8 @@ def _command_name(args: argparse.Namespace) -> str:
         "system_command",
         "recommendations_command",
         "compatibility_command",
+        "operations_command",
+        "storage_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -7649,6 +8511,71 @@ def _print_table_fields(*values: object) -> None:
 
 
 def _print_table(command: str, envelope: dict[str, Any]) -> None:
+    if command == "operations.observe":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields(
+            "APPID", "INSTALLED", "FRESHNESS", "SIZE_BYTES", "BUILD_ID"
+        )
+        for item in envelope["data"]["items"]:
+            _print_table_fields(
+                item["appid"],
+                item["installed"]["state"],
+                item["installed"]["freshness"],
+                item["size_on_disk_bytes"].get("value", ""),
+                item["build_id"].get("value", ""),
+            )
+        for name, capability in envelope["data"]["unsupported_capabilities"].items():
+            _print_table_fields(
+                "UNSUPPORTED", name, capability["availability"], capability["reason"]
+            )
+        return
+    if command == "storage.rank":
+        query_completeness = envelope["completeness"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        for capability in query_completeness["missing_capabilities"]:
+            _print_table_fields("MISSING_CAPABILITY", capability)
+        for capability in query_completeness["stale_capabilities"]:
+            _print_table_fields("STALE_CAPABILITY", capability)
+        for warning in query_completeness["warnings"]:
+            _print_table_fields("WARNING", warning["code"], warning["message"])
+        _print_table_fields("APPID", "ELIGIBILITY", "STORAGE_BYTES", "UNKNOWNS")
+        for item in envelope["data"]["results"]:
+            storage_bytes = item.get("reclaim_bytes")
+            if storage_bytes is None:
+                storage_bytes = item.get("declared_minimum_storage_upper_bytes")
+            unknowns = [
+                gate["name"] for gate in item["gates"] if gate["state"] == "unknown"
+            ]
+            _print_table_fields(
+                item["appid"], item["eligibility"], storage_bytes, ",".join(unknowns)
+            )
+        return
+    if command == "operations.plan":
+        query_completeness = envelope["completeness"]
+        plan = envelope["data"]["plan"]
+        _print_table_fields("COMPLETENESS", query_completeness["status"])
+        _print_table_fields(
+            "PLAN",
+            plan["operation"],
+            plan["target"]["appid"],
+            plan["precondition_summary"],
+            plan["capability_policy"]["execution"],
+            plan["expires_at"],
+        )
+        for item in plan["preconditions"]:
+            _print_table_fields(
+                "PRECONDITION", item["code"], item["state"], item["detail_code"]
+            )
+        for instruction in plan["ui_instructions"]:
+            _print_table_fields("HUMAN_STEP", instruction)
+        for reference in plan["human_open_references"]:
+            _print_table_fields(
+                "HUMAN_OPEN", reference["purpose"], reference["url"]
+            )
+        return
     if command == "compatibility.assess":
         query_completeness = envelope["completeness"]
         _print_table_fields("COMPLETENESS", query_completeness["status"])

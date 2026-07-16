@@ -199,8 +199,53 @@ def smoke(wheel: Path) -> None:
             for option in ("--account", "--country", "--store-class", "--unknown", "--override")
         ):
             raise RuntimeError("installed help does not expose wishlist-fit contracts")
+        operations_help = _run([str(executable), "operations", "observe", "--help"])
+        storage_rank_help = _run([str(executable), "storage", "rank", "--help"])
+        operation_plan_help = _run([str(executable), "operations", "plan", "--help"])
+        if (
+            "--machine" not in operations_help.stdout
+            or not all(
+                option in storage_rank_help.stdout
+                for option in (
+                    "--recipe",
+                    "--machine",
+                    "--target-bytes",
+                    "--budget-bytes",
+                    "--limit",
+                )
+            )
+            or not all(
+                option in operation_plan_help.stdout
+                for option in (
+                    "--account",
+                    "--machine",
+                    "--destination-library-ordinal",
+                    "--expires-minutes",
+                )
+            )
+        ):
+            raise RuntimeError("installed help does not expose M7 operation contracts")
 
         data_dir = root / "data"
+        m7_fresh = json.loads(
+            _run(
+                [
+                    str(executable),
+                    "--data-dir",
+                    str(root / "m7-fresh"),
+                    "operations",
+                    "observe",
+                    "--machine",
+                    "local",
+                ],
+                expected_code=1,
+            ).stdout
+        )
+        if (
+            m7_fresh.get("command") != "operations.observe"
+            or m7_fresh.get("error", {}).get("code") != "NOT_SYNCED"
+        ):
+            raise RuntimeError("fresh-profile M7 observation truth state is invalid")
         query = [
             str(executable),
             "--data-dir",

@@ -29,8 +29,10 @@ redacted system profiles, provisional publisher declarations, and cache-only
 target assessments are available. **M6 discovery, household, and groups is
 implemented and accepted:** bounded declared-fact discovery, synthetic/account
 group evidence, missing-copy ranges, and deterministic group recommendations
-are available. **M7 local operations and safe plans is active.** Executable
-Steam actions remain disabled.
+are available. **M7 local operations and safe plans is implemented and
+accepted:** cache-only operational observations, deterministic storage
+rankings, and inert human Steam UI plans are available. Executable Steam
+actions remain disabled.
 
 ## Install and develop
 
@@ -339,6 +341,32 @@ range. Queries never fetch implicitly. See the
 [M6 execution plan](docs/design/m6-execution.md) for accepted evidence,
 privacy, and ranking semantics.
 
+## M7 local operations and safe plans
+
+M7 reads the promoted local cache, ranks content-space evidence, and produces
+human-executed plans without opening or changing Steam:
+
+```text
+uv run steam-agent operations observe --machine local
+uv run steam-agent storage rank --recipe reclaim-space/0.1 --machine local --target-bytes 20000000000 --limit 10
+uv run steam-agent storage rank --recipe travel-install/0.1 --account primary --machine local --country US --language english --budget-bytes 50000000000 --limit 10
+uv run steam-agent operations plan verify APPID --account primary --machine local
+uv run steam-agent operations plan move APPID --account primary --machine local --destination-library-ordinal 2
+```
+
+Operational output can prove installed presence, manifest size/build, and
+observation provenance. It cannot prove that a game is running, current,
+downloadable within a time window, safe to uninstall, or protected by Steam
+Cloud. Reclaim eligibility means only that content-size evidence is rankable.
+Travel results remain conditional because declared minimum storage is neither
+download size nor actual footprint.
+
+Every operation plan states that execution is prohibited and confirmation is
+interactive-human-only. The CLI returns official HTTPS references and Steam UI
+instructions; it does not invoke them. See the
+[M7 execution plan](docs/design/m7-execution.md) and
+[read-only operation-plan ADR](docs/adr/0013-m7-read-only-operation-plans.md).
+
 The current working direction is:
 
 ```text
@@ -392,6 +420,9 @@ are added.
 - [M2 truthful account inventory execution and evidence](docs/design/m2-execution.md)
 - [M3 wishlist and deal evidence execution](docs/design/m3-execution.md)
 - [M4 next-to-play and preference execution](docs/design/m4-execution.md)
+- [M5 compatibility and ready-now execution](docs/design/m5-execution.md)
+- [M6 discovery, household, and groups execution](docs/design/m6-execution.md)
+- [M7 local operations and safe plans execution](docs/design/m7-execution.md)
 - [Cross-milestone common-question evaluation strategy](docs/design/evaluation-strategy.md)
 - [Synthetic evaluation corpus](evals/README.md)
 - [Decision register](docs/adr/README.md)

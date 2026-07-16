@@ -6,9 +6,9 @@ documentation; product architecture remains in the design documents and ADRs.
 
 ## Current boundary
 
-M1 through M6 are accepted historical work. M7 is active; later milestones
-remain roadmap hypotheses until the user explicitly selects one. Creating a milestone
-or issue does not approve an implementation, provider, credential flow, policy
+M1 through M7 are accepted historical work. Later milestones remain roadmap
+hypotheses until the user explicitly selects one. Creating a milestone or issue
+does not approve an implementation, provider, credential flow, policy
 interpretation, or ADR.
 
 The completed M1 Linear project must not be repurposed for later scope. Future

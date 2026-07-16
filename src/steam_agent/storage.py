@@ -7824,6 +7824,76 @@ class Storage:
             self._rollback_or_reopen()
             raise
 
+    def read_travel_ranking_snapshot(
+        self,
+        account_id: int,
+        machine_id: str,
+        country: str,
+        language: str,
+        now: str | datetime,
+    ) -> CompatibilitySnapshot:
+        """Read the complete visible-owned travel universe in one transaction.
+
+        Unlike an explicit compatibility request, this cache-only M7 read
+        derives its bounded subjects from the selected account snapshot. It
+        excludes played-free observations before reading declared facts and
+        never broadens the request to global demand.
+        """
+
+        if self._connection.in_transaction:
+            raise StorageError("cannot start a read snapshot inside a transaction")
+        as_of = _timestamp(now)
+        self._connection.execute("BEGIN")
+        try:
+            self._require_steam_account(account_id)
+            machine = self.get_machine(machine_id)
+            if machine is None:
+                raise ValueError("travel ranking machine is not configured")
+            owned = self._read_owned_snapshot(account_id)
+            selected = tuple(
+                item.appid
+                for item in owned.games
+                if item.inclusion_basis == "visible_owned"
+            )
+            if len(selected) > _DECLARED_APP_MAX_DEMAND:
+                raise ValueError("travel ranking universe exceeds the bound")
+            declared_apps = (
+                self._read_typed_declared_app_snapshot(
+                    account_id=account_id,
+                    machine_id=machine_id,
+                    country=country,
+                    language=language,
+                    appids=selected,
+                    as_of=as_of,
+                )
+                if selected
+                else DeclaredAppSnapshot((), None)
+            )
+            snapshot = CompatibilitySnapshot(
+                account_id=account_id,
+                machine_id=machine_id,
+                machine=machine,
+                country=country,
+                language=language,
+                as_of=as_of,
+                requested=tuple(
+                    CompatibilityRequestedApp(
+                        appid=appid,
+                        stable_game_id=steam_application_stable_id(appid),
+                    )
+                    for appid in selected
+                ),
+                system_profile=self._read_system_profile_snapshot(machine_id),
+                declared_apps=declared_apps,
+                owned=owned,
+                installed=self._read_installed_snapshot(machine_id),
+            )
+            self._connection.commit()
+            return snapshot
+        except BaseException:
+            self._rollback_or_reopen()
+            raise
+
     def read_recommendation_snapshot(
         self,
         account_id: int,

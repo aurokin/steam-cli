@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: M1, M2, M3, and M4 accepted; M5 implemented under acceptance
+Status: M1 through M7 accepted
 
 The selected executable is `steam-agent`. This document separates the current
 M1 process contract from the longer-term vocabulary so agents do not mistake a
@@ -476,6 +476,62 @@ M5 cannot prove a title playable now because update, process, launcher,
 network, and entitlement-session state are outside this milestone. A fresh
 known-not-installed observation or known incompatibility may fail
 `playable_now`; otherwise the operational result remains unknown.
+
+## Implemented M6 discovery and group commands
+
+M6 keeps explicit collection and local assertions separate from bounded,
+cache-only discovery and group queries:
+
+```text
+steam-agent sync app-facts --scope known|library|wishlist|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
+steam-agent discovery query --scope known|library|wishlist|installed|appids --limit N --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--require-mode MODE] [--format json|table]
+steam-agent profiles create|get|list|delete|clear-account ...
+steam-agent ownership set|clear ...
+steam-agent family set|clear ...
+steam-agent fact set|clear ...
+steam-agent group ownership|eligibility APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG ...
+steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --member MEMBER... [--copy-source SOURCE...] --context-account ALIAS --context-machine MACHINE --country CC --language LANG --mode MODE --objective no-purchase|min-copies|preference-fit ...
+```
+
+`discovery query` returns `discovery-query/0.1`; group eligibility and ranking
+return `group-eligibility/0.1` and `group-fit/0.1`. Candidate authorization is
+account/machine/locale scoped and never expands or fetches implicitly. Member
+and copy-source aliases are inputs but output uses request-local ordinals.
+Ownership, family availability, mode, player count, compatibility, policy, and
+missing-copy ranges retain independent three-valued states. Durable synthetic
+facts require their explicit disclosure and deletion workflow; query results
+are never persisted.
+
+## Implemented M7 local-operation commands
+
+M7 exposes three cache-only, non-executing surfaces:
+
+```text
+steam-agent operations observe --machine MACHINE [--format json|table]
+steam-agent storage rank --recipe reclaim-space/0.1 --machine MACHINE --target-bytes BYTES --limit N [--explain] [--format json|table]
+steam-agent storage rank --recipe travel-install/0.1 --account ALIAS --machine MACHINE --country CC --language english --budget-bytes BYTES --limit N [--explain] [--format json|table]
+steam-agent operations plan launch|install|uninstall|verify|backup APPID --account ALIAS --machine MACHINE [--expires-minutes N] [--format json|table]
+steam-agent operations plan move APPID --account ALIAS --machine MACHINE --destination-library-ordinal N [--expires-minutes N] [--format json|table]
+```
+
+Unknown account or machine aliases are errors rather than empty scopes. Observe
+returns `local-operation-state/0.1` from one promoted installed snapshot. It can
+establish installed presence, manifest size/build, observation time, and
+lineage; runtime, transfer queue, update currency, per-library capacity, save,
+media, Workshop/mod, and compatibility-tool state are typed unavailable.
+
+Storage ranking returns `storage-ranking/0.1`. `reclaim-space/0.1` ranks known
+content-size evidence, not safe uninstall actions. `travel-install/0.1` uses
+declared minimum-storage intervals and non-storage compatibility evidence but
+always leaves actual footprint, download/update bytes, bandwidth, queue, and
+completion time unknown. Hard gates precede preference evidence.
+
+Plans return inert `operation-plan/0.1` data with bounded expiry, deterministic
+identity, preconditions, risks, interactive-human-only confirmation, official
+HTTPS references, rollback guidance, and unknown postconditions. Move requires
+exactly one destination ordinal from 1 through 1024; every other operation
+rejects that option. The command does not open a URL or Steam URI, spawn a
+process, access a client, modify files, or claim completion.
 
 ## Exploratory future command shape
 
