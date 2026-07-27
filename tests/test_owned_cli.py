@@ -7,13 +7,14 @@ from pathlib import Path
 import pytest
 
 import steam_agent.cli as cli
+from steam_agent.activity import ACTIVITY_DISCLOSURE_VERSION
 from steam_agent.credentials import (
     CredentialError,
     InMemoryCredentialStore,
     SecretValue,
 )
 from steam_agent.steam_web_api import VisibleOwnedGame, VisibleOwnedSnapshot
-from steam_agent.storage import Storage
+from steam_agent.storage import OwnedObservation, Storage
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
@@ -782,3 +783,378 @@ def test_all_delete_reports_split_state_when_unreadable_key_cannot_be_restored(
             )
             is not None
         )
+
+
+OWNED_AT = NOW - timedelta(hours=2)
+
+
+class PlaytimeClient(Client):
+    def fetch_visible_owned_games(
+        self,
+        *,
+        steamid: str,
+        api_key: SecretValue,
+        include_appinfo: bool,
+        include_played_free_games: bool,
+    ) -> VisibleOwnedSnapshot:
+        self.calls.append((include_appinfo, include_played_free_games))
+        games = (
+            VisibleOwnedGame(
+                appid=10,
+                name="Never Played",
+                playtime_forever_minutes=0,
+                playtime_windows_forever_minutes=None,
+                playtime_mac_forever_minutes=None,
+                playtime_linux_forever_minutes=None,
+                last_played_unix=None,
+            ),
+            VisibleOwnedGame(
+                appid=20,
+                name="Played",
+                playtime_forever_minutes=120,
+                playtime_windows_forever_minutes=None,
+                playtime_mac_forever_minutes=None,
+                playtime_linux_forever_minutes=None,
+                last_played_unix=None,
+            ),
+        )
+        if include_played_free_games:
+            games += (
+                VisibleOwnedGame(
+                    appid=30,
+                    name="Playtime Absent",
+                    playtime_forever_minutes=None,
+                    playtime_windows_forever_minutes=None,
+                    playtime_mac_forever_minutes=None,
+                    playtime_linux_forever_minutes=None,
+                    last_played_unix=None,
+                ),
+            )
+        return VisibleOwnedSnapshot(
+            snapshot_state="ready",
+            games=games,
+            reported_game_count=len(games),
+            include_appinfo=include_appinfo,
+            include_played_free_games=include_played_free_games,
+        )
+
+
+def owned_synced(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Synchronize owned games observed two hours before the query clock."""
+
+    data_dir, _ = configured(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_steam_web_api_client", lambda: PlaytimeClient())
+    monkeypatch.setattr(cli, "_utc_now", lambda: OWNED_AT)
+    invoke(
+        ["--data-dir", str(data_dir), "sync", "owned", "--acknowledge-local-storage"],
+        capsys,
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    return data_dir
+
+
+def seed_activity(
+    data_dir: Path, games: tuple[dict[str, object], ...], observed_at: datetime
+) -> None:
+    with Storage(data_dir / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        storage.record_activity_data_consent(
+            account_id=account.id,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+            accepted_at=observed_at,
+            backups_acknowledged=True,
+        )
+        run = storage.begin_activity_sync(
+            account_id=account.id,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+            started_at=observed_at,
+        )
+        storage.complete_activity_snapshot(
+            run.id,
+            account_id=account.id,
+            games=games,
+            observed_at=observed_at,
+            recent_observed_at=observed_at,
+            completed_at=observed_at,
+            disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
+        )
+
+
+def playtime_states(envelope: dict[str, object]) -> dict[int, tuple[str, str]]:
+    return {
+        item["appid"]: (item["playtime_state"], item["playtime_reason"])
+        for item in envelope["data"]["items"]  # type: ignore[index]
+    }
+
+
+def test_owned_query_playtime_zero_vs_null_distinct(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+
+    code, queried, stderr = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert stderr == ""
+    assert playtime_states(queried) == {
+        10: ("zero", "owned_zero_minutes"),
+        20: ("positive", "owned_positive_minutes"),
+        30: ("unknown", "owned_playtime_absent"),
+    }
+    assert queried["data"]["playtime_state_counts"] == {  # type: ignore[index]
+        "zero": 1,
+        "positive": 1,
+        "unknown": 1,
+    }
+    assert queried["context"]["playtime_filter"] == "any"  # type: ignore[index]
+
+
+def test_owned_query_activity_newer_positive_upgrades_zero(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    seed_activity(
+        data_dir,
+        (
+            {"appid": 10, "playtime_forever_minutes": 45},
+            {"appid": 30, "playtime_forever_minutes": 5},
+        ),
+        NOW - timedelta(hours=1),
+    )
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert playtime_states(queried) == {
+        10: ("positive", "activity_newer_positive"),
+        20: ("positive", "owned_positive_minutes"),
+        30: ("positive", "activity_newer_positive"),
+    }
+
+
+def test_owned_query_activity_older_than_owned_is_ignored(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    seed_activity(
+        data_dir,
+        ({"appid": 10, "playtime_forever_minutes": 45},),
+        OWNED_AT - timedelta(hours=1),
+    )
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert playtime_states(queried)[10] == ("zero", "owned_zero_minutes")
+
+
+def test_owned_query_activity_never_downgrades_positive(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    seed_activity(
+        data_dir,
+        ({"appid": 20, "playtime_forever_minutes": 0},),
+        NOW - timedelta(minutes=1),
+    )
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert playtime_states(queried)[20] == ("positive", "owned_positive_minutes")
+
+
+def test_owned_query_expired_activity_not_consulted(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, _ = configured(tmp_path, monkeypatch)
+    database = data_dir / "steam-agent.sqlite3"
+    observed_at = NOW - timedelta(days=10)
+    with Storage(database) as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-v1",
+            accepted_at=observed_at,
+            backups_acknowledged=True,
+        )
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            run.id,
+            [
+                OwnedObservation(
+                    appid=10,
+                    name="Never Played",
+                    playtime_forever_minutes=0,
+                    inclusion_basis="visible_owned",
+                    observed_at=observed_at,
+                )
+            ],
+            base_retrieved_at=observed_at,
+            expanded_retrieved_at=observed_at,
+            base_reported_count=1,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+    # Newer than the owned observation, but past the activity hard retention.
+    seed_activity(
+        data_dir,
+        ({"appid": 10, "playtime_forever_minutes": 45},),
+        NOW - timedelta(days=8),
+    )
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert playtime_states(queried)[10] == ("zero", "owned_zero_minutes")
+
+
+def test_owned_query_playtime_filter_zero_excludes_unknown_and_reports_counts_and_limitations(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+
+    code, queried, _ = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "games",
+            "query",
+            "--scope",
+            "owned",
+            "--playtime",
+            "zero",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert [item["appid"] for item in queried["data"]["items"]] == [10]  # type: ignore[index]
+    assert queried["data"]["playtime_state_counts"] == {  # type: ignore[index]
+        "zero": 1,
+        "positive": 1,
+        "unknown": 1,
+    }
+    assert queried["context"]["playtime_filter"] == "zero"  # type: ignore[index]
+    limitations = queried["data"]["limitations"]  # type: ignore[index]
+    assert "never_played_list_is_a_lower_bound" in limitations
+    assert "zero_recorded_minutes_is_not_proof_of_never_launched" in limitations
+
+    code, unfiltered, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+    assert code == 0
+    assert (
+        "never_played_list_is_a_lower_bound"
+        not in unfiltered["data"]["limitations"]  # type: ignore[index]
+    )
+
+
+def test_owned_query_stale_owned_snapshot_yields_unknown_no_authoritative_snapshot(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW + timedelta(hours=25))
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert set(playtime_states(queried).values()) == {
+        ("unknown", "no_authoritative_snapshot")
+    }
+    assert queried["data"]["playtime_state_counts"] == {  # type: ignore[index]
+        "zero": 0,
+        "positive": 0,
+        "unknown": 3,
+    }
+
+
+def test_playtime_flag_rejected_for_installed_scope(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, _ = configured(tmp_path, monkeypatch)
+
+    code, rejected, _ = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "games",
+            "query",
+            "--scope",
+            "installed",
+            "--playtime",
+            "zero",
+        ],
+        capsys,
+    )
+
+    assert code == 2
+    assert rejected["error"]["code"] == "INVALID_ARGUMENT"  # type: ignore[index]
+
+
+def test_owned_playtime_table_output_is_path_free(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+
+    assert (
+        cli.main(
+            [
+                "--data-dir",
+                str(data_dir),
+                "games",
+                "query",
+                "--scope",
+                "owned",
+                "--playtime",
+                "zero",
+                "--format",
+                "table",
+            ]
+        )
+        == 0
+    )
+
+    rendered = capsys.readouterr()  # type: ignore[attr-defined]
+    assert "PLAYTIME_STATE\tPLAYTIME_REASON" in rendered.out
+    assert "\tzero\towned_zero_minutes" in rendered.out
+    assert str(tmp_path) not in rendered.out

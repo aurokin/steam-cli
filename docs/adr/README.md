@@ -33,6 +33,7 @@ product and provider choices open until evidence supports them.
 | D024 | Compatibility evidence and precedence | [Accepted layered M5 boundary](0011-m5-layered-compatibility.md) | Costly once agents consume verdicts | Provisional shape fixtures, pure gate/eval oracles, target scoping, unknowns, overrides, and live redacted evidence |
 | D025 | Discovery/group evidence, copy matching, and ranking boundary | [Accepted with M6](0012-m6-bounded-discovery-and-groups.md) | Costly once multi-profile results are consumed | Schema migration, category ladders, Kleene sets, matching ranges, privacy/deletion, bounded-universe and ranking evals |
 | D026 | Local operational evidence and safe-plan surface | [Accepted with M7](0013-m7-read-only-operation-plans.md) | Moderate; schemas are versioned | Installed freshness/last-good, ranking truthfulness, official-reference allowlists, and no-I/O tests |
+| D028 | Owned playtime truth state and backlog filtering | [Proposed ADR 0016](0016-owned-playtime-truth-state.md) | Easy; derived fields and one flag | Zero-versus-null, activity upgrade/never-downgrade, expiry, non-authoritative, and filter/limitation tests |
 
 ## When to create an ADR
 
