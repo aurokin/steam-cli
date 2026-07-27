@@ -1,15 +1,15 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m3-d04", "status": "active", "milestone": "M3",
+  "schema_version": "steam-agent-eval/0.2", "id": "m3-d04", "status": "active", "milestone": "M3", "scenario_kind": "contract",
   "question_family": "provider fallback", "tags": ["attribution", "fallback", "identity"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Exact primary lookup misses and normalized-game USD fallback supplies a current offer.", "facts": [
-    {"subject": "synthetic:appid:401", "state": "gg_not_found"}, {"subject": "synthetic:appid:401", "state": "cheapshark_ready", "detail": "normalized-game unknown-store USD 799"}
+    {"subject": "synthetic:appid:401", "state": "gg_not_found"}, {"subject": "synthetic:appid:401", "state": "cheapshark_ready", "detail": "amount=799; store_class=unknown; comparability=normalized_game"}
   ]},
   "conversation": {"user": ["Can another provider price this game when the primary source cannot?"], "paraphrase": "Use the fallback price evidence for this wishlist game."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US", "--store-class", "unknown"]}], "prohibited": ["sync", "browser", "exact-product-relabel"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 provider ladder", "assertions": [
-    {"path": "$.items[0].deal.fallback_rung", "operator": "equals", "expected": 1},
-    {"path": "$.items[0].deal.current_offer.provider", "operator": "equals", "expected": "cheapshark"},
-    {"path": "$.items[0].deal.current_offer.comparability", "operator": "equals", "expected": "normalized_game"}
+    {"path": "$.data.items[0].deal.fallback_rung", "operator": "equals", "expected": 1},
+    {"path": "$.data.items[0].deal.current_offer.provider", "operator": "equals", "expected": "cheapshark"},
+    {"path": "$.data.items[0].deal.current_offer.product.comparability", "operator": "equals", "expected": "normalized_game"}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [
     {"id": "fallback-attribution", "weight": 5, "requirement": "Attribute the fallback provider and preserve its identity grade.", "hard_fail": true},

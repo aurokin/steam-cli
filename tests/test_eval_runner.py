@@ -29,7 +29,7 @@ SCENARIO_ROOT = ROOT / "evals" / "scenarios"
 SCENARIO_PATHS = tuple(
     sorted(
         path
-        for family in ("m4", "m5", "m7")
+        for family in ("m3", "m4", "m5", "m7")
         for path in (SCENARIO_ROOT / family).glob("*.json")
     )
 )
@@ -75,7 +75,7 @@ def test_materializer_rejects_unsupported_milestones_and_states(
     }
     with pytest.raises(UnsupportedScenarioError):
         materialize(base, tmp_path)
-    for milestone in ("M4", "M5", "M7"):
+    for milestone in ("M3", "M4", "M5", "M7"):
         unknown_state = {
             "milestone": milestone,
             "tool_policy": {"required": []},

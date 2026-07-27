@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m3-d07", "status": "active", "milestone": "M3",
+  "schema_version": "steam-agent-eval/0.2", "id": "m3-d07", "status": "active", "milestone": "M3", "scenario_kind": "contract",
   "question_family": "deal data quality", "tags": ["failure", "running", "unevaluated"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Wishlist candidates have running, failed, and untargeted provider states.", "facts": [
     {"subject": "synthetic:appid:701", "state": "running"}, {"subject": "synthetic:appid:702", "state": "failed_rate_limited"}, {"subject": "synthetic:appid:703", "state": "unevaluated"}
@@ -7,9 +7,11 @@
   "conversation": {"user": ["Why are prices missing for these games?"], "paraphrase": "Explain the different incomplete deal states."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "retry", "browser"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 typed fallback states", "assertions": [
-    {"path": "$.completeness", "operator": "equals", "expected": "partial"},
-    {"path": "$.items[*].deal.primary_state", "operator": "ordered_equals", "expected": ["running", "failed", "unevaluated"]},
-    {"path": "$.warnings[*].code", "operator": "contains", "expected": "PROVIDER_RATE_LIMITED"}
+    {"path": "$.completeness.status", "operator": "equals", "expected": "partial"},
+    {"path": "$.data.items[?(@.appid==701)].deal.attempted_providers[1].error_code", "operator": "equals", "expected": "SYNC_IN_PROGRESS"},
+    {"path": "$.data.items[?(@.appid==702)].deal.attempted_providers[0].error_code", "operator": "equals", "expected": "PROVIDER_RATE_LIMITED"},
+    {"path": "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code", "operator": "ordered_equals", "expected": ["PRICE_EVIDENCE_NOT_EVALUATED", "PRICE_EVIDENCE_NOT_EVALUATED"]},
+    {"path": "$.completeness.warnings[*].code", "operator": "contains", "expected": "PROVIDER_RATE_LIMITED"}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [
     {"id": "state-distinction", "weight": 10, "requirement": "Keep running, failed, and unevaluated distinct.", "hard_fail": true},
