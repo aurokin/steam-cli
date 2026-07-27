@@ -72,10 +72,19 @@ def _execute(scenario: dict[str, Any]) -> dict[str, Any]:
     allowed_options = {
         "--account", "--target", "--country", "--language", "--require", "--override"
     }
+    # ``--explain`` is a lone flag; every other accepted option takes one value.
+    allowed_flags = {"--explain"}
     option_tail = arguments[first_option:]
-    assert len(option_tail) % 2 == 0
-    assert all(option_tail[index] in allowed_options for index in range(0, len(option_tail), 2))
-    assert all(not option_tail[index].startswith("--") for index in range(1, len(option_tail), 2))
+    index = 0
+    while index < len(option_tail):
+        option = option_tail[index]
+        if option in allowed_flags:
+            index += 1
+            continue
+        assert option in allowed_options
+        assert index + 1 < len(option_tail)
+        assert not option_tail[index + 1].startswith("--")
+        index += 2
     requested = tuple(int(value) for value in arguments[:first_option])
     assert _single_option(arguments, "--account") == "synthetic"
     assert _single_option(arguments, "--country") == "US"

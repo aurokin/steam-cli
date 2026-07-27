@@ -1,9 +1,10 @@
-"""Drive one scenario turn through the Codex App Server protocol.
+"""Drive one scenario conversation through the Codex App Server protocol.
 
 Speaks the ``codex app-server`` JSONL JSON-RPC protocol over stdio (protocol
 pinned against ``codex app-server generate-json-schema``, codex-cli 0.145.0):
-``initialize`` -> ``initialized`` -> ``thread/start`` -> ``turn/start``, then
-collects ``item/completed`` and ``turn/completed`` notifications. Approval
+``initialize`` -> ``initialized`` -> ``thread/start`` -> one ``turn/start``
+per scenario turn on the same thread, collecting ``item/completed`` and
+``turn/completed`` notifications into one transcript per turn. Approval
 requests are answered ``denied`` so a sandbox escape can never be granted by
 the harness; the policy itself is ``never``.
 """
@@ -16,7 +17,7 @@ import os
 import select
 import subprocess
 import time
-from typing import Any, IO
+from typing import Any, IO, Sequence
 
 
 class CodexProtocolError(RuntimeError):
@@ -46,14 +47,22 @@ def codex_version() -> str:
     return result.stdout.strip()
 
 
-def run_agent_turn(
+def run_agent_conversation(
     *,
-    prompt: str,
+    prompts: Sequence[str],
     workspace: str,
     developer_instructions: str,
     model: str | None = None,
     timeout_seconds: float = 900.0,
-) -> AgentTranscript:
+) -> list[AgentTranscript]:
+    """Run every prompt as a sequential turn on one thread.
+
+    The deadline covers the whole conversation, not each turn: a scenario's
+    later turns must not extend the budget its earlier turns already spent.
+    """
+
+    if not prompts:
+        raise ValueError("a conversation needs at least one prompt")
     process = subprocess.Popen(
         ["codex", "app-server"],
         stdin=subprocess.PIPE,
@@ -63,7 +72,7 @@ def run_agent_turn(
     try:
         return _converse(
             process,
-            prompt=prompt,
+            prompts=list(prompts),
             workspace=workspace,
             developer_instructions=developer_instructions,
             model=model,
@@ -77,15 +86,32 @@ def run_agent_turn(
             process.kill()
 
 
-def _converse(
-    process: subprocess.Popen[str],
+def run_agent_turn(
     *,
     prompt: str,
     workspace: str,
     developer_instructions: str,
+    model: str | None = None,
+    timeout_seconds: float = 900.0,
+) -> AgentTranscript:
+    return run_agent_conversation(
+        prompts=[prompt],
+        workspace=workspace,
+        developer_instructions=developer_instructions,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )[0]
+
+
+def _converse(
+    process: subprocess.Popen[str],
+    *,
+    prompts: Sequence[str],
+    workspace: str,
+    developer_instructions: str,
     model: str | None,
     timeout_seconds: float,
-) -> AgentTranscript:
+) -> list[AgentTranscript]:
     assert process.stdin is not None and process.stdout is not None
     session = _Session(process.stdin, process.stdout, timeout_seconds)
 
@@ -112,14 +138,21 @@ def _converse(
         },
     )
     thread_id = thread["thread"]["id"]
-    session.request(
-        "turn/start",
-        {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
-        },
-    )
 
+    transcripts: list[AgentTranscript] = []
+    for prompt in prompts:
+        session.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+        )
+        transcripts.append(_collect_turn(session, thread_id))
+    return transcripts
+
+
+def _collect_turn(session: _Session, thread_id: str) -> AgentTranscript:
     transcript = AgentTranscript()
     while True:
         message = session.read_message()
