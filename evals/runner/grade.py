@@ -251,6 +251,10 @@ def _positional_head(argv: Sequence[str]) -> list[str]:
     return positional
 
 
+def is_steam_agent_command(command: str) -> bool:
+    return _steam_agent_argv(_flatten_tokens(command)) is not None
+
+
 def grade_tool_policy(
     executed_commands: Sequence[str], policy: Mapping[str, Any]
 ) -> dict[str, Any]:
