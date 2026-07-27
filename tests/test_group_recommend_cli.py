@@ -459,6 +459,43 @@ def test_recommend_bounds_are_rejected(tmp_path, capsys, mutation) -> None:
     assert value["error"]["code"] == "INVALID_ARGUMENT"
 
 
+def test_recommend_members_block_and_schema_bump(
+    tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    setup(tmp_path, owned=(10,))
+    seed(tmp_path, {10: payload(10, genre=1)})
+    own(tmp_path, ALPHA, 10)
+    own(tmp_path, BETA, 10)
+    args = common(objective="min-copies", appids=(10,))
+    args.extend(("--member", "account:primary"))
+
+    code, value, stderr = invoke(tmp_path, capsys, *args)
+
+    assert code == 0 and stderr == ""
+    assert value["data"]["schema"] == "group-fit/0.2"
+    assert value["data"]["members"] == [
+        {
+            "member_ordinal": 0,
+            "kind": "synthetic",
+            "member_evidence": "asserted",
+            "last_attempt_at": None,
+        },
+        {
+            "member_ordinal": 1,
+            "kind": "synthetic",
+            "member_evidence": "asserted",
+            "last_attempt_at": None,
+        },
+        {
+            "member_ordinal": 2,
+            "kind": "account",
+            "member_evidence": "authoritative",
+            "last_attempt_at": "2026-07-12T18:00:00Z",
+        },
+    ]
+
+
 def test_host_topology_requires_explicit_host_at_cli_boundary(tmp_path, capsys) -> None:
     setup(tmp_path)
     args = common(objective="min-copies", appids=(10,))

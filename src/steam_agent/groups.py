@@ -11,8 +11,8 @@ import re
 from typing import Literal, Mapping
 
 
-SCHEMA = "group-eligibility/0.1"
-RANKING_RECIPE = "group-fit/0.1"
+SCHEMA = "group-eligibility/0.2"
+RANKING_RECIPE = "group-fit/0.2"
 MAX_APPID = (1 << 32) - 1
 MAX_MEMBERS = 32
 MAX_SOURCES = 64

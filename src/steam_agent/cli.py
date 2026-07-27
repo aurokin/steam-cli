@@ -150,6 +150,8 @@ from steam_agent.groups import (
     OwnershipFact,
     PlayerLimits,
     PolicyFact,
+    RANKING_RECIPE as GROUP_RANKING_RECIPE,
+    SCHEMA as GROUP_SCHEMA,
     assess_copies,
     assess_eligibility,
     rank_candidates,
@@ -2817,25 +2819,77 @@ def _group_feature_set(appid: int, payload: Mapping[str, Any] | None) -> Feature
     )
 
 
+def _owned_last_good_is_fresh(snapshot: Any, *, now: datetime) -> bool:
+    """Report whether a promoted last-good owned snapshot is still fresh."""
+
+    run = snapshot.latest_complete
+    if run is None or not run.promoted:
+        return False
+    reference = run.completed_at or run.started_at
+    age = (
+        now - datetime.fromisoformat(reference.replace("Z", "+00:00"))
+    ).total_seconds()
+    return 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
+
+
+def _account_member_evidence(
+    snapshot: Any, *, now: datetime
+) -> tuple[str, str | None]:
+    """Classify one account member's owned evidence without a privacy claim."""
+
+    latest = snapshot.latest
+    last_attempt_at = (
+        None if latest is None else (latest.completed_at or latest.started_at)
+    )
+    if _owned_last_good_is_fresh(snapshot, now=now):
+        evidence = "authoritative"
+    elif (
+        latest is not None
+        and latest.error_code == ErrorCode.OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT
+    ):
+        evidence = "inaccessible"
+    elif snapshot.latest_complete is None:
+        evidence = "not_synced"
+    else:
+        evidence = "stale"
+    return evidence, last_attempt_at
+
+
 def _group_ownership_by_app(
     storage: Storage,
     *,
     refs: tuple[MemberRef, ...],
     appids: tuple[int, ...],
-) -> tuple[dict[int, tuple[OwnershipFact, ...]], bool, bool, bool]:
+) -> tuple[
+    dict[int, tuple[OwnershipFact, ...]],
+    bool,
+    bool,
+    bool,
+    dict[MemberRef, str],
+    dict[MemberRef, str | None],
+]:
     account_owned: dict[MemberRef, set[int] | None] = {}
     ownership_missing = False
     ownership_stale = False
+    evidence_by_ref: dict[MemberRef, str] = {}
+    last_attempt_by_ref: dict[MemberRef, str | None] = {}
     for ref in refs:
         if ref.kind != "account":
+            evidence_by_ref[ref] = "asserted"
+            last_attempt_by_ref[ref] = None
             continue
         account = storage.get_account(ref.key)
         if account is None:
             raise ValueError("selected account is not configured")
         snapshot = storage.read_owned_snapshot(account.id)
-        missing, stale, authoritative = _owned_scope_state(snapshot, now=_utc_now())
+        now = _utc_now()
+        missing, stale, authoritative = _owned_scope_state(snapshot, now=now)
         ownership_missing = ownership_missing or missing
         ownership_stale = ownership_stale or stale
+        (
+            evidence_by_ref[ref],
+            last_attempt_by_ref[ref],
+        ) = _account_member_evidence(snapshot, now=now)
         account_owned[ref] = (
             {
                 game.appid
@@ -2878,7 +2932,32 @@ def _group_ownership_by_app(
                 state = synthetic_states[ref].get(appid, "unknown")
             facts.append(OwnershipFact(source, state))  # type: ignore[arg-type]
         result[appid] = tuple(facts)
-    return result, ownership_missing, ownership_stale, ownership_any_evidence
+    return (
+        result,
+        ownership_missing,
+        ownership_stale,
+        ownership_any_evidence,
+        evidence_by_ref,
+        last_attempt_by_ref,
+    )
+
+
+def _group_members_json(
+    members: tuple[MemberRef, ...],
+    *,
+    member_ordinals: Mapping[MemberRef, int],
+    evidence_by_ref: Mapping[MemberRef, str],
+    last_attempt_by_ref: Mapping[MemberRef, str | None],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "member_ordinal": member_ordinals[member],
+            "kind": member.kind,
+            "member_evidence": evidence_by_ref[member],
+            "last_attempt_at": last_attempt_by_ref[member],
+        }
+        for member in members
+    ]
 
 
 def _evaluate_group_app(
@@ -3083,6 +3162,7 @@ def _group_query_completeness(
     ownership_missing: bool,
     ownership_stale: bool,
     ownership_any_evidence: bool,
+    ownership_inaccessible: bool = False,
 ) -> dict[str, Any]:
     warnings: list[WarningRecord] = []
     if ownership_missing:
@@ -3099,6 +3179,16 @@ def _group_query_completeness(
                 message=(
                     "At least one selected account has stale or superseded "
                     "visible-owned evidence; its copy states remain unknown."
+                ),
+            )
+        )
+    if ownership_inaccessible:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT,
+                message=(
+                    "At least one selected account's owned-library attempt was "
+                    "inaccessible or ambiguous; its copy states remain unknown."
                 ),
             )
         )
@@ -3190,6 +3280,8 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 ownership_missing,
                 ownership_stale,
                 ownership_any_evidence,
+                evidence_by_ref,
+                last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
             declared = (
                 storage.read_declared_app_snapshot(
@@ -3310,8 +3402,21 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
                 ownership_any_evidence=ownership_any_evidence,
+                ownership_inaccessible=any(
+                    evidence == "inaccessible"
+                    for evidence in evidence_by_ref.values()
+                ),
             ),
-            data={"schema": "group-eligibility/0.1", "results": rows},
+            data={
+                "schema": GROUP_SCHEMA,
+                "members": _group_members_json(
+                    members,
+                    member_ordinals=member_ordinals,
+                    evidence_by_ref=evidence_by_ref,
+                    last_attempt_by_ref=last_attempt_by_ref,
+                ),
+                "results": rows,
+            },
         )
     except (StorageError, TypeError, ValueError):
         return _group_invalid(
@@ -3434,6 +3539,8 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_missing,
                 ownership_stale,
                 ownership_any_evidence,
+                evidence_by_ref,
+                last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
             ownership_missing = ownership_missing or scope_owned_missing
             ownership_stale = ownership_stale or scope_owned_stale
@@ -3598,9 +3705,19 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
                 ownership_any_evidence=ownership_any_evidence,
+                ownership_inaccessible=any(
+                    evidence == "inaccessible"
+                    for evidence in evidence_by_ref.values()
+                ),
             ),
             data={
-                "schema": "group-fit/0.1",
+                "schema": GROUP_RANKING_RECIPE,
+                "members": _group_members_json(
+                    members,
+                    member_ordinals=member_ordinals,
+                    evidence_by_ref=evidence_by_ref,
+                    last_attempt_by_ref=last_attempt_by_ref,
+                ),
                 "objective": args.objective,
                 "candidate_count": len(candidate_appids),
                 "eligible_ranked_count": len(ranked),
