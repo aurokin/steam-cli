@@ -18,12 +18,14 @@ and remain covered by the pure oracle only.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from steam_agent.steam_declared_facts import DECLARED_FACTS_DISCLOSURE_VERSION
-from steam_agent.storage import Storage
+from steam_agent.storage import Storage, WishlistObservation
 from steam_agent.system_profile import SYSTEM_PROFILE_DISCLOSURE_VERSION, fact, unknown
+from steam_agent.wishlist_library import WISHLIST_DISCLOSURE_VERSION
 
 from .materialize import (
     GIBIBYTE,
@@ -53,6 +55,12 @@ _COMPARABLE_STATES = {
 }
 _OPAQUE_STATES = {"opaque_cpu_gpu", "minimum_unknown_with_override"}
 _DECK_STATES = {"deck_playable", "deck_unsupported"}
+# The canonical wishlist compatibility route (ADR 0014) needs a wishlist
+# snapshot old enough to be non-authoritative while its last-good items still
+# expand the app-facts scope, and candidates absent from the visible-owned
+# projection so ``readiness:visible_owned`` stays unknown.
+_WISHLIST_STATES = {"wishlisted_comparable_minimum_stale_scope"}
+_STALE_WISHLIST_OFFSET = timedelta(hours=30)
 
 
 def _system_profile() -> dict[str, Any]:
@@ -127,6 +135,7 @@ class _Plan:
         self.appid = appid
         self.owned = True
         self.installed = True
+        self.wishlisted = False
         self.declared: dict[str, Any] | None = None
 
 
@@ -150,11 +159,54 @@ def _plan(appid: int, state: str) -> _Plan | None:
         plan.declared = declared_app_facts_payload(
             appid, linux_supported=False, windows_supported=True
         )
+    elif state in _WISHLIST_STATES:
+        plan.owned = False
+        plan.installed = False
+        plan.wishlisted = True
+        plan.declared = declared_app_facts_payload(
+            appid, linux_supported=True, linux_minimum=COMPARABLE_MINIMUM
+        )
     elif state == "requested_without_evidence":
         return None
     else:
         raise UnsupportedScenarioError(f"no M5 fixture builder for {state!r}")
     return plan
+
+
+def _write_stale_wishlist(
+    storage: Storage,
+    *,
+    account_id: int,
+    appids: Sequence[int],
+    observed_at: datetime,
+) -> None:
+    """Write one complete wishlist snapshot old enough to be non-authoritative."""
+
+    storage.record_wishlist_data_consent(
+        account_id=account_id,
+        disclosure_version=WISHLIST_DISCLOSURE_VERSION,
+        accepted_at=observed_at,
+        backups_acknowledged=True,
+    )
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="wishlist.read",
+        account_id=account_id,
+        started_at=observed_at,
+    )
+    observations = tuple(
+        WishlistObservation(appid, priority, int(observed_at.timestamp()), observed_at)
+        for priority, appid in enumerate(sorted(appids))
+    )
+    storage.complete_wishlist_snapshot(
+        run.id,
+        observations,
+        item_list_retrieved_at=observed_at,
+        item_count_retrieved_at=observed_at,
+        item_list_reported_count=len(observations),
+        item_count_reported_count=len(observations),
+        completed_at=observed_at,
+    )
 
 
 def _write_declared(
@@ -252,6 +304,14 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             plans=plans,
             now=now,
         )
+        wishlisted = [plan.appid for plan in plans if plan.wishlisted]
+        if wishlisted:
+            _write_stale_wishlist(
+                storage,
+                account_id=account.id,
+                appids=wishlisted,
+                observed_at=now - _STALE_WISHLIST_OFFSET,
+            )
 
 
 __all__ = ["build"]

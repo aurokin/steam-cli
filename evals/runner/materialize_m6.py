@@ -15,6 +15,7 @@ from the seeded visible-owned snapshot exactly as in production.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -47,7 +48,14 @@ _OWNERSHIP_STATES = {
     "group_declared_all_own": "all",
     "group_declared_first_owner_only": "first",
     "declared_mode_only": "none",
+    "group_declared_synthetic_owner_account_inaccessible": "all",
 }
+
+# States whose configured-account member must read as ``inaccessible``: a
+# newer owned attempt that failed with the provider's inaccessible-or-ambiguous
+# code invalidates the seeded last-good snapshot for that member.
+_ACCOUNT_INACCESSIBLE_STATES = {"group_declared_synthetic_owner_account_inaccessible"}
+_INACCESSIBLE_ATTEMPT_LAG = timedelta(seconds=30)
 
 
 class _Plan:
@@ -194,6 +202,25 @@ def _write_group_assertions(
                 )
 
 
+def _write_inaccessible_owned_attempt(
+    storage: Storage, *, account_id: int, attempted_at: datetime
+) -> None:
+    """Record one failed owned attempt carrying the inaccessible code."""
+
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="owned.visible.read",
+        account_id=account_id,
+        started_at=attempted_at,
+    )
+    storage.finish_owned_sync(
+        run.id,
+        status="failed",
+        completed_at=attempted_at,
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+    )
+
+
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     machine_key = required_argument_value(
         scenario,
@@ -226,6 +253,15 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             now=now,
         )
         _write_group_assertions(storage, members=members, plans=plans, now=now)
+        if any(
+            fact["state"] in _ACCOUNT_INACCESSIBLE_STATES
+            for fact in scenario["fixture"]["facts"]
+        ):
+            _write_inaccessible_owned_attempt(
+                storage,
+                account_id=account.id,
+                attempted_at=now + _INACCESSIBLE_ATTEMPT_LAG,
+            )
 
 
 __all__ = ["build"]
