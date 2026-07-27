@@ -89,6 +89,7 @@ from steam_agent.deal_query import build_deal_query_from_snapshot
 from steam_agent.feedback import FeedbackService
 from steam_agent.activity import (
     ACTIVITY_DISCLOSURE_VERSION,
+    HARD_RETENTION,
     ActivitySyncError,
     query_activity,
     query_achievements,
@@ -402,6 +403,12 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
     query.add_argument("--include-paths", action="store_true")
+    query.add_argument(
+        "--playtime",
+        choices=("any", "zero", "positive", "unknown"),
+        default="any",
+        help="Filter owned-scope items by derived playtime truth state.",
+    )
 
     discovery = commands.add_parser(
         "discovery", help="Query bounded cached declared discovery evidence."
@@ -1127,6 +1134,14 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.command == "games" and args.games_command == "query":
+        if args.playtime != "any" and args.scope != "owned":
+            return _emit_error(
+                args,
+                command="games.query",
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="--playtime is available only for owned-scope queries.",
+                exit_code=2,
+            )
         if args.scope == "wishlist":
             return _dispatch_wishlist_games_query(args, database_path)
         if args.scope in ("owned", "library"):
@@ -2235,6 +2250,52 @@ def _scope_dependency_warnings(
             )
         )
     return tuple(warnings)
+
+
+def _playtime_state(
+    owned_minutes: int | None,
+    owned_observed_at: datetime | None,
+    activity_minutes: int | None,
+    activity_observed_at: datetime | None,
+    owned_authoritative: bool,
+) -> tuple[str, str]:
+    """Derive one playtime truth state from the owned authority and activity."""
+
+    if not owned_authoritative:
+        return "unknown", "no_authoritative_snapshot"
+    if owned_minutes is None:
+        derived = ("unknown", "owned_playtime_absent")
+    elif owned_minutes > 0:
+        # Activity evidence never downgrades a recorded owned positive.
+        return "positive", "owned_positive_minutes"
+    else:
+        derived = ("zero", "owned_zero_minutes")
+    if (
+        activity_minutes is not None
+        and activity_minutes > 0
+        and activity_observed_at is not None
+        and owned_observed_at is not None
+        and activity_observed_at > owned_observed_at
+    ):
+        return "positive", "activity_newer_positive"
+    return derived
+
+
+def _unexpired_activity_playtime(
+    storage: Storage, account_id: int, *, now: datetime
+) -> dict[int, tuple[int | None, datetime]]:
+    """Return lifetime activity minutes still inside the hard retention window."""
+
+    snapshot = storage.read_activity_snapshot(account_id)
+    evidence: dict[int, tuple[int | None, datetime]] = {}
+    for row in snapshot["items"]:
+        observed_at = datetime.fromisoformat(
+            str(row["observed_at"]).replace("Z", "+00:00")
+        )
+        if now - observed_at > HARD_RETENTION:
+            continue
+        evidence[int(row["appid"])] = (row["playtime_forever_minutes"], observed_at)
+    return evidence
 
 
 def _declared_scope_appids(
@@ -6522,6 +6583,7 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                         "sequential_request_difference_may_reflect_concurrent_library_change",
                     ],
                     "next_cursor": None,
+                    "playtime_state_counts": {"zero": 0, "positive": 0, "unknown": 0},
                     "source": None,
                     "snapshot": unavailable_snapshot,
                 }
@@ -6556,6 +6618,11 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                     ),
                     "identifiers_included": False,
                     **({"machine_id": args.machine} if args.scope == "library" else {}),
+                    **(
+                        {"playtime_filter": args.playtime}
+                        if args.scope == "owned"
+                        else {}
+                    ),
                 },
                 completeness_value=completeness(
                     CompletenessStatus.UNAVAILABLE,
@@ -6577,6 +6644,45 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                 capability="owned.visible.read",
                 subject="Owned games",
             )
+            now = _utc_now()
+            _, _, authoritative = _owned_scope_state(owned_snapshot, now=now)
+            activity = _unexpired_activity_playtime(storage, account.id, now=now)
+            items: list[dict[str, Any]] = []
+            state_counts = {"zero": 0, "positive": 0, "unknown": 0}
+            for game in owned_snapshot.games:
+                activity_minutes, activity_observed_at = activity.get(
+                    game.appid, (None, None)
+                )
+                state, reason = _playtime_state(
+                    game.playtime_forever_minutes,
+                    datetime.fromisoformat(game.observed_at.replace("Z", "+00:00")),
+                    activity_minutes,
+                    activity_observed_at,
+                    authoritative,
+                )
+                state_counts[state] += 1
+                items.append(
+                    {
+                        **owned_item(game),
+                        "game_id": f"game:{owned_game_ids[game.appid]}",
+                        "playtime_state": state,
+                        "playtime_reason": reason,
+                    }
+                )
+            limitations = [
+                "individually_private_games_may_be_omitted",
+                "unplayed_free_entitlements_are_not_complete",
+                "sequential_request_difference_may_reflect_concurrent_library_change",
+            ]
+            if args.playtime == "zero":
+                limitations += [
+                    "never_played_list_is_a_lower_bound",
+                    "zero_recorded_minutes_is_not_proof_of_never_launched",
+                ]
+            if args.playtime != "any":
+                items = [
+                    item for item in items if item["playtime_state"] == args.playtime
+                ]
             return _emit_success(
                 args,
                 command="games.query",
@@ -6584,26 +6690,18 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                     "account_alias": account.alias,
                     "scopes": ["owned"],
                     "identifiers_included": False,
+                    "playtime_filter": args.playtime,
                 },
                 completeness_value=owned_completeness,
                 data={
-                    "items": [
-                        {
-                            **owned_item(game),
-                            "game_id": f"game:{owned_game_ids[game.appid]}",
-                        }
-                        for game in owned_snapshot.games
-                    ],
+                    "items": items,
                     "empty": bool(
                         owned_snapshot.latest_complete is not None
                         and not owned_snapshot.games
                     ),
-                    "limitations": [
-                        "individually_private_games_may_be_omitted",
-                        "unplayed_free_entitlements_are_not_complete",
-                        "sequential_request_difference_may_reflect_concurrent_library_change",
-                    ],
+                    "limitations": limitations,
                     "next_cursor": None,
+                    "playtime_state_counts": state_counts,
                     "source": _owned_provenance(owned_snapshot),
                     "snapshot": metadata,
                 },
@@ -8943,7 +9041,15 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
                     item["appid"], item["name"], item["state"], item["size_bytes"]
                 )
         elif scopes == ["owned"]:
-            _print_table_fields("APPID", "NAME", "VISIBLE", "BASIS", "PLAYTIME")
+            _print_table_fields(
+                "APPID",
+                "NAME",
+                "VISIBLE",
+                "BASIS",
+                "PLAYTIME",
+                "PLAYTIME_STATE",
+                "PLAYTIME_REASON",
+            )
             for item in envelope["data"]["items"]:
                 _print_table_fields(
                     item["appid"],
@@ -8951,6 +9057,8 @@ def _print_table(command: str, envelope: dict[str, Any]) -> None:
                     item["visible_in_owned_games"],
                     item["inclusion_basis"],
                     item["playtime_forever_minutes"],
+                    item["playtime_state"],
+                    item["playtime_reason"],
                 )
         elif scopes == ["wishlist"]:
             _print_table_fields("APPID", "WISHLISTED", "PRIORITY", "DATE_ADDED")

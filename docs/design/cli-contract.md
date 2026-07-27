@@ -102,7 +102,7 @@ The following surface is the accepted M2 contract:
 ```text
 steam-agent sync owned --account ALIAS [--acknowledge-local-storage]
 steam-agent sync catalog --account ALIAS --machine ID
-steam-agent games query --scope owned --account ALIAS
+steam-agent games query --scope owned --account ALIAS [--playtime any|zero|positive|unknown]
 steam-agent games query --scope library --account ALIAS --machine ID
 steam-agent data delete --provider steam-web-api --account ALIAS --yes
 steam-agent data delete --provider steam-web-api --all --yes
@@ -177,6 +177,29 @@ It keeps the following independent:
 - a stable local entity ID plus typed Steam application AppID identity;
 - family availability, playable-now, purchasability, and license kind, which
   remain `unknown` without separate evidence.
+
+Owned-scope items also carry a derived `playtime_state` of `zero`, `positive`,
+or `unknown` with exactly one `playtime_reason`: `owned_zero_minutes`,
+`owned_positive_minutes`, `activity_newer_positive`, `owned_playtime_absent`,
+or `no_authoritative_snapshot`. A recorded zero and an absent playtime field
+stay distinct: absence is `unknown`, never `zero`. The visible-owned snapshot
+is the authority. Unexpired activity evidence, read from the same store as
+[`activity query`](m4-execution.md), may only upgrade `zero` or `unknown` to
+`positive` when its lifetime minutes are above zero and its observation is
+strictly newer than the owned observation; it never downgrades a positive owned
+observation and is never required, so an absent activity consent or snapshot
+changes nothing. Activity rows past the seven-day hard retention are not
+consulted. A missing or non-authoritative owned snapshot makes every item
+`unknown` with `no_authoritative_snapshot`.
+
+`--playtime` filters owned-scope items by that state and is rejected with
+`INVALID_ARGUMENT` for any other scope. `playtime_state_counts` is computed
+before filtering, so the excluded states stay visible, and the query context
+always reports the requested `playtime_filter`. A `zero` filter adds the
+`never_played_list_is_a_lower_bound` and
+`zero_recorded_minutes_is_not_proof_of_never_launched` limitations: private
+games and unplayed free entitlements can be omitted upstream, and zero recorded
+minutes is not proof that a game was never launched.
 
 Per-account deletion removes that target's normalized projection, account-
 scoped evidence, sync/probe history, and account metadata. It does not remove

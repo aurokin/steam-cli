@@ -983,3 +983,11 @@ def test_canceled_cli_sync_does_not_leave_running_attempt(
     assert stderr == ""
     assert queried["data"]["snapshot"]["last_attempt_status"] == "failed"
     assert "SYNC_IN_PROGRESS" not in warning_codes
+
+
+def test_games_query_help_lists_playtime_filter(capsys: object) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["games", "query", "--help"])
+
+    assert exit_info.value.code == 0
+    assert "--playtime" in capsys.readouterr().out  # type: ignore[attr-defined]
