@@ -455,6 +455,14 @@ minimum comparison, requested features, likely-good experience, and
 playable-now are separate claims. In particular, `linux=false` does not fail a
 possible Proton route, and M5 does not rank CPU/GPU names or predict frame rate.
 
+The canonical wishlist compatibility route is `sync app-facts --scope wishlist`
+followed by `compatibility assess` over those wishlist AppIDs; `sync
+compatibility` remains owned-only. `compatibility assess` accepts arbitrary
+explicit AppIDs, and `readiness:visible_owned` is unknown for an AppID absent
+from the visible-owned projection, is not a mandatory gate, and never alone
+yields `incompatible`. Visible-owned absence is not a missing-entitlement
+claim. See [ADR 0014](../adr/0014-wishlist-compatibility-route.md).
+
 `--require` accepts an exact `accessibility`, `input`, or `language` feature.
 `--override` is a named, AppID-scoped, ephemeral gate decision; output retains
 both original and effective state, and no override is persisted. `--explain`
@@ -485,7 +493,7 @@ M6 keeps explicit collection and local assertions separate from bounded,
 cache-only discovery and group queries:
 
 ```text
-steam-agent sync app-facts --scope known|library|wishlist|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
+steam-agent sync app-facts --scope known|library|wishlist|installed|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
 steam-agent discovery query --scope known|library|wishlist|installed|appids --limit N --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--require-mode MODE] [--format json|table]
 steam-agent profiles create|get|list|delete|clear-account ...
 steam-agent ownership set|clear ...
@@ -494,6 +502,18 @@ steam-agent fact set|clear ...
 steam-agent group ownership|eligibility APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG ...
 steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --member MEMBER... [--copy-source SOURCE...] --context-account ALIAS --context-machine MACHINE --country CC --language LANG --mode MODE --objective no-purchase|min-copies|preference-fit ...
 ```
+
+`sync app-facts` reports the state of every snapshot it used to expand its
+scope. A wishlist scope reports `wishlist.read`, a library scope reports
+`owned.visible.read`, an installed scope reports `installed.read`, and a known
+scope reports the union of the three; an `appids` scope has no such dependency.
+A dependency whose snapshot has never completed is a missing capability with a
+`NOT_SYNCED` warning. A wishlist or owned last-good snapshot that is older than
+its freshness policy or superseded by a newer non-authoritative attempt is a
+stale capability with a `STALE_LAST_GOOD` warning; installed scans have no
+defined freshness window and are therefore never reported stale. Either state
+demotes a complete sync to partial, but neither blocks the sync nor erases
+last-good declarations.
 
 `discovery query` returns `discovery-query/0.1`; group eligibility and ranking
 return `group-eligibility/0.1` and `group-fit/0.1`. Candidate authorization is

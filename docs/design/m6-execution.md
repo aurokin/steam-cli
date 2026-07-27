@@ -130,7 +130,7 @@ last-good row. Account/provider deletion and 30-day pruning cover both versions.
 Planned tracer commands:
 
 ```text
-steam-agent sync app-facts --scope known|library|wishlist|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
+steam-agent sync app-facts --scope known|library|wishlist|installed|appids --account ALIAS --machine MACHINE --country CC --language LANG [--appid APPID...] [--max-items N] [--acknowledge-local-storage]
 steam-agent discovery query [APPID...] --scope known|library|wishlist|installed|appids --limit N --account ALIAS --machine MACHINE --country CC --language LANG [--require mode:MODE] [--format json|table]
 steam-agent profiles create synthetic:ALIAS --acknowledge-group-storage --acknowledge-backups
 steam-agent profiles get|delete synthetic:ALIAS [--yes]

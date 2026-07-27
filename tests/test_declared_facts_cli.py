@@ -12,7 +12,14 @@ from steam_agent.steam_declared_facts import (
     SteamDeclaredFactsClient,
     SteamDeclaredFactsError,
 )
-from steam_agent.storage import Machine, OwnedObservation, Storage
+from steam_agent.storage import (
+    EvidenceInput,
+    InstalledObservation,
+    Machine,
+    OwnedObservation,
+    Storage,
+    WishlistObservation,
+)
 
 
 NOW = datetime(2026, 7, 12, 12, tzinfo=timezone.utc)
@@ -99,6 +106,67 @@ def configure(tmp_path: Path) -> None:
             expanded_reported_count=1,
             completed_at=NOW,
         )
+
+
+def seed_wishlist(tmp_path: Path, *, at: datetime, appids: tuple[int, ...]) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        storage.record_wishlist_data_consent(
+            account_id=account.id,
+            disclosure_version="wishlist-v1",
+            accepted_at=at,
+            backups_acknowledged=True,
+        )
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="wishlist.read",
+            account_id=account.id,
+            started_at=at,
+        )
+        storage.complete_wishlist_snapshot(
+            run.id,
+            tuple(
+                WishlistObservation(appid, index, 100 + index, at)
+                for index, appid in enumerate(appids)
+            ),
+            item_list_retrieved_at=at,
+            item_count_retrieved_at=at,
+            item_list_reported_count=len(appids),
+            item_count_reported_count=len(appids),
+            completed_at=at,
+        )
+
+
+def seed_installed(tmp_path: Path, *, at: datetime, appids: tuple[int, ...]) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        run = storage.begin_sync(
+            provider="local_steam",
+            capability="installed",
+            machine_id="desktop",
+            started_at=at,
+        )
+        for appid in appids:
+            storage.record_installed_observation(
+                run.id,
+                InstalledObservation(
+                    appid,
+                    "/private/library",
+                    f"private-install-dir-{appid}",
+                    at,
+                    "Fixture Game",
+                ),
+                EvidenceInput(
+                    "local_steam",
+                    "installed",
+                    "local_file",
+                    f"appmanifest_{appid}.acf",
+                    at,
+                    "local_heuristic",
+                    {"private": "must-not-escape"},
+                ),
+            )
+        storage.finish_installed_sync(run.id, status="complete", completed_at=at)
 
 
 def test_sync_requires_disclosure_then_persists_normalized_cache_only(
@@ -1037,3 +1105,202 @@ def test_rate_limit_without_retry_after_uses_default_persisted_backoff(
                WHERE provider='steam-store-appdetails' AND budget_scope='global'"""
         ).fetchone()[0]
     assert retry_at == "2026-07-12T12:05:00Z"
+
+
+STALE = datetime(2026, 7, 10, tzinfo=timezone.utc)
+
+
+def sync_app_facts(tmp_path: Path, capsys, scope: str, *extra: str):
+    return invoke(
+        tmp_path,
+        capsys,
+        "sync",
+        "app-facts",
+        "--scope",
+        scope,
+        *extra,
+        "--account",
+        "primary",
+        "--machine",
+        "desktop",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--acknowledge-local-storage",
+    )
+
+
+def test_app_facts_wishlist_scope_reports_missing_wishlist_lineage(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli, "_declared_facts_client", lambda: pytest.fail("unsynced scope fetched")
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "wishlist")
+
+    assert code == 0
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["missing_capabilities"] == ["wishlist.read"]
+    assert result["completeness"]["stale_capabilities"] == []
+    assert [
+        warning["code"] for warning in result["completeness"]["warnings"]
+    ] == ["NOT_SYNCED"]
+
+
+def test_app_facts_wishlist_scope_reports_stale_wishlist_lineage(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    seed_wishlist(tmp_path, at=STALE, appids=(400,))
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "wishlist")
+
+    assert code == 0
+    assert result["data"]["targeted"] == [400]
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["missing_capabilities"] == []
+    assert result["completeness"]["stale_capabilities"] == ["wishlist.read"]
+    assert any(
+        warning["code"] == "STALE_LAST_GOOD"
+        for warning in result["completeness"]["warnings"]
+    )
+
+
+def test_app_facts_library_scope_reports_owned_lineage(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE sync_runs SET started_at=?,completed_at=?
+               WHERE capability='owned.visible.read'""",
+            ("2026-07-10T00:00:00Z", "2026-07-10T00:00:01Z"),
+        )
+        storage._connection.commit()  # noqa: SLF001
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "library")
+
+    assert code == 0
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["stale_capabilities"] == ["owned.visible.read"]
+    assert any(
+        warning["code"] == "STALE_LAST_GOOD"
+        for warning in result["completeness"]["warnings"]
+    )
+
+
+def test_app_facts_installed_scope_missing_only_never_stale(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli, "_declared_facts_client", lambda: pytest.fail("unsynced scope fetched")
+    )
+
+    code, missing, _ = sync_app_facts(tmp_path, capsys, "installed")
+
+    assert code == 0
+    assert missing["completeness"]["status"] == "partial"
+    assert missing["completeness"]["missing_capabilities"] == ["installed.read"]
+    assert missing["completeness"]["stale_capabilities"] == []
+
+    seed_installed(tmp_path, at=STALE, appids=(400,))
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, aged, _ = sync_app_facts(tmp_path, capsys, "installed")
+
+    assert code == 0
+    assert aged["data"]["targeted"] == [400]
+    assert aged["completeness"]["status"] == "complete"
+    assert aged["completeness"]["missing_capabilities"] == []
+    assert aged["completeness"]["stale_capabilities"] == []
+
+
+def test_app_facts_known_scope_merges_dependency_lineage(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "known")
+
+    assert code == 0
+    assert result["data"]["targeted"] == [400]
+    assert result["completeness"]["status"] == "partial"
+    assert result["completeness"]["missing_capabilities"] == [
+        "installed.read",
+        "wishlist.read",
+    ]
+    assert result["completeness"]["stale_capabilities"] == []
+    assert any(
+        warning["code"] == "NOT_SYNCED"
+        for warning in result["completeness"]["warnings"]
+    )
+
+
+def test_app_facts_appids_scope_has_no_dependency_lineage(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "appids", "--appid", "400")
+
+    assert code == 0
+    assert result["completeness"]["status"] == "complete"
+    assert result["completeness"]["missing_capabilities"] == []
+    assert result["completeness"]["stale_capabilities"] == []
+    assert result["completeness"]["warnings"] == []
+
+
+def test_app_facts_fresh_scopes_remain_complete(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    seed_wishlist(tmp_path, at=NOW, appids=(400,))
+    seed_installed(tmp_path, at=NOW, appids=(400,))
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(
+        cli,
+        "_declared_facts_client",
+        lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
+    )
+
+    code, result, _ = sync_app_facts(tmp_path, capsys, "known")
+
+    assert code == 0
+    assert result["completeness"]["status"] == "complete"
+    assert result["completeness"]["missing_capabilities"] == []
+    assert result["completeness"]["stale_capabilities"] == []
+    assert result["completeness"]["warnings"] == []
