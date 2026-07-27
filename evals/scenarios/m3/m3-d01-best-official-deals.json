@@ -1,8 +1,9 @@
 {
-  "schema_version": "steam-agent-eval/0.1",
+  "schema_version": "steam-agent-eval/0.2",
   "id": "m3-d01",
   "status": "active",
   "milestone": "M3",
+  "scenario_kind": "contract",
   "question_family": "best wishlist deals",
   "tags": ["attribution", "ranking", "official-store"],
   "frozen_time": "2030-01-15T12:00:00Z",
@@ -10,9 +11,9 @@
     "kind": "synthetic_normalized",
     "description": "Three fresh exact-product official offers with comparable USD lows.",
     "facts": [
-      {"subject": "synthetic:appid:101", "state": "fresh_ready", "detail": "USD 500 against USD 2000 exact low basis"},
-      {"subject": "synthetic:appid:102", "state": "fresh_ready", "detail": "USD 900 against USD 1800 exact low basis"},
-      {"subject": "synthetic:appid:103", "state": "fresh_ready", "detail": "USD 1200 against USD 1200 exact low basis"}
+      {"subject": "synthetic:appid:101", "state": "fresh_ready", "detail": "amount=500; low=2000"},
+      {"subject": "synthetic:appid:102", "state": "fresh_ready", "detail": "amount=900; low=1800"},
+      {"subject": "synthetic:appid:103", "state": "fresh_ready", "detail": "amount=1200; low=1200"}
     ]
   },
   "conversation": {"user": ["What are the best official-store deals on my wishlist right now?"], "paraphrase": "Rank my current wishlist bargains from official stores."},
@@ -24,9 +25,9 @@
   "deterministic_oracle": {
     "recipe_or_contract": "deal-evidence/0.1",
     "assertions": [
-      {"path": "$.completeness", "operator": "equals", "expected": "complete"},
-      {"path": "$.items[*].appid", "operator": "ordered_equals", "expected": [101, 102, 103]},
-      {"path": "$.items[*].evidence.provider", "operator": "contains", "expected": "gg-deals"}
+      {"path": "$.completeness.status", "operator": "equals", "expected": "complete"},
+      {"path": "$.data.items[*].appid", "operator": "ordered_equals", "expected": [101, 102, 103]},
+      {"path": "$.data.items[*].deal.current_offer.provider", "operator": "contains", "expected": "gg-deals"}
     ]
   },
   "fact_rubric": {"grading": "deterministic", "criteria": [

@@ -1,22 +1,23 @@
 {
-  "schema_version": "steam-agent-eval/0.1",
+  "schema_version": "steam-agent-eval/0.2",
   "id": "m3-d02",
   "status": "active",
   "milestone": "M3",
+  "scenario_kind": "contract",
   "question_family": "historical low summary",
   "tags": ["boundary", "historical-low", "uncertainty"],
   "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Exact comparable offers at, inside, and outside the accepted near-low boundary.", "facts": [
-    {"subject": "synthetic:appid:201", "state": "at_low"},
-    {"subject": "synthetic:appid:202", "state": "near_low_inside_boundary"},
-    {"subject": "synthetic:appid:203", "state": "outside_near_low_boundary"}
+    {"subject": "synthetic:appid:201", "state": "at_low", "detail": "amount=1000; low=1000"},
+    {"subject": "synthetic:appid:202", "state": "near_low_inside_boundary", "detail": "amount=1050; low=1000"},
+    {"subject": "synthetic:appid:203", "state": "outside_near_low_boundary", "detail": "amount=1051; low=1000"}
   ]},
   "conversation": {"user": ["Which wishlist games are at or near their historical low?"], "paraphrase": "Show only prices that match or nearly match the provider low."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "full-history-claim", "browser"]},
   "deterministic_oracle": {"recipe_or_contract": "deal-evidence/0.1", "assertions": [
-    {"path": "$.items[?(@.appid==201)].deal.grade", "operator": "equals", "expected": "at_historical_low"},
-    {"path": "$.items[?(@.appid==202)].deal.grade", "operator": "equals", "expected": "near_historical_low"},
-    {"path": "$.items[?(@.appid==203)].deal.grade", "operator": "omits", "expected": ["at_historical_low", "near_historical_low"]}
+    {"path": "$.data.items[?(@.appid==201)].deal.bucket", "operator": "equals", "expected": "at_or_below_low"},
+    {"path": "$.data.items[?(@.appid==202)].deal.bucket", "operator": "equals", "expected": "within_5_percent"},
+    {"path": "$.data.items[?(@.appid==203)].deal.bucket", "operator": "one_of", "expected": ["discounted", "current_only", "noncomparable", "unknown"]}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [
     {"id": "boundary-fidelity", "weight": 5, "requirement": "Classify all three low-boundary cases exactly.", "hard_fail": true},

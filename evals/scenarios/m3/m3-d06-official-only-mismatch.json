@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m3-d06", "status": "active", "milestone": "M3",
+  "schema_version": "steam-agent-eval/0.2", "id": "m3-d06", "status": "active", "milestone": "M3", "scenario_kind": "contract",
   "question_family": "store constrained deal", "tags": ["currency", "hard-constraint", "official-store"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A cheaper keyshop offer and non-USD offer coexist with a comparable official USD offer.", "facts": [
     {"subject": "synthetic:appid:601", "state": "official_usd_1200"}, {"subject": "synthetic:appid:601", "state": "keyshop_usd_500"}, {"subject": "synthetic:appid:601", "state": "official_eur_700"}
@@ -7,9 +7,9 @@
   "conversation": {"user": ["Show me the best official-store deal in US dollars only."], "paraphrase": "Exclude keyshops and currency-mismatched prices."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US", "--store-class", "official"]}], "prohibited": ["sync", "browser", "keyshop-selection"]},
   "deterministic_oracle": {"recipe_or_contract": "deal-evidence/0.1 comparison context", "assertions": [
-    {"path": "$.items[0].deal.current_offer.price.amount_minor", "operator": "equals", "expected": 1200},
-    {"path": "$.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"},
-    {"path": "$.items[0].deal.current_offer.price.currency", "operator": "equals", "expected": "USD"}
+    {"path": "$.data.items[0].deal.current_offer.price.amount_minor", "operator": "equals", "expected": 1200},
+    {"path": "$.data.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"},
+    {"path": "$.data.items[0].deal.current_offer.price.currency", "operator": "equals", "expected": "USD"}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [
     {"id": "hard-context", "weight": 10, "requirement": "Never substitute the cheaper keyshop or EUR amount.", "hard_fail": true}

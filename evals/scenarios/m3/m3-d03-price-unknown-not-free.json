@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m3-d03", "status": "active", "milestone": "M3",
+  "schema_version": "steam-agent-eval/0.2", "id": "m3-d03", "status": "active", "milestone": "M3", "scenario_kind": "contract",
   "question_family": "missing price", "tags": ["fallback", "not-found", "unknown-not-free"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Both primary and fallback providers return fresh not-found outcomes.", "facts": [
     {"subject": "synthetic:appid:301", "state": "gg_not_found"}, {"subject": "synthetic:appid:301", "state": "cheapshark_not_found"}
@@ -7,9 +7,9 @@
   "conversation": {"user": ["What is the current price for this wishlist game?"], "paraphrase": "Is this game free right now?"},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "browser", "mutation"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 cache-only deal query", "assertions": [
-    {"path": "$.items[0].deal.current_offer", "operator": "equals", "expected": null},
-    {"path": "$.items[0].deal.attempted_providers[*].state", "operator": "ordered_equals", "expected": ["not_found", "not_found"]},
-    {"path": "$.items[0].warnings", "operator": "contains", "expected": "PRICE_UNKNOWN"}
+    {"path": "$.data.items[0].deal.current_offer", "operator": "equals", "expected": null},
+    {"path": "$.data.items[0].deal.attempted_providers[*].status", "operator": "ordered_equals", "expected": ["not_found", "not_found"]},
+    {"path": "$.data.items[0].deal.reasons", "operator": "contains", "expected": "no_current_or_historical_evidence"}
   ]},
   "fact_rubric": {"grading": "deterministic", "criteria": [
     {"id": "unknown-not-free", "weight": 10, "requirement": "State that price is unknown and never infer free from missing evidence.", "hard_fail": true}
