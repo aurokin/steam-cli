@@ -314,6 +314,10 @@ def _assert_oracle(document: dict[str, Any], assertion: dict[str, Any]) -> None:
 def test_active_m4_deterministic_oracle_is_executable(scenario_path: Path) -> None:
     scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
     assert scenario["status"] == "active"
+    if scenario["schema_version"] != "steam-agent-eval/0.1":
+        # 0.2 scenarios are executed end to end against the installed CLI by
+        # tests/test_eval_runner.py; this module re-implements the 0.1 corpus.
+        pytest.skip("schema 0.2 scenarios are covered by the materializer round trip")
     result = _execute(scenario)
     assertions = scenario["deterministic_oracle"]["assertions"]
     assert assertions, "an active deterministic oracle cannot be empty"

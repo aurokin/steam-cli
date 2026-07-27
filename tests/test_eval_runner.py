@@ -29,7 +29,7 @@ SCENARIO_ROOT = ROOT / "evals" / "scenarios"
 SCENARIO_PATHS = tuple(
     sorted(
         path
-        for family in ("m3", "m4", "m5", "m7")
+        for family in ("m2", "m3", "m4", "m5", "m6", "m7")
         for path in (SCENARIO_ROOT / family).glob("*.json")
     )
 )
@@ -43,6 +43,10 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
     path: Path, tmp_path: Path, capsys: object
 ) -> None:
     scenario = json.loads(path.read_text())
+    if not scenario["tool_policy"]["required"]:
+        # Boundary probes are graded from the transcript alone; there is no
+        # required command whose document this test could reproduce.
+        pytest.skip("boundary probe declares no required command")
     if scenario["id"] in EXPECTED_UNSUPPORTED:
         with pytest.raises(UnsupportedScenarioError):
             materialize(scenario, tmp_path)
@@ -56,7 +60,15 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
     assert code == 0
     document = json.loads(captured.out)
 
-    result = grade.grade_oracle(document, scenario["deterministic_oracle"])
+    # Trace and final-answer assertions are graded from an agent transcript,
+    # which this deterministic round trip does not produce.
+    oracle = dict(scenario["deterministic_oracle"])
+    oracle["assertions"] = [
+        assertion
+        for assertion in oracle["assertions"]
+        if assertion.get("source", "cli_document") == "cli_document"
+    ]
+    result = grade.grade_oracle(document, oracle)
     assert result["passed"], result["failed"]
 
     rendered = json.dumps(document)
@@ -75,7 +87,7 @@ def test_materializer_rejects_unsupported_milestones_and_states(
     }
     with pytest.raises(UnsupportedScenarioError):
         materialize(base, tmp_path)
-    for milestone in ("M3", "M4", "M5", "M7"):
+    for milestone in ("M2", "M3", "M4", "M5", "M6", "M7"):
         unknown_state = {
             "milestone": milestone,
             "tool_policy": {"required": []},

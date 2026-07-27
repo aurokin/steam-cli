@@ -43,7 +43,9 @@ from steam_agent.storage import (
     CatalogPageInput,
     CatalogStreamInput,
     Storage,
+    WishlistObservation,
 )
+from steam_agent.wishlist_library import WISHLIST_DISCLOSURE_VERSION
 
 from .materialize import (
     FUTURE_OFFSET,
@@ -93,6 +95,7 @@ class _Plan:
     def __init__(self, appid: int) -> None:
         self.appid = appid
         self.installed = True
+        self.wishlisted = False
         self.activity: dict[str, Any] | None = None
         self.feedback: list[tuple[str, str | int | None]] = []
         self.traits: list[tuple[str, str]] = []
@@ -152,6 +155,9 @@ def _plan(appid: int, state: str, now: datetime) -> _Plan:
         plan.traits.append(("user:controller", "present"))
     elif state == "required_feature_fail":
         plan.traits.append(("user:controller", "absent"))
+    elif state == "wishlisted_without_deal_evidence":
+        plan.installed = False
+        plan.wishlisted = True
     elif state == "score_60":
         plan.feedback.append(("rating", "liked"))
     elif state == "controller_unknown_higher_fit":
@@ -260,6 +266,42 @@ def _write_achievements(
     storage.finish_achievement_sync(run.id, completed_at=observed)
 
 
+def _write_wishlist(
+    storage: Storage,
+    *,
+    account_id: int,
+    appids: Sequence[int],
+    now: datetime,
+) -> None:
+    """Write one complete wishlist snapshot with no price or review evidence."""
+
+    storage.record_wishlist_data_consent(
+        account_id=account_id,
+        disclosure_version=WISHLIST_DISCLOSURE_VERSION,
+        accepted_at=now,
+        backups_acknowledged=True,
+    )
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="wishlist.read",
+        account_id=account_id,
+        started_at=now,
+    )
+    observations = tuple(
+        WishlistObservation(appid, priority, int(now.timestamp()), now)
+        for priority, appid in enumerate(sorted(appids))
+    )
+    storage.complete_wishlist_snapshot(
+        run.id,
+        observations,
+        item_list_retrieved_at=now,
+        item_count_retrieved_at=now,
+        item_list_reported_count=len(observations),
+        item_count_reported_count=len(observations),
+        completed_at=now,
+    )
+
+
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     machine_key = scenario_machine_key(scenario)
     account_alias = scenario_account_alias(scenario)
@@ -312,6 +354,12 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             completed_at=now,
             disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         )
+
+        wishlisted = [plan.appid for plan in plans if plan.wishlisted]
+        if wishlisted:
+            _write_wishlist(
+                storage, account_id=account.id, appids=wishlisted, now=now
+            )
 
         if states & _ACHIEVEMENT_STATES:
             _write_achievements(
