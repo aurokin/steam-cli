@@ -289,7 +289,14 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
         cli.MemberRef("synthetic", "guest"),
     )
     with Storage(path, readonly=True) as storage:
-        ownership, missing, stale, any_evidence = cli._group_ownership_by_app(  # noqa: SLF001
+        (
+            ownership,
+            missing,
+            stale,
+            any_evidence,
+            evidence_by_ref,
+            _last_attempt_by_ref,
+        ) = cli._group_ownership_by_app(  # noqa: SLF001
             storage, refs=refs, appids=(400,)
         )
 
@@ -297,6 +304,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
     assert missing is False
     assert stale is True
     assert any_evidence is False
+    assert evidence_by_ref[refs[0]] == "stale"
 
 
 def test_group_with_only_unsynced_accounts_is_unavailable(
@@ -506,3 +514,218 @@ def test_group_eligibility_propagates_stale_declared_facts(
     assert code == 0
     assert value["completeness"]["status"] == "partial"
     assert value["completeness"]["stale_capabilities"] == ["discovery.declared.read"]
+
+
+def configure_second_account(tmp_path: Path, alias: str, steam_id64: str) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.configure_steam_account(
+            alias=alias,
+            steam_id64=steam_id64,
+            configured_at=NOW,
+        )
+        storage.record_owned_data_consent(
+            account_id=account.id,
+            disclosure_version="owned-visible-v1",
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+
+
+def seed_failed_owned_sync(
+    tmp_path: Path,
+    alias: str,
+    *,
+    error_code: str,
+    attempted_at: datetime = NOW,
+) -> None:
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account(alias)
+        assert account is not None
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=attempted_at,
+        )
+        storage.finish_owned_sync(
+            run.id,
+            status="failed",
+            completed_at=attempted_at,
+            error_code=error_code,
+        )
+
+
+def ownership_query(*members: str) -> list[str]:
+    arguments = ["group", "ownership", "400"]
+    for member in members:
+        arguments.extend(("--member", member))
+    arguments.extend(
+        (
+            "--account",
+            "primary",
+            "--machine",
+            "local",
+            "--country",
+            "US",
+            "--language",
+            "english",
+        )
+    )
+    return arguments
+
+
+def test_group_members_block_authoritative_and_asserted(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+
+    code, value, stderr = invoke(
+        tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
+    )
+
+    assert code == 0 and stderr == ""
+    assert value["data"]["members"] == [
+        {
+            "member_ordinal": 0,
+            "kind": "account",
+            "member_evidence": "authoritative",
+            "last_attempt_at": "2026-07-12T18:00:00Z",
+        },
+        {
+            "member_ordinal": 1,
+            "kind": "synthetic",
+            "member_evidence": "asserted",
+            "last_attempt_at": None,
+        },
+    ]
+
+
+def test_group_member_inaccessible_from_failed_owned_attempt(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    seed_failed_owned_sync(
+        tmp_path,
+        "primary",
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+    )
+
+    code, value, stderr = invoke(
+        tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
+    )
+
+    assert code == 0 and stderr == ""
+    assert value["data"]["members"][0] == {
+        "member_ordinal": 0,
+        "kind": "account",
+        "member_evidence": "inaccessible",
+        "last_attempt_at": "2026-07-12T18:00:00Z",
+    }
+    assert value["data"]["results"][0]["ownership"]["members"][0]["state"] == "unknown"
+    assert {
+        "code": "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+        "message": (
+            "At least one selected account's owned-library attempt was "
+            "inaccessible or ambiguous; its copy states remain unknown."
+        ),
+    } in value["completeness"]["warnings"]
+    rendered = json.dumps(value).casefold()
+    assert "primary" not in rendered
+    assert "guest" not in rendered
+    assert "private" not in rendered
+
+
+def test_group_member_stale_beats_not_synced_precedence(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path, with_owned=True)
+    configure_second_account(tmp_path, "other", "76561198999999998")
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE sync_runs SET started_at=?, completed_at=?
+               WHERE capability='owned.visible.read'""",
+            ("2026-07-01T00:00:00Z", "2026-07-01T00:00:01Z"),
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    code, value, stderr = invoke(
+        tmp_path, capsys, *ownership_query("account:primary", "account:other")
+    )
+
+    assert code == 0 and stderr == ""
+    assert [item["member_evidence"] for item in value["data"]["members"]] == [
+        "stale",
+        "not_synced",
+    ]
+    assert [item["last_attempt_at"] for item in value["data"]["members"]] == [
+        "2026-07-01T00:00:01Z",
+        None,
+    ]
+
+
+def test_group_member_inaccessible_with_fresh_last_good_is_authoritative(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    seed_failed_owned_sync(
+        tmp_path,
+        "primary",
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+        attempted_at=datetime(2026, 7, 12, 19, tzinfo=timezone.utc),
+    )
+
+    code, value, stderr = invoke(
+        tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
+    )
+
+    assert code == 0 and stderr == ""
+    assert value["data"]["members"][0] == {
+        "member_ordinal": 0,
+        "kind": "account",
+        "member_evidence": "authoritative",
+        "last_attempt_at": "2026-07-12T19:00:00Z",
+    }
+
+
+def test_group_schema_bump_to_0_2(tmp_path: Path, capsys: object) -> None:
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Alpha")
+    create_profile(tmp_path, capsys, "synthetic:Beta")
+    seed_declared(tmp_path, 400)
+
+    code, value, _ = invoke(
+        tmp_path, capsys, *ownership_query("synthetic:Alpha", "synthetic:Beta")
+    )
+    assert code == 0
+    assert value["data"]["schema"] == "group-eligibility/0.2"
+
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "group",
+        "eligibility",
+        "400",
+        "--member",
+        "synthetic:Alpha",
+        "--member",
+        "synthetic:Beta",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--mode",
+        "online_coop",
+    )
+    assert code == 0
+    assert value["data"]["schema"] == "group-eligibility/0.2"

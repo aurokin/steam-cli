@@ -496,13 +496,30 @@ steam-agent group recommend --scope known|library|wishlist|installed|appids --li
 ```
 
 `discovery query` returns `discovery-query/0.1`; group eligibility and ranking
-return `group-eligibility/0.1` and `group-fit/0.1`. Candidate authorization is
+return `group-eligibility/0.2` and `group-fit/0.2`. Candidate authorization is
 account/machine/locale scoped and never expands or fetches implicitly. Member
 and copy-source aliases are inputs but output uses request-local ordinals.
 Ownership, family availability, mode, player count, compatibility, policy, and
 missing-copy ranges retain independent three-valued states. Durable synthetic
 facts require their explicit disclosure and deletion workflow; query results
 are never persisted.
+
+Both group query schemas carry a `members` array in request member-ordinal
+order, using the same ordinals as `ownership.members`. Each entry reports
+`kind`, `last_attempt_at`, and one `member_evidence` value: `authoritative`
+(a fresh promoted complete visible-owned snapshot), `stale` (a last-good
+snapshot that is stale, superseded, or unpromoted), `not_synced` (no last-good
+snapshot), `inaccessible` (the latest owned attempt failed with
+`OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT`), or `asserted` (synthetic
+members, whose `last_attempt_at` is always null). For account members the
+precedence is deterministic: authoritative, then inaccessible, then
+not_synced, then stale. `inaccessible` means inaccessible or ambiguous exactly
+as in M2; it is never a privacy diagnosis, is never serialized as `private`,
+and aliases are still never emitted. An inaccessible account member adds the
+typed `OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT` completeness warning
+alongside the existing not-synced and stale warnings, and counts like a
+missing member for the partial/unavailable ladder. Per-app ownership states
+remain `owned | not_owned | unknown`.
 
 ## Implemented M7 local-operation commands
 

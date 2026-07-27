@@ -5,6 +5,8 @@ from dataclasses import replace
 import pytest
 
 from steam_agent.groups import (
+    RANKING_RECIPE,
+    SCHEMA,
     CopySourceRef,
     FamilyEdge,
     FeatureSet,
@@ -363,3 +365,8 @@ def test_preference_fit_rejects_missing_scores_and_duplicate_candidates() -> Non
         rank_candidates((replace(item, preference=None),), objective="preference-fit")
     with pytest.raises(ValueError, match="unique"):
         rank_candidates((item, item), objective="min-copies")
+
+
+def test_schema_constants_are_0_2() -> None:
+    assert SCHEMA == "group-eligibility/0.2"
+    assert RANKING_RECIPE == "group-fit/0.2"
