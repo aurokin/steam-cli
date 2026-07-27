@@ -12,11 +12,16 @@ MARKDOWN_LINK = re.compile(r"]\(([^)]+)\)")
 PERSONAL_HOME = re.compile(r"/(?:Users|home)/[^/\s`)]+/")
 
 
+RESULTS_ROOT = REPO_ROOT / "evals" / "results"
+
+
 def markdown_files() -> list[Path]:
     return sorted(
         path
         for path in REPO_ROOT.rglob("*.md")
-        if ".git" not in path.parts and ".venv" not in path.parts
+        if ".git" not in path.parts
+        and ".venv" not in path.parts
+        and not path.is_relative_to(RESULTS_ROOT)
     )
 
 

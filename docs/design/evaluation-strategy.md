@@ -103,7 +103,14 @@ blind comparison and task-specific rubrics while retaining expert review.
   deterministic scenarios; M3 scenarios are schema/privacy checked only.
 - A new executable scenario is added only after its exact CLI and recipe
   contract is accepted and backed by normal product tests.
-- A future runner may materialize normalized fixtures through public storage
-  APIs and execute an installed CLI. It must not make provider requests.
+- An opt-in agent-execution runner exists under `evals/runner/`. It
+  materializes normalized fixtures through public storage APIs, drives one
+  scenario turn through the Codex App Server protocol in a network-disabled
+  sandbox, and grades the transcript deterministically: tool policy, oracle
+  assertions against the harness-captured CLI document, the agent's
+  claim/evidence sidecar, and a binary privacy gate over the answer surface.
+  It makes no provider requests and requires a locally installed `codex`
+  binary; normal CI exercises only its materializer and grader. M7 scenarios
+  are materializable today; M5 and M4 builders remain future work.
 - Generated traces, answers, judgments, and reports stay under
   `evals/results/`, which is ignored by Git.
