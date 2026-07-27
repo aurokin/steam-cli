@@ -42,6 +42,7 @@ from steam_agent.storage import (
     CatalogObservation,
     CatalogPageInput,
     CatalogStreamInput,
+    OwnedObservation,
     Storage,
     WishlistObservation,
 )
@@ -62,6 +63,17 @@ from .materialize import (
 
 _ACHIEVEMENT_STATES = {"stale_activity", "achievements_unevaluated", "fresh_activity"}
 _STALE_ACHIEVEMENT_STATES = {"stale_activity"}
+
+# Playtime-truth scenarios need per-app lifetime minutes the shared owned
+# writer does not express, and they need the owned observation to predate the
+# activity snapshot so the strictly-newer activity upgrade can apply at all.
+_PLAYTIME_STATES = {
+    "owned_never_played",
+    "owned_recorded_positive_minutes",
+    "owned_playtime_field_absent",
+    "owned_zero_minutes_activity_newer_positive",
+}
+_OWNED_PLAYTIME_LAG = timedelta(minutes=10)
 
 
 def _iso(value: datetime) -> str:
@@ -99,6 +111,7 @@ class _Plan:
         self.activity: dict[str, Any] | None = None
         self.feedback: list[tuple[str, str | int | None]] = []
         self.traits: list[tuple[str, str]] = []
+        self.owned_minutes: int | None = 0
 
 
 def _plan(appid: int, state: str, now: datetime) -> _Plan:
@@ -155,6 +168,17 @@ def _plan(appid: int, state: str, now: datetime) -> _Plan:
         plan.traits.append(("user:controller", "present"))
     elif state == "required_feature_fail":
         plan.traits.append(("user:controller", "absent"))
+    elif state == "owned_never_played":
+        plan.installed = False
+    elif state == "owned_recorded_positive_minutes":
+        plan.installed = False
+        plan.owned_minutes = 600
+    elif state == "owned_playtime_field_absent":
+        plan.installed = False
+        plan.owned_minutes = None
+    elif state == "owned_zero_minutes_activity_newer_positive":
+        plan.installed = False
+        plan.activity = _activity_row(appid, now, lifetime=180, recent=0, days_ago=3)
     elif state == "wishlisted_without_deal_evidence":
         plan.installed = False
         plan.wishlisted = True
@@ -168,6 +192,41 @@ def _plan(appid: int, state: str, now: datetime) -> _Plan:
     else:
         raise UnsupportedScenarioError(f"no M4 fixture builder for {state!r}")
     return plan
+
+
+def _write_owned_playtime(
+    storage: Storage,
+    *,
+    account_id: int,
+    plans: Sequence[_Plan],
+    observed_at: datetime,
+) -> None:
+    """Write one complete visible-owned snapshot carrying per-app minutes."""
+
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="owned.visible.read",
+        account_id=account_id,
+        started_at=observed_at,
+    )
+    storage.complete_owned_snapshot(
+        run.id,
+        tuple(
+            OwnedObservation(
+                plan.appid,
+                plan.owned_minutes,
+                "visible_owned",
+                observed_at,
+                f"Synthetic title {plan.appid}",
+            )
+            for plan in sorted(plans, key=lambda plan: plan.appid)
+        ),
+        base_retrieved_at=observed_at,
+        expanded_retrieved_at=observed_at,
+        base_reported_count=len(plans),
+        expanded_reported_count=len(plans),
+        completed_at=observed_at,
+    )
 
 
 def _stream(kind: str, appids: Sequence[int], now: datetime) -> CatalogStreamInput:
@@ -319,7 +378,15 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             account_alias=account_alias,
             now=now,
         )
-        write_owned_snapshot(storage, account.id, appids, now)
+        if states & _PLAYTIME_STATES:
+            _write_owned_playtime(
+                storage,
+                account_id=account.id,
+                plans=plans,
+                observed_at=now - _OWNED_PLAYTIME_LAG,
+            )
+        else:
+            write_owned_snapshot(storage, account.id, appids, now)
         _write_catalog(
             storage,
             account_id=account.id,
