@@ -1,22 +1,30 @@
 """Materialize scenario fixtures into a real ``--data-dir`` cache.
 
-Each builder writes synthetic normalized evidence through public ``Storage``
-APIs only, per the evaluation strategy: the runner must not make provider
-requests. Timestamps are written relative to wall-clock now because the
-installed CLI has no clock override; every M7 state's fresh/stale semantics
-depend on sync ordering and bounded windows, not on the scenario's frozen
-time, so recent offsets reproduce the expected states.
+Family builders live in ``materialize_<milestone>.py`` next to this module and
+are dispatched by the scenario's milestone.  Each builder writes synthetic
+normalized evidence through public ``Storage`` APIs only, per the evaluation
+strategy: the runner must not make provider requests.
+
+Timestamps are written relative to wall-clock now because the installed CLI
+has no clock override.  One offset policy applies everywhere: fresh evidence
+is written a minute in the past, deliberately stale evidence sits inside
+``(fresh_window, HARD_RETENTION)`` (24 hours for the six-hour windows), and
+deliberately future evidence uses six hours ahead.
+
+This module owns only the dispatcher and the helpers shared by the family
+builders.  Family builders import from here and never edit it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import importlib
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from steam_agent.steam_declared_facts import DECLARED_FACTS_DISCLOSURE_VERSION
 from steam_agent.storage import (
+    Account,
     EvidenceInput,
     InstalledObservation,
     Machine,
@@ -25,16 +33,35 @@ from steam_agent.storage import (
 )
 
 _SUBJECT = re.compile(r"\Asynthetic:appid:(\d+)\Z")
+_TARGET_MACHINE = re.compile(r"\Amachine:(.+)\Z")
 _SYNTHETIC_STEAM_ID64 = "76561198999999999"
 
 GIBIBYTE = 1 << 30
+STALE_OFFSET = timedelta(hours=24)
+FUTURE_OFFSET = timedelta(hours=6)
 
 
 class UnsupportedScenarioError(ValueError):
     """The scenario's milestone or fixture state has no materializer."""
 
 
-def _parse_detail(detail: str | None) -> dict[str, str]:
+def materialize(scenario: Mapping[str, Any], data_dir: Path) -> None:
+    """Write the scenario fixture into ``data_dir / steam-agent.sqlite3``."""
+
+    milestone = scenario["milestone"]
+    module_name = f"{__package__}.materialize_{str(milestone).lower()}"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as error:
+        raise UnsupportedScenarioError(
+            f"no materializer for milestone {milestone!r} yet"
+        ) from error
+    module.build(scenario, data_dir)
+
+
+def parse_detail(detail: str | None) -> dict[str, str]:
+    """Split a fixture ``detail`` string into its ``key=value`` pairs."""
+
     values: dict[str, str] = {}
     for token in (detail or "").split(";"):
         key, separator, value = token.strip().partition("=")
@@ -43,7 +70,7 @@ def _parse_detail(detail: str | None) -> dict[str, str]:
     return values
 
 
-def _subject_appid(fact: Mapping[str, Any]) -> int:
+def subject_appid(fact: Mapping[str, Any]) -> int:
     match = _SUBJECT.match(fact["subject"])
     if match is None:
         raise UnsupportedScenarioError(f"unsupported subject {fact['subject']!r}")
@@ -60,195 +87,165 @@ def required_argument_value(scenario: Mapping[str, Any], flag: str, default: str
     return default
 
 
-def materialize(scenario: Mapping[str, Any], data_dir: Path) -> None:
-    """Write the scenario fixture into ``data_dir / steam-agent.sqlite3``."""
+def scenario_machine_key(scenario: Mapping[str, Any]) -> str:
+    """Resolve the machine key the required command actually addresses."""
 
-    milestone = scenario["milestone"]
-    if milestone != "M7":
-        raise UnsupportedScenarioError(
-            f"no materializer for milestone {milestone!r} yet"
-        )
-    _materialize_m7(scenario, data_dir)
+    explicit = required_argument_value(scenario, "--machine", "")
+    if explicit:
+        return explicit
+    target = required_argument_value(scenario, "--target", "")
+    match = _TARGET_MACHINE.match(target)
+    if match is not None:
+        return match.group(1)
+    if target:
+        # Non-machine targets (``valve:steam-deck``) still need a configured
+        # evidence-context machine.
+        return "synthetic-machine"
+    return "local"
 
 
-def _materialize_m7(scenario: Mapping[str, Any], data_dir: Path) -> None:
-    machine_key = required_argument_value(scenario, "--machine", "synthetic-machine")
-    account_alias = required_argument_value(scenario, "--account", "synthetic")
-    now = datetime.now(timezone.utc) - timedelta(minutes=1)
+def scenario_account_alias(scenario: Mapping[str, Any]) -> str:
+    return required_argument_value(scenario, "--account", "synthetic")
 
-    installed: list[tuple[int, int, str]] = []
-    owned: list[int] = []
-    declared: list[int] = []
-    failed_scan_after = False
 
-    for fact in scenario["fixture"]["facts"]:
-        appid = _subject_appid(fact)
-        state = fact["state"]
-        detail = _parse_detail(fact.get("detail"))
-        if state == "fresh_installed":
-            installed.append(
-                (appid, int(detail.get("size", 0)), detail.get("build", "1"))
-            )
-        elif state == "fresh_installed_2gb":
-            installed.append((appid, 2_000_000_000, "1"))
-        elif state == "fresh_installed_4gb":
-            installed.append((appid, 4_000_000_000, "1"))
-        elif state == "retained_after_failed_scan":
-            installed.append(
-                (appid, int(detail.get("size", 4_000_000_000)), detail.get("build", "1"))
-            )
-            failed_scan_after = True
-        elif state in {"verify_plan_requested", "move_plan_destination_two"}:
-            installed.append((appid, 1_000_000_000, "1"))
-            owned.append(appid)
-        elif state == "travel_declared_fit":
-            owned.append(appid)
-            declared.append(appid)
-        else:
-            raise UnsupportedScenarioError(f"no M7 fixture builder for {state!r}")
+def materialization_now() -> datetime:
+    """The single wall-clock reference every builder writes relative to."""
 
-    with Storage(data_dir / "steam-agent.sqlite3") as storage:
-        storage.upsert_machine(
-            Machine(machine_key, "Synthetic machine", "linux", "x86_64"),
-            observed_at=now,
-        )
-        account = storage.configure_steam_account(
-            alias=account_alias,
-            steam_id64=_SYNTHETIC_STEAM_ID64,
-            configured_at=now,
-        )
-        storage.record_owned_data_consent(
-            account_id=account.id,
-            disclosure_version="owned-visible-v1",
-            accepted_at=now,
-            backups_acknowledged=True,
-        )
-        owned_run = storage.begin_sync(
-            provider="steam_web_api",
-            capability="owned.visible.read",
-            account_id=account.id,
-            started_at=now,
-        )
-        owned_appids = sorted({*owned, *(appid for appid, _, _ in installed)})
-        storage.complete_owned_snapshot(
-            owned_run.id,
-            tuple(
-                OwnedObservation(
-                    appid, 0, "visible_owned", now, f"Synthetic title {appid}"
-                )
-                for appid in owned_appids
+    return datetime.now(timezone.utc) - timedelta(minutes=1)
+
+
+def seed_identity(
+    storage: Storage,
+    *,
+    machine_key: str,
+    account_alias: str,
+    now: datetime,
+) -> Account:
+    storage.upsert_machine(
+        Machine(machine_key, "Synthetic machine", "linux", "x86_64"),
+        observed_at=now,
+    )
+    account = storage.configure_steam_account(
+        alias=account_alias,
+        steam_id64=_SYNTHETIC_STEAM_ID64,
+        configured_at=now,
+    )
+    storage.record_owned_data_consent(
+        account_id=account.id,
+        disclosure_version="owned-visible-v1",
+        accepted_at=now,
+        backups_acknowledged=True,
+    )
+    return account
+
+
+def write_owned_snapshot(
+    storage: Storage,
+    account_id: int,
+    appids: Sequence[int],
+    now: datetime,
+) -> None:
+    ordered = sorted(set(appids))
+    run = storage.begin_sync(
+        provider="steam_web_api",
+        capability="owned.visible.read",
+        account_id=account_id,
+        started_at=now,
+    )
+    storage.complete_owned_snapshot(
+        run.id,
+        tuple(
+            OwnedObservation(appid, 0, "visible_owned", now, f"Synthetic title {appid}")
+            for appid in ordered
+        ),
+        base_retrieved_at=now,
+        expanded_retrieved_at=now,
+        base_reported_count=len(ordered),
+        expanded_reported_count=len(ordered),
+        completed_at=now,
+    )
+
+
+def write_installed(
+    storage: Storage,
+    machine_key: str,
+    entries: Sequence[tuple[int, int, str]],
+    now: datetime,
+) -> int:
+    """Record one complete installed scan; omitted AppIDs become known-false."""
+
+    run = storage.begin_sync(
+        provider="local_steam",
+        capability="installed",
+        machine_id=machine_key,
+        started_at=now,
+    )
+    for appid, size_bytes, build_id in entries:
+        storage.record_installed_observation(
+            run.id,
+            InstalledObservation(
+                appid=appid,
+                library_root="/synthetic/library",
+                install_dir=f"/synthetic/library/steamapps/common/title-{appid}",
+                observed_at=now,
+                name=f"Synthetic title {appid}",
+                build_id=build_id,
+                size_bytes=size_bytes,
+                manifest_path=f"/synthetic/library/steamapps/appmanifest_{appid}.acf",
+                manifest_mtime=now,
             ),
-            base_retrieved_at=now,
-            expanded_retrieved_at=now,
-            base_reported_count=len(owned_appids),
-            expanded_reported_count=len(owned_appids),
-            completed_at=now,
-        )
-
-        installed_run = storage.begin_sync(
-            provider="local_steam",
-            capability="installed",
-            machine_id=machine_key,
-            started_at=now,
-        )
-        for appid, size_bytes, build_id in installed:
-            storage.record_installed_observation(
-                installed_run.id,
-                InstalledObservation(
-                    appid=appid,
-                    library_root="/synthetic/library",
-                    install_dir=f"/synthetic/library/steamapps/common/title-{appid}",
-                    observed_at=now,
-                    name=f"Synthetic title {appid}",
-                    build_id=build_id,
-                    size_bytes=size_bytes,
-                    manifest_path=(
-                        f"/synthetic/library/steamapps/appmanifest_{appid}.acf"
-                    ),
-                    manifest_mtime=now,
-                ),
-                EvidenceInput(
-                    provider="local_steam",
-                    capability="installed",
-                    source_kind="local_file",
-                    source_locator=(
-                        f"/synthetic/library/steamapps/appmanifest_{appid}.acf"
-                    ),
-                    retrieved_at=now,
-                    support_level="local_heuristic",
-                    payload={"synthetic": True},
-                ),
-            )
-        storage.finish_installed_sync(
-            installed_run.id, status="complete", completed_at=now
-        )
-        if failed_scan_after:
-            failed_run = storage.begin_sync(
+            EvidenceInput(
                 provider="local_steam",
                 capability="installed",
-                machine_id=machine_key,
-                started_at=now + timedelta(seconds=30),
-            )
-            storage.finish_installed_sync(
-                failed_run.id, status="failed", completed_at=now + timedelta(seconds=30)
-            )
-
-        if declared:
-            storage.record_compatibility_data_consent(
-                account_id=account.id,
-                disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
-                accepted_at=now,
-                backups_acknowledged=True,
-            )
-            declared_run, _, _ = storage.begin_declared_app_sync(
-                account_id=account.id,
-                machine_id=machine_key,
-                demanded_appids=declared,
-                country="US",
-                language="english",
-                max_items=len(declared),
-                skip_fresh_terminal=True,
-                started_at=now,
-                disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
-            )
-            for appid in declared:
-                storage.record_declared_app_result(
-                    declared_run.id,
-                    account_id=account.id,
-                    appid=appid,
-                    state="ready",
-                    observed_at=now,
-                    facts=_declared_payload(appid),
-                )
-            storage.finish_declared_app_sync(declared_run.id, completed_at=now)
+                source_kind="local_file",
+                source_locator=f"/synthetic/library/steamapps/appmanifest_{appid}.acf",
+                retrieved_at=now,
+                support_level="local_heuristic",
+                payload={"synthetic": True},
+            ),
+        )
+    storage.finish_installed_sync(run.id, status="complete", completed_at=now)
+    return run.id
 
 
-def _declared_payload(appid: int) -> dict[str, object]:
-    return {
-        "schema_id": "declared-app-facts/0.2",
+def declared_app_facts_payload(
+    appid: int,
+    *,
+    linux_supported: bool = True,
+    windows_supported: bool = False,
+    linux_minimum: str | None = None,
+    category_slugs: Sequence[str] = (),
+    schema_id: str = "declared-app-facts/0.2",
+) -> dict[str, object]:
+    """Build one normalized declared-facts payload the store will accept."""
+
+    payload: dict[str, object] = {
+        "schema_id": schema_id,
         "appid": appid,
         "context": {"country": "US", "language": "english"},
         "platforms": {
             "state": "declared",
-            "windows": False,
+            "windows": windows_supported,
             "macos": False,
-            "linux": True,
+            "linux": linux_supported,
         },
         "requirements": [
             {
                 "platform": platform,
-                "state": "declared" if platform == "linux" else "undeclared",
-                "minimum": (
-                    "Storage: 1 GB available space" if platform == "linux" else None
+                "state": (
+                    "declared"
+                    if platform == "linux" and linux_minimum is not None
+                    else "undeclared"
                 ),
+                "minimum": linux_minimum if platform == "linux" else None,
                 "recommended": None,
             }
             for platform in ("linux", "macos", "windows")
         ],
         "languages": {"state": "undeclared", "items": [], "unrecognized_count": 0},
         "categories": {
-            "state": "undeclared",
-            "known_slugs": [],
+            "state": "declared" if category_slugs else "undeclared",
+            "known_slugs": list(category_slugs),
             "unknown_ids": [],
             "source": "steam_store_appdetails",
             "numeric_ids": [],
@@ -273,3 +270,26 @@ def _declared_payload(appid: int) -> dict[str, object]:
             "automation_supported": False,
         },
     }
+    if schema_id == "declared-app-facts/0.1":
+        payload.pop("genres")
+        payload.pop("coming_soon")
+    return payload
+
+
+__all__ = [
+    "GIBIBYTE",
+    "FUTURE_OFFSET",
+    "STALE_OFFSET",
+    "UnsupportedScenarioError",
+    "declared_app_facts_payload",
+    "materialization_now",
+    "materialize",
+    "parse_detail",
+    "required_argument_value",
+    "scenario_account_alias",
+    "scenario_machine_key",
+    "seed_identity",
+    "subject_appid",
+    "write_installed",
+    "write_owned_snapshot",
+]

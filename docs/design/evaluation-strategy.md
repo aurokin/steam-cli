@@ -97,20 +97,32 @@ blind comparison and task-specific rubrics while retaining expert review.
 
 ## Current implementation
 
-- Normal CI validates every scenario against `scenario-0.1.json`, including
-  synthetic privacy canaries.
+- Normal CI validates every scenario against the schema its own
+  `schema_version` names, including synthetic privacy canaries. `0.2` adds a
+  required `scenario_kind` of `contract` or `boundary`, reads
+  `conversation.user` as sequential turns, and lets an assertion name its
+  source: the captured CLI document (the default), a turn's final answer
+  (`refusal_expected`, `contains`, `omits`), or the executed-command trace
+  (`must_not_execute`). A boundary scenario may therefore carry no fixture
+  facts and no required command.
 - M4, M5, and M7 oracle modules execute installed command behavior against
   deterministic scenarios; M3 scenarios are schema/privacy checked only.
 - A new executable scenario is added only after its exact CLI and recipe
   contract is accepted and backed by normal product tests.
 - An opt-in agent-execution runner exists under `evals/runner/`. It
-  materializes normalized fixtures through public storage APIs, drives one
-  scenario turn through the Codex App Server protocol in a network-disabled
-  sandbox, and grades the transcript deterministically: tool policy, oracle
-  assertions against the harness-captured CLI document, the agent's
+  materializes normalized fixtures through public storage APIs, drives every
+  scenario turn in order on one Codex App Server thread in a network-disabled
+  sandbox, and grades the transcript deterministically: tool policy over all
+  turns, oracle assertions against their declared source, the agent's
   claim/evidence sidecar, and a binary privacy gate over the answer surface.
   It makes no provider requests and requires a locally installed `codex`
-  binary; normal CI exercises only its materializer and grader. M7 scenarios
-  are materializable today; M5 and M4 builders remain future work.
+  binary; normal CI exercises only its materializers and grader.
+- M4, M5, and M7 fixtures are materializable today through
+  `evals/runner/materialize_m4.py`, `materialize_m5.py`, and
+  `materialize_m7.py`. The two Valve Deck scenarios stay pure-oracle-only
+  because no CLI writer produces exact-target Deck review evidence.
+- The privacy gate always fails on a leaked canary or a personal path. The
+  personal Steam ID pattern is skipped only when the scenario's own required
+  command asks for identifiers with `--include-identifiers`.
 - Generated traces, answers, judgments, and reports stay under
   `evals/results/`, which is ignored by Git.
