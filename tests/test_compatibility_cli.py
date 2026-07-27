@@ -10,6 +10,7 @@ import pytest
 
 import steam_agent.cli as cli
 from steam_agent.compatibility import CompatibilityTarget
+from steam_agent.steam_declared_facts import DECLARED_FACTS_DISCLOSURE_VERSION
 from steam_agent.compatibility_adapter import assess_compatibility_snapshot
 from steam_agent.storage import (
     DeclaredAppDemand,
@@ -52,6 +53,56 @@ def configure(tmp_path: Path) -> None:
             accepted_at=NOW,
             backups_acknowledged=True,
         )
+
+
+def wishlist_declared_payload(appid: int) -> dict[str, object]:
+    return {
+        "schema_id": "declared-app-facts/0.2",
+        "appid": appid,
+        "context": {"country": "US", "language": "english"},
+        "platforms": {
+            "state": "declared",
+            "windows": False,
+            "macos": False,
+            "linux": True,
+        },
+        "requirements": [
+            {
+                "platform": platform,
+                "state": "undeclared",
+                "minimum": None,
+                "recommended": None,
+            }
+            for platform in ("linux", "macos", "windows")
+        ],
+        "languages": {"state": "undeclared", "items": [], "unrecognized_count": 0},
+        "categories": {
+            "state": "undeclared",
+            "known_slugs": [],
+            "unknown_ids": [],
+            "source": "steam_store_appdetails",
+            "numeric_ids": [],
+        },
+        "genres": {
+            "state": "undeclared",
+            "source": "steam_store_appdetails",
+            "items": [],
+        },
+        "coming_soon": {"state": "unknown", "localized_date_display": None},
+        "controller_support": None,
+        "external_account_notice": {"state": "unknown", "text": None},
+        "drm_notice": {"state": "unknown", "text": None},
+        "source": {
+            "provider": "steam_store",
+            "support_level": "provisional",
+            "source_locator": "steam_store_appdetails",
+            "human_reference_url": (
+                f"https://store.steampowered.com/app/{appid}/?cc=US&l=english"
+            ),
+            "access_mode": "manual_only",
+            "automation_supported": False,
+        },
+    }
 
 
 def populated_snapshot(tmp_path: Path):
@@ -1089,3 +1140,86 @@ def test_assess_rejects_target_grammar_before_storage(
     assert code == 2
     assert stderr == ""
     assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_assess_wishlist_appid_visible_owned_unknown_nonblocking(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path)
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        owned_run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            owned_run.id,
+            (OwnedObservation(400, 0, "visible_owned", NOW, "Private title"),),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=1,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+        storage.record_compatibility_data_consent(
+            account_id=account.id,
+            disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
+            accepted_at=NOW,
+            backups_acknowledged=True,
+        )
+        declared_run, _, _ = storage.begin_declared_app_sync(
+            account_id=account.id,
+            machine_id="local",
+            demanded_appids=[730],
+            country="US",
+            language="english",
+            max_items=10,
+            skip_fresh_terminal=True,
+            started_at=NOW,
+            disclosure_version=DECLARED_FACTS_DISCLOSURE_VERSION,
+        )
+        storage.record_declared_app_result(
+            declared_run.id,
+            account_id=account.id,
+            appid=730,
+            state="ready",
+            observed_at=NOW,
+            facts=wishlist_declared_payload(730),
+        )
+        storage.finish_declared_app_sync(declared_run.id, completed_at=NOW)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(cli, "_declared_facts_client", forbid)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "compatibility",
+        "assess",
+        "730",
+        "--account",
+        "primary",
+        "--target",
+        "machine:local",
+        "--country",
+        "US",
+        "--language",
+        "english",
+        "--explain",
+    )
+
+    assert code == 0 and stderr == ""
+    item = value["data"]["results"][0]
+    owned_gate = next(
+        gate for gate in item["gates"] if gate["name"] == "readiness:visible_owned"
+    )
+    assert owned_gate["original"] == "unknown"
+    assert owned_gate["effective"] == "unknown"
+    assert owned_gate["mandatory"] is False
+    assert (
+        owned_gate["original_unknown_reason"]
+        == "visible_owned_absence_is_not_nonownership"
+    )
+    assert item["compatibility"] != "incompatible"

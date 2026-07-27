@@ -1780,6 +1780,8 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             for game in owned.games
             if not app_facts_command or game.inclusion_basis == "visible_owned"
         }
+        scope_missing: set[str] = set()
+        scope_stale: set[str] = set()
         if app_facts_command:
             wishlist = storage.read_wishlist_snapshot(account.id)
             installed = storage.read_installed_snapshot(machine.id)
@@ -1794,6 +1796,13 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             }[args.scope]
             demanded_appids = tuple(sorted(scope_appids | set(demanded_selection)))
             owned_dependency_stale = False
+            scope_missing, scope_stale = _scope_dependency_state(
+                args.scope,
+                owned=owned,
+                wishlist=wishlist,
+                installed=installed,
+                now=started_at,
+            )
         else:
             owned_reference = (
                 owned.latest_complete.completed_at or owned.latest_complete.started_at
@@ -1827,10 +1836,11 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 message="Every prioritized AppID must be in the cached visible-owned library.",
                 exit_code=2,
             )
+        scope_warnings = _scope_dependency_warnings(scope_missing, scope_stale)
         if not demanded_appids:
             empty_status = (
                 CompletenessStatus.PARTIAL
-                if owned_dependency_stale
+                if owned_dependency_stale or scope_missing or scope_stale
                 else CompletenessStatus.COMPLETE
             )
             empty_warnings = (
@@ -1845,7 +1855,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 ]
                 if owned_dependency_stale
                 else []
-            )
+            ) + list(scope_warnings)
             return _emit_success(
                 args,
                 command=command,
@@ -1859,8 +1869,14 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 },
                 completeness_value=completeness(
                     empty_status,
-                    stale_capabilities=(
-                        ["owned.visible.read"] if owned_dependency_stale else []
+                    missing_capabilities=sorted(scope_missing),
+                    stale_capabilities=sorted(
+                        scope_stale
+                        | (
+                            {"owned.visible.read"}
+                            if owned_dependency_stale
+                            else set()
+                        )
                     ),
                     warnings=empty_warnings,
                 ),
@@ -2060,6 +2076,10 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
                 ),
             )
         )
+    if scope_missing or scope_stale:
+        if status == CompletenessStatus.COMPLETE:
+            status = CompletenessStatus.PARTIAL
+        warnings.extend(scope_warnings)
     return _emit_success(
         args,
         command=command,
@@ -2073,13 +2093,15 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
         },
         completeness_value=completeness(
             status,
-            missing_capabilities=(
-                ["compatibility.declared.read"] if missing_declared else []
+            missing_capabilities=sorted(
+                ({"compatibility.declared.read"} if missing_declared else set())
+                | scope_missing
             ),
             stale_capabilities=(
                 sorted(
                     ({"compatibility.declared.read"} if stale_declared else set())
                     | ({"owned.visible.read"} if owned_dependency_stale else set())
+                    | scope_stale
                 )
             ),
             warnings=warnings,
@@ -2127,6 +2149,92 @@ def _owned_scope_state(snapshot: Any, *, now: datetime) -> tuple[bool, bool, boo
         latest_complete is not None and not authoritative,
         authoritative,
     )
+
+
+def _wishlist_scope_state(snapshot: Any, *, now: datetime) -> tuple[bool, bool, bool]:
+    latest_complete = snapshot.latest_complete
+    reference = (
+        None
+        if latest_complete is None
+        else latest_complete.completed_at or latest_complete.started_at
+    )
+    age = (
+        None
+        if reference is None
+        else (
+            now - datetime.fromisoformat(reference.replace("Z", "+00:00"))
+        ).total_seconds()
+    )
+    authoritative = (
+        snapshot.latest is not None
+        and snapshot.latest.status == "complete"
+        and snapshot.latest.promoted
+        and age is not None
+        and 0 <= age <= _WISHLIST_SYNC_FRESHNESS_SECONDS
+    )
+    return (
+        latest_complete is None,
+        latest_complete is not None and not authoritative,
+        authoritative,
+    )
+
+
+def _scope_dependency_state(
+    scope: str,
+    *,
+    owned: Any,
+    wishlist: Any,
+    installed: Any,
+    now: datetime,
+) -> tuple[set[str], set[str]]:
+    """Report the state of every snapshot that expanded an app-facts scope."""
+
+    missing: set[str] = set()
+    stale: set[str] = set()
+    if scope in ("library", "known"):
+        owned_missing, owned_stale, _ = _owned_scope_state(owned, now=now)
+        if owned_missing:
+            missing.add("owned.visible.read")
+        if owned_stale:
+            stale.add("owned.visible.read")
+    if scope in ("wishlist", "known"):
+        wishlist_missing, wishlist_stale, _ = _wishlist_scope_state(wishlist, now=now)
+        if wishlist_missing:
+            missing.add("wishlist.read")
+        if wishlist_stale:
+            stale.add("wishlist.read")
+    if scope in ("installed", "known") and installed.latest_complete is None:
+        # Installed scans have no defined freshness window, so a present
+        # last-good installed snapshot is never reported stale.
+        missing.add("installed.read")
+    return missing, stale
+
+
+def _scope_dependency_warnings(
+    missing: set[str], stale: set[str]
+) -> tuple[WarningRecord, ...]:
+    warnings: list[WarningRecord] = []
+    if missing:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.NOT_SYNCED,
+                message=(
+                    "Declared-fact demand expanded from a scope whose source "
+                    "snapshot has never completed: " + ", ".join(sorted(missing)) + "."
+                ),
+            )
+        )
+    if stale:
+        warnings.append(
+            WarningRecord(
+                code=ErrorCode.STALE_LAST_GOOD,
+                message=(
+                    "Declared-fact demand expanded from a stale or superseded "
+                    "last-good snapshot: " + ", ".join(sorted(stale)) + "."
+                ),
+            )
+        )
+    return tuple(warnings)
 
 
 def _declared_scope_appids(
