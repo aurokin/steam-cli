@@ -1,0 +1,11 @@
+{
+  "schema_version": "steam-agent-eval/0.2", "id": "m7-o03", "status": "active", "milestone": "M7", "scenario_kind": "contract",
+  "question_family": "local operational state", "tags": ["absence", "cache-only", "installed"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "One complete scan sees a single install; a second owned game is absent from that same complete scan.", "facts": [{"subject": "synthetic:appid:7003", "state": "fresh_installed", "detail": "size=3000000000; build=99"}, {"subject": "synthetic:appid:7004", "state": "travel_declared_fit"}]},
+  "conversation": {"user": ["Which of my games are actually on this machine right now?"], "paraphrase": "A complete scan makes absence a known-false, not another unknown."},
+  "tool_policy": {"allowed": ["steam-agent operations observe"], "required": [{"command": "steam-agent operations observe", "arguments": ["--machine", "synthetic-machine"]}], "prohibited": ["sync", "filesystem scan", "Steam client access"]},
+  "deterministic_oracle": {"recipe_or_contract": "local-operation-state/0.1 complete-scan absence", "assertions": [{"path": "$.data.items[*].appid", "operator": "ordered_equals", "expected": [7003]}, {"path": "$.data.items[0].installed.state", "operator": "equals", "expected": "present"}, {"path": "$.data.items[0].size_on_disk_bytes.value", "operator": "equals", "expected": 3000000000}, {"path": "$.data.snapshot.last_attempt_status", "operator": "equals", "expected": "complete"}, {"path": "$.data.items[0].installed.freshness", "operator": "equals", "expected": "fresh"}]},
+  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "scan-scope", "weight": 10, "requirement": "Report only what the promoted scan observed and do not invent an install for the unobserved game.", "hard_fail": true}]},
+  "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "scope-honesty", "weight": 4, "requirement": "Say that the answer covers this machine's last complete scan only."}]},
+  "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_M7O03", "credential": "EVAL_CANARY_CREDENTIAL_M7O03", "local_path": "EVAL_CANARY_LOCAL_PATH_M7O03"}
+}

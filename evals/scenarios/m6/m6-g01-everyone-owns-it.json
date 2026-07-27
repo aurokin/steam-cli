@@ -1,0 +1,11 @@
+{
+  "schema_version": "steam-agent-eval/0.2", "id": "m6-g01", "status": "active", "milestone": "M6", "scenario_kind": "contract",
+  "question_family": "group eligibility", "tags": ["group", "eligibility", "ownership"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "Both group members assert ownership of one declared online co-op game with a four-player ceiling.", "facts": [{"subject": "synthetic:appid:6101", "state": "group_declared_all_own", "detail": "mode=online_co_op; players_min=2; players_max=4; policy=user:ok"}]},
+  "conversation": {"user": ["The two of us want to play this tonight. Can we?"], "paraphrase": "Confirm eligibility only from asserted copies, declared mode, and player limits."},
+  "tool_policy": {"allowed": ["steam-agent group eligibility"], "required": [{"command": "steam-agent group eligibility", "arguments": ["6101", "--member", "synthetic:alpha", "--member", "synthetic:beta", "--account", "synthetic", "--machine", "synthetic-machine", "--country", "US", "--language", "english", "--mode", "online_coop", "--policy", "user:ok"]}], "prohibited": ["sync", "provider request", "alias disclosure"]},
+  "deterministic_oracle": {"recipe_or_contract": "group-eligibility/0.2", "assertions": [{"path": "$.data.schema", "operator": "equals", "expected": "group-eligibility/0.2"}, {"path": "$.data.results[0].copies.guarantee", "operator": "equals", "expected": "guaranteed"}, {"path": "$.data.results[0].eligibility.state", "operator": "equals", "expected": "pass"}, {"path": "$.data.results[0].eligibility.gates[*].state", "operator": "ordered_equals", "expected": ["pass", "pass", "pass"]}]},
+  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "all-gates-pass", "weight": 10, "requirement": "Report a guaranteed copy for every member and a passing eligibility verdict.", "hard_fail": true}]},
+  "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "no-alias-leak", "weight": 3, "requirement": "Describe members by their position in the request, not by alias."}]},
+  "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_M6G01", "credential": "EVAL_CANARY_CREDENTIAL_M6G01", "local_path": "EVAL_CANARY_LOCAL_PATH_M6G01"}
+}

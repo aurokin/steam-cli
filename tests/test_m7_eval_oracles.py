@@ -137,6 +137,10 @@ def _resolve(document: dict[str, Any], path: str) -> Any:
 def test_every_m7_operation_oracle_executes(path: Path) -> None:
     scenario = json.loads(path.read_text(encoding="utf-8"))
     assert scenario["status"] == "active"
+    if scenario["schema_version"] != "steam-agent-eval/0.1":
+        # 0.2 scenarios are executed end to end against the installed CLI by
+        # tests/test_eval_runner.py; this module re-implements the 0.1 corpus.
+        pytest.skip("schema 0.2 scenarios are covered by the materializer round trip")
     actual = _execute(scenario)
     serialized = json.dumps(actual, sort_keys=True)
     assert all(
