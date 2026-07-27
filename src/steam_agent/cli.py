@@ -2819,29 +2819,22 @@ def _group_feature_set(appid: int, payload: Mapping[str, Any] | None) -> Feature
     )
 
 
-def _owned_last_good_is_fresh(snapshot: Any, *, now: datetime) -> bool:
-    """Report whether a promoted last-good owned snapshot is still fresh."""
-
-    run = snapshot.latest_complete
-    if run is None or not run.promoted:
-        return False
-    reference = run.completed_at or run.started_at
-    age = (
-        now - datetime.fromisoformat(reference.replace("Z", "+00:00"))
-    ).total_seconds()
-    return 0 <= age <= _OWNED_SYNC_FRESHNESS_SECONDS
-
-
 def _account_member_evidence(
     snapshot: Any, *, now: datetime
 ) -> tuple[str, str | None]:
-    """Classify one account member's owned evidence without a privacy claim."""
+    """Classify one account member's owned evidence without a privacy claim.
+
+    Mirrors ``_owned_scope_state`` exactly so ``member_evidence`` can never
+    read ``authoritative`` while the same query resolved the member's per-app
+    states to ``unknown``.
+    """
 
     latest = snapshot.latest
     last_attempt_at = (
         None if latest is None else (latest.completed_at or latest.started_at)
     )
-    if _owned_last_good_is_fresh(snapshot, now=now):
+    _, _, authoritative = _owned_scope_state(snapshot, now=now)
+    if authoritative:
         evidence = "authoritative"
     elif (
         latest is not None

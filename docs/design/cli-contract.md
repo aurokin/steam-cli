@@ -550,7 +550,10 @@ are never persisted.
 Both group query schemas carry a `members` array in request member-ordinal
 order, using the same ordinals as `ownership.members`. Each entry reports
 `kind`, `last_attempt_at`, and one `member_evidence` value: `authoritative`
-(a fresh promoted complete visible-owned snapshot), `stale` (a last-good
+(the snapshot the query itself treated as authoritative for per-app states —
+a fresh promoted complete visible-owned snapshot with no invalidating newer
+attempt, so `authoritative` can never accompany all-unknown per-app states
+for that member), `stale` (a last-good
 snapshot that is stale, superseded, or unpromoted), `not_synced` (no last-good
 snapshot), `inaccessible` (the latest owned attempt failed with
 `OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT`), or `asserted` (synthetic

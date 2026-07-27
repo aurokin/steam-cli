@@ -668,9 +668,13 @@ def test_group_member_stale_beats_not_synced_precedence(
     ]
 
 
-def test_group_member_inaccessible_with_fresh_last_good_is_authoritative(
+def test_group_member_newer_inaccessible_attempt_matches_per_app_unknown(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Evidence mirrors per-app resolution: a newer inaccessible attempt
+    invalidates the last-good snapshot for this query, so the member reads
+    inaccessible rather than authoritative while its states are unknown."""
+
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path, with_owned=True)
     create_profile(tmp_path, capsys, "synthetic:Guest")
@@ -689,9 +693,16 @@ def test_group_member_inaccessible_with_fresh_last_good_is_authoritative(
     assert value["data"]["members"][0] == {
         "member_ordinal": 0,
         "kind": "account",
-        "member_evidence": "authoritative",
+        "member_evidence": "inaccessible",
         "last_attempt_at": "2026-07-12T19:00:00Z",
     }
+    account_states = {
+        member["member_ordinal"]: member["state"]
+        for result in value["data"]["results"]
+        for member in result["ownership"]["members"]
+        if member["member_ordinal"] == 0
+    }
+    assert set(account_states.values()) <= {"unknown"}
 
 
 def test_group_schema_bump_to_0_2(tmp_path: Path, capsys: object) -> None:
