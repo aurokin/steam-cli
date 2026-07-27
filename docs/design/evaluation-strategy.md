@@ -35,9 +35,10 @@ remain opt-in follow-up work and cannot compensate for a contract failure.
    implement a judge or depend on a model API.
 
 The scenario corpus under [`evals/`](../../evals/) represents these layers
-explicitly. Normal CI schema- and privacy-validates every M3, M4, M5, and M7
-scenario. Executable deterministic CLI oracles cover M4, M5, and M7; M3 cases
-remain accepted contract descriptions without a corpus-level CLI runner.
+explicitly. Normal CI schema- and privacy-validates every M2, M3, M4, M5, M6,
+and M7 scenario. Executable deterministic CLI oracles cover M3, M4, M5, and
+M7, and the materializer round trip executes every M2 and M6 contract
+scenario through the installed CLI.
 
 ## Metrics
 
@@ -105,8 +106,11 @@ blind comparison and task-specific rubrics while retaining expert review.
   (`refusal_expected`, `contains`, `omits`), or the executed-command trace
   (`must_not_execute`). A boundary scenario may therefore carry no fixture
   facts and no required command.
-- M4, M5, and M7 oracle modules execute installed command behavior against
-  deterministic scenarios; M3 scenarios are schema/privacy checked only.
+- M3, M4, M5, and M7 oracle modules execute installed command behavior
+  against deterministic scenarios; M2 and M6 contract scenarios are executed
+  through the materializer round trip, and boundary probes (refusal,
+  must-not-execute, multi-turn pressure) are graded from the agent transcript
+  by the opt-in runner.
 - A new executable scenario is added only after its exact CLI and recipe
   contract is accepted and backed by normal product tests.
 - An opt-in agent-execution runner exists under `evals/runner/`. It
@@ -117,10 +121,11 @@ blind comparison and task-specific rubrics while retaining expert review.
   claim/evidence sidecar, and a binary privacy gate over the answer surface.
   It makes no provider requests and requires a locally installed `codex`
   binary; normal CI exercises only its materializers and grader.
-- M4, M5, and M7 fixtures are materializable today through
-  `evals/runner/materialize_m4.py`, `materialize_m5.py`, and
-  `materialize_m7.py`. The two Valve Deck scenarios stay pure-oracle-only
-  because no CLI writer produces exact-target Deck review evidence.
+- M2, M3, M4, M5, M6, and M7 fixtures are materializable today through the
+  per-milestone `evals/runner/materialize_*.py` modules. The two Valve Deck
+  scenarios stay pure-oracle-only because no CLI writer produces
+  exact-target Deck review evidence, and each materializer module documents
+  the states it cannot reproduce.
 - The privacy gate always fails on a leaked canary or a personal path. The
   personal Steam ID pattern is skipped only when the scenario's own required
   command asks for identifiers with `--include-identifiers`.
