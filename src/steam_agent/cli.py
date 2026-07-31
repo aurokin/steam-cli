@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import getpass
 import hashlib
@@ -151,7 +151,9 @@ from steam_agent.groups import (
     PlayerLimits,
     PolicyFact,
     RANKING_RECIPE as GROUP_RANKING_RECIPE,
+    RANKING_RECIPE_V0_2 as GROUP_RANKING_RECIPE_V0_2,
     SCHEMA as GROUP_SCHEMA,
+    SCHEMA_V0_2 as GROUP_SCHEMA_V0_2,
     assess_copies,
     assess_eligibility,
     rank_candidates,
@@ -514,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
         leaf.add_argument("--machine", required=True)
         leaf.add_argument("--country", required=True)
         leaf.add_argument("--language", required=True)
+        leaf.add_argument(
+            "--include-member-evidence",
+            action="store_true",
+            help=(
+                "Include request-ordinal member evidence and select the group "
+                "0.2 response contract."
+            ),
+        )
         if name == "eligibility":
             leaf.add_argument(
                 "--mode",
@@ -547,6 +557,14 @@ def build_parser() -> argparse.ArgumentParser:
     group_recommend.add_argument("--context-machine", required=True)
     group_recommend.add_argument("--country", required=True)
     group_recommend.add_argument("--language", required=True)
+    group_recommend.add_argument(
+        "--include-member-evidence",
+        action="store_true",
+        help=(
+            "Include request-ordinal member evidence and select the group 0.2 "
+            "response contract."
+        ),
+    )
     group_recommend.add_argument(
         "--mode",
         required=True,
@@ -2294,7 +2312,8 @@ def _unexpired_activity_playtime(
         observed_at = datetime.fromisoformat(
             str(row["observed_at"]).replace("Z", "+00:00")
         )
-        if now - observed_at > HARD_RETENTION:
+        age = now - observed_at
+        if age < timedelta(0) or age > HARD_RETENTION:
             continue
         evidence[int(row["appid"])] = (row["playtime_forever_minutes"], observed_at)
     return evidence
@@ -2858,6 +2877,7 @@ def _group_ownership_by_app(
     bool,
     bool,
     bool,
+    bool,
     dict[MemberRef, str],
     dict[MemberRef, str | None],
 ]:
@@ -2904,10 +2924,13 @@ def _group_ownership_by_app(
         for ref in refs
         if ref.kind == "synthetic"
     }
-    ownership_any_evidence = any(
-        values is not None for values in account_owned.values()
-    ) or any(
+    account_evidence = any(values is not None for values in account_owned.values())
+    ownership_any_evidence = account_evidence or any(
         any(appid in states for appid in appids) for states in synthetic_states.values()
+    )
+    ownership_usable_evidence = account_evidence or any(
+        any(states.get(appid) in {"owned", "not_owned"} for appid in appids)
+        for states in synthetic_states.values()
     )
     result: dict[int, tuple[OwnershipFact, ...]] = {}
     for appid in appids:
@@ -2930,6 +2953,7 @@ def _group_ownership_by_app(
         ownership_missing,
         ownership_stale,
         ownership_any_evidence,
+        ownership_usable_evidence,
         evidence_by_ref,
         last_attempt_by_ref,
     )
@@ -3185,11 +3209,17 @@ def _group_query_completeness(
                 ),
             )
         )
-    if (ownership_missing and not ownership_any_evidence) or (
+    ownership_effectively_missing = ownership_missing or ownership_inaccessible
+    if (ownership_effectively_missing and not ownership_any_evidence) or (
         declared_total and missing_declared == declared_total
     ):
         status = CompletenessStatus.UNAVAILABLE
-    elif missing_declared or stale_declared or ownership_missing or ownership_stale:
+    elif (
+        missing_declared
+        or stale_declared
+        or ownership_effectively_missing
+        or ownership_stale
+    ):
         status = CompletenessStatus.PARTIAL
     else:
         status = CompletenessStatus.COMPLETE
@@ -3198,7 +3228,9 @@ def _group_query_completeness(
         missing_capabilities=sorted(
             {
                 *(["discovery.declared.read"] if missing_declared else []),
-                *(["owned.visible.read"] if ownership_missing else []),
+                *(
+                    ["owned.visible.read"] if ownership_effectively_missing else []
+                ),
             }
         ),
         stale_capabilities=sorted(
@@ -3273,6 +3305,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 ownership_missing,
                 ownership_stale,
                 ownership_any_evidence,
+                ownership_usable_evidence,
                 evidence_by_ref,
                 last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
@@ -3394,19 +3427,36 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 declared_total=(len(appids) if declared is not None else 0),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
-                ownership_any_evidence=ownership_any_evidence,
-                ownership_inaccessible=any(
-                    evidence == "inaccessible"
-                    for evidence in evidence_by_ref.values()
+                ownership_any_evidence=(
+                    ownership_usable_evidence
+                    if args.include_member_evidence
+                    else ownership_any_evidence
+                ),
+                ownership_inaccessible=(
+                    args.include_member_evidence
+                    and any(
+                        evidence_by_ref[member] == "inaccessible"
+                        for member in members
+                    )
                 ),
             ),
             data={
-                "schema": GROUP_SCHEMA,
-                "members": _group_members_json(
-                    members,
-                    member_ordinals=member_ordinals,
-                    evidence_by_ref=evidence_by_ref,
-                    last_attempt_by_ref=last_attempt_by_ref,
+                "schema": (
+                    GROUP_SCHEMA_V0_2
+                    if args.include_member_evidence
+                    else GROUP_SCHEMA
+                ),
+                **(
+                    {
+                        "members": _group_members_json(
+                            members,
+                            member_ordinals=member_ordinals,
+                            evidence_by_ref=evidence_by_ref,
+                            last_attempt_by_ref=last_attempt_by_ref,
+                        )
+                    }
+                    if args.include_member_evidence
+                    else {}
                 ),
                 "results": rows,
             },
@@ -3532,6 +3582,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_missing,
                 ownership_stale,
                 ownership_any_evidence,
+                ownership_usable_evidence,
                 evidence_by_ref,
                 last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
@@ -3697,19 +3748,36 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 declared_total=len(demanded),
                 ownership_missing=ownership_missing,
                 ownership_stale=ownership_stale,
-                ownership_any_evidence=ownership_any_evidence,
-                ownership_inaccessible=any(
-                    evidence == "inaccessible"
-                    for evidence in evidence_by_ref.values()
+                ownership_any_evidence=(
+                    ownership_usable_evidence
+                    if args.include_member_evidence
+                    else ownership_any_evidence
+                ),
+                ownership_inaccessible=(
+                    args.include_member_evidence
+                    and any(
+                        evidence_by_ref[member] == "inaccessible"
+                        for member in members
+                    )
                 ),
             ),
             data={
-                "schema": GROUP_RANKING_RECIPE,
-                "members": _group_members_json(
-                    members,
-                    member_ordinals=member_ordinals,
-                    evidence_by_ref=evidence_by_ref,
-                    last_attempt_by_ref=last_attempt_by_ref,
+                "schema": (
+                    GROUP_RANKING_RECIPE_V0_2
+                    if args.include_member_evidence
+                    else GROUP_RANKING_RECIPE
+                ),
+                **(
+                    {
+                        "members": _group_members_json(
+                            members,
+                            member_ordinals=member_ordinals,
+                            evidence_by_ref=evidence_by_ref,
+                            last_attempt_by_ref=last_attempt_by_ref,
+                        )
+                    }
+                    if args.include_member_evidence
+                    else {}
                 ),
                 "objective": args.objective,
                 "candidate_count": len(candidate_appids),
@@ -6684,14 +6752,20 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                 "last_successful_sync_at": None,
             }
             if args.scope == "owned":
+                limitations = [
+                    "individually_private_games_may_be_omitted",
+                    "unplayed_free_entitlements_are_not_complete",
+                    "sequential_request_difference_may_reflect_concurrent_library_change",
+                ]
+                if args.playtime == "zero":
+                    limitations += [
+                        "never_played_list_is_a_lower_bound",
+                        "zero_recorded_minutes_is_not_proof_of_never_launched",
+                    ]
                 empty_data: dict[str, Any] = {
                     "items": [],
                     "empty": False,
-                    "limitations": [
-                        "individually_private_games_may_be_omitted",
-                        "unplayed_free_entitlements_are_not_complete",
-                        "sequential_request_difference_may_reflect_concurrent_library_change",
-                    ],
+                    "limitations": limitations,
                     "next_cursor": None,
                     "playtime_state_counts": {"zero": 0, "positive": 0, "unknown": 0},
                     "source": None,

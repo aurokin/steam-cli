@@ -6,7 +6,9 @@ import pytest
 
 from steam_agent.groups import (
     RANKING_RECIPE,
+    RANKING_RECIPE_V0_2,
     SCHEMA,
+    SCHEMA_V0_2,
     CopySourceRef,
     FamilyEdge,
     FeatureSet,
@@ -367,6 +369,8 @@ def test_preference_fit_rejects_missing_scores_and_duplicate_candidates() -> Non
         rank_candidates((item, item), objective="min-copies")
 
 
-def test_schema_constants_are_0_2() -> None:
-    assert SCHEMA == "group-eligibility/0.2"
-    assert RANKING_RECIPE == "group-fit/0.2"
+def test_schema_constants_preserve_0_1_and_name_0_2_explicitly() -> None:
+    assert SCHEMA == "group-eligibility/0.1"
+    assert SCHEMA_V0_2 == "group-eligibility/0.2"
+    assert RANKING_RECIPE == "group-fit/0.1"
+    assert RANKING_RECIPE_V0_2 == "group-fit/0.2"

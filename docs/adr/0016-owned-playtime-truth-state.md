@@ -1,6 +1,6 @@
 # ADR 0016: owned-query playtime truth state and never-played filtering
 
-Status: proposed
+Status: accepted 2026-07-31
 
 ## Context
 

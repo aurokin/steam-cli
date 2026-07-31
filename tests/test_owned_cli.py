@@ -963,6 +963,26 @@ def test_owned_query_activity_older_than_owned_is_ignored(
     assert playtime_states(queried)[10] == ("zero", "owned_zero_minutes")
 
 
+def test_owned_query_future_activity_is_ignored_after_clock_correction(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    seed_activity(
+        data_dir,
+        ({"appid": 10, "playtime_forever_minutes": 45},),
+        NOW + timedelta(minutes=1),
+    )
+
+    code, queried, _ = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "owned"], capsys
+    )
+
+    assert code == 0
+    assert playtime_states(queried)[10] == ("zero", "owned_zero_minutes")
+
+
 def test_owned_query_activity_never_downgrades_positive(
     tmp_path: Path,
     capsys: object,
@@ -1081,6 +1101,34 @@ def test_owned_query_playtime_filter_zero_excludes_unknown_and_reports_counts_an
     )
 
 
+def test_owned_query_zero_filter_keeps_limitations_when_account_is_unavailable(
+    tmp_path: Path,
+    capsys: object,
+) -> None:
+    code, queried, stderr = invoke(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "games",
+            "query",
+            "--scope",
+            "owned",
+            "--account",
+            "missing",
+            "--playtime",
+            "zero",
+        ],
+        capsys,
+    )
+
+    assert code == 0 and stderr == ""
+    assert queried["completeness"]["status"] == "unavailable"  # type: ignore[index]
+    assert queried["data"]["limitations"][-2:] == [  # type: ignore[index]
+        "never_played_list_is_a_lower_bound",
+        "zero_recorded_minutes_is_not_proof_of_never_launched",
+    ]
+
+
 def test_owned_query_stale_owned_snapshot_yields_unknown_no_authoritative_snapshot(
     tmp_path: Path,
     capsys: object,
@@ -1127,6 +1175,38 @@ def test_playtime_flag_rejected_for_installed_scope(
 
     assert code == 2
     assert rejected["error"]["code"] == "INVALID_ARGUMENT"  # type: ignore[index]
+
+
+def test_playtime_any_is_a_noop_for_installed_scope(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, _ = configured(tmp_path, monkeypatch)
+
+    code, omitted, stderr = invoke(
+        ["--data-dir", str(data_dir), "games", "query", "--scope", "installed"],
+        capsys,
+    )
+    explicit_code, explicit, explicit_stderr = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "games",
+            "query",
+            "--scope",
+            "installed",
+            "--playtime",
+            "any",
+        ],
+        capsys,
+    )
+
+    assert code == explicit_code == 0
+    assert stderr == explicit_stderr == ""
+    omitted.pop("generated_at")
+    explicit.pop("generated_at")
+    assert explicit == omitted
 
 
 def test_owned_playtime_table_output_is_path_free(

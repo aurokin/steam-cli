@@ -192,10 +192,13 @@ changes nothing. Activity rows past the seven-day hard retention are not
 consulted. A missing or non-authoritative owned snapshot makes every item
 `unknown` with `no_authoritative_snapshot`.
 
-`--playtime` filters owned-scope items by that state and is rejected with
-`INVALID_ARGUMENT` for any other scope. `playtime_state_counts` is computed
-before filtering, so the excluded states stay visible, and the query context
-always reports the requested `playtime_filter`. A `zero` filter adds the
+`--playtime` filters owned-scope items by that state. A state-selecting value
+(`zero`, `positive`, or `unknown`) is rejected with `INVALID_ARGUMENT` for any
+other scope. The neutral `any`, which is also the value used when the flag is
+omitted, is accepted on every scope and changes nothing. `playtime_state_counts`
+is computed before filtering, so the excluded states stay visible, and an
+owned query's context always reports the requested `playtime_filter`. A `zero`
+filter adds the
 `never_played_list_is_a_lower_bound` and
 `zero_recorded_minutes_is_not_proof_of_never_launched` limitations: private
 games and unplayed free entitlements can be omitted upstream, and zero recorded
@@ -522,8 +525,8 @@ steam-agent profiles create|get|list|delete|clear-account ...
 steam-agent ownership set|clear ...
 steam-agent family set|clear ...
 steam-agent fact set|clear ...
-steam-agent group ownership|eligibility APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG ...
-steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --member MEMBER... [--copy-source SOURCE...] --context-account ALIAS --context-machine MACHINE --country CC --language LANG --mode MODE --objective no-purchase|min-copies|preference-fit ...
+steam-agent group ownership|eligibility APPID... --member MEMBER... [--copy-source SOURCE...] --account ALIAS --machine MACHINE --country CC --language LANG [--include-member-evidence] ...
+steam-agent group recommend --scope known|library|wishlist|installed|appids --limit N [--appid APPID...] --member MEMBER... [--copy-source SOURCE...] --context-account ALIAS --context-machine MACHINE --country CC --language LANG --mode MODE --objective no-purchase|min-copies|preference-fit [--include-member-evidence] ...
 ```
 
 `sync app-facts` reports the state of every snapshot it used to expand its
@@ -539,21 +542,22 @@ demotes a complete sync to partial, but neither blocks the sync nor erases
 last-good declarations.
 
 `discovery query` returns `discovery-query/0.1`; group eligibility and ranking
-return `group-eligibility/0.2` and `group-fit/0.2`. Candidate authorization is
-account/machine/locale scoped and never expands or fetches implicitly. Member
-and copy-source aliases are inputs but output uses request-local ordinals.
+return their accepted `group-eligibility/0.1` and `group-fit/0.1` contracts by
+default. `--include-member-evidence` selects `group-eligibility/0.2` or
+`group-fit/0.2`. Candidate authorization is account/machine/locale scoped and
+never expands or fetches implicitly. Member and copy-source aliases are inputs
+but output uses request-local ordinals.
 Ownership, family availability, mode, player count, compatibility, policy, and
 missing-copy ranges retain independent three-valued states. Durable synthetic
 facts require their explicit disclosure and deletion workflow; query results
 are never persisted.
 
-Both group query schemas carry a `members` array in request member-ordinal
-order, using the same ordinals as `ownership.members`. Each entry reports
-`kind`, `last_attempt_at`, and one `member_evidence` value: `authoritative`
-(the snapshot the query itself treated as authoritative for per-app states —
-a fresh promoted complete visible-owned snapshot with no invalidating newer
-attempt, so `authoritative` can never accompany all-unknown per-app states
-for that member), `stale` (a last-good
+The opt-in 0.2 group query schemas carry a top-level `members` array in request
+member-ordinal order, using the same ordinals as `ownership.members`. Each
+entry reports `kind`, `last_attempt_at`, and one `member_evidence` value:
+`authoritative`
+(a fresh promoted complete visible-owned snapshot with no invalidating newer
+attempt), `stale` (a last-good
 snapshot that is stale, superseded, or unpromoted), `not_synced` (no last-good
 snapshot), `inaccessible` (the latest owned attempt failed with
 `OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT`), or `asserted` (synthetic
@@ -561,11 +565,19 @@ members, whose `last_attempt_at` is always null). For account members the
 precedence is deterministic: authoritative, then inaccessible, then
 not_synced, then stale. `inaccessible` means inaccessible or ambiguous exactly
 as in M2; it is never a privacy diagnosis, is never serialized as `private`,
-and aliases are still never emitted. An inaccessible account member adds the
-typed `OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT` completeness warning
-alongside the existing not-synced and stale warnings, and counts like a
-missing member for the partial/unavailable ladder. Per-app ownership states
-remain `owned | not_owned | unknown`.
+and aliases are still never emitted. Only an inaccessible account that is an
+actual playing member contributes the 0.2 diagnostic; an inaccessible extra
+copy source does not. The playing member adds the typed
+`OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT` warning and
+`owned.visible.read` missing capability, and counts as missing ownership
+evidence: completeness is unavailable with no other usable ownership evidence
+and partial when other ownership evidence exists. Unflagged 0.1 output retains
+its prior warning and status semantics. Per-app ownership states remain
+`owned | not_owned | unknown`. Account snapshots establish observed
+ownership only: absence of an AppID does not establish non-ownership, so an
+authoritative empty snapshot can legitimately accompany all-`unknown` per-app
+states for that member. Synthetic assertions remain the only source of an
+explicit `not_owned` state.
 
 ## Implemented M7 local-operation commands
 

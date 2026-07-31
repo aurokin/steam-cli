@@ -1,6 +1,6 @@
 # ADR 0014: canonical wishlist compatibility route and scope-dependency lineage
 
-Status: proposed
+Status: accepted 2026-07-31
 
 ## Context
 

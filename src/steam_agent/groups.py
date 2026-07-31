@@ -11,8 +11,10 @@ import re
 from typing import Literal, Mapping
 
 
-SCHEMA = "group-eligibility/0.2"
-RANKING_RECIPE = "group-fit/0.2"
+SCHEMA = "group-eligibility/0.1"
+SCHEMA_V0_2 = "group-eligibility/0.2"
+RANKING_RECIPE = "group-fit/0.1"
+RANKING_RECIPE_V0_2 = "group-fit/0.2"
 MAX_APPID = (1 << 32) - 1
 MAX_MEMBERS = 32
 MAX_SOURCES = 64
@@ -710,7 +712,9 @@ __all__ = [
     "PolicyFact",
     "PreferenceScore",
     "RANKING_RECIPE",
+    "RANKING_RECIPE_V0_2",
     "SCHEMA",
+    "SCHEMA_V0_2",
     "assess_copies",
     "assess_eligibility",
     "rank_candidates",

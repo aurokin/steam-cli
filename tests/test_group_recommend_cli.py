@@ -459,7 +459,7 @@ def test_recommend_bounds_are_rejected(tmp_path, capsys, mutation) -> None:
     assert value["error"]["code"] == "INVALID_ARGUMENT"
 
 
-def test_recommend_members_block_and_schema_bump(
+def test_recommend_member_evidence_contract_is_opt_in(
     tmp_path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
@@ -470,11 +470,17 @@ def test_recommend_members_block_and_schema_bump(
     args = common(objective="min-copies", appids=(10,))
     args.extend(("--member", "account:primary"))
 
-    code, value, stderr = invoke(tmp_path, capsys, *args)
+    code, default, stderr = invoke(tmp_path, capsys, *args)
+    flagged_code, flagged, flagged_stderr = invoke(
+        tmp_path, capsys, *args, "--include-member-evidence"
+    )
 
-    assert code == 0 and stderr == ""
-    assert value["data"]["schema"] == "group-fit/0.2"
-    assert value["data"]["members"] == [
+    assert code == flagged_code == 0
+    assert stderr == flagged_stderr == ""
+    assert default["data"]["schema"] == "group-fit/0.1"
+    assert "members" not in default["data"]
+    assert flagged["data"]["schema"] == "group-fit/0.2"
+    assert flagged["data"]["members"] == [
         {
             "member_ordinal": 0,
             "kind": "synthetic",
@@ -494,6 +500,12 @@ def test_recommend_members_block_and_schema_bump(
             "last_attempt_at": "2026-07-12T18:00:00Z",
         },
     ]
+    assert {
+        key: value
+        for key, value in flagged["data"].items()
+        if key not in {"schema", "members"}
+    } == {key: value for key, value in default["data"].items() if key != "schema"}
+    assert flagged["completeness"] == default["completeness"]
 
 
 def test_host_topology_requires_explicit_host_at_cli_boundary(tmp_path, capsys) -> None:

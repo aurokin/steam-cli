@@ -294,6 +294,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
             missing,
             stale,
             any_evidence,
+            usable_evidence,
             evidence_by_ref,
             _last_attempt_by_ref,
         ) = cli._group_ownership_by_app(  # noqa: SLF001
@@ -304,6 +305,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
     assert missing is False
     assert stale is True
     assert any_evidence is False
+    assert usable_evidence is False
     assert evidence_by_ref[refs[0]] == "stale"
 
 
@@ -555,7 +557,9 @@ def seed_failed_owned_sync(
         )
 
 
-def ownership_query(*members: str) -> list[str]:
+def ownership_query(
+    *members: str, include_member_evidence: bool = False
+) -> list[str]:
     arguments = ["group", "ownership", "400"]
     for member in members:
         arguments.extend(("--member", member))
@@ -571,6 +575,8 @@ def ownership_query(*members: str) -> list[str]:
             "english",
         )
     )
+    if include_member_evidence:
+        arguments.append("--include-member-evidence")
     return arguments
 
 
@@ -582,7 +588,11 @@ def test_group_members_block_authoritative_and_asserted(
     create_profile(tmp_path, capsys, "synthetic:Guest")
 
     code, value, stderr = invoke(
-        tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "synthetic:Guest", include_member_evidence=True
+        ),
     )
 
     assert code == 0 and stderr == ""
@@ -602,23 +612,93 @@ def test_group_members_block_authoritative_and_asserted(
     ]
 
 
-def test_group_member_inaccessible_from_failed_owned_attempt(
+def test_group_fresh_empty_authoritative_member_preserves_unknown_ownership(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path)
     create_profile(tmp_path, capsys, "synthetic:Guest")
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("primary")
+        assert account is not None
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            run.id,
+            (),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=0,
+            expanded_reported_count=0,
+            completed_at=NOW,
+        )
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "synthetic:Guest", include_member_evidence=True
+        ),
+    )
+
+    assert code == 0 and stderr == ""
+    assert value["data"]["members"][0]["member_evidence"] == "authoritative"
+    assert value["data"]["results"][0]["ownership"]["members"][0]["state"] == (
+        "unknown"
+    )
+
+
+@pytest.mark.parametrize("usable_state", ("owned", "not_owned"))
+def test_group_member_inaccessible_with_other_usable_assertion_is_partial(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+    usable_state: str,
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    assert (
+        invoke(
+            tmp_path,
+            capsys,
+            "ownership",
+            "set",
+            "synthetic:Guest",
+            "400",
+            usable_state,
+        )[0]
+        == 0
+    )
     seed_failed_owned_sync(
         tmp_path,
         "primary",
         error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
     )
 
+    default_code, default, default_stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query("account:primary", "synthetic:Guest"),
+    )
     code, value, stderr = invoke(
-        tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "synthetic:Guest", include_member_evidence=True
+        ),
     )
 
-    assert code == 0 and stderr == ""
+    assert default_code == code == 0
+    assert default_stderr == stderr == ""
+    assert default["data"]["schema"] == "group-eligibility/0.1"
+    assert default["completeness"]["status"] == "partial"
+    assert "members" not in default["data"]
+    assert value["data"]["schema"] == "group-eligibility/0.2"
     assert value["data"]["members"][0] == {
         "member_ordinal": 0,
         "kind": "account",
@@ -633,10 +713,63 @@ def test_group_member_inaccessible_from_failed_owned_attempt(
             "inaccessible or ambiguous; its copy states remain unknown."
         ),
     } in value["completeness"]["warnings"]
+    assert value["completeness"]["status"] == "partial"
+    assert value["completeness"]["missing_capabilities"] == ["owned.visible.read"]
     rendered = json.dumps(value).casefold()
     assert "primary" not in rendered
     assert "guest" not in rendered
     assert "private" not in rendered
+
+
+def test_group_inaccessible_member_with_only_explicit_unknown_is_unavailable(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path)
+    create_profile(tmp_path, capsys, "synthetic:Guest")
+    assert (
+        invoke(
+            tmp_path,
+            capsys,
+            "ownership",
+            "set",
+            "synthetic:Guest",
+            "400",
+            "unknown",
+        )[0]
+        == 0
+    )
+    seed_failed_owned_sync(
+        tmp_path,
+        "primary",
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+    )
+
+    default_code, default, default_stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query("account:primary", "synthetic:Guest"),
+    )
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "synthetic:Guest", include_member_evidence=True
+        ),
+    )
+
+    assert default_code == code == 0
+    assert default_stderr == stderr == ""
+    assert default["data"]["schema"] == "group-eligibility/0.1"
+    assert default["completeness"]["status"] == "partial"
+    assert "members" not in default["data"]
+    assert value["data"]["schema"] == "group-eligibility/0.2"
+    assert value["data"]["results"][0]["ownership"]["members"] == [
+        {"member_ordinal": 0, "state": "unknown"},
+        {"member_ordinal": 1, "state": "unknown"},
+    ]
+    assert value["completeness"]["status"] == "unavailable"
+    assert value["completeness"]["missing_capabilities"] == ["owned.visible.read"]
 
 
 def test_group_member_stale_beats_not_synced_precedence(
@@ -654,7 +787,11 @@ def test_group_member_stale_beats_not_synced_precedence(
         storage._connection.commit()  # noqa: SLF001
 
     code, value, stderr = invoke(
-        tmp_path, capsys, *ownership_query("account:primary", "account:other")
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "account:other", include_member_evidence=True
+        ),
     )
 
     assert code == 0 and stderr == ""
@@ -668,13 +805,9 @@ def test_group_member_stale_beats_not_synced_precedence(
     ]
 
 
-def test_group_member_newer_inaccessible_attempt_matches_per_app_unknown(
+def test_group_inaccessible_only_is_opt_in_missing_evidence(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Evidence mirrors per-app resolution: a newer inaccessible attempt
-    invalidates the last-good snapshot for this query, so the member reads
-    inaccessible rather than authoritative while its states are unknown."""
-
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path, with_owned=True)
     create_profile(tmp_path, capsys, "synthetic:Guest")
@@ -685,41 +818,111 @@ def test_group_member_newer_inaccessible_attempt_matches_per_app_unknown(
         attempted_at=datetime(2026, 7, 12, 19, tzinfo=timezone.utc),
     )
 
-    code, value, stderr = invoke(
+    code, default, stderr = invoke(
         tmp_path, capsys, *ownership_query("account:primary", "synthetic:Guest")
     )
+    flagged_code, flagged, flagged_stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "synthetic:Guest", include_member_evidence=True
+        ),
+    )
 
-    assert code == 0 and stderr == ""
-    assert value["data"]["members"][0] == {
+    assert code == flagged_code == 0
+    assert stderr == flagged_stderr == ""
+    assert default["data"]["schema"] == "group-eligibility/0.1"
+    assert "members" not in default["data"]
+    assert default["completeness"]["status"] == "partial"
+    assert default["completeness"]["missing_capabilities"] == []
+    assert all(
+        warning["code"] != "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"
+        for warning in default["completeness"]["warnings"]
+    )
+
+    assert flagged["data"]["schema"] == "group-eligibility/0.2"
+    assert flagged["data"]["members"][0] == {
         "member_ordinal": 0,
         "kind": "account",
         "member_evidence": "inaccessible",
         "last_attempt_at": "2026-07-12T19:00:00Z",
     }
-    account_states = {
-        member["member_ordinal"]: member["state"]
-        for result in value["data"]["results"]
-        for member in result["ownership"]["members"]
-        if member["member_ordinal"] == 0
-    }
-    assert set(account_states.values()) <= {"unknown"}
+    assert flagged["data"]["results"][0]["ownership"]["members"][0]["state"] == (
+        "unknown"
+    )
+    assert flagged["completeness"]["status"] == "unavailable"
+    assert flagged["completeness"]["missing_capabilities"] == ["owned.visible.read"]
+    assert any(
+        warning["code"] == "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"
+        for warning in flagged["completeness"]["warnings"]
+    )
 
 
-def test_group_schema_bump_to_0_2(tmp_path: Path, capsys: object) -> None:
+def test_group_inaccessible_copy_source_does_not_change_member_evidence_status(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path, with_owned=True)
+    create_profile(tmp_path, capsys, "synthetic:Alpha")
+    create_profile(tmp_path, capsys, "synthetic:Beta")
+    seed_failed_owned_sync(
+        tmp_path,
+        "primary",
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+        attempted_at=datetime(2026, 7, 12, 19, tzinfo=timezone.utc),
+    )
+    arguments = ownership_query(
+        "synthetic:Alpha", "synthetic:Beta", include_member_evidence=True
+    )
+    arguments.extend(("--copy-source", "account:primary"))
+
+    code, value, stderr = invoke(tmp_path, capsys, *arguments)
+
+    assert code == 0 and stderr == ""
+    assert [member["member_evidence"] for member in value["data"]["members"]] == [
+        "asserted",
+        "asserted",
+    ]
+    assert value["completeness"]["status"] == "partial"
+    assert value["completeness"]["missing_capabilities"] == []
+    assert value["completeness"]["stale_capabilities"] == ["owned.visible.read"]
+    assert all(
+        warning["code"] != "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"
+        for warning in value["completeness"]["warnings"]
+    )
+
+
+def test_group_member_evidence_contract_is_opt_in_for_ownership_and_eligibility(
+    tmp_path: Path, capsys: object
+) -> None:
     configure(tmp_path)
     create_profile(tmp_path, capsys, "synthetic:Alpha")
     create_profile(tmp_path, capsys, "synthetic:Beta")
     seed_declared(tmp_path, 400)
 
-    code, value, _ = invoke(
+    code, ownership_default, _ = invoke(
         tmp_path, capsys, *ownership_query("synthetic:Alpha", "synthetic:Beta")
     )
-    assert code == 0
-    assert value["data"]["schema"] == "group-eligibility/0.2"
-
-    code, value, _ = invoke(
+    flagged_code, ownership_flagged, _ = invoke(
         tmp_path,
         capsys,
+        *ownership_query(
+            "synthetic:Alpha", "synthetic:Beta", include_member_evidence=True
+        ),
+    )
+
+    assert code == flagged_code == 0
+    assert ownership_default["data"]["schema"] == "group-eligibility/0.1"
+    assert "members" not in ownership_default["data"]
+    assert ownership_flagged["data"]["schema"] == "group-eligibility/0.2"
+    assert [
+        member["member_evidence"] for member in ownership_flagged["data"]["members"]
+    ] == ["asserted", "asserted"]
+    assert ownership_flagged["data"]["results"] == ownership_default["data"][
+        "results"
+    ]
+
+    eligibility_arguments = [
         "group",
         "eligibility",
         "400",
@@ -737,6 +940,26 @@ def test_group_schema_bump_to_0_2(tmp_path: Path, capsys: object) -> None:
         "english",
         "--mode",
         "online_coop",
+    ]
+    code, eligibility_default, _ = invoke(
+        tmp_path,
+        capsys,
+        *eligibility_arguments,
     )
-    assert code == 0
-    assert value["data"]["schema"] == "group-eligibility/0.2"
+    flagged_code, eligibility_flagged, _ = invoke(
+        tmp_path,
+        capsys,
+        *eligibility_arguments,
+        "--include-member-evidence",
+    )
+
+    assert code == flagged_code == 0
+    assert eligibility_default["data"]["schema"] == "group-eligibility/0.1"
+    assert "members" not in eligibility_default["data"]
+    assert eligibility_flagged["data"]["schema"] == "group-eligibility/0.2"
+    assert [
+        member["member_evidence"] for member in eligibility_flagged["data"]["members"]
+    ] == ["asserted", "asserted"]
+    assert eligibility_flagged["data"]["results"] == eligibility_default["data"][
+        "results"
+    ]
