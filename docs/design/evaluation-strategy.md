@@ -137,9 +137,10 @@ blind comparison and task-specific rubrics while retaining expert review.
   workspace root, no network, and no approvals. The profile extends
   `:workspace`, denies the host root by default, retains Codex's minimal
   platform reads, inherits workspace writes, and explicitly reopens only the
-  resolved Python interpreter file, its standard-library, platform-library,
-  pure-library, and site-package directories, and this repository's `src/`
-  directory. `/tmp` and the App Server process `TMPDIR` remain denied. The
+  resolved Python interpreter file, its runtime-library, standard-library,
+  platform-library, pure-library, and site-package directories, and this
+  repository's `src/` directory. `/tmp` and the App Server process `TMPDIR`
+  remain denied. The
   driver verifies the active profile identity, its exact resolved filesystem
   and network rules, runtime roots, working directory, ephemeral and
   non-persisted thread state, approval policy, sandbox response, empty

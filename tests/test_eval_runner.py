@@ -1784,6 +1784,11 @@ def test_codex_permission_roots_do_not_reopen_python_prefixes(
         },
     )
     monkeypatch.setattr(
+        codex_driver.sysconfig,
+        "get_config_var",
+        lambda name: "/usr/local/lib" if name == "LIBDIR" else None,
+    )
+    monkeypatch.setattr(
         codex_driver.site,
         "getsitepackages",
         lambda: ["/usr/local/lib/python3.12/site-packages"],
@@ -1794,6 +1799,7 @@ def test_codex_permission_roots_do_not_reopen_python_prefixes(
     assert Path("/usr").resolve() not in roots
     assert Path("/usr/local").resolve() not in roots
     assert Path("/usr/bin/python3.12").resolve() in roots
+    assert Path("/usr/local/lib").resolve() in roots
     assert Path("/usr/lib/python3.12").resolve() in roots
     assert Path("/usr/local/lib/python3.12/site-packages").resolve() in roots
     assert Path("/opt/python/site-packages").resolve() in roots

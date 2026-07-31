@@ -262,6 +262,11 @@ def _permission_read_roots() -> tuple[Path, ...]:
     candidates = [
         Path(sys.executable).resolve(),
         *(
+            [Path(runtime_library_dir).resolve()]
+            if (runtime_library_dir := sysconfig.get_config_var("LIBDIR"))
+            else []
+        ),
+        *(
             Path(value).resolve()
             for name in ("stdlib", "platstdlib", "purelib", "platlib")
             if (value := scheme_paths.get(name))
