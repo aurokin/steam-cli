@@ -22,8 +22,11 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   binary). Reproducible model comparisons should pin both dimensions, for
   example `--model gpt-5.6-sol --effort high`; supported effort values are
   `low`, `medium`, `high`, and `xhigh`. Normal CI covers only its materializer
-  and grader. Agent execution explicitly expects `m5-c03` and `m5-c04` to be
-  unsupported; any other materialization failure fails the run.
+  and grader. Agent execution explicitly expects `m5-c03`, `m5-c04`, and
+  `m5-c11` to be unsupported; the first two lack a CLI writer, while `m5-c11`
+  requires a sync plus multiple required CLI documents that the cache-only,
+  single-document live runner intentionally rejects. Any other materialization
+  failure fails the run.
   A run in which every selected scenario is skipped also fails.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git. New run directories are mode `0700`, artifact files are
@@ -34,9 +37,14 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   `results/`. Runs that fail a turn, evidence, tool, or privacy gate persist
   only structural activity plus content hashes and lengths, not raw prompts,
   reasoning, commands, answers, or tool output.
-  Evaluated commands run under a least-privilege permission profile that
-  denies host reads, including the App Server's isolated authentication, while
-  reopening only the workspace and the runtime paths needed by the frozen CLI.
+  Evaluated commands run under the named `steam-agent-eval` permission
+  profile. It denies the host root by default, inherits workspace writes, and
+  reopens read access only for Codex's minimal platform set, the resolved
+  Python interpreter, its standard-library and site-package directories, and
+  this repository's `src/` directory. The App Server's isolated authentication
+  and temporary directory remain denied; network access is disabled. These
+  explicit runtime paths are host-readable, so this is not an absolute
+  no-host-read boundary.
   App Server and ordinary background command descendants run in one process
   group and are terminated together. A deliberately detached descendant (for
   example, one that creates a new session) can escape process-group cleanup;

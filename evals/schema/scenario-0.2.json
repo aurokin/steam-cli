@@ -220,7 +220,25 @@
             "required": ["source"],
             "properties": {
               "source": {"const": "final_answer"},
-              "expected": {"type": "string", "pattern": "\\S"},
+              "expected": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["required_all", "required_any", "forbidden"],
+                "properties": {
+                  "required_all": {
+                    "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": {"type": "string", "pattern": "\\S"}
+                  },
+                  "required_any": {
+                    "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": {"type": "string", "pattern": "\\S"}
+                  },
+                  "forbidden": {
+                    "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": {"type": "string", "pattern": "\\S"}
+                  }
+                }
+              },
               "path": {"const": "$"}
             }
           }

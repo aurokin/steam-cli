@@ -7,9 +7,9 @@ per scenario turn on the same thread, collecting ``item/completed`` and
 ``turn/completed`` notifications into one transcript per turn. Approval
 requests are answered ``denied`` so a sandbox escape can never be granted by
 the harness; the policy itself is ``never``. A custom permission profile
-constrains writes to the workspace, denies network access, and denies host
-reads except for the minimum Python runtime and package roots needed by the
-frozen CLI launcher.
+constrains writes to the workspace, denies network access, denies the host root
+by default, and reopens Codex's minimal platform set plus the specific Python
+runtime and package paths needed by the frozen CLI launcher.
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import site
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from typing import Any, IO, Sequence
@@ -256,12 +258,24 @@ def _app_server_process_args(executable: str, workspace: Path) -> list[str]:
 def _permission_read_roots() -> tuple[Path, ...]:
     """Return the minimum host roots needed by the frozen Python launcher."""
 
-    candidates = (
+    scheme_paths = sysconfig.get_paths()
+    candidates = [
+        Path(sys.executable).resolve(),
+        *(
+            Path(value).resolve()
+            for name in ("stdlib", "platstdlib", "purelib", "platlib")
+            if (value := scheme_paths.get(name))
+        ),
+        *(Path(value).resolve() for value in site.getsitepackages()),
+        (Path(__file__).resolve().parents[2] / "src").resolve(),
+    ]
+    broad_prefixes = {
         Path(sys.base_prefix).resolve(),
         Path(sys.prefix).resolve(),
-        (Path(__file__).resolve().parents[2] / "src").resolve(),
+    }
+    return tuple(
+        path for path in dict.fromkeys(candidates) if path not in broad_prefixes
     )
-    return tuple(dict.fromkeys(candidates))
 
 
 def _permission_filesystem_rules() -> dict[str, str]:

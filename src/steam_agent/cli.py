@@ -2878,16 +2878,19 @@ def _group_ownership_by_app(
     bool,
     bool,
     bool,
+    dict[MemberRef, tuple[bool, bool]],
     dict[MemberRef, str],
     dict[MemberRef, str | None],
 ]:
     account_owned: dict[MemberRef, set[int] | None] = {}
     ownership_missing = False
     ownership_stale = False
+    scope_state_by_ref: dict[MemberRef, tuple[bool, bool]] = {}
     evidence_by_ref: dict[MemberRef, str] = {}
     last_attempt_by_ref: dict[MemberRef, str | None] = {}
     for ref in refs:
         if ref.kind != "account":
+            scope_state_by_ref[ref] = (False, False)
             evidence_by_ref[ref] = "asserted"
             last_attempt_by_ref[ref] = None
             continue
@@ -2899,6 +2902,7 @@ def _group_ownership_by_app(
         missing, stale, authoritative = _owned_scope_state(snapshot, now=now)
         ownership_missing = ownership_missing or missing
         ownership_stale = ownership_stale or stale
+        scope_state_by_ref[ref] = (missing, stale)
         (
             evidence_by_ref[ref],
             last_attempt_by_ref[ref],
@@ -2957,8 +2961,32 @@ def _group_ownership_by_app(
         ownership_stale,
         ownership_any_evidence,
         ownership_usable_evidence,
+        scope_state_by_ref,
         evidence_by_ref,
         last_attempt_by_ref,
+    )
+
+
+def _group_v02_generic_ownership_state(
+    *,
+    refs: tuple[MemberRef, ...],
+    members: tuple[MemberRef, ...],
+    scope_state_by_ref: Mapping[MemberRef, tuple[bool, bool]],
+    evidence_by_ref: Mapping[MemberRef, str],
+) -> tuple[bool, bool]:
+    """Exclude inaccessible playing members from generic missing/stale state."""
+
+    inaccessible_members = {
+        member
+        for member in members
+        if evidence_by_ref[member] == "inaccessible"
+    }
+    included = [
+        scope_state_by_ref[ref] for ref in refs if ref not in inaccessible_members
+    ]
+    return (
+        any(missing for missing, _ in included),
+        any(stale for _, stale in included),
     )
 
 
@@ -3309,9 +3337,19 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 ownership_stale,
                 ownership_any_evidence,
                 ownership_usable_evidence,
+                scope_state_by_ref,
                 evidence_by_ref,
                 last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
+            if args.include_member_evidence:
+                ownership_missing, ownership_stale = (
+                    _group_v02_generic_ownership_state(
+                        refs=refs,
+                        members=members,
+                        scope_state_by_ref=scope_state_by_ref,
+                        evidence_by_ref=evidence_by_ref,
+                    )
+                )
             declared = (
                 storage.read_declared_app_snapshot(
                     account_id=context_account.id,
@@ -3586,11 +3624,28 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 ownership_stale,
                 ownership_any_evidence,
                 ownership_usable_evidence,
+                scope_state_by_ref,
                 evidence_by_ref,
                 last_attempt_by_ref,
             ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
-            ownership_missing = ownership_missing or scope_owned_missing
-            ownership_stale = ownership_stale or scope_owned_stale
+            context_ref = MemberRef("account", context_account.alias)
+            context_is_inaccessible_member = (
+                args.include_member_evidence
+                and context_ref in members
+                and evidence_by_ref[context_ref] == "inaccessible"
+            )
+            if args.include_member_evidence:
+                ownership_missing, ownership_stale = (
+                    _group_v02_generic_ownership_state(
+                        refs=refs,
+                        members=members,
+                        scope_state_by_ref=scope_state_by_ref,
+                        evidence_by_ref=evidence_by_ref,
+                    )
+                )
+            if not context_is_inaccessible_member:
+                ownership_missing = ownership_missing or scope_owned_missing
+                ownership_stale = ownership_stale or scope_owned_stale
             family_by_member = {
                 member: (
                     storage.read_group_family_for_appids(

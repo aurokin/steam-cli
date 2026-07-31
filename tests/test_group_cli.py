@@ -295,6 +295,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
             stale,
             any_evidence,
             usable_evidence,
+            _scope_state_by_ref,
             evidence_by_ref,
             _last_attempt_by_ref,
         ) = cli._group_ownership_by_app(  # noqa: SLF001
@@ -768,6 +769,9 @@ def test_group_member_inaccessible_with_other_usable_assertion_is_partial(
             "inaccessible or ambiguous; its copy states remain unknown."
         ),
     } in value["completeness"]["warnings"]
+    assert [
+        warning["code"] for warning in value["completeness"]["warnings"]
+    ] == ["OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"]
     assert value["completeness"]["status"] == "partial"
     assert value["completeness"]["missing_capabilities"] == ["owned.visible.read"]
     rendered = json.dumps(value).casefold()
@@ -890,10 +894,9 @@ def test_group_inaccessible_only_is_opt_in_missing_evidence(
     assert "members" not in default["data"]
     assert default["completeness"]["status"] == "partial"
     assert default["completeness"]["missing_capabilities"] == []
-    assert all(
-        warning["code"] != "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"
-        for warning in default["completeness"]["warnings"]
-    )
+    assert [
+        warning["code"] for warning in default["completeness"]["warnings"]
+    ] == ["STALE_LAST_GOOD"]
 
     assert flagged["data"]["schema"] == "group-eligibility/0.2"
     assert flagged["data"]["members"][0] == {
@@ -907,10 +910,10 @@ def test_group_inaccessible_only_is_opt_in_missing_evidence(
     )
     assert flagged["completeness"]["status"] == "unavailable"
     assert flagged["completeness"]["missing_capabilities"] == ["owned.visible.read"]
-    assert any(
-        warning["code"] == "OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"
-        for warning in flagged["completeness"]["warnings"]
-    )
+    assert flagged["completeness"]["stale_capabilities"] == []
+    assert [
+        warning["code"] for warning in flagged["completeness"]["warnings"]
+    ] == ["OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT"]
 
 
 def test_group_inaccessible_copy_source_does_not_change_member_evidence_status(

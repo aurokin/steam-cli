@@ -133,16 +133,19 @@ blind comparison and task-specific rubrics while retaining expert review.
   and grader. Agent execution expects only `m5-c03`, `m5-c04`, and `m5-c11` to
   be unsupported. An unexpected unsupported scenario or a selection in which
   every scenario is skipped fails the run.
-- The runner requests an explicit legacy `workspace-write` sandbox, one runtime
-  workspace root, no network, and no approvals. Codex 0.146's named
-  `:workspace` profile does not honor the requested `/tmp` and `TMPDIR`
-  exclusions, so the runner does not use it and requires a null active-profile
-  response. The driver verifies the returned runtime roots, working directory,
-  ephemeral and non-persisted thread state, approval policy, sandbox type,
-  network state, empty additional writable roots, disabled legacy temporary
-  roots, and a nonempty instruction-source list containing the exact private
-  workspace `AGENTS.md` (with every source workspace-local) before any model
-  turn.
+- The runner selects a named `steam-agent-eval` permission profile, one runtime
+  workspace root, no network, and no approvals. The profile extends
+  `:workspace`, denies the host root by default, retains Codex's minimal
+  platform reads, inherits workspace writes, and explicitly reopens only the
+  resolved Python interpreter file, its standard-library, platform-library,
+  pure-library, and site-package directories, and this repository's `src/`
+  directory. `/tmp` and the App Server process `TMPDIR` remain denied. The
+  driver verifies the active profile identity, its exact resolved filesystem
+  and network rules, runtime roots, working directory, ephemeral and
+  non-persisted thread state, approval policy, sandbox response, empty
+  additional writable roots, temporary-directory exclusions, and a nonempty
+  instruction-source list containing the exact private workspace `AGENTS.md`
+  (with every source workspace-local) before any model turn.
 - App Server runs with a disposable private `CODEX_HOME` containing only a
   mode-`0600` copy of the existing `auth.json`; personal config, MCP servers,
   plugins, hooks, skills, state, and history are not inherited. Web search and
@@ -152,21 +155,29 @@ blind comparison and task-specific rubrics while retaining expert review.
   catalog to be empty, and the thread's MCP inventory to be empty before
   `thread/start` or `turn/start`, as applicable. Authentication and protocol
   failures use generic errors and never include raw App Server payloads.
-  The model command environment inherits only a small locale/PATH allowlist
-  and receives workspace-local `HOME` and `TMPDIR` values, so the disposable
-  Codex home is not disclosed to shell commands. Codex 0.146 silently changes
+  App Server's process `TMPDIR` is its isolated Codex home, which the permission
+  profile denies to evaluated commands. The model command environment inherits
+  only a small locale/PATH allowlist and receives workspace-local `HOME` and
+  `TMPDIR` values, so it neither discloses nor grants access to the disposable
+  Codex home. Codex 0.146 silently changes
   a thread to read-only when `environments: []` is sent; because that would
   also disable the required CLI, the field is omitted. The disposable Codex
   home carries no configured remote environment, leaving only App Server's
   built-in local execution environment. The private Codex home and all of its
   transient state are removed after App Server exits.
-- On macOS with Codex 0.146, the resulting sandbox still permits reads
-  elsewhere on the host; true host-read isolation therefore requires running
-  the eval in an isolated OS account, container, or VM. Developer instructions
-  prohibit host inspection, but instructions are not a security boundary. The
-  driver records every completed item, permits command execution and explicitly
-  informational item types, and fails the tool-policy gate on file changes,
-  MCP/dynamic calls, web search, collaboration, and unknown activity. Clean
+- On macOS with Codex 0.146, the host root is denied but the profile's minimal
+  platform set and explicitly reopened Python runtime, package, and source
+  paths remain readable. This is therefore a least-privilege host-read boundary,
+  not an absolute no-host-read guarantee; stronger isolation requires an
+  isolated OS account or VM. Developer instructions prohibit host inspection,
+  but instructions are not a security boundary. App Server and ordinary
+  background command descendants share a process group that is terminated as
+  a unit; a deliberately detached descendant can escape that cleanup, so the
+  runner's exact-command policy rejects such activity and the runner does not
+  claim to be a process jail. The driver records every completed item, permits
+  command execution and explicitly informational item types, and fails the
+  tool-policy gate on file changes, MCP/dynamic calls, web search,
+  collaboration, and unknown activity. Clean
   artifacts redact host paths and privacy canaries. If turn completion,
   required evidence, tool policy, or privacy fails, the transcript and report
   retain only structural activity plus content hashes and lengths; raw prompts,

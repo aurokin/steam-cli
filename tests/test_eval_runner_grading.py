@@ -398,8 +398,6 @@ def test_private_host_path_forms_share_detection_and_redaction(
     "text",
     (
         "https://example.com/Users/example/secret-tail.txt",
-        "https://example.com/?next=file:///Users/example/secret-tail.txt",
-        "https://example.com/?next=file:%2FUsers%2Fsecret-tail.txt",
         "steam://open/path:/Users/example/secret-tail.txt",
         "$.data.items[0].path",
         "$['relative/repository/path']",
@@ -452,6 +450,38 @@ def test_private_host_path_detection_ignores_public_and_relative_text(
     ),
 )
 def test_json_path_syntax_does_not_hide_embedded_private_paths(
+    text: str, private_path: str, redacted: str
+) -> None:
+    assert grade.find_private_host_paths(text) == [private_path]
+    assert grade.redact_private_host_paths(text) == redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "private_path", "redacted"),
+    (
+        (
+            "https://example.invalid/?path=/Users/person/secret",
+            "/Users/person/secret",
+            "https://example.invalid/?path=<redacted-host-path>",
+        ),
+        (
+            "https://example.invalid/#/Users/person/secret",
+            "/Users/person/secret",
+            "https://example.invalid/#<redacted-host-path>",
+        ),
+        (
+            "https://example.invalid/?next=file:///Users/person/secret",
+            "file:///Users/person/secret",
+            "https://example.invalid/?next=<redacted-host-path>",
+        ),
+        (
+            "https://example.invalid/?next=file:%2FUsers%2Fperson%2Fsecret",
+            "file:%2FUsers%2Fperson%2Fsecret",
+            "https://example.invalid/?next=<redacted-host-path>",
+        ),
+    ),
+)
+def test_public_url_query_and_fragment_do_not_hide_private_paths(
     text: str, private_path: str, redacted: str
 ) -> None:
     assert grade.find_private_host_paths(text) == [private_path]
