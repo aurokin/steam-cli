@@ -449,6 +449,42 @@ def test_claims_grading_requires_supported_sidecar() -> None:
     assert missing["provided"] is False
 
 
+def test_extract_sidecar_accepts_only_a_terminal_json_block() -> None:
+    claims = [{"path": "$.data.state", "value": "present"}]
+    message = (
+        "Grounded answer.\n```json\n"
+        + json.dumps({"claims": claims})
+        + "\n```\n\t"
+    )
+
+    assert runner_main._extract_sidecar(message) == (claims, False)  # noqa: SLF001
+    assert runner_main._extract_sidecar(  # noqa: SLF001
+        'Declined.\n```json\n{"declined": true}\n```'
+    ) == (None, True)
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        "trailing prose",
+        "```text\nnot a sidecar\n```",
+        "```json\n{not valid json}\n```",
+        "```json\n[]\n```",
+        '```json\n{"notes": []}\n```',
+        '```json\n{"claims": "invalid", "declined": true}\n```',
+        '```json\n{"claims": ["invalid"]}\n```',
+    ),
+)
+def test_extract_sidecar_does_not_fall_back_before_invalid_terminal_content(
+    terminal: str,
+) -> None:
+    earlier = '```json\n{"claims": [{"path": "$.data.state", "value": 1}]}\n```'
+
+    assert runner_main._extract_sidecar(  # noqa: SLF001
+        f"{earlier}\n{terminal}"
+    ) == (None, False)
+
+
 def test_oracle_operators_cover_schema_vocabulary() -> None:
     document = {"data": {"tags": ["a", "b"], "state": "stale"}}
     assert grade.evaluate_assertion(
@@ -1783,6 +1819,120 @@ def test_unsafe_run_persists_only_structural_transcript_content(
     assert '"type": "commandExecution"' in persisted
 
 
+@pytest.mark.parametrize(
+    "failing_layer", ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
+)
+def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
+    failing_layer: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_path = SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json"
+    scenario = json.loads(scenario_path.read_text())
+    scenario["_path"] = scenario_path
+    secret = f"contentful-{failing_layer}-payload"
+    scenario["conversation"]["user"] = [secret]
+    command = "./bin/steam-agent --data-dir steam-agent-data --help"
+    event = {
+        "method": "item/completed",
+        "params": {
+            "item": {
+                "type": "commandExecution",
+                "command": command,
+                "status": "completed",
+                "exitCode": 0,
+                "aggregatedOutput": secret,
+            }
+        },
+    }
+
+    monkeypatch.setattr(runner_main, "materialize", lambda *args: None)
+    monkeypatch.setattr(runner_main, "_frozen_cli_launcher", lambda *args: None)
+    monkeypatch.setattr(codex_driver, "codex_version", lambda: "codex-cli test")
+    monkeypatch.setattr(
+        codex_driver,
+        "run_agent_conversation",
+        lambda **kwargs: [
+            codex_driver.AgentTranscript(
+                commands=[
+                    {
+                        "command": command,
+                        "exit_code": 0,
+                        "status": "completed",
+                        "output": secret,
+                    }
+                ],
+                agent_messages=[
+                    f'{secret}\n```json\n{{"claims": []}}\n```'
+                ],
+                events=[event, {"method": "reasoning", "content": secret}],
+                turn_status="completed",
+                effective_model="model-a",
+                effective_reasoning_effort="high",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "_grade_agent_turns",
+        lambda turns: {
+            "passed": failing_layer != "agent_turns",
+            "failed": [],
+        },
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "_grade_tool_policy",
+        lambda *args, **kwargs: {
+            "passed": failing_layer != "tool_policy",
+            "required": [],
+            "violations": [],
+            "unlisted_calls": [],
+            "steam_agent_calls": 1,
+        },
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "_grade_claims_by_turn",
+        lambda *args, **kwargs: {
+            "passed": failing_layer != "claims",
+            "failed": [{"value": secret}] if failing_layer == "claims" else [],
+        },
+    )
+    monkeypatch.setattr(
+        grade,
+        "grade_assertions",
+        lambda *args, **kwargs: {
+            "passed": failing_layer != "oracle",
+            "failed": [],
+        },
+    )
+    monkeypatch.setattr(
+        grade,
+        "grade_privacy",
+        lambda *args, **kwargs: {
+            "passed": failing_layer != "privacy",
+            "leaked_canaries": [],
+            "private_host_paths": [],
+            "personal_patterns": [],
+        },
+    )
+
+    runner_main.run_scenario(
+        scenario,
+        tmp_path / "run",
+        model="model-a",
+        effort="high",
+        timeout_seconds=1,
+    )
+
+    scenario_dir = tmp_path / "run" / scenario["id"]
+    persisted = (scenario_dir / "report.json").read_text() + (
+        scenario_dir / "transcript.jsonl"
+    ).read_text()
+    assert secret not in persisted
+    assert command not in persisted
+    assert "unsafe-trace-content" in persisted
+
+
 def _passing_runner_report() -> dict:
     return {
         "metrics": {
@@ -1842,3 +1992,88 @@ def test_main_unexpected_unsupported_fails_but_family_expected_skip_is_neutral(
 
     monkeypatch.setattr(runner_main, "run_scenario", run_family)
     assert runner_main.main(["--family", "m5"]) == 0
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    (codex_driver.CodexProtocolError, OSError, ValueError),
+)
+def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
+    error_type: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: object,
+) -> None:
+    canary = "exception-canary-value"
+    private_path = tmp_path / "private" / canary
+    scenarios = [
+        {"id": "m7-fails", "privacy_canaries": {"exception": canary}},
+        {"id": "m7-passes", "privacy_canaries": {}},
+    ]
+    attempted: list[str] = []
+
+    monkeypatch.setattr(runner_main, "ROOT", tmp_path)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: scenarios)
+
+    def run_family(scenario, *args, **kwargs):
+        del args, kwargs
+        attempted.append(scenario["id"])
+        if scenario["id"] == "m7-fails":
+            raise error_type(f"failure at {private_path}\nraw response body")
+        return _passing_runner_report()
+
+    monkeypatch.setattr(runner_main, "run_scenario", run_family)
+
+    assert runner_main.main(["--family", "m7"]) == 1
+    assert attempted == ["m7-fails", "m7-passes"]
+    error = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert str(private_path) not in error
+    assert canary not in error
+    assert "raw response body" not in error
+    assert "Traceback" not in error
+    assert f"FAIL ({error_type.__name__}; details omitted)" in error
+
+    [run_dir] = (tmp_path / "evals" / "results").iterdir()
+    summary_path = run_dir / "summary.json"
+    summary_text = summary_path.read_text()
+    assert str(private_path) not in summary_text
+    assert canary not in summary_text
+    assert "raw response body" not in summary_text
+    assert stat.S_IMODE(run_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(summary_path.stat().st_mode) == 0o600
+    summary = json.loads(summary_text)
+    assert summary[0]["scenario"] == "m7-fails"
+    assert summary[0]["passed"] is False
+    error_summary = summary[0]["error"]
+    assert error_summary["type"] == error_type.__name__
+    assert error_summary["redactions"] == {
+        "private_host_path": True,
+        "privacy_canary": True,
+    }
+    assert error_summary["content"]["omitted"] == "unsafe-trace-content"
+    assert len(error_summary["content"]["sha256"]) == 64
+    assert error_summary["content"]["length"] > 0
+    assert summary[1]["scenario"] == "m7-passes"
+    assert summary[1]["passed"] is True
+
+
+@pytest.mark.parametrize("error", (KeyboardInterrupt(), SystemExit(2)))
+def test_main_does_not_catch_process_control_exceptions(
+    error: BaseException, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner_main, "ROOT", tmp_path)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    monkeypatch.setattr(
+        runner_main,
+        "_load_scenarios",
+        lambda *args: [{"id": "m7-control", "privacy_canaries": {}}],
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "run_scenario",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error)):
+        runner_main.main(["--scenario", "m7-control"])

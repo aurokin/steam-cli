@@ -38,7 +38,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_ROOT = ROOT / "evals" / "scenarios"
 RESULTS_ROOT = ROOT / "evals" / "results"
 
-_CLAIMS_BLOCK = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+_TERMINAL_FENCED_BLOCK = re.compile(
+    r"```(?P<language>[^\s`\r\n]+)[ \t]*(?:\r?\n|[ \t]+)"
+    r"(?P<body>(?:(?!```)[\s\S])*?)```\s*\Z"
+)
 _PASS_LAYERS = ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
 _EXPECTED_UNSUPPORTED_AGENT_SCENARIOS = {"m5-c03", "m5-c04", "m5-c11"}
 _CONFIRMED_DATA_DELETE_SCENARIO = "m2-b03"
@@ -380,23 +383,29 @@ def _oracle_document(
 def _extract_sidecar(
     message: str | None,
 ) -> tuple[list[dict[str, Any]] | None, bool]:
-    """Return the final json block's claims and whether the agent declined."""
+    """Return claims only from a valid terminal JSON sidecar block."""
 
     if not message:
         return None, False
-    for block in reversed(_CLAIMS_BLOCK.findall(message)):
-        try:
-            payload = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        declined = payload.get("declined") is True
-        claims = payload.get("claims")
-        if isinstance(claims, list):
-            return claims, declined
-        if declined:
-            return None, True
+    match = _TERMINAL_FENCED_BLOCK.search(message)
+    if match is None or match.group("language").casefold() != "json":
+        return None, False
+    try:
+        payload = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return None, False
+    if not isinstance(payload, dict):
+        return None, False
+    declined = payload.get("declined") is True
+    if "claims" in payload:
+        claims = payload["claims"]
+        if not isinstance(claims, list) or not all(
+            isinstance(claim, dict) for claim in claims
+        ):
+            return None, False
+        return claims, declined
+    if declined:
+        return None, True
     return None, False
 
 
@@ -639,10 +648,20 @@ def run_scenario(
         scenario["privacy_canaries"],
         allow_identifier_patterns=allow_identifier_patterns,
     )
-    retain_transcript_content = (
-        agent_turns_metric["passed"]
-        and tool_policy_metric["passed"]
-        and privacy_metric["passed"]
+    oracle_metric = grade.grade_assertions(
+        scenario["deterministic_oracle"],
+        document=oracle_document,
+        turns=turns,
+    )
+    metrics = {
+        "agent_turns": agent_turns_metric,
+        "tool_policy": tool_policy_metric,
+        "oracle": oracle_metric,
+        "claims": claims_metric,
+        "privacy": privacy_metric,
+    }
+    retain_transcript_content = all(
+        metrics[layer]["passed"] for layer in _PASS_LAYERS
     )
 
     rendered_turns = [
@@ -689,17 +708,7 @@ def run_scenario(
             allow_data_delete=allow_data_delete,
         ),
         "turns": rendered_turns,
-        "metrics": {
-            "agent_turns": agent_turns_metric,
-            "tool_policy": tool_policy_metric,
-            "oracle": grade.grade_assertions(
-                scenario["deterministic_oracle"],
-                document=oracle_document,
-                turns=turns,
-            ),
-            "claims": claims_metric,
-            "privacy": privacy_metric,
-        },
+        "metrics": metrics,
         "operational": {
             "duration_seconds": (finished - started).total_seconds(),
             "command_executions": sum(len(turn["commands"]) for turn in turns),
@@ -816,6 +825,36 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 exit_code = 1
+            continue
+        except Exception as error:
+            sensitive_values = tuple(
+                scenario.get("privacy_canaries", {}).values()
+            )
+            error_text = _sanitize_text(str(error), sensitive_values)
+            error_type = type(error).__name__
+            print(
+                f"{scenario['id']}: FAIL ({error_type}; details omitted)",
+                file=sys.stderr,
+            )
+            summaries.append(
+                {
+                    "scenario": scenario["id"],
+                    "passed": False,
+                    "error": {
+                        "type": error_type,
+                        "content": _omitted_content(error_text),
+                        "redactions": {
+                            "private_host_path": (
+                                "<redacted-host-path>" in error_text
+                            ),
+                            "privacy_canary": (
+                                "<redacted-privacy-canary>" in error_text
+                            ),
+                        },
+                    },
+                }
+            )
+            exit_code = 1
             continue
         executed_count += 1
         metrics = report["metrics"]
