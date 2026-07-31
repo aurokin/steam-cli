@@ -14,6 +14,7 @@ access. Codex's macOS sandbox still permits host reads outside that root.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,10 @@ _APP_SERVER_ARGS = (
     "--disable",
     "apps",
 )
+_APP_SERVER_LOCALE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM")
+_SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
+_REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
+_VERSION_ERROR = "required codex app-server version is unavailable"
 
 
 @dataclass
@@ -69,11 +74,67 @@ class AgentTranscript:
         return json.dumps(self.events)
 
 
+@dataclass
+class _TurnCollectionState:
+    thread_id: str
+    turn_id: str
+    started: bool = False
+    started_items: dict[str, str] = field(default_factory=dict)
+    completed_items: set[str] = field(default_factory=set)
+
+    def matches_turn(self, params: dict[str, Any]) -> bool:
+        return (
+            params.get("threadId") == self.thread_id
+            and params.get("turnId") == self.turn_id
+        )
+
+    def start_item(self, params: dict[str, Any], item: dict[str, Any]) -> bool:
+        item_id = item.get("id")
+        item_type = item.get("type")
+        status = item.get("status")
+        if not (
+            self.started
+            and self.matches_turn(params)
+            and isinstance(item_id, str)
+            and item_id
+            and isinstance(item_type, str)
+            and item_id not in self.started_items
+            and item_id not in self.completed_items
+            and (status is None or status == "inProgress")
+            and (item_type != "commandExecution" or status == "inProgress")
+        ):
+            return False
+        self.started_items[item_id] = item_type
+        return True
+
+    def complete_item(self, params: dict[str, Any], item: dict[str, Any]) -> bool:
+        item_id = item.get("id")
+        item_type = item.get("type")
+        status = item.get("status")
+        if not (
+            self.started
+            and self.matches_turn(params)
+            and isinstance(item_id, str)
+            and isinstance(item_type, str)
+            and self.started_items.get(item_id) == item_type
+            and (status is None or status in _ITEM_TERMINAL_STATUSES)
+            and (
+                item_type != "commandExecution"
+                or status in _ITEM_TERMINAL_STATUSES
+            )
+        ):
+            return False
+        self.started_items.pop(item_id)
+        self.completed_items.add(item_id)
+        return True
+
+
 def codex_version() -> str:
-    result = subprocess.run(
-        ["codex", "--version"], capture_output=True, text=True, check=True
-    )
-    return result.stdout.strip()
+    executable = shutil.which(_APP_SERVER_ARGS[0])
+    if executable is None:
+        raise CodexProtocolError(_VERSION_ERROR)
+    _validate_codex_version(executable, environment=None)
+    return _REQUIRED_CODEX_VERSION
 
 
 def run_agent_conversation(
@@ -97,14 +158,13 @@ def run_agent_conversation(
         isolated_home = Path(home_name)
         isolated_home.chmod(0o700)
         _copy_auth_file(isolated_home)
-        child_environment = os.environ.copy()
-        child_environment["CODEX_HOME"] = str(isolated_home)
-        workspace_bin = str(Path(workspace) / "bin")
-        child_environment["PATH"] = os.pathsep.join(
-            (workspace_bin, child_environment.get("PATH", ""))
-        )
+        child_environment = _app_server_environment(isolated_home, Path(workspace))
+        app_server = shutil.which(_APP_SERVER_ARGS[0])
+        if app_server is None:
+            raise CodexProtocolError(_VERSION_ERROR)
+        _validate_codex_version(app_server, environment=child_environment)
         process = subprocess.Popen(
-            list(_APP_SERVER_ARGS),
+            _app_server_process_args(app_server, Path(workspace)),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -127,6 +187,66 @@ def run_agent_conversation(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
+
+
+def _app_server_environment(
+    isolated_home: Path, workspace: Path
+) -> dict[str, str]:
+    """Build a non-secret process environment independent of thread policy.
+
+    The App Server gets only authentication copied into its isolated
+    ``CODEX_HOME`` and the small non-secret set below. The executable is
+    resolved before launch, so its child PATH does not need a workspace entry.
+    """
+
+    environment = {
+        key: value
+        for key in _APP_SERVER_LOCALE_ENV_KEYS
+        if (value := os.environ.get(key)) is not None
+    }
+    environment.update(
+        {
+            "CODEX_HOME": str(isolated_home),
+            "HOME": str(workspace),
+            "TMPDIR": str(workspace),
+            "PATH": os.defpath,
+        }
+    )
+    return environment
+
+
+def _validate_codex_version(
+    executable: str, *, environment: dict[str, str] | None
+) -> None:
+    """Exact-gate the protocol implementation without retaining its output."""
+
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise CodexProtocolError(_VERSION_ERROR) from None
+    if result.returncode != 0 or result.stdout.strip() != _REQUIRED_CODEX_VERSION:
+        raise CodexProtocolError(_VERSION_ERROR)
+
+
+def _app_server_process_args(executable: str, workspace: Path) -> list[str]:
+    policy_overrides = (
+        'shell_environment_policy.inherit="core"',
+        "shell_environment_policy.include_only="
+        + json.dumps(list(_SHELL_ENV_INCLUDE_ONLY), separators=(",", ":")),
+        "shell_environment_policy.set.HOME=" + json.dumps(str(workspace)),
+        "shell_environment_policy.set.TMPDIR=" + json.dumps(str(workspace)),
+    )
+    args = [executable, *_APP_SERVER_ARGS[1:]]
+    for override in policy_overrides:
+        args.extend(("-c", override))
+    return args
 
 
 def _copy_auth_file(isolated_home: Path) -> None:
@@ -207,13 +327,15 @@ def _converse(
         }
         if effort is not None:
             turn_params["effort"] = effort
-        session.request(
+        turn_response = session.request(
             "turn/start",
             turn_params,
         )
+        turn_id = _validated_turn_id(turn_response)
         transcript = _collect_turn(
             session,
             thread_id,
+            turn_id,
             workspace=workspace,
             effective_model=effective_model,
             effective_reasoning_effort=effective_effort,
@@ -223,6 +345,20 @@ def _converse(
             effective_model = transcript.confirmed_model
             effective_effort = transcript.confirmed_reasoning_effort
     return transcripts
+
+
+def _validated_turn_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        raise CodexProtocolError("app-server returned an invalid turn boundary")
+    turn = response.get("turn")
+    turn_id = turn.get("id") if isinstance(turn, dict) else None
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or turn.get("status") != "inProgress"
+    ):
+        raise CodexProtocolError("app-server returned an invalid turn boundary")
+    return turn_id
 
 
 def _thread_start_params(
@@ -244,11 +380,6 @@ def _thread_start_params(
                 "network_access": False,
                 "exclude_tmpdir_env_var": True,
                 "exclude_slash_tmp": True,
-            },
-            "shell_environment_policy": {
-                "inherit": "core",
-                "include_only": ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM"],
-                "set": {"HOME": workspace, "TMPDIR": workspace},
             },
         },
         "developerInstructions": developer_instructions,
@@ -369,6 +500,9 @@ def _validate_external_tool_boundary(
             and features.get("apps") is False
             and features.get("plugins") is False
             and config.get("plugins") == {}
+            and _validate_shell_environment_policy(
+                config.get("shell_environment_policy"), workspace
+            )
         )
     mcp = session.request(
         "mcpServerStatus/list",
@@ -377,8 +511,23 @@ def _validate_external_tool_boundary(
     mcp_valid = mcp.get("data") == [] and mcp.get("nextCursor") is None
     if not config_valid or not mcp_valid:
         raise CodexProtocolError(
-            "app-server retained an external tool source; refusing to start a turn"
+            "app-server retained an external tool source or process policy; "
+            "refusing to start a turn"
         )
+
+
+def _validate_shell_environment_policy(policy: Any, workspace: str) -> bool:
+    if not isinstance(policy, dict):
+        return False
+    return policy == {
+        "inherit": "core",
+        "ignore_default_excludes": None,
+        "exclude": None,
+        "include_only": list(_SHELL_ENV_INCLUDE_ONLY),
+        "set": {"HOME": workspace, "TMPDIR": workspace},
+        "experimental_use_profile": None,
+        "filters": None,
+    }
 
 
 _INFORMATIONAL_ITEM_TYPES = {
@@ -391,11 +540,138 @@ _INFORMATIONAL_ITEM_TYPES = {
     "reasoning",
     "userMessage",
 }
+_DISALLOWED_ITEM_TYPES = {
+    "collabAgentToolCall",
+    "dynamicToolCall",
+    "fileChange",
+    "imageGeneration",
+    "imageView",
+    "mcpToolCall",
+    "sleep",
+    "subAgentActivity",
+    "webSearch",
+}
+_GLOBAL_NOTIFICATION_METHODS = {"account/rateLimits/updated"}
+_ITEM_SCOPED_NOTIFICATION_METHODS = {
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/plan/delta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+}
+_TURN_SCOPED_NOTIFICATION_METHODS = {
+    "model/safetyBuffering/updated",
+    "model/verification",
+    "thread/compacted",
+    "thread/tokenUsage/updated",
+    "turn/moderationMetadata",
+    "turn/plan/updated",
+}
+_THREAD_SCOPED_NOTIFICATION_METHODS = {"thread/status/changed"}
+_ITEM_STATUSES = {"completed", "declined", "failed", "inProgress"}
+_ITEM_TERMINAL_STATUSES = {"completed", "declined", "failed"}
+_TURN_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
+_SERVER_REQUEST_RESULTS: dict[str, tuple[str, dict[str, Any]]] = {
+    "item/commandExecution/requestApproval": (
+        "commandApproval",
+        {"decision": "decline"},
+    ),
+    "item/fileChange/requestApproval": ("fileApproval", {"decision": "decline"}),
+    "item/tool/requestUserInput": ("userInput", {"answers": {}}),
+    "mcpServer/elicitation/request": ("mcpElicitation", {"action": "decline"}),
+    "item/permissions/requestApproval": ("permissions", {"permissions": {}}),
+    "item/tool/call": (
+        "dynamicTool",
+        {"contentItems": [], "success": False},
+    ),
+    "applyPatchApproval": (
+        "legacyApproval",
+        {"decision": {"denied": {"rejection": "denied by eval harness"}}},
+    ),
+    "execCommandApproval": (
+        "legacyApproval",
+        {"decision": {"denied": {"rejection": "denied by eval harness"}}},
+    ),
+}
+_UNFULFILLABLE_SERVER_REQUEST_METHODS = {
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate",
+    "currentTime/read",
+}
+
+
+@dataclass(frozen=True)
+class _MalformedWireEvidence:
+    content: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DeniedServerRequestEvidence:
+    content: dict[str, Any]
+    request_kind: str
+    thread_id: Any
+    turn_id: Any
+    item_reference: Any
+    ordering_valid: bool
+
+
+@dataclass(frozen=True)
+class _ServerRequestResolutionEvidence:
+    content: dict[str, Any]
+    thread_id: Any
+    ordering_valid: bool
+
+
+def _wire_fingerprint(message: Any) -> dict[str, Any]:
+    rendered = json.dumps(
+        message, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return {
+        "sha256": hashlib.sha256(rendered).hexdigest(),
+        "byte_length": len(rendered),
+    }
+
+
+def _item_event(method: str, item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"method": method, "item": {"type": "<unrecognized>"}}
+    item_type = item.get("type")
+    known_types = _INFORMATIONAL_ITEM_TYPES | _DISALLOWED_ITEM_TYPES | {
+        "commandExecution"
+    }
+    structural_type = item_type if item_type in known_types else "<unrecognized>"
+    event: dict[str, Any] = {"method": method, "item": {"type": structural_type}}
+    status = item.get("status")
+    if status in _ITEM_STATUSES:
+        event["item"]["status"] = status
+    return event
+
+
+def _item_violation_type(item_type: Any) -> str:
+    if item_type in _DISALLOWED_ITEM_TYPES:
+        return item_type
+    return "unrecognizedItem"
+
+
+def _record_invalid_notification(
+    transcript: AgentTranscript,
+    method: str,
+    message: dict[str, Any],
+    reason: str,
+) -> None:
+    transcript.events.append(
+        {"method": method, "valid": False, "content": _wire_fingerprint(message)}
+    )
+    transcript.activity_violations.append(
+        {"item_type": "protocolNotification", "reason": reason}
+    )
 
 
 def _collect_turn(
     session: _Session,
     thread_id: str,
+    turn_id: str,
     *,
     workspace: str,
     effective_model: str | None,
@@ -405,43 +681,173 @@ def _collect_turn(
         effective_model=effective_model,
         effective_reasoning_effort=effective_reasoning_effort,
     )
-    pending_commands: set[str] = set()
+    state = _TurnCollectionState(thread_id=thread_id, turn_id=turn_id)
     while True:
         message = session.read_message()
-        if "method" in message and "id" in message:
-            session.deny(message)
-            transcript.events.append(message)
+        if isinstance(message, _MalformedWireEvidence):
+            transcript.events.append(
+                {
+                    "method": "<unrecognized-wire-message>",
+                    "content": message.content,
+                }
+            )
             transcript.activity_violations.append(
                 {
-                    "item_type": f"serverRequest:{message['method']}",
+                    "item_type": "unrecognizedMessage",
+                    "reason": "malformed_wire_message_activity",
+                }
+            )
+            continue
+        if isinstance(message, _DeniedServerRequestEvidence):
+            scope_valid = (
+                message.ordering_valid
+                and (message.thread_id is None or message.thread_id == thread_id)
+                and (message.turn_id is None or message.turn_id == turn_id)
+            )
+            item_request_kinds = {
+                "commandApproval",
+                "dynamicTool",
+                "fileApproval",
+                "permissions",
+                "userInput",
+            }
+            if message.request_kind in item_request_kinds:
+                scope_valid = (
+                    scope_valid and message.item_reference in state.started_items
+                )
+            transcript.events.append(
+                {
+                    "method": "<server-request>",
+                    "denied": True,
+                    "scope_valid": scope_valid,
+                    "content": message.content,
+                }
+            )
+            transcript.activity_violations.append(
+                {
+                    "item_type": "serverRequest",
+                    "reason": "disallowed_server_request_activity",
+                }
+            )
+            if not scope_valid:
+                transcript.activity_violations.append(
+                    {
+                        "item_type": "serverRequest",
+                        "reason": "invalid_server_request_order_or_scope",
+                    }
+                )
+            continue
+        if isinstance(message, _ServerRequestResolutionEvidence):
+            valid = message.ordering_valid and message.thread_id == thread_id
+            transcript.events.append(
+                {"method": "serverRequest/resolved", "valid": valid}
+            )
+            if not valid:
+                transcript.activity_violations.append(
+                    {
+                        "item_type": "serverRequestResolution",
+                        "reason": "invalid_server_request_resolution_order_or_scope",
+                    }
+                )
+            continue
+        if not isinstance(message, dict):
+            transcript.events.append({"method": "<unrecognized-wire-message>"})
+            transcript.activity_violations.append(
+                {
+                    "item_type": "unrecognizedMessage",
+                    "reason": "malformed_wire_message_activity",
+                }
+            )
+            continue
+        method = message.get("method")
+        if "method" in message and "id" in message:
+            transcript.events.append(
+                {
+                    "method": "<server-request>",
+                    "content": _wire_fingerprint(message),
+                }
+            )
+            transcript.activity_violations.append(
+                {
+                    "item_type": "serverRequest",
                     "reason": "disallowed_server_request_activity",
                 }
             )
             continue
         if "method" not in message:
+            transcript.events.append(
+                {
+                    "method": "<unrecognized-wire-message>",
+                    "content": _wire_fingerprint(message),
+                }
+            )
+            transcript.activity_violations.append(
+                {
+                    "item_type": "unrecognizedMessage",
+                    "reason": "unrecognized_wire_message_activity",
+                }
+            )
             continue
-        transcript.events.append(message)
-        method = message["method"]
-        params = message.get("params", {})
-        if method == "item/started":
-            item = params.get("item", {})
+        raw_params = message.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        if method == "turn/started":
+            raw_turn = params.get("turn")
+            turn = raw_turn if isinstance(raw_turn, dict) else {}
+            valid = (
+                not state.started
+                and params.get("threadId") == thread_id
+                and turn.get("id") == turn_id
+                and turn.get("status") == "inProgress"
+            )
+            if not valid:
+                _record_invalid_notification(
+                    transcript,
+                    "turn/started",
+                    message,
+                    "invalid_turn_started_order_or_scope",
+                )
+                continue
+            state.started = True
+            transcript.events.append({"method": "turn/started", "valid": True})
+        elif method == "item/started":
+            raw_item = params.get("item")
+            item = raw_item if isinstance(raw_item, dict) else {}
             item_type = item.get("type")
-            if item_type == "commandExecution":
-                pending_commands.add(str(item.get("id", "<missing>")))
-            elif item_type not in _INFORMATIONAL_ITEM_TYPES:
+            valid = state.start_item(params, item)
+            if not valid:
+                _record_invalid_notification(
+                    transcript,
+                    "item/started",
+                    message,
+                    "invalid_item_started_order_or_scope",
+                )
+                continue
+            transcript.events.append(_item_event(method, item))
+            if (
+                item_type != "commandExecution"
+                and item_type not in _INFORMATIONAL_ITEM_TYPES
+            ):
                 transcript.activity_violations.append(
                     {
-                        "item_type": (
-                            item_type if isinstance(item_type, str) else "<missing>"
-                        ),
+                        "item_type": _item_violation_type(item_type),
                         "reason": "disallowed_started_item_activity",
                     }
                 )
         elif method == "item/completed":
-            item = params.get("item", {})
+            raw_item = params.get("item")
+            item = raw_item if isinstance(raw_item, dict) else {}
             item_type = item.get("type")
+            valid = state.complete_item(params, item)
+            if not valid:
+                _record_invalid_notification(
+                    transcript,
+                    "item/completed",
+                    message,
+                    "invalid_item_completion_order_or_scope",
+                )
+                continue
+            transcript.events.append(_item_event(method, item))
             if item_type == "commandExecution":
-                pending_commands.discard(str(item.get("id", "<missing>")))
                 transcript.commands.append(
                     {
                         "command": item.get("command", ""),
@@ -455,9 +861,7 @@ def _collect_turn(
             elif item_type not in _INFORMATIONAL_ITEM_TYPES:
                 transcript.activity_violations.append(
                     {
-                        "item_type": (
-                            item_type if isinstance(item_type, str) else "<missing>"
-                        ),
+                        "item_type": _item_violation_type(item_type),
                         "reason": "disallowed_completed_item_activity",
                     }
                 )
@@ -467,29 +871,175 @@ def _collect_turn(
         ):
             settings = params.get("threadSettings", {})
             _validate_settings_boundary(settings, workspace)
+            transcript.events.append(
+                {"method": "thread/settings/updated", "boundary_valid": True}
+            )
             transcript.effective_model = settings.get("model")
             transcript.effective_reasoning_effort = settings.get("effort")
             transcript.confirmed_model = settings.get("model")
             transcript.confirmed_reasoning_effort = settings.get("effort")
             transcript.thread_settings_confirmed = True
-        elif method == "model/rerouted" and params.get("threadId") == thread_id:
+        elif method == "thread/settings/updated":
+            _record_invalid_notification(
+                transcript,
+                "thread/settings/updated",
+                message,
+                "invalid_thread_settings_scope",
+            )
+        elif method == "model/rerouted" and state.matches_turn(params):
+            transcript.events.append({"method": "model/rerouted"})
             transcript.effective_model = params.get("toModel")
-        elif method == "turn/completed" and params.get("threadId") == thread_id:
+        elif method == "model/rerouted":
+            _record_invalid_notification(
+                transcript,
+                "model/rerouted",
+                message,
+                "invalid_model_reroute_scope",
+            )
+        elif method == "turn/completed":
+            raw_turn = params.get("turn")
+            turn = raw_turn if isinstance(raw_turn, dict) else {}
+            status = turn.get("status")
+            valid = (
+                state.started
+                and params.get("threadId") == thread_id
+                and turn.get("id") == turn_id
+                and status in _TURN_TERMINAL_STATUSES
+            )
+            if not valid:
+                _record_invalid_notification(
+                    transcript,
+                    "turn/completed",
+                    message,
+                    "invalid_turn_completion_order_or_scope",
+                )
+                continue
             transcript.activity_violations.extend(
                 {
-                    "item_type": "commandExecution",
-                    "reason": "incomplete_command_item_activity",
+                    "item_type": (
+                        item_type
+                        if item_type
+                        in _INFORMATIONAL_ITEM_TYPES
+                        | _DISALLOWED_ITEM_TYPES
+                        | {"commandExecution"}
+                        else "unrecognizedItem"
+                    ),
+                    "reason": "incomplete_item_activity",
                 }
-                for _item_id in sorted(pending_commands)
+                for _item_id, item_type in sorted(state.started_items.items())
             )
-            turn = params.get("turn", {})
-            transcript.turn_status = turn.get("status", "unknown")
+            transcript.turn_status = status
             transcript.turn_error = turn.get("error")
+            transcript.events.append(
+                {
+                    "method": "turn/completed",
+                    "status": transcript.turn_status,
+                    "has_error": transcript.turn_error is not None,
+                }
+            )
             return transcript
         elif method == "error":
             raise CodexProtocolError(
                 "app-server reported an error during turn collection"
             )
+        elif method == "remoteControl/status/changed":
+            transcript.events.append(
+                {"method": "remoteControl/status/changed", "disabled": True}
+                if isinstance(params, dict) and params.get("status") == "disabled"
+                else {
+                    "method": "remoteControl/status/changed",
+                    "disabled": False,
+                    "content": _wire_fingerprint(message),
+                }
+            )
+            if not isinstance(params, dict) or params.get("status") != "disabled":
+                transcript.activity_violations.append(
+                    {
+                        "item_type": "remoteControl",
+                        "reason": "enabled_remote_control_activity",
+                    }
+                )
+        elif method == "thread/started":
+            started_thread = params.get("thread") if isinstance(params, dict) else None
+            matches = (
+                isinstance(started_thread, dict)
+                and started_thread.get("id") == thread_id
+            )
+            transcript.events.append(
+                {"method": "thread/started", "thread_matches": matches}
+            )
+            if not matches:
+                transcript.activity_violations.append(
+                    {
+                        "item_type": "threadStarted",
+                        "reason": "unexpected_thread_started_activity",
+                    }
+                )
+        elif method in _ITEM_SCOPED_NOTIFICATION_METHODS:
+            item_id = params.get("itemId")
+            valid = (
+                state.started
+                and state.matches_turn(params)
+                and isinstance(item_id, str)
+                and item_id in state.started_items
+            )
+            if valid:
+                transcript.events.append({"method": method})
+            else:
+                _record_invalid_notification(
+                    transcript,
+                    method,
+                    message,
+                    "invalid_item_notification_order_or_scope",
+                )
+        elif method in _TURN_SCOPED_NOTIFICATION_METHODS:
+            if state.started and state.matches_turn(params):
+                transcript.events.append({"method": method})
+            else:
+                _record_invalid_notification(
+                    transcript,
+                    method,
+                    message,
+                    "invalid_turn_notification_order_or_scope",
+                )
+        elif method in _THREAD_SCOPED_NOTIFICATION_METHODS:
+            if params.get("threadId") == thread_id:
+                transcript.events.append({"method": method})
+            else:
+                _record_invalid_notification(
+                    transcript,
+                    method,
+                    message,
+                    "invalid_thread_notification_scope",
+                )
+        elif method in _GLOBAL_NOTIFICATION_METHODS:
+            transcript.events.append({"method": method})
+        elif method == "serverRequest/resolved":
+            _record_invalid_notification(
+                transcript,
+                "serverRequest/resolved",
+                message,
+                "unsanitized_server_request_resolution",
+            )
+        else:
+            transcript.events.append(
+                {
+                    "method": "<unrecognized-notification>",
+                    "content": _wire_fingerprint(message),
+                }
+            )
+            transcript.activity_violations.append(
+                {
+                    "item_type": "unrecognizedNotification",
+                    "reason": "unrecognized_notification_activity",
+                }
+            )
+
+
+def _request_id_key(value: Any) -> tuple[type[Any], Any] | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    return (type(value), value)
 
 
 class _Session:
@@ -498,7 +1048,8 @@ class _Session:
         self._stdout = stdout
         self._deadline = time.monotonic() + timeout_seconds
         self._next_id = 0
-        self._pending_notifications: list[dict[str, Any]] = []
+        self._pending_notifications: list[Any] = []
+        self._server_requests: dict[tuple[type[Any], Any], bool] = {}
         self._buffer = b""
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
@@ -511,32 +1062,103 @@ class _Session:
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         )
         while True:
-            message = self._read_line()
-            if message.get("id") == request_id and "method" not in message:
+            message = self._prepare_incoming(self._read_line())
+            if (
+                isinstance(message, dict)
+                and message.get("id") == request_id
+                and "method" not in message
+            ):
                 if "error" in message:
                     raise CodexProtocolError(f"app-server request {method} failed")
                 return message.get("result", {})
             self._pending_notifications.append(message)
 
-    def read_message(self) -> dict[str, Any]:
+    def read_message(self) -> Any:
         if self._pending_notifications:
             return self._pending_notifications.pop(0)
-        return self._read_line()
+        return self._prepare_incoming(self._read_line())
 
-    def deny(self, server_request: dict[str, Any]) -> None:
-        self._write(
-            {
-                "jsonrpc": "2.0",
-                "id": server_request["id"],
-                "result": {"decision": "denied"},
+    def _prepare_incoming(self, message: Any) -> Any:
+        if not isinstance(message, dict):
+            return _MalformedWireEvidence(content=_wire_fingerprint(message))
+        if "method" in message and "id" in message:
+            return self._deny_server_request(message)
+        if message.get("method") == "serverRequest/resolved":
+            return self._sanitize_server_request_resolution(message)
+        return message
+
+    def _deny_server_request(
+        self, message: dict[str, Any]
+    ) -> _DeniedServerRequestEvidence:
+        request_id = message.get("id")
+        request_key = _request_id_key(request_id)
+        method = message.get("method")
+        params = message.get("params")
+        request_kind = "unknown"
+        response: dict[str, Any]
+        if isinstance(method, str) and method in _SERVER_REQUEST_RESULTS:
+            request_kind, result = _SERVER_REQUEST_RESULTS[method]
+            response = {"result": result}
+        elif method in _UNFULFILLABLE_SERVER_REQUEST_METHODS:
+            request_kind = "unfulfillable"
+            response = {
+                "error": {
+                    "code": -32603,
+                    "message": "request unavailable in eval harness",
+                }
             }
+        else:
+            response = {
+                "error": {
+                    "code": -32601,
+                    "message": "request unavailable in eval harness",
+                }
+            }
+        wire_id = request_id if request_key is not None else None
+        self._write({"jsonrpc": "2.0", "id": wire_id, **response})
+
+        ordering_valid = request_key is not None and request_key not in self._server_requests
+        if ordering_valid:
+            self._server_requests[request_key] = False
+        scoped = params if isinstance(params, dict) else {}
+        item_reference = (
+            scoped.get("callId")
+            if request_kind == "dynamicTool"
+            else scoped.get("itemId")
+        )
+        return _DeniedServerRequestEvidence(
+            content=_wire_fingerprint(message),
+            request_kind=request_kind,
+            thread_id=scoped.get("threadId"),
+            turn_id=scoped.get("turnId"),
+            item_reference=item_reference,
+            ordering_valid=ordering_valid,
+        )
+
+    def _sanitize_server_request_resolution(
+        self, message: dict[str, Any]
+    ) -> _ServerRequestResolutionEvidence:
+        raw_params = message.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        request_key = _request_id_key(params.get("requestId"))
+        ordering_valid = (
+            request_key is not None
+            and request_key in self._server_requests
+            and self._server_requests[request_key] is False
+        )
+        if ordering_valid:
+            self._server_requests[request_key] = True
+        return _ServerRequestResolutionEvidence(
+            content=_wire_fingerprint(message),
+            thread_id=params.get("threadId"),
+            ordering_valid=ordering_valid,
         )
 
     def _write(self, message: dict[str, Any]) -> None:
         self._stdin.write(json.dumps(message).encode() + b"\n")
         self._stdin.flush()
 
-    def _read_line(self) -> dict[str, Any]:
+    def _read_line(self) -> Any:
         # Raw fd reads with a private buffer: select() on the fd cannot see
         # lines already sitting in a buffered stream, so buffering is ours.
         while b"\n" not in self._buffer:

@@ -289,16 +289,19 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
                 completed_at=now,
                 disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
             )
-
-        write_owned_snapshot(
-            storage, account.id, [plan.appid for plan in plans if plan.owned], now
-        )
-        write_installed(
-            storage,
-            machine_key,
-            [(plan.appid, 1_000_000_000, "1") for plan in plans if plan.installed],
-            now,
-        )
+            write_owned_snapshot(
+                storage, account.id, [plan.appid for plan in plans if plan.owned], now
+            )
+            write_installed(
+                storage,
+                machine_key,
+                [
+                    (plan.appid, 1_000_000_000, "1")
+                    for plan in plans
+                    if plan.installed
+                ],
+                now,
+            )
         _write_declared(
             storage,
             account_id=account.id,

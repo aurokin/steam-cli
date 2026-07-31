@@ -830,7 +830,16 @@ def main(argv: list[str] | None = None) -> int:
             sensitive_values = tuple(
                 scenario.get("privacy_canaries", {}).values()
             )
-            error_text = _sanitize_text(str(error), sensitive_values)
+            raw_error_text = str(error)
+            redactions = {
+                "private_host_path": bool(
+                    grade.find_private_host_paths(raw_error_text)
+                ),
+                "privacy_canary": any(
+                    sensitive in raw_error_text for sensitive in sensitive_values
+                ),
+            }
+            error_text = _sanitize_text(raw_error_text, sensitive_values)
             error_type = type(error).__name__
             print(
                 f"{scenario['id']}: FAIL ({error_type}; details omitted)",
@@ -843,14 +852,7 @@ def main(argv: list[str] | None = None) -> int:
                     "error": {
                         "type": error_type,
                         "content": _omitted_content(error_text),
-                        "redactions": {
-                            "private_host_path": (
-                                "<redacted-host-path>" in error_text
-                            ),
-                            "privacy_canary": (
-                                "<redacted-privacy-canary>" in error_text
-                            ),
-                        },
+                        "redactions": redactions,
                     },
                 }
             )

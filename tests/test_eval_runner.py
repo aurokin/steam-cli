@@ -12,6 +12,7 @@ import copy
 from datetime import datetime
 import io
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -153,12 +154,33 @@ def test_m5_requested_without_evidence_keeps_system_profile_missing(
         ).read_text(encoding="utf-8")
     )
 
-    materialize(scenario, tmp_path)
+    workspace = tmp_path / "workspace"
+    data_dir = workspace / "steam-agent-data"
+    runner_main._ensure_private_dir(workspace)  # noqa: SLF001
+    runner_main._ensure_private_dir(data_dir)  # noqa: SLF001
+    materialize(scenario, data_dir)
 
-    with storage_module.Storage(tmp_path / "steam-agent.sqlite3") as storage:
-        snapshot = storage.read_system_profile_snapshot("synthetic-machine")
-    assert snapshot["profile"] is None
-    assert snapshot["latest"] is None
+    with storage_module.Storage(data_dir / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("synthetic")
+        assert account is not None
+        profile = storage.read_system_profile_snapshot("synthetic-machine")
+        owned = storage.read_owned_snapshot(account.id)
+        installed = storage.read_installed_snapshot("synthetic-machine")
+    assert profile["profile"] is None
+    assert profile["latest"] is None
+    assert owned.latest is None
+    assert owned.latest_complete is None
+    assert installed.latest is None
+    assert installed.latest_complete is None
+
+    launcher = runner_main._frozen_cli_launcher(  # noqa: SLF001
+        workspace, scenario["frozen_time"]
+    )
+    document = runner_main._oracle_document(  # noqa: SLF001
+        data_dir, scenario["tool_policy"]["required"][0], launcher
+    )
+    assert document["data"]["results"][0]["compatibility"] == "unknown"
+    assert document["data"]["results"][0]["playable_now"] == "unknown"
 
 
 def _scenario_02_assertion_errors(assertion: dict[str, object]) -> list[object]:
@@ -192,6 +214,12 @@ def _scenario_02_assertion_errors(assertion: dict[str, object]) -> list[object]:
             "expected": {},
             "source": "cli_document",
         },
+        {
+            "path": "$.data.state",
+            "operator": "one_of",
+            "expected": "fresh",
+        },
+        {"path": "$.data.state", "operator": "one_of", "expected": []},
     ),
 )
 def test_schema_02_rejects_assertions_the_grader_cannot_execute(
@@ -205,6 +233,15 @@ def test_schema_02_omitted_assertion_source_defaults_to_cli_document() -> None:
         "path": "$.data.state",
         "operator": "equals",
         "expected": "fresh",
+    }
+    assert not _scenario_02_assertion_errors(assertion)
+
+
+def test_schema_02_one_of_accepts_nonempty_array() -> None:
+    assertion = {
+        "path": "$.data.state",
+        "operator": "one_of",
+        "expected": ["fresh", "stale"],
     }
     assert not _scenario_02_assertion_errors(assertion)
 
@@ -231,6 +268,64 @@ def test_frozen_launcher_reproduces_time_sensitive_oracle(tmp_path: Path) -> Non
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
     assert stat.S_IMODE(launcher.stat().st_mode) == 0o700
     assert launcher.read_text().splitlines()[0] == f"#!{sys.executable}"
+
+
+def test_frozen_launcher_applies_scenario_clock_to_storage_retention(
+    tmp_path: Path,
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m5" / "m5-c01-compatible-machine.json").read_text()
+    )
+    scenario["frozen_time"] = "2020-01-15T12:00:00Z"
+    workspace = tmp_path / "workspace"
+    data_dir = workspace / "steam-agent-data"
+    runner_main._ensure_private_dir(workspace)  # noqa: SLF001
+    runner_main._ensure_private_dir(data_dir)  # noqa: SLF001
+    materialize(scenario, data_dir)
+    with storage_module.Storage(data_dir / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("synthetic")
+        assert account is not None
+        consent = storage.get_compatibility_data_consent(account.id)
+        assert consent is not None
+        storage.begin_declared_app_sync(
+            account_id=account.id,
+            machine_id="synthetic-machine",
+            demanded_appids=[5999],
+            country="US",
+            language="english",
+            max_items=1,
+            skip_fresh_terminal=False,
+            started_at=materialization_now(scenario),
+            disclosure_version=consent.disclosure_version,
+            explicit_appids=[5999],
+        )
+
+    launcher = runner_main._frozen_cli_launcher(  # noqa: SLF001
+        workspace, scenario["frozen_time"]
+    )
+    document = runner_main._oracle_document(  # noqa: SLF001
+        data_dir,
+        {
+            "command": "steam-agent discovery query",
+            "arguments": [
+                "--scope",
+                "known",
+                "--limit",
+                "10",
+                "--account",
+                "synthetic",
+                "--machine",
+                "synthetic-machine",
+                "--country",
+                "US",
+                "--language",
+                "english",
+            ],
+        },
+        launcher,
+    )
+
+    assert [item["appid"] for item in document["data"]["items"]] == [5101, 5999]
 
 
 def test_m7_move_fixture_materializes_two_bounded_library_roots(
@@ -264,7 +359,7 @@ POLICY = {
 def test_tool_policy_passes_required_call_including_shell_wrapper() -> None:
     result = grade.grade_tool_policy(
         [
-            "bash -lc 'steam-agent --data-dir /tmp/w/data "
+            "/bin/bash -lc 'steam-agent --data-dir /tmp/w/data "
             "operations observe --machine synthetic-machine'"
         ],
         POLICY,
@@ -762,7 +857,7 @@ def _captured_result(
 
 def test_required_document_comes_from_one_captured_successful_command() -> None:
     command = (
-        "bash -lc './bin/steam-agent --data-dir steam-agent-data operations observe "
+        "/bin/bash -lc './bin/steam-agent --data-dir steam-agent-data operations observe "
         "--machine synthetic-machine'"
     )
     turns = [
@@ -1040,6 +1135,20 @@ def test_artifact_sanitizer_drops_host_paths_and_unrelated_command_output() -> N
     assert sanitized["params"]["item"]["aggregatedOutput"] == '{"data": {}}'
 
 
+def test_unknown_notification_unsafe_artifact_omits_raw_payload() -> None:
+    event = {
+        "method": "config/value/write",
+        "params": {"private_payload": "must-not-be-persisted"},
+    }
+
+    structural = runner_main._structural_transcript_event(event)  # noqa: SLF001
+    rendered = json.dumps(structural)
+
+    assert structural["method"] == "config/value/write"
+    assert structural["content"]["omitted"] == "unsafe-trace-content"
+    assert "must-not-be-persisted" not in rendered
+
+
 def _thread_boundary_response(workspace: str) -> dict:
     return {
         "thread": {
@@ -1079,6 +1188,79 @@ def _thread_boundary_settings(workspace: str) -> dict:
     }
 
 
+def _resolved_app_server_config(workspace: str) -> dict:
+    return {
+        "web_search": "disabled",
+        "apps": {
+            "_default": {
+                "enabled": False,
+                "destructive_enabled": False,
+                "open_world_enabled": False,
+            }
+        },
+        "features": {"apps": False, "plugins": False},
+        "plugins": {},
+        "shell_environment_policy": {
+            "inherit": "core",
+            "ignore_default_excludes": None,
+            "exclude": None,
+            "include_only": ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM"],
+            "set": {"HOME": workspace, "TMPDIR": workspace},
+            "experimental_use_profile": None,
+            "filters": None,
+        },
+    }
+
+
+def _turn_started_notification(
+    thread_id: str = "thread-1", turn_id: str = "turn-1"
+) -> dict:
+    return {
+        "method": "turn/started",
+        "params": {
+            "threadId": thread_id,
+            "turn": {"id": turn_id, "status": "inProgress"},
+        },
+    }
+
+
+def _turn_completed_notification(
+    thread_id: str = "thread-1",
+    turn_id: str = "turn-1",
+    status: str = "completed",
+) -> dict:
+    return {
+        "method": "turn/completed",
+        "params": {
+            "threadId": thread_id,
+            "turn": {"id": turn_id, "status": status, "error": None},
+        },
+    }
+
+
+def _item_notification(
+    method: str,
+    item_id: str,
+    item_type: str,
+    *,
+    thread_id: str = "thread-1",
+    turn_id: str = "turn-1",
+    **item_fields,
+) -> dict:
+    if item_type == "commandExecution" and "status" not in item_fields:
+        item_fields["status"] = (
+            "inProgress" if method == "item/started" else "completed"
+        )
+    return {
+        "method": method,
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "item": {"id": item_id, "type": item_type, **item_fields},
+        },
+    }
+
+
 def test_codex_driver_copies_only_auth_into_private_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1107,6 +1289,25 @@ def test_codex_driver_uses_and_removes_isolated_home(
     (source / "auth.json").write_text('{"token":"synthetic"}')
     (source / "config.toml").write_text("must_not_be_copied = true")
     monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-inherited")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-be-inherited")
+    for key in codex_driver._APP_SERVER_LOCALE_ENV_KEYS:  # noqa: SLF001
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LANG", "synthetic-locale")
+    monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
+    def fake_run(args, **kwargs):
+        observed["version_args"] = args
+        observed["version_env"] = kwargs["env"]
+        return type(
+            "VersionResult",
+            (),
+            {
+                "returncode": 0,
+                "stdout": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+            },
+        )()
+
+    monkeypatch.setattr(codex_driver.subprocess, "run", fake_run)
     observed: dict[str, object] = {}
 
     class FakeProcess:
@@ -1121,11 +1322,19 @@ def test_codex_driver_uses_and_removes_isolated_home(
             return 0
 
     def fake_popen(args, **kwargs):
-        isolated_home = Path(kwargs["env"]["CODEX_HOME"])
+        environment = kwargs["env"]
+        isolated_home = Path(environment["CODEX_HOME"])
         observed["home"] = isolated_home
         observed["args"] = args
         assert isolated_home != source
         assert {path.name for path in isolated_home.iterdir()} == {"auth.json"}
+        assert environment == {
+            "CODEX_HOME": str(isolated_home),
+            "HOME": str(workspace),
+            "TMPDIR": str(workspace),
+            "PATH": os.defpath,
+            "LANG": "synthetic-locale",
+        }
         return FakeProcess()
 
     def fake_converse(process, **kwargs):
@@ -1144,9 +1353,70 @@ def test_codex_driver_uses_and_removes_isolated_home(
         )
         == []
     )
-    assert observed["args"] == list(codex_driver._APP_SERVER_ARGS)  # noqa: SLF001
+    assert observed["args"] == codex_driver._app_server_process_args(  # noqa: SLF001
+        "/trusted/codex", workspace
+    )
+    assert observed["version_args"] == ["/trusted/codex", "--version"]
+    assert observed["version_env"] == {
+        "CODEX_HOME": str(observed["home"]),
+        "HOME": str(workspace),
+        "TMPDIR": str(workspace),
+        "PATH": os.defpath,
+        "LANG": "synthetic-locale",
+    }
+    process_args = observed["args"]
+    assert (
+        'shell_environment_policy.inherit="core"' in process_args
+        and 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","LC_CTYPE","TERM"]'
+        in process_args
+        and f"shell_environment_policy.set.HOME={json.dumps(str(workspace))}"
+        in process_args
+        and f"shell_environment_policy.set.TMPDIR={json.dumps(str(workspace))}"
+        in process_args
+    )
     assert observed["terminated"] is True
     assert not Path(observed["home"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (0, "codex-cli 0.146.1"),
+        (0, "codex-cli 0.145.0"),
+        (1, "private-upgrade-output"),
+    ],
+)
+def test_codex_driver_exact_version_gate_is_generic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
+    monkeypatch.setattr(
+        codex_driver.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "VersionResult", (), {"returncode": returncode, "stdout": stdout}
+        )(),
+    )
+    monkeypatch.setattr(
+        codex_driver.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("version mismatch must precede launch"),
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver.run_agent_conversation(
+            prompts=["synthetic"],
+            workspace=str(workspace),
+            developer_instructions="synthetic",
+        )
+
+    assert str(captured.value) == "required codex app-server version is unavailable"
+    assert stdout not in str(captured.value)
 
 
 @pytest.mark.parametrize(
@@ -1233,6 +1503,54 @@ def test_codex_driver_external_tool_preflight_fails_without_logging_values(
     assert "private-plugin-name" not in str(captured.value)
 
 
+def test_codex_driver_external_tool_preflight_attests_resolved_process_policy() -> None:
+    workspace = "/synthetic/workspace"
+
+    class FakeSession:
+        def request(self, method, params):
+            if method == "config/read":
+                assert params == {"cwd": workspace, "includeLayers": False}
+                return {"config": _resolved_app_server_config(workspace)}
+            assert method == "mcpServerStatus/list"
+            return {"data": [], "nextCursor": None}
+
+    codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+        FakeSession(), "thread-1", workspace
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "bad_value"),
+    [
+        (("inherit",), "all"),
+        (("include_only",), ["PATH"]),
+        (("set", "HOME"), "/other"),
+        (("ignore_default_excludes",), False),
+    ],
+)
+def test_codex_driver_rejects_resolved_process_policy_mismatch(
+    path: tuple[str, ...], bad_value: object
+) -> None:
+    workspace = "/synthetic/workspace"
+    config = _resolved_app_server_config(workspace)
+    target = config["shell_environment_policy"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = bad_value
+
+    class FakeSession:
+        def request(self, method, params):
+            del params
+            if method == "config/read":
+                return {"config": config}
+            return {"data": [], "nextCursor": None}
+
+    with pytest.raises(codex_driver.CodexProtocolError, match="process policy"):
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            FakeSession(), "thread-1", workspace
+        )
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -1294,6 +1612,7 @@ def test_codex_driver_protocol_errors_do_not_include_server_payloads(
         codex_driver._collect_turn(  # noqa: SLF001
             ErrorSession(),
             "thread-1",
+            "turn-1",
             workspace="/synthetic/workspace",
             effective_model="model-a",
             effective_reasoning_effort="medium",
@@ -1339,77 +1658,70 @@ def test_codex_driver_rejects_changed_boundary_fields(
 def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
     class FakeSession:
         def __init__(self) -> None:
-            self.messages = [
-                *(
-                    {
-                        "method": "item/completed",
-                        "params": {"item": {"type": item_type, "text": "info"}},
-                    }
-                    for item_type in (
-                        "agentMessage",
-                        "reasoning",
-                        "plan",
-                        "contextCompaction",
+            informational = (
+                "agentMessage",
+                "reasoning",
+                "plan",
+                "contextCompaction",
+            )
+            disallowed = (
+                "fileChange",
+                "mcpToolCall",
+                "dynamicToolCall",
+                "webSearch",
+                "collabAgentToolCall",
+                "subAgentActivity",
+                "imageView",
+                "sleep",
+                "futureToolCall",
+            )
+            self.messages = [_turn_started_notification()]
+            for index, item_type in enumerate((*informational, *disallowed)):
+                item_id = f"item-{index}"
+                self.messages.extend(
+                    (
+                        _item_notification("item/started", item_id, item_type),
+                        _item_notification(
+                            "item/completed",
+                            item_id,
+                            item_type,
+                            text="info" if item_type == "agentMessage" else "opaque",
+                        ),
                     )
-                ),
-                *(
-                    {
-                        "method": "item/completed",
-                        "params": {"item": {"type": item_type}},
-                    }
-                    for item_type in (
-                        "fileChange",
-                        "mcpToolCall",
-                        "dynamicToolCall",
-                        "webSearch",
-                        "collabAgentToolCall",
-                        "subAgentActivity",
-                        "imageView",
-                        "sleep",
-                        "futureToolCall",
-                    )
-                ),
-                {
-                    "method": "item/completed",
-                    "params": {
-                        "item": {
-                            "type": "commandExecution",
-                            "command": "steam-agent --help",
-                            "exitCode": 0,
-                            "status": "completed",
-                            "aggregatedOutput": "help",
-                        }
-                    },
-                },
-                {
-                    "method": "item/started",
-                    "params": {
-                        "item": {"id": "unfinished", "type": "commandExecution"}
-                    },
-                },
+                )
+            self.messages.extend(
+                [
+                    _item_notification(
+                        "item/started", "command", "commandExecution"
+                    ),
+                    _item_notification(
+                        "item/completed",
+                        "command",
+                        "commandExecution",
+                        command="steam-agent --help",
+                        exitCode=0,
+                        status="completed",
+                        aggregatedOutput="help",
+                    ),
+                    _item_notification(
+                        "item/started", "unfinished", "commandExecution"
+                    ),
                 {
                     "id": 99,
                     "method": "item/commandExecution/requestApproval",
                     "params": {"command": "opaque"},
                 },
-                {
-                    "method": "turn/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turn": {"status": "completed", "error": None},
-                    },
-                },
-            ]
+                    _turn_completed_notification(),
+                ]
+            )
 
         def read_message(self):
             return self.messages.pop(0)
 
-        def deny(self, message) -> None:
-            del message
-
     transcript = codex_driver._collect_turn(  # noqa: SLF001
         FakeSession(),
         "thread-1",
+        "turn-1",
         workspace="/synthetic/workspace",
         effective_model="model-a",
         effective_reasoning_effort="medium",
@@ -1417,7 +1729,7 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
 
     assert transcript.agent_messages == ["info"]
     assert transcript.commands[0]["command"] == "steam-agent --help"
-    assert [item["item_type"] for item in transcript.activity_violations] == [
+    disallowed_types = [
         "fileChange",
         "mcpToolCall",
         "dynamicToolCall",
@@ -1426,14 +1738,662 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
         "subAgentActivity",
         "imageView",
         "sleep",
-        "futureToolCall",
-        "serverRequest:item/commandExecution/requestApproval",
+        "unrecognizedItem",
+    ]
+    assert [item["item_type"] for item in transcript.activity_violations] == [
+        item_type for item_type in disallowed_types for _phase in range(2)
+    ] + [
+        "serverRequest",
         "commandExecution",
     ]
-    assert transcript.activity_violations[-1]["reason"] == (
-        "incomplete_command_item_activity"
+    assert transcript.activity_violations[-1]["reason"] == "incomplete_item_activity"
+    assert len(transcript.events) == 32
+    rendered_events = json.dumps(transcript.events)
+    assert "futureToolCall" not in rendered_events
+    assert "item/commandExecution/requestApproval" not in rendered_events
+    assert "opaque" not in rendered_events
+
+
+def test_codex_driver_allows_known_benign_notifications() -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = [_turn_started_notification()]
+            self.messages.append(
+                _item_notification("item/started", "reasoning", "reasoning")
+            )
+            self.messages.extend(
+                (
+                    {
+                        "method": method,
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "itemId": "reasoning",
+                            "content": "opaque",
+                        },
+                    }
+                    for method in sorted(
+                        codex_driver._ITEM_SCOPED_NOTIFICATION_METHODS  # noqa: SLF001
+                    )
+                )
+            )
+            self.messages.extend(
+                {
+                    "method": method,
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "content": "opaque",
+                    },
+                }
+                for method in sorted(
+                    codex_driver._TURN_SCOPED_NOTIFICATION_METHODS  # noqa: SLF001
+                )
+            )
+            self.messages.extend(
+                {
+                    "method": method,
+                    "params": {"threadId": "thread-1", "content": "opaque"},
+                }
+                for method in sorted(
+                    codex_driver._THREAD_SCOPED_NOTIFICATION_METHODS  # noqa: SLF001
+                )
+            )
+            self.messages.extend(
+                {
+                    "method": method,
+                    "params": {"content": "opaque"},
+                }
+                for method in sorted(
+                    codex_driver._GLOBAL_NOTIFICATION_METHODS  # noqa: SLF001
+                )
+            )
+            self.messages.extend(
+                (
+                    _item_notification(
+                        "item/completed", "reasoning", "reasoning"
+                    ),
+                    _turn_completed_notification(),
+                )
+            )
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    transcript = codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
     )
-    assert len(transcript.events) == 17
+
+    assert transcript.activity_violations == []
+    assert transcript.turn_status == "completed"
+    assert "opaque" not in json.dumps(transcript.events)
+
+
+def test_codex_driver_validates_queued_pre_turn_notifications() -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = [
+                {
+                    "method": "remoteControl/status/changed",
+                    "params": {
+                        "status": "disabled",
+                        "installationId": "private-installation",
+                        "serverName": "private-server",
+                    },
+                },
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "thread-1",
+                            "cwd": "/private/raw-thread-payload",
+                        }
+                    },
+                },
+                _turn_started_notification(),
+                _turn_completed_notification(),
+            ]
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    transcript = codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
+    )
+
+    assert transcript.activity_violations == []
+    assert transcript.events[:2] == [
+        {"method": "remoteControl/status/changed", "disabled": True},
+        {"method": "thread/started", "thread_matches": True},
+    ]
+    rendered = json.dumps(transcript.events)
+    assert "private-installation" not in rendered
+    assert "private-server" not in rendered
+    assert "/private/raw-thread-payload" not in rendered
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "method": "remoteControl/status/changed",
+            "params": {"status": "connected", "private": "must-not-persist"},
+        },
+        {
+            "method": "thread/started",
+            "params": {
+                "thread": {"id": "other-thread", "private": "must-not-persist"}
+            },
+        },
+    ],
+)
+def test_codex_driver_rejects_invalid_pre_turn_notification_without_raw_payload(
+    message: dict,
+) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = [
+                message,
+                _turn_started_notification(),
+                _turn_completed_notification(),
+            ]
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    transcript = codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
+    )
+
+    assert len(transcript.activity_violations) == 1
+    assert "must-not-persist" not in json.dumps(transcript.events)
+
+
+def test_codex_driver_records_every_unrecognized_notification_structurally() -> None:
+    unknown_methods = ("item/tool/call", "config/value/write", "account/updated")
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = [
+                _turn_started_notification(),
+                *(
+                    {
+                        "method": method,
+                        "params": {"private_payload": "must-not-be-recorded"},
+                    }
+                    for method in unknown_methods
+                ),
+                _turn_completed_notification(),
+            ]
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    transcript = codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
+    )
+
+    assert transcript.activity_violations == [
+        {
+            "item_type": "unrecognizedNotification",
+            "reason": "unrecognized_notification_activity",
+        }
+    ] * len(unknown_methods)
+    rendered_violations = json.dumps(transcript.activity_violations)
+    assert "must-not-be-recorded" not in rendered_violations
+    assert all(method not in rendered_violations for method in unknown_methods)
+    rendered_events = json.dumps(transcript.events)
+    assert "must-not-be-recorded" not in rendered_events
+    assert all(method not in rendered_events for method in unknown_methods)
+    assert [event["method"] for event in transcript.events[1:-1]] == [
+        "<unrecognized-notification>"
+    ] * len(unknown_methods)
+
+
+def test_codex_driver_does_not_persist_raw_delta_content() -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = [
+                _turn_started_notification(),
+                _item_notification("item/started", "agent", "agentMessage"),
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "itemId": "agent",
+                        "delta": "private-streaming-content",
+                    },
+                },
+                _item_notification(
+                    "item/completed", "agent", "agentMessage", text="done"
+                ),
+                _turn_completed_notification(),
+            ]
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    transcript = codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
+    )
+
+    assert transcript.events[2] == {"method": "item/agentMessage/delta"}
+    assert "private-streaming-content" not in json.dumps(transcript.events)
+
+
+def _collect_messages(messages: list[object]) -> codex_driver.AgentTranscript:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.messages = messages.copy()
+
+        def read_message(self):
+            return self.messages.pop(0)
+
+    return codex_driver._collect_turn(  # noqa: SLF001
+        FakeSession(),
+        "thread-1",
+        "turn-1",
+        workspace="/synthetic/workspace",
+        effective_model="model-a",
+        effective_reasoning_effort="medium",
+    )
+
+
+def test_codex_driver_rejects_foreign_command_completion() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _item_notification(
+                "item/completed",
+                "command",
+                "commandExecution",
+                thread_id="foreign-thread",
+                command="private-foreign-command",
+                aggregatedOutput="private-foreign-output",
+                exitCode=0,
+                status="completed",
+            ),
+            _item_notification(
+                "item/completed",
+                "command",
+                "commandExecution",
+                command="./bin/steam-agent --help",
+                aggregatedOutput="safe-output",
+                exitCode=0,
+                status="completed",
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert [command["command"] for command in transcript.commands] == [
+        "./bin/steam-agent --help"
+    ]
+    assert any(
+        violation["reason"] == "invalid_item_completion_order_or_scope"
+        for violation in transcript.activity_violations
+    )
+    rendered = json.dumps(transcript.events)
+    assert "private-foreign-command" not in rendered
+    assert "private-foreign-output" not in rendered
+    assert "foreign-thread" not in rendered
+
+
+def test_codex_driver_rejects_stale_turn_completion() -> None:
+    stale = _turn_completed_notification(turn_id="stale-turn", status="failed")
+    stale["params"]["turn"]["error"] = {"message": "private-stale-error"}
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            stale,
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.turn_status == "completed"
+    assert transcript.activity_violations == [
+        {
+            "item_type": "protocolNotification",
+            "reason": "invalid_turn_completion_order_or_scope",
+        }
+    ]
+    assert "private-stale-error" not in json.dumps(transcript.events)
+    assert "stale-turn" not in json.dumps(transcript.events)
+
+
+@pytest.mark.parametrize("started_type", [None, "reasoning"])
+def test_codex_driver_rejects_completion_without_matching_start(
+    started_type: str | None,
+) -> None:
+    messages = [_turn_started_notification()]
+    if started_type is not None:
+        messages.append(_item_notification("item/started", "item", started_type))
+    messages.extend(
+        (
+            _item_notification(
+                "item/completed",
+                "item",
+                "commandExecution",
+                command="private-unmatched-command",
+                aggregatedOutput="private-unmatched-output",
+                status="completed",
+            ),
+            _turn_completed_notification(),
+        )
+    )
+
+    transcript = _collect_messages(messages)
+
+    assert transcript.commands == []
+    assert transcript.activity_violations[0]["reason"] == (
+        "invalid_item_completion_order_or_scope"
+    )
+    rendered = json.dumps(transcript.events)
+    assert "private-unmatched-command" not in rendered
+    assert "private-unmatched-output" not in rendered
+
+
+def test_codex_driver_accepts_interrupted_turn_and_correlated_compaction() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            {
+                "method": "thread/compacted",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"},
+            },
+            _turn_completed_notification(status="interrupted"),
+        ]
+    )
+
+    assert transcript.turn_status == "interrupted"
+    assert transcript.activity_violations == []
+    assert transcript.events[1] == {"method": "thread/compacted"}
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_result"),
+    [
+        ("item/commandExecution/requestApproval", {"decision": "decline"}),
+        ("item/fileChange/requestApproval", {"decision": "decline"}),
+        ("item/tool/requestUserInput", {"answers": {}}),
+        ("mcpServer/elicitation/request", {"action": "decline"}),
+        ("item/permissions/requestApproval", {"permissions": {}}),
+        ("item/tool/call", {"contentItems": [], "success": False}),
+        (
+            "applyPatchApproval",
+            {"decision": {"denied": {"rejection": "denied by eval harness"}}},
+        ),
+        (
+            "execCommandApproval",
+            {"decision": {"denied": {"rejection": "denied by eval harness"}}},
+        ),
+    ],
+)
+def test_codex_session_uses_pinned_non_grant_server_response_schema(
+    method: str, expected_result: dict
+) -> None:
+    client_output = io.BytesIO()
+    session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
+
+    evidence = session._prepare_incoming(  # noqa: SLF001
+        {
+            "jsonrpc": "2.0",
+            "id": "server-request-1",
+            "method": method,
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "private": "must-not-persist",
+            },
+        }
+    )
+
+    response = json.loads(client_output.getvalue().splitlines()[-1])
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "server-request-1",
+        "result": expected_result,
+    }
+    assert isinstance(evidence, codex_driver._DeniedServerRequestEvidence)  # noqa: SLF001
+    assert method not in repr(evidence)
+    assert "must-not-persist" not in repr(evidence)
+
+
+@pytest.mark.parametrize(
+    ("method", "code"),
+    [
+        ("account/chatgptAuthTokens/refresh", -32603),
+        ("attestation/generate", -32603),
+        ("currentTime/read", -32603),
+        ("private/unknown/request", -32601),
+    ],
+)
+def test_codex_session_returns_generic_error_for_unfulfillable_server_request(
+    method: str, code: int
+) -> None:
+    client_output = io.BytesIO()
+    session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
+
+    evidence = session._prepare_incoming(  # noqa: SLF001
+        {
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": method,
+            "params": {"private": "must-not-persist"},
+        }
+    )
+
+    response = json.loads(client_output.getvalue().splitlines()[-1])
+    assert response["error"] == {
+        "code": code,
+        "message": "request unavailable in eval harness",
+    }
+    assert isinstance(evidence, codex_driver._DeniedServerRequestEvidence)  # noqa: SLF001
+    assert method not in repr(evidence)
+    assert "must-not-persist" not in repr(evidence)
+
+
+def test_codex_session_denies_request_before_waited_response_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client_output = io.BytesIO()
+    session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
+    messages = iter(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": "server-request-1",
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "private": "must-not-persist",
+                },
+            },
+            {"jsonrpc": "2.0", "id": 1, "result": {"turn": {"id": "turn-1"}}},
+        ]
+    )
+    monkeypatch.setattr(session, "_read_line", lambda: next(messages))
+
+    response = session.request("turn/start", {})
+
+    assert response == {"turn": {"id": "turn-1"}}
+    written = [json.loads(line) for line in client_output.getvalue().splitlines()]
+    assert written[1]["result"] == {"decision": "decline"}
+    assert len(session._pending_notifications) == 1  # noqa: SLF001
+    pending = repr(session._pending_notifications)  # noqa: SLF001
+    assert "requestApproval" not in pending
+    assert "must-not-persist" not in pending
+
+
+def test_codex_session_tracks_server_request_resolution_order() -> None:
+    client_output = io.BytesIO()
+    session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
+    request = {
+        "jsonrpc": "2.0",
+        "id": "server-request-1",
+        "method": "item/tool/call",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    }
+    resolution = {
+        "method": "serverRequest/resolved",
+        "params": {"requestId": "server-request-1", "threadId": "thread-1"},
+    }
+
+    session._prepare_incoming(request)  # noqa: SLF001
+    first = session._prepare_incoming(resolution)  # noqa: SLF001
+    duplicate = session._prepare_incoming(resolution)  # noqa: SLF001
+
+    assert first.ordering_valid is True
+    assert duplicate.ordering_valid is False
+    assert "server-request-1" not in repr((first, duplicate))
+
+
+def test_codex_driver_wire_cannot_forge_private_evidence_markers() -> None:
+    sentinels = ("<malformed-wire-message>", "<server-request-denied>")
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            *(
+                {
+                    "method": sentinel,
+                    "content": f"private-{index}",
+                    "params": {"private": f"payload-{index}"},
+                }
+                for index, sentinel in enumerate(sentinels)
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    rendered = json.dumps(transcript.events)
+    assert all(sentinel not in rendered for sentinel in sentinels)
+    assert "private-" not in rendered
+    assert "payload-" not in rendered
+    assert [event["method"] for event in transcript.events[1:-1]] == [
+        "<unrecognized-notification>",
+        "<unrecognized-notification>",
+    ]
+
+
+def test_codex_driver_rejects_non_phase_turn_statuses() -> None:
+    invalid_start = _turn_started_notification()
+    invalid_start["params"]["turn"]["status"] = "completed"
+    invalid_completion = _turn_completed_notification(status="inProgress")
+    transcript = _collect_messages(
+        [
+            invalid_start,
+            _turn_started_notification(),
+            invalid_completion,
+            _turn_completed_notification(status="interrupted"),
+        ]
+    )
+
+    assert transcript.turn_status == "interrupted"
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_turn_started_order_or_scope",
+        "invalid_turn_completion_order_or_scope",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("started_status", "completed_status"),
+    [("completed", "completed"), ("inProgress", "inProgress")],
+)
+def test_codex_driver_rejects_reversed_command_statuses_as_evidence(
+    started_status: str, completed_status: str
+) -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification(
+                "item/started",
+                "command",
+                "commandExecution",
+                status=started_status,
+            ),
+            _item_notification(
+                "item/completed",
+                "command",
+                "commandExecution",
+                status=completed_status,
+                command="private-invalid-command",
+                aggregatedOutput="private-invalid-output",
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == []
+    assert any(
+        item["reason"].startswith("invalid_item_")
+        for item in transcript.activity_violations
+    )
+    rendered = json.dumps(transcript.events)
+    assert "private-invalid-command" not in rendered
+    assert "private-invalid-output" not in rendered
+
+
+def test_codex_session_correlates_dynamic_tool_request_by_call_id() -> None:
+    client_output = io.BytesIO()
+    session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
+
+    evidence = session._prepare_incoming(  # noqa: SLF001
+        {
+            "jsonrpc": "2.0",
+            "id": "server-request-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "dynamic-call",
+                "itemId": "wrong-field",
+            },
+        }
+    )
+
+    assert evidence.item_reference == "dynamic-call"
+
+
+@pytest.mark.parametrize("status", [None, "completed", "failed"])
+def test_codex_driver_turn_start_response_requires_in_progress(
+    status: str | None,
+) -> None:
+    response = {"turn": {"id": "turn-1"}}
+    if status is not None:
+        response["turn"]["status"] = status
+
+    with pytest.raises(codex_driver.CodexProtocolError, match="turn boundary"):
+        codex_driver._validated_turn_id(response)  # noqa: SLF001
 
 
 def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
@@ -1448,6 +2408,7 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
             del stdin, stdout, timeout_seconds
             self.requests = []
             self.messages = []
+            self.turn = 0
             FakeSession.latest = self
 
         def request(self, method, params):
@@ -1460,23 +2421,12 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
             if method == "thread/start":
                 return _thread_boundary_response("/synthetic/workspace")
             if method == "config/read":
-                return {
-                    "config": {
-                        "web_search": "disabled",
-                        "apps": {
-                            "_default": {
-                                "enabled": False,
-                                "destructive_enabled": False,
-                                "open_world_enabled": False,
-                            }
-                        },
-                        "features": {"apps": False, "plugins": False},
-                        "plugins": {},
-                    }
-                }
+                return {"config": _resolved_app_server_config("/synthetic/workspace")}
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
             if method == "turn/start":
+                self.turn += 1
+                turn_id = f"turn-{self.turn}"
                 self.messages.extend(
                     [
                         {
@@ -1488,15 +2438,11 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
                                 ),
                             },
                         },
-                        {
-                            "method": "turn/completed",
-                            "params": {
-                                "threadId": "thread-1",
-                                "turn": {"status": "completed", "error": None},
-                            },
-                        },
+                        _turn_started_notification(turn_id=turn_id),
+                        _turn_completed_notification(turn_id=turn_id),
                     ]
                 )
+                return {"turn": {"id": turn_id, "status": "inProgress"}}
             return {}
 
         def notify(self, method, params) -> None:
@@ -1544,14 +2490,7 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
         "exclude_tmpdir_env_var": True,
         "exclude_slash_tmp": True,
     }
-    assert thread_params["config"]["shell_environment_policy"] == {
-        "inherit": "core",
-        "include_only": ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM"],
-        "set": {
-            "HOME": "/synthetic/workspace",
-            "TMPDIR": "/synthetic/workspace",
-        },
-    }
+    assert "shell_environment_policy" not in thread_params["config"]
     methods = [method for method, _params in FakeSession.latest.requests]
     assert methods.index("account/read") < methods.index("thread/start")
     assert methods.index("config/read") < methods.index("turn/start")
@@ -1593,24 +2532,13 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
             if method == "thread/start":
                 return _thread_boundary_response("/synthetic/workspace")
             if method == "config/read":
-                return {
-                    "config": {
-                        "web_search": "disabled",
-                        "apps": {
-                            "_default": {
-                                "enabled": False,
-                                "destructive_enabled": False,
-                                "open_world_enabled": False,
-                            }
-                        },
-                        "features": {"apps": False, "plugins": False},
-                        "plugins": {},
-                    }
-                }
+                return {"config": _resolved_app_server_config("/synthetic/workspace")}
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
             if method == "turn/start":
                 self.turn += 1
+                turn_id = f"turn-{self.turn}"
+                self.messages.append(_turn_started_notification(turn_id=turn_id))
                 if self.turn == 1:
                     self.messages.append(
                         {
@@ -1624,14 +2552,9 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
                         }
                     )
                 self.messages.append(
-                    {
-                        "method": "turn/completed",
-                        "params": {
-                            "threadId": "thread-1",
-                            "turn": {"status": "completed", "error": None},
-                        },
-                    }
+                    _turn_completed_notification(turn_id=turn_id)
                 )
+                return {"turn": {"id": turn_id, "status": "inProgress"}}
             return {}
 
         def notify(self, method, params) -> None:

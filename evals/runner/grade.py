@@ -17,75 +17,251 @@ from typing import Any, Iterable, Mapping, Sequence
 _FILTER = re.compile(r"\?\(@\.([a-z_]+)==(?:(\d+)|'([^']+)')\)\Z")
 _SEGMENT = re.compile(r"([a-z_][a-z0-9_]*)((?:\[[^]]+\])*)\Z")
 _BRACKET = re.compile(r"\[([^]]+)\]")
-_PATH_TOKEN = r"[\w~@%+=$.-]+(?:'[\w~@%+=$.-]+)*"
-_PRIVATE_HOST_PATH = re.compile(
-    rf"""(?ix)
-    (?:
-        (?<![\w.:/\\])
-        /(?![/.])
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})*/
-        )*
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})+
-            (?=$|[\"'`<>\r\n),;])
-          |
-            {_PATH_TOKEN}
-        )
-      |
-        (?<![\w])
-        [a-z]:[\\/]
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})*[\\/]
-        )*
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})+
-            (?=$|[\"'`<>\r\n),;])
-          |
-            {_PATH_TOKEN}
-        )
-      |
-        (?<![\w\\])
-        \\\\{_PATH_TOKEN}[\\/]
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})*[\\/]
-        )*
-        (?:
-            {_PATH_TOKEN}(?:[ ]+{_PATH_TOKEN})+
-            (?=$|[\"'`<>\r\n),;])
-          |
-            {_PATH_TOKEN}
+_PUBLIC_URL = re.compile(r"(?i)\b(?:https?|steam)://[^\s\"'`<>]+")
+_JSON_PATH = re.compile(
+    r"\$(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]\r\n]*\])+"
+)
+_PATH_FORM_BOUNDARIES = frozenset("\"'`([{<>=,:;")
+# A colon is deliberately absent here: ``error:/Users/...`` and other
+# non-file URI schemes are not evidence of a local host path. ``file:`` and
+# the explicit human-readable ``path:`` label are recognized separately.
+_POSIX_PATH_BOUNDARIES = frozenset("\"'`([{<>=,;")
+_PATH_END_DELIMITERS = frozenset('"`<>),;|&')
+_ENCODED_SEPARATOR = re.compile(r"(?i)%(?:2f|5c)")
+_HOME_USER_CHARACTER = re.compile(r"[\w.-]", re.UNICODE)
+
+
+def _has_path_boundary(text: str, index: int, *, posix: bool = False) -> bool:
+    if index == 0:
+        return True
+    previous = text[index - 1]
+    boundaries = _POSIX_PATH_BOUNDARIES if posix else _PATH_FORM_BOUNDARIES
+    return previous.isspace() or previous in boundaries
+
+
+def _encoded_separator_at(text: str, index: int) -> bool:
+    return _ENCODED_SEPARATOR.match(text, index) is not None
+
+
+def _drive_root_at(text: str, index: int) -> bool:
+    return (
+        index + 2 < len(text)
+        and text[index].isalpha()
+        and text[index + 1] == ":"
+        and text[index + 2] in "/\\"
+    )
+
+
+def _uri_has_path_root(
+    text: str, index: int, *, allow_drive: bool = False
+) -> bool:
+    return (
+        index < len(text)
+        and (
+            text[index] in "/\\"
+            or _encoded_separator_at(text, index)
+            or (allow_drive and _drive_root_at(text, index))
         )
     )
-    """
-)
-_PUBLIC_URL = re.compile(r"(?i)\b(?:https?|steam)://[^\s\"'`<>]+")
 
 
-def _private_host_path_matches(text: str) -> Iterable[re.Match[str]]:
-    url_spans = [match.span() for match in _PUBLIC_URL.finditer(text)]
-    for match in _PRIVATE_HOST_PATH.finditer(text):
-        if any(start <= match.start() < end for start, end in url_spans):
+def _private_path_form_at(text: str, index: int) -> tuple[str, int] | None:
+    """Return the private path form and the first index after its root."""
+
+    if text[index : index + len("file:")].casefold() == "file:" and (
+        _has_path_boundary(text, index)
+    ):
+        root_end = index + len("file:")
+        if _uri_has_path_root(text, root_end, allow_drive=True):
+            return "file_uri", root_end
+    if text[index : index + len("path:")].casefold() == "path:" and (
+        _has_path_boundary(text, index)
+    ):
+        root_end = index + len("path:")
+        if _uri_has_path_root(text, root_end):
+            return "path_label", root_end
+    if text[index] == "~" and _has_path_boundary(text, index):
+        cursor = index + 1
+        while cursor < len(text) and _HOME_USER_CHARACTER.fullmatch(text[cursor]):
+            cursor += 1
+        if cursor < len(text) and text[cursor] == "/":
+            return "home", cursor + 1
+    if text.startswith("\\\\?\\", index) and _has_path_boundary(text, index):
+        root_end = index + len("\\\\?\\")
+        if _drive_root_at(text, root_end):
+            return "extended_drive", root_end + 3
+        if text[root_end : root_end + 4].casefold() == "unc\\":
+            return "extended_unc", root_end + 4
+    if text.startswith("\\\\", index) and _has_path_boundary(text, index):
+        return "unc", index + 2
+    if text.startswith("//", index) and _has_path_boundary(
+        text, index, posix=True
+    ):
+        return "forward_unc", index + 2
+    if (
+        _drive_root_at(text, index)
+        and _has_path_boundary(text, index)
+    ):
+        return "drive", index + 3
+    if (
+        text[index] == "/"
+        and not text.startswith("//", index)
+        and _has_path_boundary(text, index, posix=True)
+    ):
+        return "posix", index + 1
+    return None
+
+
+def _is_internal_quote(text: str, index: int) -> bool:
+    if index == 0 or index + 1 >= len(text):
+        return False
+    previous = text[index - 1]
+    following = text[index + 1]
+    return (
+        not previous.isspace()
+        and not following.isspace()
+        and previous not in _PATH_END_DELIMITERS
+        and following not in _PATH_END_DELIMITERS
+    )
+
+
+def _is_unquoted_path_delimiter(text: str, index: int) -> bool:
+    character = text[index]
+    if character in {'"', "`"}:
+        return not _is_internal_quote(text, index)
+    if character not in _PATH_END_DELIMITERS:
+        return False
+    if index + 1 >= len(text):
+        return True
+    following = text[index + 1]
+    return following.isspace() or following in {'"', "'", "`", "]", "}"}
+
+
+def _private_path_end(text: str, start: int, root_end: int) -> int:
+    enclosing_quote = (
+        text[start - 1]
+        if start > 0 and text[start - 1] in {'"', "'", "`"}
+        else None
+    )
+    end = root_end
+    while end < len(text):
+        character = text[end]
+        # NUL is the only character POSIX excludes from a path component.
+        # Treat every other character conservatively as possible path content;
+        # this sanitizer may over-redact ambiguous prose, but must never leave
+        # a suffix of a private filename behind.
+        if character == "\0":
+            break
+        if enclosing_quote is not None:
+            if character == enclosing_quote and not (
+                _is_internal_quote(text, end)
+            ):
+                break
+        else:
+            if _is_unquoted_path_delimiter(text, end):
+                break
+            if character == "'" and not _is_internal_quote(text, end):
+                break
+        end += 1
+    while end > root_end and text[end - 1] == " ":
+        end -= 1
+    return end
+
+
+def _unc_has_server_and_share(value: str, *, extended: bool = False) -> bool:
+    if extended:
+        value = value[len("\\\\?\\UNC\\") :]
+    else:
+        value = value[2:]
+    components = [
+        component.strip()
+        for component in re.split(r"[\\/]+", value)
+        if component.strip()
+    ]
+    return len(components) >= 2
+
+
+def _private_path_is_complete(
+    text: str, start: int, end: int, form: str, root_end: int
+) -> bool:
+    if end < root_end:
+        return False
+    value = text[start:end]
+    if form == "extended_unc":
+        return _unc_has_server_and_share(value, extended=True)
+    if form in {"unc", "forward_unc"}:
+        return _unc_has_server_and_share(value)
+    if form in {
+        "drive",
+        "extended_drive",
+        "file_uri",
+        "path_label",
+        "home",
+        "posix",
+    }:
+        rooted = text[root_end:end]
+        without_encoded_separators = _ENCODED_SEPARATOR.sub("/", rooted)
+        return any(
+            character not in "/\\" and not character.isspace()
+            for character in without_encoded_separators
+        )
+    return False
+
+
+def _protected_path_spans(text: str) -> list[tuple[int, int]]:
+    return sorted(
+        [
+            *(match.span() for match in _PUBLIC_URL.finditer(text)),
+            *(match.span() for match in _JSON_PATH.finditer(text)),
+        ]
+    )
+
+
+def _private_host_path_spans(text: str) -> Iterable[tuple[int, int]]:
+    protected = _protected_path_spans(text)
+    protected_index = 0
+    index = 0
+    while index < len(text):
+        while (
+            protected_index < len(protected)
+            and protected[protected_index][1] <= index
+        ):
+            protected_index += 1
+        if (
+            protected_index < len(protected)
+            and protected[protected_index][0] <= index
+        ):
+            index = protected[protected_index][1]
             continue
-        yield match
+        form = _private_path_form_at(text, index)
+        if form is None:
+            index += 1
+            continue
+        form_name, root_end = form
+        end = _private_path_end(text, index, root_end)
+        if _private_path_is_complete(text, index, end, form_name, root_end):
+            yield index, end
+            index = end
+        else:
+            index += 1
 
 
 def find_private_host_paths(text: str) -> list[str]:
-    """Find absolute host paths while ignoring URLs and relative recipe text."""
+    """Find private host-path forms while ignoring public and relative text."""
 
     return list(
-        dict.fromkeys(match.group(0) for match in _private_host_path_matches(text))
+        dict.fromkeys(text[start:end] for start, end in _private_host_path_spans(text))
     )
 
 
 def redact_private_host_paths(text: str) -> str:
-    """Remove absolute host paths from persisted runner artifacts."""
+    """Remove private host-path forms from persisted runner artifacts."""
 
     parts: list[str] = []
     start = 0
-    for match in _private_host_path_matches(text):
-        parts.extend((text[start : match.start()], "<redacted-host-path>"))
-        start = match.end()
+    for match_start, match_end in _private_host_path_spans(text):
+        parts.extend((text[start:match_start], "<redacted-host-path>"))
+        start = match_end
     parts.append(text[start:])
     return "".join(parts)
 
@@ -241,6 +417,8 @@ def evaluate_assertion(document: Any, assertion: Mapping[str, Any]) -> bool:
             return not any(json_semantically_equal(item, expected) for item in actual)
         return expected not in actual
     if operator == "one_of":
+        if not isinstance(expected, list) or not expected:
+            raise ValueError("one_of expected must be a nonempty list")
         return any(json_semantically_equal(actual, item) for item in expected)
     raise ValueError(f"unsupported operator {operator!r}")
 
@@ -342,7 +520,7 @@ def _grade_trace(
 
 
 _COMMAND_SEPARATORS = {"&", "&&", "||", ";", "|"}
-_SHELL_EXECUTABLES = {"bash", "sh", "zsh"}
+_TRACE_SHELL_EXECUTABLES = {"bash", "sh", "zsh"}
 _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES = {
     "/bin/bash",
     "/bin/sh",
@@ -351,9 +529,6 @@ _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES = {
     "/usr/bin/sh",
     "/usr/bin/zsh",
 }
-_TRUSTED_SHELL_EXECUTABLES = (
-    _SHELL_EXECUTABLES | _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES
-)
 _COMMAND_BUILTINS = {"command", "exec"}
 _STEAM_AGENT_EXECUTABLES = {"steam-agent", "./bin/steam-agent"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
@@ -398,7 +573,7 @@ def _command_invocations(command: str) -> list[list[str]]:
         if not normalized:
             continue
         executable = _executable_name(normalized[0])
-        if executable in _SHELL_EXECUTABLES:
+        if executable in _TRACE_SHELL_EXECUTABLES:
             payload = _shell_payload(normalized[1:])
             if payload is not None:
                 invocations.extend(_command_invocations(payload))
@@ -485,12 +660,13 @@ def normalized_steam_agent_argv(
 
     The executable itself is omitted. Only bare ``steam-agent`` and the
     frozen workspace launcher ``./bin/steam-agent`` are trusted. A direct call
-    may have one ``command`` or ``exec`` builtin. One conventional ``sh``,
-    ``bash``, or ``zsh`` ``-c`` wrapper is also accepted. Anything
-    compound, redirected, substituted, malformed, or resolving through a
-    process wrapper such as ``sudo``, ``env``, or ``nohup`` fails closed.
-    App Server's standard absolute ``/bin`` and ``/usr/bin`` shell paths are
-    trusted explicitly; arbitrary paths are never accepted by basename.
+    may have one ``command`` or ``exec`` builtin. One conventional wrapper
+    using a standard absolute ``/bin`` or ``/usr/bin`` ``sh``, ``bash``, or
+    ``zsh`` with ``-c`` or ``-lc`` is also accepted. Anything compound,
+    redirected, substituted, malformed, or resolving through a process wrapper
+    such as ``sudo``, ``env``, or ``nohup`` fails closed. Arbitrary paths and
+    bare shell names are never accepted by basename because the live workspace
+    controls the front of ``PATH``.
     """
 
     return _normalized_steam_agent_argv(
@@ -517,7 +693,7 @@ def _normalized_steam_agent_argv(
     tokens = _unwrap_command_prefix(tokens)
     if not tokens:
         return None
-    if tokens[0] in _TRUSTED_SHELL_EXECUTABLES:
+    if tokens[0] in _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES:
         if not allow_shell_wrapper:
             return None
         payload = _shell_wrapper_payload(tokens)
