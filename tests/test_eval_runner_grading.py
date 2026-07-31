@@ -166,9 +166,24 @@ def test_leading_assignments_cannot_poison_the_frozen_launcher(
     assert not grade.grade_tool_policy([command], POLICY)["passed"]
 
 
-def test_one_safe_shell_wrapper_is_allowed() -> None:
+@pytest.mark.parametrize(
+    "shell",
+    (
+        "bash",
+        "sh",
+        "zsh",
+        "/bin/bash",
+        "/bin/sh",
+        "/bin/zsh",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        "/usr/bin/zsh",
+    ),
+)
+@pytest.mark.parametrize("option", ("-c", "-lc"))
+def test_one_safe_shell_wrapper_is_allowed(shell: str, option: str) -> None:
     command = (
-        "bash -lc 'command ./bin/steam-agent operations observe "
+        f"{shell} {option} 'command ./bin/steam-agent operations observe "
         "--machine=synthetic-machine'"
     )
     result = grade.grade_tool_policy([command], POLICY)
@@ -227,13 +242,55 @@ def test_only_the_bare_frozen_path_executable_is_allowed(executable: str) -> Non
     assert not grade.grade_tool_policy([command], POLICY)["passed"]
 
 
-def test_shell_wrapper_must_also_be_a_bare_executable() -> None:
+@pytest.mark.parametrize(
+    "shell",
+    (
+        "/tmp/evil/bash",
+        "/private/tmp/zsh",
+        "/usr/local/bin/zsh",
+        "./bin/zsh",
+        "../bin/zsh",
+        "/bin/dash",
+        "/bin/Zsh",
+    ),
+)
+def test_shell_wrapper_rejects_untrusted_absolute_and_relative_lookalikes(
+    shell: str,
+) -> None:
     command = (
-        "/tmp/evil/bash -c 'steam-agent operations observe --machine synthetic-machine'"
+        f"{shell} -c 'steam-agent operations observe --machine synthetic-machine'"
     )
 
     assert grade.normalized_steam_agent_argv(command) is None
     assert not grade.grade_tool_policy([command], POLICY)["passed"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        "./bin/steam-agent operations observe --machine synthetic-machine && true",
+        "./bin/steam-agent operations observe --machine synthetic-machine > out.json",
+        "./bin/steam-agent operations observe --machine synthetic-machine $(true)",
+        "PATH=/tmp/evil ./bin/steam-agent operations observe --machine synthetic-machine",
+        "/tmp/evil/steam-agent operations observe --machine synthetic-machine",
+        "bash -lc './bin/steam-agent operations observe --machine synthetic-machine'",
+        "sudo ./bin/steam-agent operations observe --machine synthetic-machine",
+    ),
+)
+def test_trusted_absolute_shell_wrapper_preserves_fail_closed_payload(payload: str) -> None:
+    command = f'/bin/zsh -lc "{payload}"'
+
+    assert (
+        grade.normalized_steam_agent_argv(
+            command, expected_executable="./bin/steam-agent"
+        )
+        is None
+    )
+    assert not grade.grade_tool_policy(
+        [command],
+        POLICY,
+        expected_executable="./bin/steam-agent",
+    )["passed"]
 
 
 def test_command_builtin_must_be_bare() -> None:

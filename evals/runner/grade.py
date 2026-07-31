@@ -343,6 +343,17 @@ def _grade_trace(
 
 _COMMAND_SEPARATORS = {"&", "&&", "||", ";", "|"}
 _SHELL_EXECUTABLES = {"bash", "sh", "zsh"}
+_TRUSTED_ABSOLUTE_SHELL_EXECUTABLES = {
+    "/bin/bash",
+    "/bin/sh",
+    "/bin/zsh",
+    "/usr/bin/bash",
+    "/usr/bin/sh",
+    "/usr/bin/zsh",
+}
+_TRUSTED_SHELL_EXECUTABLES = (
+    _SHELL_EXECUTABLES | _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES
+)
 _COMMAND_BUILTINS = {"command", "exec"}
 _STEAM_AGENT_EXECUTABLES = {"steam-agent", "./bin/steam-agent"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
@@ -478,6 +489,8 @@ def normalized_steam_agent_argv(
     ``bash``, or ``zsh`` ``-c`` wrapper is also accepted. Anything
     compound, redirected, substituted, malformed, or resolving through a
     process wrapper such as ``sudo``, ``env``, or ``nohup`` fails closed.
+    App Server's standard absolute ``/bin`` and ``/usr/bin`` shell paths are
+    trusted explicitly; arbitrary paths are never accepted by basename.
     """
 
     return _normalized_steam_agent_argv(
@@ -504,7 +517,7 @@ def _normalized_steam_agent_argv(
     tokens = _unwrap_command_prefix(tokens)
     if not tokens:
         return None
-    if tokens[0] in _SHELL_EXECUTABLES:
+    if tokens[0] in _TRUSTED_SHELL_EXECUTABLES:
         if not allow_shell_wrapper:
             return None
         payload = _shell_wrapper_payload(tokens)
