@@ -37,7 +37,7 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     account_alias = required_argument_value(
         scenario, "--alias", scenario_account_alias(scenario)
     )
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     owned: list[int] = []
     for fact in scenario["fixture"]["facts"]:

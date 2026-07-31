@@ -1,11 +1,11 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m5-c03", "status": "active", "milestone": "M5",
+  "schema_version": "steam-agent-eval/0.2", "id": "m5-c03", "status": "active", "milestone": "M5", "scenario_kind": "contract",
   "question_family": "Steam Deck compatibility", "tags": ["conditional", "steam-deck", "target"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Valve rates the exact Deck target Playable with user-attention conditions.", "facts": [{"subject": "synthetic:appid:5301", "state": "deck_playable"}]},
   "conversation": {"user": ["Will this work on Steam Deck?"], "paraphrase": "Preserve Valve Playable as conditional rather than Verified."},
   "tool_policy": {"allowed": ["steam-agent compatibility assess"], "required": [{"command": "steam-agent compatibility assess", "arguments": ["5301", "--account", "synthetic", "--target", "valve:steam-deck", "--country", "US", "--language", "english"]}], "prohibited": ["sync", "rating widening", "performance promise"]},
   "deterministic_oracle": {"recipe_or_contract": "compatibility/0.1 Valve Deck mapping", "assertions": [{"path": "$.data.results[0].compatibility", "operator": "equals", "expected": "conditional"}, {"path": "$.data.results[0].gates[4].original", "operator": "equals", "expected": "pass"}]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "playable-conditional", "weight": 10, "requirement": "Map exact-target Playable to a known condition.", "hard_fail": true}]},
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.results[0].compatibility", "$.data.results[0].gates[4].original_condition"], "criteria": [{"id": "playable-conditional", "weight": 10, "requirement": "Map exact-target Playable to a known condition.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "condition", "weight": 3, "requirement": "Explain that Playable may require user attention."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_C03", "credential": "EVAL_CANARY_CREDENTIAL_C03", "local_path": "EVAL_CANARY_LOCAL_PATH_C03"}
 }

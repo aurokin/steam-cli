@@ -112,6 +112,11 @@
       "required": ["grading", "criteria"],
       "properties": {
         "grading": {"const": "deterministic"},
+        "required_claim_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^\\$\\."}
+        },
         "criteria": {"$ref": "#/$defs/criteria"}
       }
     },
@@ -148,6 +153,25 @@
           "tool_policy": {"properties": {"required": {"minItems": 1}}}
         }
       }
+    },
+    {
+      "if": {
+        "required": ["tool_policy"],
+        "properties": {
+          "tool_policy": {
+            "required": ["required"],
+            "properties": {"required": {"minItems": 1}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "fact_rubric": {
+            "required": ["required_claim_paths"],
+            "properties": {"required_claim_paths": {"minItems": 1}}
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -182,7 +206,8 @@
             "required": ["source"],
             "properties": {
               "source": {"const": "trace"},
-              "expected": {"type": "string", "pattern": "^steam-agent"}
+              "path": {"const": "$"},
+              "expected": {"type": "string", "pattern": "\\S"}
             }
           }
         },

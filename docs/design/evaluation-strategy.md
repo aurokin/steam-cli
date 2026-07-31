@@ -1,7 +1,8 @@
 # Cross-milestone common-question evaluation strategy
 
-Status: working quality strategy; deterministic M4, M5, and M7 oracles are in
-normal CI, while model judging remains opt-in.
+Status: working quality strategy; deterministic scenario, materializer, and
+applicable CLI-oracle coverage for M2–M7 is in normal CI, while live model
+execution and judging remain opt-in.
 
 ## Purpose and boundary
 
@@ -115,12 +116,72 @@ blind comparison and task-specific rubrics while retaining expert review.
   contract is accepted and backed by normal product tests.
 - An opt-in agent-execution runner exists under `evals/runner/`. It
   materializes normalized fixtures through public storage APIs, drives every
-  scenario turn in order on one Codex App Server thread in a network-disabled
-  sandbox, and grades the transcript deterministically: tool policy over all
-  turns, oracle assertions against their declared source, the agent's
-  claim/evidence sidecar, and a binary privacy gate over the answer surface.
-  It makes no provider requests and requires a locally installed `codex`
-  binary; normal CI exercises only its materializers and grader.
+  scenario turn in order on one Codex App Server thread, and grades the
+  transcript deterministically: successful completion of every turn, tool
+  policy over every completed App Server item (including zero exit status for
+  a required command), oracle assertions against their declared source, every
+  turn's claim/evidence
+  sidecar aggregated into required fact-path coverage (with per-turn support
+  diagnostics), and a binary privacy gate over the answer surface. Claims and
+  CLI-document assertions are graded against the JSON output captured from
+  exactly one successful required command in the transcript, with exact
+  normalized arguments and the relative `--data-dir steam-agent-data`; the
+  runner does not invoke the CLI again to manufacture grading evidence.
+  Non-JSON or multiple-document output fails closed. Fixture and CLI clocks use
+  the scenario's `frozen_time`. It makes no provider requests and requires a
+  locally installed `codex` binary; normal CI exercises only its materializers
+  and grader. Agent execution expects only `m5-c03`, `m5-c04`, and `m5-c11` to
+  be unsupported. An unexpected unsupported scenario or a selection in which
+  every scenario is skipped fails the run.
+- The runner requests an explicit legacy `workspace-write` sandbox, one runtime
+  workspace root, no network, and no approvals. Codex 0.146's named
+  `:workspace` profile does not honor the requested `/tmp` and `TMPDIR`
+  exclusions, so the runner does not use it and requires a null active-profile
+  response. The driver verifies the returned runtime roots, working directory,
+  ephemeral and non-persisted thread state, approval policy, sandbox type,
+  network state, empty additional writable roots, disabled legacy temporary
+  roots, and a nonempty instruction-source list containing the exact private
+  workspace `AGENTS.md` (with every source workspace-local) before any model
+  turn.
+- App Server runs with a disposable private `CODEX_HOME` containing only a
+  mode-`0600` copy of the existing `auth.json`; personal config, MCP servers,
+  plugins, hooks, skills, state, and history are not inherited. Web search and
+  apps are explicitly disabled, client dynamic tools are empty, and a
+  declaration-only preflight requires usable authentication, resolved web/app
+  settings and app/plugin feature flags to remain disabled, the resolved plugin
+  catalog to be empty, and the thread's MCP inventory to be empty before
+  `thread/start` or `turn/start`, as applicable. Authentication and protocol
+  failures use generic errors and never include raw App Server payloads.
+  The model command environment inherits only a small locale/PATH allowlist
+  and receives workspace-local `HOME` and `TMPDIR` values, so the disposable
+  Codex home is not disclosed to shell commands. Codex 0.146 silently changes
+  a thread to read-only when `environments: []` is sent; because that would
+  also disable the required CLI, the field is omitted. The disposable Codex
+  home carries no configured remote environment, leaving only App Server's
+  built-in local execution environment. The private Codex home and all of its
+  transient state are removed after App Server exits.
+- On macOS with Codex 0.146, the resulting sandbox still permits reads
+  elsewhere on the host; true host-read isolation therefore requires running
+  the eval in an isolated OS account, container, or VM. Developer instructions
+  prohibit host inspection, but instructions are not a security boundary. The
+  driver records every completed item, permits command execution and explicitly
+  informational item types, and fails the tool-policy gate on file changes,
+  MCP/dynamic calls, web search, collaboration, and unknown activity. Clean
+  artifacts redact host paths and privacy canaries. If turn completion,
+  required evidence, tool policy, or privacy fails, the transcript and report
+  retain only structural activity plus content hashes and lengths; raw prompts,
+  reasoning, answers, commands, and tool output are omitted.
+- Each scenario uses a private temporary writable workspace. Its synthetic
+  data directory contains a hidden canary file that the product CLI ignores,
+  making prohibited filesystem inspection observable. The entire workspace,
+  including the cache, canary file, and agent-created files, is removed on
+  success or failure before runner-authored artifacts are persisted. Result
+  directories are `0700`; sanitized transcript and report files are `0600`.
+- Reports distinguish requested model and effort from the effective values
+  returned by App Server thread settings for each turn. If App Server does not
+  confirm an effective turn override, the effective value remains null rather
+  than being inferred from the request. A turn-scoped reroute is reported for
+  that turn but is not carried forward without a thread-settings confirmation.
 - M2, M3, M4, M5, M6, and M7 fixtures are materializable today through the
   per-milestone `evals/runner/materialize_*.py` modules. The two Valve Deck
   scenarios stay pure-oracle-only because no CLI writer produces
@@ -129,5 +190,5 @@ blind comparison and task-specific rubrics while retaining expert review.
 - The privacy gate always fails on a leaked canary or a personal path. The
   personal Steam ID pattern is skipped only when the scenario's own required
   command asks for identifiers with `--include-identifiers`.
-- Generated traces, answers, judgments, and reports stay under
-  `evals/results/`, which is ignored by Git.
+- Sanitized transcripts and reports stay under `evals/results/`, which is
+  ignored by Git; writable workspaces and raw agent output do not.

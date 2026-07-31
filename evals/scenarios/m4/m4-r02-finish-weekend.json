@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m4-r02", "status": "active", "milestone": "M4",
+  "schema_version": "steam-agent-eval/0.2", "id": "m4-r02", "status": "active", "milestone": "M4", "scenario_kind": "contract",
   "question_family": "finishability", "tags": ["finishability", "time-budget", "unknown-policy"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Explicit remaining-time estimates fall within, exceed, or are unknown for a six-hour budget.", "facts": [
     {"subject": "synthetic:appid:1201", "state": "remaining_240_minutes"}, {"subject": "synthetic:appid:1202", "state": "remaining_600_minutes"}, {"subject": "synthetic:appid:1203", "state": "remaining_unknown"}
@@ -9,7 +9,7 @@
   "deterministic_oracle": {"recipe_or_contract": "finishability/0.1", "assertions": [
     {"path": "$.data.eligible[0].appid", "operator": "equals", "expected": 1201}, {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1202}, {"path": "$.data.conditional[0].appid", "operator": "equals", "expected": 1203}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "budget-gate", "weight": 5, "requirement": "Apply the explicit six-hour budget before scoring.", "hard_fail": true}, {"id": "unknown-duration", "weight": 5, "requirement": "Keep unknown duration conditional rather than zero or infinite.", "hard_fail": true}]},
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.eligible[0].appid", "$.data.excluded[0].appid", "$.data.conditional[0].appid"], "criteria": [{"id": "budget-gate", "weight": 5, "requirement": "Apply the explicit six-hour budget before scoring.", "hard_fail": true}, {"id": "unknown-duration", "weight": 5, "requirement": "Keep unknown duration conditional rather than zero or infinite.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "plausibility-language", "weight": 3, "requirement": "Describe finishability as evidence-bounded, not guaranteed."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_R02", "credential": "EVAL_CANARY_CREDENTIAL_R02", "local_path": "EVAL_CANARY_LOCAL_PATH_R02"}
 }

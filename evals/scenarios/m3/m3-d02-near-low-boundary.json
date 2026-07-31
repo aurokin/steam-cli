@@ -19,7 +19,7 @@
     {"path": "$.data.items[?(@.appid==202)].deal.bucket", "operator": "equals", "expected": "within_5_percent"},
     {"path": "$.data.items[?(@.appid==203)].deal.bucket", "operator": "one_of", "expected": ["discounted", "current_only", "noncomparable", "unknown"]}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[?(@.appid==201)].deal.bucket", "$.data.items[?(@.appid==202)].deal.bucket", "$.data.items[?(@.appid==203)].deal.bucket", "$.data.limitations[1]"], "criteria": [
     {"id": "boundary-fidelity", "weight": 5, "requirement": "Classify all three low-boundary cases exactly.", "hard_fail": true},
     {"id": "summary-scope", "weight": 5, "requirement": "Describe provider low summaries without claiming a complete price graph.", "hard_fail": true}
   ]},

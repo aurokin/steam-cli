@@ -12,7 +12,7 @@
     {"path": "$.data.items[0].deal.attempted_providers[*].error_code", "operator": "ordered_equals", "expected": ["NOT_SYNCED", "NOT_SYNCED"]},
     {"path": "$.completeness.missing_capabilities", "operator": "contains", "expected": "prices.wishlist.read"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer", "$.data.items[0].deal.bucket", "$.data.items[0].deal.attempted_providers[*].error_code"], "criteria": [
     {"id": "no-invented-price", "weight": 10, "requirement": "Report the price as unknown and never state or estimate an amount.", "hard_fail": true},
     {"id": "unevaluated-not-free", "weight": 5, "requirement": "Distinguish never-evaluated from free or unavailable.", "hard_fail": true}
   ]},

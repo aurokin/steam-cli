@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m4-r03", "status": "active", "milestone": "M4",
+  "schema_version": "steam-agent-eval/0.2", "id": "m4-r03", "status": "active", "milestone": "M4", "scenario_kind": "contract",
   "question_family": "installed next play", "tags": ["hard-constraint", "installed", "next-play"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A high-fit uninstalled candidate competes with a lower-fit installed candidate.", "facts": [{"subject": "synthetic:appid:1301", "state": "installed_fit_60"}, {"subject": "synthetic:appid:1302", "state": "uninstalled_fit_95"}]},
   "conversation": {"user": ["What installed game should I play tonight?"], "paraphrase": "Only recommend something already installed."},
@@ -7,7 +7,7 @@
   "deterministic_oracle": {"recipe_or_contract": "recommendations/0.1 three-valued gates", "assertions": [
     {"path": "$.data.eligible[0].appid", "operator": "equals", "expected": 1301}, {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1302}, {"path": "$.data.excluded[0].gates[?(@.name=='installed')].effective", "operator": "equals", "expected": "fail"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "installed-hard-gate", "weight": 10, "requirement": "Never allow the higher-fit uninstalled title to win.", "hard_fail": true}]},
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.eligible[0].appid", "$.data.excluded[0].appid", "$.data.excluded[0].gates[?(@.name=='installed')].effective"], "criteria": [{"id": "installed-hard-gate", "weight": 10, "requirement": "Never allow the higher-fit uninstalled title to win.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "direct-recommendation", "weight": 2, "requirement": "Give a direct recommendation with the installed constraint visible."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_R03", "credential": "EVAL_CANARY_CREDENTIAL_R03", "local_path": "EVAL_CANARY_LOCAL_PATH_R03"}
 }

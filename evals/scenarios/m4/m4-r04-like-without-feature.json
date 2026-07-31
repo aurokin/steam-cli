@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.1", "id": "m4-r04", "status": "active", "milestone": "M4",
+  "schema_version": "steam-agent-eval/0.2", "id": "m4-r04", "status": "active", "milestone": "M4", "scenario_kind": "contract",
   "question_family": "preference with avoidance", "tags": ["explicit-feedback", "feature-rule", "hard-constraint"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Direct positive feedback and an explicit user-namespaced crafting avoidance conflict across candidates.", "facts": [
     {"subject": "synthetic:appid:1401", "state": "high_direct_fit_user:crafting_true"}, {"subject": "synthetic:appid:1402", "state": "moderate_direct_fit_user:crafting_false"}, {"subject": "synthetic:appid:1403", "state": "fit_unknown_user:crafting_unknown"}
@@ -9,7 +9,7 @@
   "deterministic_oracle": {"recipe_or_contract": "preference-fit/0.1", "assertions": [
     {"path": "$.data.eligible[0].appid", "operator": "equals", "expected": 1402}, {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1401}, {"path": "$.data.conditional[0].appid", "operator": "equals", "expected": 1403}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [{"id": "avoidance-gate", "weight": 10, "requirement": "Apply explicit feature avoidance before preference score.", "hard_fail": true}, {"id": "no-semantic-inference", "weight": 5, "requirement": "Do not infer unsupported cross-game similarity or traits.", "hard_fail": true}]},
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.eligible[0].appid", "$.data.excluded[0].appid", "$.data.conditional[0].appid"], "criteria": [{"id": "avoidance-gate", "weight": 10, "requirement": "Apply explicit feature avoidance before preference score.", "hard_fail": true}, {"id": "no-semantic-inference", "weight": 5, "requirement": "Do not infer unsupported cross-game similarity or traits.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "tradeoff", "weight": 3, "requirement": "Explain the fit-versus-avoidance tradeoff clearly."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_R04", "credential": "EVAL_CANARY_CREDENTIAL_R04", "local_path": "EVAL_CANARY_LOCAL_PATH_R04"}
 }

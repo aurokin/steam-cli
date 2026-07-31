@@ -5,9 +5,11 @@ are dispatched by the scenario's milestone.  Each builder writes synthetic
 normalized evidence through public ``Storage`` APIs only, per the evaluation
 strategy: the runner must not make provider requests.
 
-Timestamps are written relative to wall-clock now because the installed CLI
-has no clock override.  One offset policy applies everywhere: fresh evidence
-is written a minute in the past, deliberately stale evidence sits inside
+Timestamps are written relative to one minute before each scenario's
+``frozen_time``.  The runner invokes the installed CLI through a tiny
+workspace-local launcher that
+uses the same clock, so fixture freshness does not depend on the day the eval
+is run.  Deliberately stale evidence sits inside
 ``(fresh_window, HARD_RETENTION)`` (24 hours for the six-hour windows), and
 deliberately future evidence uses six hours ahead.
 
@@ -53,6 +55,8 @@ def materialize(scenario: Mapping[str, Any], data_dir: Path) -> None:
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as error:
+        if error.name != module_name:
+            raise
         raise UnsupportedScenarioError(
             f"no materializer for milestone {milestone!r} yet"
         ) from error
@@ -108,10 +112,21 @@ def scenario_account_alias(scenario: Mapping[str, Any]) -> str:
     return required_argument_value(scenario, "--account", "synthetic")
 
 
-def materialization_now() -> datetime:
-    """The single wall-clock reference every builder writes relative to."""
+def materialization_now(scenario: Mapping[str, Any]) -> datetime:
+    """Return the fresh-evidence anchor before the scenario clock."""
 
-    return datetime.now(timezone.utc) - timedelta(minutes=1)
+    value = scenario.get("frozen_time")
+    if not isinstance(value, str):
+        raise UnsupportedScenarioError("scenario has no frozen_time")
+    try:
+        frozen = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise UnsupportedScenarioError(
+            f"scenario has invalid frozen_time {value!r}"
+        ) from error
+    if frozen.tzinfo is None:
+        raise UnsupportedScenarioError("scenario frozen_time must be timezone-aware")
+    return frozen.astimezone(timezone.utc) - timedelta(minutes=1)
 
 
 def seed_identity(
@@ -171,6 +186,8 @@ def write_installed(
     machine_key: str,
     entries: Sequence[tuple[int, int, str]],
     now: datetime,
+    *,
+    library_roots: Mapping[int, str] | None = None,
 ) -> int:
     """Record one complete installed scan; omitted AppIDs become known-false."""
 
@@ -181,24 +198,25 @@ def write_installed(
         started_at=now,
     )
     for appid, size_bytes, build_id in entries:
+        library_root = (library_roots or {}).get(appid, "/synthetic/library")
         storage.record_installed_observation(
             run.id,
             InstalledObservation(
                 appid=appid,
-                library_root="/synthetic/library",
-                install_dir=f"/synthetic/library/steamapps/common/title-{appid}",
+                library_root=library_root,
+                install_dir=f"{library_root}/steamapps/common/title-{appid}",
                 observed_at=now,
                 name=f"Synthetic title {appid}",
                 build_id=build_id,
                 size_bytes=size_bytes,
-                manifest_path=f"/synthetic/library/steamapps/appmanifest_{appid}.acf",
+                manifest_path=f"{library_root}/steamapps/appmanifest_{appid}.acf",
                 manifest_mtime=now,
             ),
             EvidenceInput(
                 provider="local_steam",
                 capability="installed",
                 source_kind="local_file",
-                source_locator=f"/synthetic/library/steamapps/appmanifest_{appid}.acf",
+                source_locator=f"{library_root}/steamapps/appmanifest_{appid}.acf",
                 retrieved_at=now,
                 support_level="local_heuristic",
                 payload={"synthetic": True},

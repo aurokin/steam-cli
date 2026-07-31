@@ -11,7 +11,7 @@
     {"path": "$.data.items[0].deal.attempted_providers[*].status", "operator": "ordered_equals", "expected": ["not_found", "not_found"]},
     {"path": "$.data.items[0].deal.reasons", "operator": "contains", "expected": "no_current_or_historical_evidence"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer", "$.data.items[0].deal.reasons"], "criteria": [
     {"id": "unknown-not-free", "weight": 10, "requirement": "State that price is unknown and never infer free from missing evidence.", "hard_fail": true}
   ]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "helpful-limitation", "weight": 2, "requirement": "Explain the provider miss without excess implementation detail."}]},

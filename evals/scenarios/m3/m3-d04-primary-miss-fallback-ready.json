@@ -11,7 +11,7 @@
     {"path": "$.data.items[0].deal.current_offer.provider", "operator": "equals", "expected": "cheapshark"},
     {"path": "$.data.items[0].deal.current_offer.product.comparability", "operator": "equals", "expected": "normalized_game"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.fallback_rung", "$.data.items[0].deal.current_offer.provider", "$.data.items[0].deal.current_offer.product.comparability", "$.data.items[0].deal.current_offer.store_class", "$.data.items[0].deal.current_offer.price.currency"], "criteria": [
     {"id": "fallback-attribution", "weight": 5, "requirement": "Attribute the fallback provider and preserve its identity grade.", "hard_fail": true},
     {"id": "store-limitation", "weight": 5, "requirement": "Preserve unknown-store and USD-only limitations."}
   ]},

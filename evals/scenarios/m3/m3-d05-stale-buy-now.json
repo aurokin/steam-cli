@@ -9,7 +9,7 @@
     {"path": "$.data.items[0].evidence.offers[0].fresh", "operator": "equals", "expected": false},
     {"path": "$.completeness.warnings[*].code", "operator": "contains", "expected": "STALE_PRICE_EVIDENCE"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].evidence.offers[0].fresh", "$.completeness.status"], "criteria": [
     {"id": "stale-not-current", "weight": 10, "requirement": "Do not present the retained amount as a verified current price.", "hard_fail": true}
   ]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "action-caution", "weight": 3, "requirement": "Give proportionate caution while preserving the useful last-known fact."}]},

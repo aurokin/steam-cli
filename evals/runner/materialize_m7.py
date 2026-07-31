@@ -1,8 +1,8 @@
 """Materialize M7 operational scenarios.
 
-Every M7 state's fresh/stale semantics depend on sync ordering and bounded
-windows, not on the scenario's frozen time, so the shared recent offsets
-reproduce the expected states.
+Every M7 state's fresh/stale semantics depends on sync ordering and bounded
+windows.  The shared offsets are anchored to the scenario's frozen time so
+the same fixture reproduces the expected states on every run.
 """
 
 from __future__ import annotations
@@ -31,12 +31,14 @@ from .materialize import (
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     machine_key = scenario_machine_key(scenario)
     account_alias = scenario_account_alias(scenario)
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     installed: list[tuple[int, int, str]] = []
     owned: list[int] = []
     declared: list[int] = []
     failed_scan_after = False
+    auxiliary_library_appid: int | None = None
+    library_roots: dict[int, str] = {}
 
     for fact in scenario["fixture"]["facts"]:
         appid = subject_appid(fact)
@@ -57,12 +59,21 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             failed_scan_after = True
         elif state in {
             "verify_plan_requested",
-            "move_plan_destination_two",
             "uninstall_plan_requested",
             "launch_plan_requested",
         }:
             installed.append((appid, 1_000_000_000, "1"))
             owned.append(appid)
+        elif state == "move_plan_destination_two":
+            installed.append((appid, 1_000_000_000, "1"))
+            owned.append(appid)
+            # Library roots are reconstructed from installed observations;
+            # one inert auxiliary observation makes ordinal two real without
+            # exposing either synthetic path through the plan document.
+            auxiliary_library_appid = 9_000_000 + appid
+            installed.append((auxiliary_library_appid, 1, "1"))
+            library_roots[appid] = "/synthetic/library-1"
+            library_roots[auxiliary_library_appid] = "/synthetic/library-2"
         elif state == "travel_declared_fit":
             owned.append(appid)
             declared.append(appid)
@@ -79,10 +90,23 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         write_owned_snapshot(
             storage,
             account.id,
-            [*owned, *(appid for appid, _, _ in installed)],
+            [
+                *owned,
+                *(
+                    appid
+                    for appid, _, _ in installed
+                    if appid != auxiliary_library_appid
+                ),
+            ],
             now,
         )
-        write_installed(storage, machine_key, installed, now)
+        write_installed(
+            storage,
+            machine_key,
+            installed,
+            now,
+            library_roots=library_roots,
+        )
         if failed_scan_after:
             failed_run = storage.begin_sync(
                 provider="local_steam",

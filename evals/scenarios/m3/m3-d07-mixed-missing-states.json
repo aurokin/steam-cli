@@ -13,7 +13,7 @@
     {"path": "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code", "operator": "ordered_equals", "expected": ["PRICE_EVIDENCE_NOT_EVALUATED", "PRICE_EVIDENCE_NOT_EVALUATED"]},
     {"path": "$.completeness.warnings[*].code", "operator": "contains", "expected": "PROVIDER_RATE_LIMITED"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[?(@.appid==701)].deal.attempted_providers[1].error_code", "$.data.items[?(@.appid==702)].deal.attempted_providers[0].error_code", "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code"], "criteria": [
     {"id": "state-distinction", "weight": 10, "requirement": "Keep running, failed, and unevaluated distinct.", "hard_fail": true},
     {"id": "cache-only", "weight": 5, "requirement": "Do not imply that the query refreshed or retried data.", "hard_fail": true}
   ]},

@@ -364,7 +364,7 @@ def _write_wishlist(
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     machine_key = scenario_machine_key(scenario)
     account_alias = scenario_account_alias(scenario)
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     facts = [(subject_appid(fact), fact["state"]) for fact in scenario["fixture"]["facts"]]
     plans = [_plan(appid, state, now) for appid, state in facts]

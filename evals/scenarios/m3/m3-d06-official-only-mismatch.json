@@ -11,7 +11,7 @@
     {"path": "$.data.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"},
     {"path": "$.data.items[0].deal.current_offer.price.currency", "operator": "equals", "expected": "USD"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer.price.amount_minor", "$.data.items[0].deal.current_offer.store_class", "$.data.items[0].deal.current_offer.price.currency"], "criteria": [
     {"id": "hard-context", "weight": 10, "requirement": "Never substitute the cheaper keyshop or EUR amount.", "hard_fail": true}
   ]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "constraint-clarity", "weight": 2, "requirement": "Mention that cheaper excluded evidence exists only if useful."}]},

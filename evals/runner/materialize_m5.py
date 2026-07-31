@@ -7,8 +7,8 @@ scenario needs a component to stay unknown, the declared minimum text is
 written to be unparseable by that parser; if a future parser learns to compare
 it, adjust the scenario prose, never the parser.
 
-``INSTALLED_FRESH`` is fifteen minutes.  No asserted field depends on it, but
-the installed observation is written one minute in the past so the
+``INSTALLED_FRESH`` is fifteen minutes.  No asserted field depends on it; the
+installed observation is written one minute before the scenario clock so the
 storage-free minimum path stays selected for installed candidates.
 
 Valve Deck targets have no CLI writer: ``compatibility_query`` never
@@ -254,7 +254,7 @@ def _write_declared(
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     machine_key = scenario_machine_key(scenario)
     account_alias = scenario_account_alias(scenario)
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     plans = [
         plan

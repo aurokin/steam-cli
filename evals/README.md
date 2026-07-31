@@ -16,12 +16,24 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 - `scenarios/m7/` covers local-operation truth, storage ranking, and inert-plan
   boundaries without filesystem, provider, browser, or client access.
 - `runner/` is the opt-in agent-execution runner: it materializes fixtures
-  into a real `--data-dir` cache, drives one turn through the Codex App
-  Server protocol, and grades the transcript deterministically. Run it with
-  `uv run python -m evals.runner --family m7` (requires a local `codex`
-  binary). Normal CI covers only its materializer and grader.
+  into a real `--data-dir` cache, drives every scenario turn through one
+  Codex App Server thread, and grades the transcript deterministically. Run it
+  with `uv run python -m evals.runner --family m7` (requires a local `codex`
+  binary). Reproducible model comparisons should pin both dimensions, for
+  example `--model gpt-5.6-sol --effort high`; supported effort values are
+  `low`, `medium`, `high`, and `xhigh`. Normal CI covers only its materializer
+  and grader. Agent execution explicitly expects `m5-c03`, `m5-c04`, and
+  `m5-c11` to be unsupported; any other materialization failure fails the run.
+  A run in which every selected scenario is skipped also fails.
 - `results/` is reserved for generated traces, answers, and judge reports and
-  is ignored by Git.
+  is ignored by Git. New run directories are mode `0700`, artifact files are
+  mode `0600`, unrelated command output is omitted, and host paths are
+  redacted before persistence. Each scenario's writable agent workspace is a
+  private temporary directory that is removed before its sanitized transcript
+  and report are written; caches and agent-created files never persist under
+  `results/`. Runs that fail a turn, evidence, tool, or privacy gate persist
+  only structural activity plus content hashes and lengths, not raw prompts,
+  reasoning, commands, answers, or tool output.
 
 Each scenario keeps four concerns distinct: expected deterministic behavior, a
 tool-use policy, a fact rubric, and an opt-in qualitative answer rubric. Normal

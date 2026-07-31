@@ -232,7 +232,7 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         "--account",
         required_argument_value(scenario, "--context-account", "synthetic"),
     )
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     plans = [_plan(fact) for fact in scenario["fixture"]["facts"]]
     members = _members(scenario)

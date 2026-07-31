@@ -15,6 +15,7 @@ Two independent properties are checked for each scenario:
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 import sys
@@ -23,6 +24,7 @@ from typing import Any
 import pytest
 
 import steam_agent.cli as cli
+import steam_agent.storage as storage_module
 from steam_agent.deal_evidence import (
     DealEvidenceSnapshot,
     HistoricalLowSummary,
@@ -47,6 +49,24 @@ from evals.runner.materialize import materialize  # noqa: E402
 SCENARIO_PATHS = tuple(
     sorted((ROOT / "evals" / "scenarios" / "m3").glob("*.json"))
 )
+
+
+def _freeze_cli_clock(
+    monkeypatch: pytest.MonkeyPatch, scenario: dict[str, Any]
+) -> None:
+    frozen = datetime.fromisoformat(
+        scenario["frozen_time"].replace("Z", "+00:00")
+    )
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return frozen.replace(tzinfo=None)
+            return frozen.astimezone(tz)
+
+    monkeypatch.setattr(cli, "datetime", FrozenDatetime)
+    monkeypatch.setattr(storage_module, "datetime", FrozenDatetime)
 
 
 def _run(scenario: dict[str, Any], data_dir: Path, capsys: Any) -> dict[str, Any]:
@@ -151,10 +171,14 @@ def _reranked(document: dict[str, Any]) -> dict[int, Any]:
 
 @pytest.mark.parametrize("path", SCENARIO_PATHS, ids=lambda path: path.stem)
 def test_active_m3_deterministic_oracle_is_executable(
-    path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    path: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = json.loads(path.read_text(encoding="utf-8"))
     assert scenario["status"] == "active"
+    _freeze_cli_clock(monkeypatch, scenario)
     materialize(scenario, tmp_path)
 
     document = _run(scenario, tmp_path, capsys)
@@ -170,9 +194,13 @@ def test_active_m3_deterministic_oracle_is_executable(
 
 @pytest.mark.parametrize("path", SCENARIO_PATHS, ids=lambda path: path.stem)
 def test_m3_document_ranking_is_rank_deals_over_its_own_evidence(
-    path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    path: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = json.loads(path.read_text(encoding="utf-8"))
+    _freeze_cli_clock(monkeypatch, scenario)
     materialize(scenario, tmp_path)
     document = _run(scenario, tmp_path, capsys)
 

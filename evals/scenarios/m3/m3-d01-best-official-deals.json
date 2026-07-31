@@ -30,7 +30,7 @@
       {"path": "$.data.items[*].deal.current_offer.provider", "operator": "contains", "expected": "gg-deals"}
     ]
   },
-  "fact_rubric": {"grading": "deterministic", "criteria": [
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[*].appid", "$.context.country", "$.context.currency", "$.context.store_class", "$.data.items[*].deal.current_offer.fresh", "$.data.items[*].deal.current_offer.provider"], "criteria": [
     {"id": "correct-order", "weight": 5, "requirement": "Preserve the deterministic deal order.", "hard_fail": true},
     {"id": "price-context", "weight": 5, "requirement": "State US, USD, official-store, freshness, and attribution."}
   ]},

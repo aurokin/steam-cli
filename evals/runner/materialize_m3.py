@@ -381,7 +381,7 @@ def _as_datetime(value: str | datetime) -> datetime:
 
 def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     account_alias = scenario_account_alias(scenario)
-    now = materialization_now()
+    now = materialization_now(scenario)
 
     plan = _Plan()
     appids: list[int] = []
