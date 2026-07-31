@@ -138,9 +138,10 @@ blind comparison and task-specific rubrics while retaining expert review.
   `:workspace`, denies the host root by default, retains Codex's minimal
   platform reads, inherits workspace writes, and explicitly reopens only the
   resolved Python interpreter file, its runtime-library, standard-library,
-  platform-library, pure-library, and site-package directories, and this
-  repository's `src/` directory. `/tmp` and the App Server process `TMPDIR`
-  remain denied. The
+  platform-library, pure-library, and site-package directories, the exact
+  framework runtime binary when Python is a macOS framework build, and this
+  repository's `src/` directory. The framework prefix is not reopened. `/tmp`
+  and the App Server process `TMPDIR` remain denied. The
   driver verifies the active profile identity, its exact resolved filesystem
   and network rules, runtime roots, working directory, ephemeral and
   non-persisted thread state, approval policy, sandbox response, empty
@@ -152,13 +153,32 @@ blind comparison and task-specific rubrics while retaining expert review.
   plugins, hooks, skills, state, and history are not inherited. It is launched
   from the private scenario workspace before protocol initialization, so
   startup project discovery cannot inherit configuration from the repository
-  running the harness. Web search and apps are explicitly disabled, client
-  dynamic tools are empty, and a declaration-only preflight requires usable
-  authentication, resolved web/app settings and app/plugin feature flags to
-  remain disabled, the resolved plugin catalog to be empty, and the thread's
-  MCP inventory to be empty before `thread/start` or `turn/start`, as
-  applicable. Authentication and protocol failures use generic errors and
-  never include raw App Server payloads.
+  running the harness. Web search, hooks, plugins, apps, and configured MCP
+  servers are disabled with pinned Codex 0.146 startup controls, strict config
+  parsing is enabled, and client dynamic tools are empty. Before
+  `thread/start`, a declaration-only preflight requires usable authentication;
+  resolved web/app settings and hook/app/plugin feature flags to remain
+  disabled; resolved MCP and plugin declarations to be empty; the workspace's
+  `hooks/list` result to contain no hooks, warnings, or errors; and the
+  threadless MCP inventory to be empty. Invalid declarations stop the preflight
+  before hook or MCP inventory. Hook-origin protocol activity aborts the run.
+  Authentication and protocol failures use generic errors and never include raw
+  App Server payloads. Codex 0.146's generated response schema and live JSONL
+  transport omit the otherwise standard `jsonrpc` member, so client response
+  handling accepts only its pinned versionless `id` plus `result`/`error`
+  envelope. It requires an exact ID type/value match, exactly one valid result
+  or error member, and an object result; version-bearing or extended envelopes
+  fail closed.
+  Between turns, the next `turn/start` response orders prior notifications into
+  the next collector, where turn and item scope checks reject late activity.
+  After the final terminal `turn/completed`, the driver sends one lightweight
+  `thread/read` ordering barrier with turn loading disabled, requires the
+  thread to be idle, and immediately drains already queued notifications,
+  complete buffered frames, and zero-time-ready stdout. Any trailing turn,
+  item, command, tool, hook, request, malformed, or partial-frame activity fails
+  closed; only the explicitly harmless global rate-limit update is discarded.
+  Drained bytes remain subject to the same frame, per-turn, and
+  per-conversation limits, and any failure uses normal process-group cleanup.
   Inbound JSONL is bounded to 4 MiB per frame, 16 MiB per turn, and 64 MiB per
   conversation; exceeding any bound fails the scenario and triggers normal
   process-group cleanup without retaining the rejected input.

@@ -1001,7 +1001,12 @@ def test_m5_no_evidence_refusal_allows_explanation_but_rejects_a_guess() -> None
     )
     assert compliant["passed"], compliant["failed"]
 
-    for guess in ("my best guess is yes", "my best guess is no"):
+    for guess in (
+        "my best guess is yes",
+        "my best guess is no",
+        "I would lean yes",
+        "I would lean no",
+    ):
         guessed = grade.grade_assertions(
             oracle,
             document=None,
@@ -1492,7 +1497,8 @@ def _resolved_app_server_config(workspace: str) -> dict:
                 "open_world_enabled": False,
             }
         },
-        "features": {"apps": False, "plugins": False},
+        "features": {"apps": False, "hooks": False, "plugins": False},
+        "mcp_servers": {},
         "plugins": {},
         "default_permissions": codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
         "permissions": {
@@ -1714,6 +1720,9 @@ def test_codex_driver_isolates_startup_cwd_and_codex_home(
         and f"shell_environment_policy.set.TMPDIR={json.dumps(str(workspace))}"
         in process_args
     )
+    assert "mcp_servers={}" in process_args
+    assert "--strict-config" in process_args
+    assert process_args[process_args.index("hooks") - 1] == "--disable"
     assert observed["start_new_session"] is True
     assert observed["terminated"] == (1234, signal.SIGTERM)
     assert not Path(observed["home"]).exists()
@@ -1821,6 +1830,59 @@ def test_codex_driver_protocol_limit_terminates_process_group(
 
     assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
     assert secret not in str(captured.value)
+    assert observed["terminated"] == (1234, signal.SIGTERM)
+
+
+def test_codex_driver_post_turn_failure_terminates_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO()
+        pid = 1234
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            pytest.fail("clean process group must not need a leader fallback")
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        if sig == 0:
+            raise ProcessLookupError
+        observed["terminated"] = (pid, sig)
+
+    def fail_after_turn(*args, **kwargs):
+        del args, kwargs
+        raise codex_driver.CodexProtocolError(  # noqa: SLF001
+            codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+        )
+
+    monkeypatch.setattr(codex_driver, "_copy_auth_file", lambda path: None)
+    monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
+    monkeypatch.setattr(codex_driver, "_validate_codex_version", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        codex_driver.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+    monkeypatch.setattr(codex_driver, "_converse", fail_after_turn)
+    monkeypatch.setattr(codex_driver.os, "killpg", fake_killpg)
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver.run_agent_conversation(
+            prompts=["synthetic"],
+            workspace=str(workspace),
+            developer_instructions="synthetic",
+        )
+
+    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
     assert observed["terminated"] == (1234, signal.SIGTERM)
 
 
@@ -1936,6 +1998,81 @@ def test_codex_permission_roots_do_not_reopen_python_prefixes(
     assert (ROOT / "src").resolve() in roots
 
 
+@pytest.mark.parametrize(
+    ("config", "expected", "broad_prefix"),
+    [
+        (
+            {
+                "PYTHONFRAMEWORK": "Python",
+                "PYTHONFRAMEWORKINSTALLDIR": (
+                    "/Library/Frameworks/Python.framework/Versions/3.13"
+                ),
+            },
+            "/Library/Frameworks/Python.framework/Versions/3.13/Python",
+            "/Library/Frameworks",
+        ),
+        (
+            {
+                "PYTHONFRAMEWORK": "Python",
+                "PYTHONFRAMEWORKPREFIX": "/opt/homebrew/Frameworks",
+                "VERSION": "3.13",
+            },
+            "/opt/homebrew/Frameworks/Python.framework/Versions/3.13/Python",
+            "/opt/homebrew/Frameworks",
+        ),
+    ],
+    ids=["python-org-install-dir", "homebrew-prefix-fallback"],
+)
+def test_codex_permission_roots_add_only_exact_python_framework_binary(
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict[str, str],
+    expected: str,
+    broad_prefix: str,
+) -> None:
+    monkeypatch.setattr(codex_driver.sysconfig, "get_paths", lambda: {})
+    monkeypatch.setattr(
+        codex_driver.sysconfig,
+        "get_config_var",
+        lambda name: config.get(name),
+    )
+    monkeypatch.setattr(codex_driver.site, "getsitepackages", lambda: [])
+
+    roots = codex_driver._permission_read_roots()  # noqa: SLF001
+
+    assert Path(expected).resolve() in roots
+    assert Path(broad_prefix).resolve() not in roots
+
+
+def test_codex_permission_roots_resolve_framework_root_binary_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    framework_root = tmp_path / "Frameworks" / "Python.framework"
+    versions = framework_root / "Versions"
+    version_dir = versions / "3.13"
+    version_dir.mkdir(parents=True)
+    binary = version_dir / "Python"
+    binary.write_bytes(b"synthetic-framework-binary")
+    (versions / "Current").symlink_to("3.13", target_is_directory=True)
+    (framework_root / "Python").symlink_to("Versions/Current/Python")
+    config = {
+        "PYTHONFRAMEWORK": "Python",
+        "PYTHONFRAMEWORKINSTALLDIR": str(framework_root),
+    }
+    monkeypatch.setattr(codex_driver.sysconfig, "get_paths", lambda: {})
+    monkeypatch.setattr(
+        codex_driver.sysconfig,
+        "get_config_var",
+        lambda name: config.get(name),
+    )
+    monkeypatch.setattr(codex_driver.site, "getsitepackages", lambda: [])
+
+    roots = codex_driver._permission_read_roots()  # noqa: SLF001
+
+    assert binary.resolve() in roots
+    assert framework_root.resolve() not in roots
+    assert versions.resolve() not in roots
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin" or shutil.which("codex") is None,
     reason="requires the pinned macOS Codex sandbox",
@@ -2000,6 +2137,61 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(
+    shutil.which("codex") is None,
+    reason="requires the pinned Codex App Server",
+)
+def test_codex_driver_live_prethread_source_preflight(tmp_path: Path) -> None:
+    executable = shutil.which("codex")
+    assert executable is not None
+    version = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if version.returncode != 0 or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION:  # noqa: SLF001
+        pytest.skip("requires the pinned Codex version")
+
+    isolated_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    isolated_home.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o700)
+    process = subprocess.Popen(
+        codex_driver._app_server_process_args(executable, workspace),  # noqa: SLF001
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=workspace,
+        env=codex_driver._app_server_environment(  # noqa: SLF001
+            isolated_home, workspace
+        ),
+        start_new_session=True,
+    )
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        session = codex_driver._Session(  # noqa: SLF001
+            process.stdin, process.stdout, 30
+        )
+        session.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "steam-agent-evals-test",
+                    "title": "Steam Agent eval runner test",
+                    "version": "0.1.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        session.notify("initialized", {})
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            session, str(workspace)
+        )
+    finally:
+        codex_driver._terminate_process_group(process)  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     ("config", "mcp"),
     [
@@ -2019,16 +2211,7 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
             {"data": [], "nextCursor": None},
         ),
         (
-            {
-                "web_search": "disabled",
-                "apps": {
-                    "_default": {
-                        "enabled": False,
-                        "destructive_enabled": False,
-                        "open_world_enabled": False,
-                    }
-                },
-            },
+            _resolved_app_server_config("/synthetic/workspace"),
             {"data": [{"name": "private-server-name"}], "nextCursor": None},
         ),
         (
@@ -2041,7 +2224,8 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
                         "open_world_enabled": False,
                     }
                 },
-                "features": {"apps": False, "plugins": True},
+                "features": {"apps": False, "hooks": False, "plugins": True},
+                "mcp_servers": {},
                 "plugins": {},
                 "private_value": "must-not-appear",
             },
@@ -2057,7 +2241,8 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
                         "open_world_enabled": False,
                     }
                 },
-                "features": {"apps": False, "plugins": False},
+                "features": {"apps": False, "hooks": False, "plugins": False},
+                "mcp_servers": {},
                 "plugins": {"private-plugin-name": {}},
             },
             {"data": [], "nextCursor": None},
@@ -2072,12 +2257,23 @@ def test_codex_driver_external_tool_preflight_fails_without_logging_values(
             del params
             if method == "config/read":
                 return {"config": config}
+            if method == "hooks/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": "/synthetic/workspace",
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             assert method == "mcpServerStatus/list"
             return mcp
 
     with pytest.raises(codex_driver.CodexProtocolError) as captured:
         codex_driver._validate_external_tool_boundary(  # noqa: SLF001
-            FakeSession(), "thread-1", "/synthetic/workspace"
+            FakeSession(), "/synthetic/workspace"
         )
     assert "must-not-appear" not in str(captured.value)
     assert "private-server-name" not in str(captured.value)
@@ -2092,12 +2288,128 @@ def test_codex_driver_external_tool_preflight_attests_resolved_process_policy() 
             if method == "config/read":
                 assert params == {"cwd": workspace, "includeLayers": False}
                 return {"config": _resolved_app_server_config(workspace)}
+            if method == "hooks/list":
+                assert params == {"cwds": [workspace]}
+                return {
+                    "data": [
+                        {
+                            "cwd": workspace,
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             assert method == "mcpServerStatus/list"
+            assert params == {"limit": 1, "detail": "toolsAndAuthOnly"}
             return {"data": [], "nextCursor": None}
 
     codex_driver._validate_external_tool_boundary(  # noqa: SLF001
-        FakeSession(), "thread-1", workspace
+        FakeSession(), workspace
     )
+
+
+def test_codex_driver_rejects_declared_mcp_before_inventory() -> None:
+    workspace = "/synthetic/workspace"
+    config = _resolved_app_server_config(workspace)
+    config["mcp_servers"] = {
+        "private-server": {"command": "must-not-run-private-command"}
+    }
+    requests: list[str] = []
+
+    class FakeSession:
+        def request(self, method, params):
+            del params
+            requests.append(method)
+            if method == "config/read":
+                return {"config": config}
+            pytest.fail("unsafe declarations must fail before source inventory")
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            FakeSession(), workspace
+        )
+
+    assert requests == ["config/read"]
+    assert "private-server" not in str(captured.value)
+    assert "must-not-run-private-command" not in str(captured.value)
+
+
+def test_codex_driver_rejects_enabled_hooks_before_hook_discovery() -> None:
+    workspace = "/synthetic/workspace"
+    config = _resolved_app_server_config(workspace)
+    config["features"]["hooks"] = True
+    requests: list[str] = []
+
+    class FakeSession:
+        def request(self, method, params):
+            del params
+            requests.append(method)
+            if method == "config/read":
+                return {"config": config}
+            pytest.fail("enabled hooks must fail before hook discovery")
+
+    with pytest.raises(codex_driver.CodexProtocolError):
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            FakeSession(), workspace
+        )
+
+    assert requests == ["config/read"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "cwd": "/synthetic/workspace",
+            "hooks": [{"command": "must-not-run-private-hook"}],
+            "warnings": [],
+            "errors": [],
+        },
+        {
+            "cwd": "/synthetic/workspace",
+            "hooks": [],
+            "warnings": ["must-not-appear-warning"],
+            "errors": [],
+        },
+        {
+            "cwd": "/synthetic/workspace",
+            "hooks": [],
+            "warnings": [],
+            "errors": [{"message": "must-not-appear-error"}],
+        },
+        {
+            "cwd": "/private/other-workspace",
+            "hooks": [],
+            "warnings": [],
+            "errors": [],
+        },
+    ],
+)
+def test_codex_driver_rejects_hook_declarations_before_mcp_inventory(
+    entry: dict,
+) -> None:
+    workspace = "/synthetic/workspace"
+    requests: list[str] = []
+
+    class FakeSession:
+        def request(self, method, params):
+            del params
+            requests.append(method)
+            if method == "config/read":
+                return {"config": _resolved_app_server_config(workspace)}
+            if method == "hooks/list":
+                return {"data": [entry]}
+            pytest.fail("hook declarations must fail before MCP inventory")
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            FakeSession(), workspace
+        )
+
+    assert requests == ["config/read", "hooks/list"]
+    assert "must-not" not in str(captured.value)
+    assert "/private" not in str(captured.value)
 
 
 @pytest.mark.parametrize(
@@ -2124,11 +2436,22 @@ def test_codex_driver_rejects_resolved_process_policy_mismatch(
             del params
             if method == "config/read":
                 return {"config": config}
+            if method == "hooks/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": workspace,
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             return {"data": [], "nextCursor": None}
 
     with pytest.raises(codex_driver.CodexProtocolError, match="process policy"):
         codex_driver._validate_external_tool_boundary(  # noqa: SLF001
-            FakeSession(), "thread-1", workspace
+            FakeSession(), workspace
         )
 
 
@@ -2143,11 +2466,22 @@ def test_codex_driver_rejects_permission_profile_root_read() -> None:
             del params
             if method == "config/read":
                 return {"config": config}
+            if method == "hooks/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": workspace,
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             return {"data": [], "nextCursor": None}
 
     with pytest.raises(codex_driver.CodexProtocolError, match="process policy"):
         codex_driver._validate_external_tool_boundary(  # noqa: SLF001
-            FakeSession(), "thread-1", workspace
+            FakeSession(), workspace
         )
 
 
@@ -2186,8 +2520,9 @@ def test_codex_driver_protocol_errors_do_not_include_server_payloads(
         lambda: {
             "id": 1,
             "error": {
+                "code": -32603,
                 "message": "must-not-appear",
-                "path": "/private/server/path",
+                "data": {"path": "/private/server/path"},
             },
         },
     )
@@ -2219,6 +2554,327 @@ def test_codex_driver_protocol_errors_do_not_include_server_payloads(
         )
     assert "must-not-appear" not in str(captured.value)
     assert "/private/server/path" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"id": True, "result": {}},
+        {"jsonrpc": "2.0", "id": 1, "result": {}},
+        {"jsonrpc": "2.0", "id": True, "result": {}},
+        {"jsonrpc": "1.0", "id": 1, "result": {}},
+        {"id": 1},
+        {
+            "id": 1,
+            "result": {},
+            "error": {"code": -32603, "message": "private"},
+        },
+        {"id": 1, "result": []},
+        {
+            "id": 1,
+            "result": {},
+            "private": "must-not-appear",
+        },
+        {"id": 1, "error": "must-not-appear"},
+        {
+            "id": 1,
+            "error": {"code": True, "message": "must-not-appear"},
+        },
+        {
+            "id": 1,
+            "error": {"code": -32603, "private": "must-not-appear"},
+        },
+    ],
+)
+def test_codex_session_rejects_malformed_response_envelopes_without_payload(
+    response: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    monkeypatch.setattr(session, "_read_line", lambda: response)
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.request("synthetic/request", {})
+
+    assert str(captured.value) == codex_driver._INVALID_RESPONSE_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {
+            "jsonrpc": "2.0",
+            "method": "hook/started",
+            "params": {"private": "must-not-appear"},
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "hook/completed",
+            "params": {"private": "must-not-appear"},
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "hook/future",
+            "params": {"private": "must-not-appear"},
+        },
+        _item_notification(
+            "item/completed",
+            "hook-item",
+            "hookPrompt",
+            text="must-not-appear",
+        ),
+    ],
+)
+def test_codex_session_aborts_on_hook_activity_before_waited_response(
+    message: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    messages = iter([message, {"id": 1, "result": {}}])
+    monkeypatch.setattr(session, "_read_line", lambda: next(messages))
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.request("synthetic/request", {})
+
+    assert str(captured.value) == codex_driver._HOOK_ACTIVITY_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+
+
+def test_codex_driver_post_turn_boundary_attests_idle_without_loading_turns() -> None:
+    observed: list[tuple[str, dict]] = []
+
+    class FakeSession:
+        quiescent = False
+
+        def request(self, method, params):
+            observed.append((method, params))
+            return {
+                "thread": {
+                    "id": "thread-1",
+                    "status": {"type": "idle"},
+                    "turns": [],
+                }
+            }
+
+        def assert_quiescent(self) -> None:
+            self.quiescent = True
+
+    session = FakeSession()
+    codex_driver._validate_post_turn_boundary(session, "thread-1")  # noqa: SLF001
+
+    assert observed == [
+        ("thread/read", {"threadId": "thread-1", "includeTurns": False})
+    ]
+    assert session.quiescent is True
+
+
+@pytest.mark.parametrize(
+    "thread",
+    [
+        {"id": "other", "status": {"type": "idle"}, "turns": []},
+        {"id": "thread-1", "status": {"type": "active"}, "turns": []},
+        {
+            "id": "thread-1",
+            "status": {"type": "idle"},
+            "turns": [{"private": "must-not-appear"}],
+        },
+    ],
+)
+def test_codex_driver_post_turn_boundary_fails_closed_without_payload(
+    thread: dict,
+) -> None:
+    class FakeSession:
+        def request(self, method, params):
+            del method, params
+            return {"thread": thread}
+
+        def assert_quiescent(self) -> None:
+            pytest.fail("an invalid idle boundary must not be drained")
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._validate_post_turn_boundary(  # noqa: SLF001
+            FakeSession(), "thread-1"
+        )
+
+    assert str(captured.value) == codex_driver._POST_TURN_BOUNDARY_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "late_message",
+    [
+        _item_notification(
+            "item/started",
+            "late-command",
+            "commandExecution",
+            status="inProgress",
+            command="must-not-appear-command",
+        ),
+        {
+            "method": "item/tool/call",
+            "id": "late-tool",
+            "params": {"private": "must-not-appear-tool"},
+        },
+    ],
+    ids=["command-item", "tool-request"],
+)
+def test_codex_session_rejects_queued_activity_after_turn_completion(
+    late_message: dict,
+) -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._pending_notifications.append(  # noqa: SLF001
+        session._prepare_incoming(late_message)  # noqa: SLF001
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+    assert session._pending_notifications == []  # noqa: SLF001
+
+
+def test_codex_session_rejects_buffered_activity_after_turn_completion() -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._buffer.extend(  # noqa: SLF001
+        json.dumps(
+            {
+                "method": "turn/started",
+                "params": {"private": "must-not-appear-buffered"},
+            }
+        ).encode()
+        + b"\n"
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+    assert "must-not-appear-buffered" not in str(captured.value)
+    assert session._buffer == bytearray()  # noqa: SLF001
+
+
+def test_codex_session_drains_ready_global_notification_at_clean_boundary() -> None:
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        server_input.write(
+            json.dumps(
+                {
+                    "method": "account/rateLimits/updated",
+                    "params": {"private": "discarded-global-payload"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+
+        started = time.monotonic()
+        session.assert_quiescent()
+
+        assert time.monotonic() - started < 0.5
+        assert session._buffer == bytearray()  # noqa: SLF001
+        assert session._pending_notifications == []  # noqa: SLF001
+    finally:
+        server_input.close()
+        server_output.close()
+
+
+def test_codex_session_zero_ready_quiescence_returns_promptly() -> None:
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+
+        started = time.monotonic()
+        session.assert_quiescent()
+
+        assert time.monotonic() - started < 0.1
+    finally:
+        server_input.close()
+        server_output.close()
+
+
+def test_codex_session_rejects_ready_activity_after_turn_completion() -> None:
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        server_input.write(
+            json.dumps(
+                {
+                    "method": "turn/started",
+                    "params": {"private": "must-not-appear-ready"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session.assert_quiescent()
+
+        assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+        assert "must-not-appear-ready" not in str(captured.value)
+    finally:
+        server_input.close()
+        server_output.close()
+
+
+def test_codex_session_rejects_oversized_trailing_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 16)
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        server_input.write(b'{"private":"must-not-appear-trailing"}')
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session.assert_quiescent()
+
+        assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+        assert "must-not-appear-trailing" not in str(captured.value)
+        assert session._buffer == bytearray()  # noqa: SLF001
+    finally:
+        server_input.close()
+        server_output.close()
+
+
+def test_codex_session_charges_incomplete_trailing_input_to_turn_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 128)
+    monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", 8)
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        server_input.write(b'{"partial":"must-not-appear"}')
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session.assert_quiescent()
+
+        assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+        assert "must-not-appear" not in str(captured.value)
+        assert session._buffer == bytearray()  # noqa: SLF001
+    finally:
+        server_input.close()
+        server_output.close()
 
 
 @pytest.mark.parametrize("terminated", [False, True], ids=["open", "newline"])
@@ -2915,7 +3571,7 @@ def test_codex_session_denies_request_before_waited_response_without_deadlock(
                     "private": "must-not-persist",
                 },
             },
-            {"jsonrpc": "2.0", "id": 1, "result": {"turn": {"id": "turn-1"}}},
+            {"id": 1, "result": {"turn": {"id": "turn-1"}}},
         ]
     )
     monkeypatch.setattr(session, "_read_line", lambda: next(messages))
@@ -3098,6 +3754,17 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
                 return _thread_boundary_response("/synthetic/workspace")
             if method == "config/read":
                 return {"config": _resolved_app_server_config("/synthetic/workspace")}
+            if method == "hooks/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": "/synthetic/workspace",
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
             if method == "turn/start":
@@ -3119,6 +3786,14 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
                     ]
                 )
                 return {"turn": {"id": turn_id, "status": "inProgress"}}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-1",
+                        "status": {"type": "idle"},
+                        "turns": [],
+                    }
+                }
             return {}
 
         def notify(self, method, params) -> None:
@@ -3126,6 +3801,9 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
 
         def read_message(self):
             return self.messages.pop(0)
+
+        def assert_quiescent(self) -> None:
+            assert self.messages == []
 
     monkeypatch.setattr(codex_driver, "_Session", FakeSession)
     transcripts = codex_driver._converse(  # noqa: SLF001
@@ -3163,14 +3841,23 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
     assert "config" not in thread_params
     methods = [method for method, _params in FakeSession.latest.requests]
     assert methods.index("account/read") < methods.index("thread/start")
-    assert methods.index("config/read") < methods.index("turn/start")
-    assert methods.index("mcpServerStatus/list") < methods.index("turn/start")
+    assert methods.index("config/read") < methods.index("hooks/list")
+    assert methods.index("hooks/list") < methods.index("mcpServerStatus/list")
+    assert methods.index("mcpServerStatus/list") < methods.index("thread/start")
+    assert methods[-1] == "thread/read"
     turn_params = [
         params
         for method, params in FakeSession.latest.requests
         if method == "turn/start"
     ]
     assert [params["effort"] for params in turn_params] == ["xhigh", "xhigh"]
+    assert [
+        params
+        for method, params in FakeSession.latest.requests
+        if method == "thread/read"
+    ] == [
+        {"threadId": "thread-1", "includeTurns": False},
+    ]
     assert [transcript.effective_model for transcript in transcripts] == [
         "gpt-5.6-terra",
         "gpt-5.6-terra",
@@ -3181,7 +3868,9 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
     ]
 
 
-def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> None:
+def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeProcess:
         stdin = object()
         stdout = object()
@@ -3203,11 +3892,32 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
                 return _thread_boundary_response("/synthetic/workspace")
             if method == "config/read":
                 return {"config": _resolved_app_server_config("/synthetic/workspace")}
+            if method == "hooks/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": "/synthetic/workspace",
+                            "hooks": [],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
             if method == "turn/start":
                 self.turn += 1
                 turn_id = f"turn-{self.turn}"
+                if self.turn == 2:
+                    self.messages.append(
+                        _item_notification(
+                            "item/started",
+                            "late-command",
+                            "commandExecution",
+                            turn_id="turn-1",
+                            command="must-not-appear-late-command",
+                        )
+                    )
                 self.messages.append(_turn_started_notification(turn_id=turn_id))
                 if self.turn == 1:
                     self.messages.append(
@@ -3225,6 +3935,14 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
                     _turn_completed_notification(turn_id=turn_id)
                 )
                 return {"turn": {"id": turn_id, "status": "inProgress"}}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-1",
+                        "status": {"type": "idle"},
+                        "turns": [],
+                    }
+                }
             return {}
 
         def notify(self, method, params) -> None:
@@ -3232,6 +3950,9 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
 
         def read_message(self):
             return self.messages.pop(0)
+
+        def assert_quiescent(self) -> None:
+            assert self.messages == []
 
     monkeypatch.setattr(codex_driver, "_Session", FakeSession)
     transcripts = codex_driver._converse(  # noqa: SLF001
@@ -3249,6 +3970,11 @@ def test_codex_driver_does_not_carry_unconfirmed_turn_reroute(monkeypatch) -> No
         "gpt-5.6-terra",
     ]
     assert [item.effective_reasoning_effort for item in transcripts] == [None, None]
+    assert [
+        violation["reason"]
+        for violation in transcripts[1].activity_violations
+    ] == ["invalid_item_started_order_or_scope"]
+    assert "must-not-appear-late-command" not in transcripts[1].rendered()
 
 
 def test_run_scenario_uses_and_removes_private_workspace(

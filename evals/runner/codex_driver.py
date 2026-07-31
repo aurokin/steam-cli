@@ -46,10 +46,15 @@ _APP_SERVER_ARGS = (
     "apps._default.destructive_enabled=false",
     "-c",
     "apps._default.open_world_enabled=false",
+    "-c",
+    "mcp_servers={}",
+    "--disable",
+    "hooks",
     "--disable",
     "plugins",
     "--disable",
     "apps",
+    "--strict-config",
 )
 _APP_SERVER_LOCALE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM")
 _SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
@@ -60,6 +65,14 @@ _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
+_INVALID_RESPONSE_ERROR = "app-server returned an invalid response"
+_HOOK_ACTIVITY_ERROR = "app-server emitted disallowed hook activity"
+_POST_TURN_ACTIVITY_ERROR = "app-server emitted activity after turn completion"
+_POST_TURN_BOUNDARY_ERROR = "app-server did not reach an idle turn boundary"
+_EXTERNAL_SOURCE_ERROR = (
+    "app-server retained an external source or process policy; "
+    "refusing to start a thread"
+)
 
 
 @dataclass
@@ -272,6 +285,11 @@ def _permission_read_roots() -> tuple[Path, ...]:
             else []
         ),
         *(
+            [framework_binary]
+            if (framework_binary := _python_framework_binary()) is not None
+            else []
+        ),
+        *(
             Path(value).resolve()
             for name in ("stdlib", "platstdlib", "purelib", "platlib")
             if (value := scheme_paths.get(name))
@@ -286,6 +304,33 @@ def _permission_read_roots() -> tuple[Path, ...]:
     return tuple(
         path for path in dict.fromkeys(candidates) if path not in broad_prefixes
     )
+
+
+def _python_framework_binary() -> Path | None:
+    """Return the exact macOS framework binary needed by framework builds."""
+
+    framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+    if not isinstance(framework, str) or not framework:
+        return None
+    install_dir = sysconfig.get_config_var("PYTHONFRAMEWORKINSTALLDIR")
+    if isinstance(install_dir, str) and install_dir:
+        return (Path(install_dir) / framework).resolve()
+    prefix = sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")
+    version = sysconfig.get_config_var("VERSION")
+    if not (
+        isinstance(prefix, str)
+        and prefix
+        and isinstance(version, str)
+        and version
+    ):
+        return None
+    return (
+        Path(prefix)
+        / f"{framework}.framework"
+        / "Versions"
+        / version
+        / framework
+    ).resolve()
 
 
 def _permission_filesystem_rules() -> dict[str, str]:
@@ -414,13 +459,13 @@ def _converse(
     )
     session.notify("initialized", {})
     _validate_account_boundary(session)
+    _validate_external_tool_boundary(session, workspace)
     thread = session.request(
         "thread/start",
         _thread_start_params(workspace, developer_instructions, model),
     )
     _validate_thread_boundary(thread, workspace)
     thread_id = thread["thread"]["id"]
-    _validate_external_tool_boundary(session, thread_id, workspace)
     effective_model = thread.get("model")
     effective_effort = thread.get("reasoningEffort") if effort is None else None
 
@@ -449,7 +494,26 @@ def _converse(
         if transcript.thread_settings_confirmed:
             effective_model = transcript.confirmed_model
             effective_effort = transcript.confirmed_reasoning_effort
+    _validate_post_turn_boundary(session, thread_id)
     return transcripts
+
+
+def _validate_post_turn_boundary(session: _Session, thread_id: str) -> None:
+    """Order after terminal delivery, attest idle, and reject trailing activity."""
+
+    response = session.request(
+        "thread/read", {"threadId": thread_id, "includeTurns": False}
+    )
+    thread = response.get("thread")
+    valid = (
+        isinstance(thread, dict)
+        and thread.get("id") == thread_id
+        and thread.get("status") == {"type": "idle"}
+        and thread.get("turns") == []
+    )
+    if not valid:
+        raise CodexProtocolError(_POST_TURN_BOUNDARY_ERROR)
+    session.assert_quiescent()
 
 
 def _validated_turn_id(response: Any) -> str:
@@ -585,10 +649,8 @@ def _validate_account_boundary(session: _Session) -> None:
         )
 
 
-def _validate_external_tool_boundary(
-    session: _Session, thread_id: str, workspace: str
-) -> None:
-    """Fail before a model turn if App Server retained an external tool source."""
+def _validate_external_tool_boundary(session: _Session, workspace: str) -> None:
+    """Fail before thread creation if App Server retained an external source."""
 
     response = session.request(
         "config/read", {"cwd": workspace, "includeLayers": False}
@@ -607,23 +669,37 @@ def _validate_external_tool_boundary(
             and apps_default.get("destructive_enabled") is False
             and apps_default.get("open_world_enabled") is False
             and features.get("apps") is False
+            and features.get("hooks") is False
             and features.get("plugins") is False
+            and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
             and _validate_permission_profile_config(config)
             and _validate_shell_environment_policy(
                 config.get("shell_environment_policy"), workspace
             )
         )
+    if not config_valid:
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+
+    hooks = session.request("hooks/list", {"cwds": [workspace]})
+    hooks_valid = hooks.get("data") == [
+        {
+            "cwd": workspace,
+            "hooks": [],
+            "warnings": [],
+            "errors": [],
+        }
+    ]
+    if not hooks_valid:
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+
     mcp = session.request(
         "mcpServerStatus/list",
-        {"threadId": thread_id, "limit": 1, "detail": "toolsAndAuthOnly"},
+        {"limit": 1, "detail": "toolsAndAuthOnly"},
     )
     mcp_valid = mcp.get("data") == [] and mcp.get("nextCursor") is None
-    if not config_valid or not mcp_valid:
-        raise CodexProtocolError(
-            "app-server retained an external tool source or process policy; "
-            "refusing to start a turn"
-        )
+    if not mcp_valid:
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
 
 
 def _validate_permission_profile_config(config: dict[str, Any]) -> bool:
@@ -680,7 +756,6 @@ _INFORMATIONAL_ITEM_TYPES = {
     "contextCompaction",
     "enteredReviewMode",
     "exitedReviewMode",
-    "hookPrompt",
     "plan",
     "reasoning",
     "userMessage",
@@ -689,6 +764,7 @@ _DISALLOWED_ITEM_TYPES = {
     "collabAgentToolCall",
     "dynamicToolCall",
     "fileChange",
+    "hookPrompt",
     "imageGeneration",
     "imageView",
     "mcpToolCall",
@@ -744,6 +820,15 @@ _UNFULFILLABLE_SERVER_REQUEST_METHODS = {
     "attestation/generate",
     "currentTime/read",
 }
+
+
+def _is_harmless_global_notification(message: Any) -> bool:
+    return (
+        isinstance(message, dict)
+        and set(message) == {"method", "params"}
+        and message.get("method") in _GLOBAL_NOTIFICATION_METHODS
+        and isinstance(message.get("params"), dict)
+    )
 
 
 @dataclass(frozen=True)
@@ -1187,6 +1272,53 @@ def _request_id_key(value: Any) -> tuple[type[Any], Any] | None:
     return (type(value), value)
 
 
+def _is_hook_activity(message: dict[str, Any]) -> bool:
+    method = message.get("method")
+    if isinstance(method, str) and method.startswith("hook/"):
+        return True
+    if method not in {"item/started", "item/completed"}:
+        return False
+    params = message.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    return isinstance(item, dict) and item.get("type") == "hookPrompt"
+
+
+def _validated_response_result(
+    message: dict[str, Any], request_id: int, method: str
+) -> dict[str, Any]:
+    request_key = _request_id_key(request_id)
+    response_key = _request_id_key(message.get("id"))
+    has_result = "result" in message
+    has_error = "error" in message
+    response_field = "result" if has_result else "error"
+    if (
+        request_key is None
+        or response_key != request_key
+        or has_result == has_error
+        # Codex 0.146's generated JSONRPCResponse schema and live App Server
+        # responses are deliberately versionless: exactly id + result/error.
+        or set(message) != {"id", response_field}
+    ):
+        raise CodexProtocolError(_INVALID_RESPONSE_ERROR)
+
+    if has_error:
+        error = message["error"]
+        if (
+            not isinstance(error, dict)
+            or not isinstance(error.get("code"), int)
+            or isinstance(error.get("code"), bool)
+            or not isinstance(error.get("message"), str)
+            or not set(error).issubset({"code", "message", "data"})
+        ):
+            raise CodexProtocolError(_INVALID_RESPONSE_ERROR)
+        raise CodexProtocolError(f"app-server request {method} failed")
+
+    result = message["result"]
+    if not isinstance(result, dict):
+        raise CodexProtocolError(_INVALID_RESPONSE_ERROR)
+    return result
+
+
 class _Session:
     def __init__(self, stdin: IO[bytes], stdout: IO[bytes], timeout_seconds: float):
         self._stdin = stdin
@@ -1215,14 +1347,8 @@ class _Session:
         )
         while True:
             message = self._prepare_incoming(self._read_line())
-            if (
-                isinstance(message, dict)
-                and message.get("id") == request_id
-                and "method" not in message
-            ):
-                if "error" in message:
-                    raise CodexProtocolError(f"app-server request {method} failed")
-                return message.get("result", {})
+            if isinstance(message, dict) and "method" not in message:
+                return _validated_response_result(message, request_id, method)
             self._pending_notifications.append(message)
 
     def read_message(self) -> Any:
@@ -1230,9 +1356,33 @@ class _Session:
             return self._pending_notifications.pop(0)
         return self._prepare_incoming(self._read_line())
 
+    def assert_quiescent(self) -> None:
+        """Drain already ordered input and reject non-global activity."""
+
+        while True:
+            if self._pending_notifications:
+                message = self._pending_notifications.pop(0)
+            else:
+                # thread/read is the ordering barrier. Polling once at zero
+                # timeout drains only bytes that are already observable after
+                # its response, without adding an arbitrary sleep window.
+                found, raw_message = self._read_line_until(time.monotonic())
+                if not found:
+                    if self._buffer:
+                        buffered = len(self._buffer)
+                        self._buffer.clear()
+                        self._charge_input(buffered)
+                        self._raise_post_turn_activity()
+                    return
+                message = self._prepare_incoming(raw_message)
+            if not _is_harmless_global_notification(message):
+                self._raise_post_turn_activity()
+
     def _prepare_incoming(self, message: Any) -> Any:
         if not isinstance(message, dict):
             return _MalformedWireEvidence(content=_wire_fingerprint(message))
+        if _is_hook_activity(message):
+            raise CodexProtocolError(_HOOK_ACTIVITY_ERROR)
         if "method" in message and "id" in message:
             return self._deny_server_request(message)
         if message.get("method") == "serverRequest/resolved":
@@ -1311,6 +1461,12 @@ class _Session:
         self._stdin.flush()
 
     def _read_line(self) -> Any:
+        found, message = self._read_line_until(self._deadline)
+        if not found:
+            raise CodexProtocolError("timed out waiting for app-server")
+        return message
+
+    def _read_line_until(self, deadline: float) -> tuple[bool, Any]:
         # Raw fd reads with a private buffer: select() on the fd cannot see
         # lines already sitting in a buffered stream, so buffering is ours.
         while True:
@@ -1322,15 +1478,13 @@ class _Session:
                 self._charge_input(consumed)
                 line = bytes(self._buffer[:newline])
                 del self._buffer[:consumed]
-                return json.loads(line)
+                return True, json.loads(line)
             if len(self._buffer) > _MAX_JSONL_FRAME_BYTES:
                 self._raise_input_limit()
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
-                raise CodexProtocolError("timed out waiting for app-server")
+            remaining = max(0, deadline - time.monotonic())
             ready, _, _ = select.select([self._stdout], [], [], remaining)
             if not ready:
-                raise CodexProtocolError("timed out waiting for app-server")
+                return False, None
             chunk = os.read(self._stdout.fileno(), 65536)
             if not chunk:
                 raise CodexProtocolError("app-server closed its stdout")
@@ -1349,4 +1503,11 @@ class _Session:
     def _raise_input_limit(self) -> None:
         self._buffer.clear()
         self._pending_notifications.clear()
+        self._server_requests.clear()
         raise CodexProtocolError(_PROTOCOL_INPUT_LIMIT_ERROR)
+
+    def _raise_post_turn_activity(self) -> None:
+        self._buffer.clear()
+        self._pending_notifications.clear()
+        self._server_requests.clear()
+        raise CodexProtocolError(_POST_TURN_ACTIVITY_ERROR)
