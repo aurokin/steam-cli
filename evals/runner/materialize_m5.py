@@ -1,11 +1,12 @@
 """Materialize M5 compatibility scenarios.
 
-Machine-target scenarios seed one complete system profile plus per-app
-declared facts through the public sync writers, so the CLI's own bounded
-minimum-requirement parser -- not the fixture -- decides each gate.  Where a
-scenario needs a component to stay unknown, the declared minimum text is
-written to be unparseable by that parser; if a future parser learns to compare
-it, adjust the scenario prose, never the parser.
+Machine-target scenarios with candidate evidence seed one complete system
+profile plus per-app declared facts through the public sync writers, so the
+CLI's own bounded minimum-requirement parser -- not the fixture -- decides each
+gate.  A request with no candidate evidence keeps the system profile absent.
+Where a scenario needs a component to stay unknown, the declared minimum text
+is written to be unparseable by that parser; if a future parser learns to
+compare it, adjust the scenario prose, never the parser.
 
 ``INSTALLED_FRESH`` is fifteen minutes.  No asserted field depends on it; the
 installed observation is written one minute before the scenario clock so the
@@ -269,24 +270,25 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             account_alias=account_alias,
             now=now,
         )
-        storage.record_system_profile_consent(
-            machine_id=machine_key,
-            disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
-            accepted_at=now,
-            backups_acknowledged=True,
-        )
-        profile_run = storage.begin_system_profile_sync(
-            machine_id=machine_key,
-            disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
-            started_at=now,
-        )
-        storage.complete_system_profile_sync(
-            profile_run.id,
-            profile=_system_profile(),
-            observed_at=now,
-            completed_at=now,
-            disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
-        )
+        if plans:
+            storage.record_system_profile_consent(
+                machine_id=machine_key,
+                disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+                accepted_at=now,
+                backups_acknowledged=True,
+            )
+            profile_run = storage.begin_system_profile_sync(
+                machine_id=machine_key,
+                disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+                started_at=now,
+            )
+            storage.complete_system_profile_sync(
+                profile_run.id,
+                profile=_system_profile(),
+                observed_at=now,
+                completed_at=now,
+                disclosure_version=SYSTEM_PROFILE_DISCLOSURE_VERSION,
+            )
 
         write_owned_snapshot(
             storage, account.id, [plan.appid for plan in plans if plan.owned], now

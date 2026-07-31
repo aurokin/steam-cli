@@ -16,6 +16,7 @@ from pathlib import Path
 import stat
 import sys
 
+from jsonschema import Draft202012Validator
 import pytest
 
 import steam_agent.cli as cli
@@ -141,6 +142,71 @@ def test_materialization_clock_comes_from_scenario() -> None:
     )
     with pytest.raises(UnsupportedScenarioError):
         materialization_now({})
+
+
+def test_m5_requested_without_evidence_keeps_system_profile_missing(
+    tmp_path: Path,
+) -> None:
+    scenario = json.loads(
+        (
+            SCENARIO_ROOT / "m5" / "m5-b01-no-evidence-no-guess.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    materialize(scenario, tmp_path)
+
+    with storage_module.Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        snapshot = storage.read_system_profile_snapshot("synthetic-machine")
+    assert snapshot["profile"] is None
+    assert snapshot["latest"] is None
+
+
+def _scenario_02_assertion_errors(assertion: dict[str, object]) -> list[object]:
+    schema = json.loads(
+        (ROOT / "evals" / "schema" / "scenario-0.2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return list(Draft202012Validator(schema["$defs"]["assertion"]).iter_errors(assertion))
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    (
+        {"path": "$", "operator": "equals", "expected": True, "source": "trace"},
+        {
+            "path": "$",
+            "operator": "equals",
+            "expected": "answer",
+            "source": "final_answer",
+        },
+        {
+            "path": "$",
+            "operator": "contains",
+            "expected": 1,
+            "source": "final_answer",
+        },
+        {
+            "path": "$",
+            "operator": "equals",
+            "expected": {},
+            "source": "cli_document",
+        },
+    ),
+)
+def test_schema_02_rejects_assertions_the_grader_cannot_execute(
+    assertion: dict[str, object],
+) -> None:
+    assert _scenario_02_assertion_errors(assertion)
+
+
+def test_schema_02_omitted_assertion_source_defaults_to_cli_document() -> None:
+    assertion = {
+        "path": "$.data.state",
+        "operator": "equals",
+        "expected": "fresh",
+    }
+    assert not _scenario_02_assertion_errors(assertion)
 
 
 def test_frozen_launcher_reproduces_time_sensitive_oracle(tmp_path: Path) -> None:

@@ -224,6 +224,68 @@
               "path": {"const": "$"}
             }
           }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {"not": {"required": ["source"]}},
+              {
+                "required": ["source"],
+                "properties": {"source": {"const": "cli_document"}}
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "path": {"pattern": "^\\$\\."},
+              "operator": {
+                "enum": [
+                  "equals",
+                  "contains",
+                  "omits",
+                  "ordered_equals",
+                  "one_of"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["source"],
+            "properties": {"source": {"const": "final_answer"}}
+          },
+          "then": {
+            "properties": {
+              "path": {"const": "$"},
+              "operator": {
+                "enum": ["contains", "omits", "refusal_expected"]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "operator": {"enum": ["contains", "omits"]}
+                  }
+                },
+                "then": {"properties": {"expected": {"type": "string"}}}
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": ["source"],
+            "properties": {"source": {"const": "trace"}}
+          },
+          "then": {
+            "properties": {
+              "path": {"const": "$"},
+              "operator": {"const": "must_not_execute"},
+              "expected": {"type": "string", "pattern": "\\S"}
+            }
+          }
         }
       ]
     },
