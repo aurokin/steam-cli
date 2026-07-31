@@ -6,9 +6,10 @@ pinned against ``codex app-server generate-json-schema``, codex-cli 0.146.0):
 per scenario turn on the same thread, collecting ``item/completed`` and
 ``turn/completed`` notifications into one transcript per turn. Approval
 requests are answered ``denied`` so a sandbox escape can never be granted by
-the harness; the policy itself is ``never``. An explicit workspace-write
-sandbox and a single runtime workspace root constrain writes and network
-access. Codex's macOS sandbox still permits host reads outside that root.
+the harness; the policy itself is ``never``. A custom permission profile
+constrains writes to the workspace, denies network access, and denies host
+reads except for the minimum Python runtime and package roots needed by the
+frozen CLI launcher.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, IO, Sequence
@@ -50,6 +53,7 @@ _APP_SERVER_LOCALE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM")
 _SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
 _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
 _VERSION_ERROR = "required codex app-server version is unavailable"
+_PERMISSION_PROFILE = "steam-agent-eval"
 
 
 @dataclass
@@ -169,6 +173,7 @@ def run_agent_conversation(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=child_environment,
+            start_new_session=True,
         )
         try:
             return _converse(
@@ -181,12 +186,7 @@ def run_agent_conversation(
                 timeout_seconds=timeout_seconds,
             )
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+            _terminate_process_group(process)
 
 
 def _app_server_environment(
@@ -208,7 +208,9 @@ def _app_server_environment(
         {
             "CODEX_HOME": str(isolated_home),
             "HOME": str(workspace),
-            "TMPDIR": str(workspace),
+            # The permission profile denies the process TMPDIR so evaluated
+            # commands cannot read the copied App Server authentication.
+            "TMPDIR": str(isolated_home),
             "PATH": os.defpath,
         }
     )
@@ -242,11 +244,90 @@ def _app_server_process_args(executable: str, workspace: Path) -> list[str]:
         + json.dumps(list(_SHELL_ENV_INCLUDE_ONLY), separators=(",", ":")),
         "shell_environment_policy.set.HOME=" + json.dumps(str(workspace)),
         "shell_environment_policy.set.TMPDIR=" + json.dumps(str(workspace)),
+        "default_permissions=" + json.dumps(_PERMISSION_PROFILE),
+        f"permissions.{_PERMISSION_PROFILE}=" + _permission_profile_toml(),
     )
     args = [executable, *_APP_SERVER_ARGS[1:]]
     for override in policy_overrides:
         args.extend(("-c", override))
     return args
+
+
+def _permission_read_roots() -> tuple[Path, ...]:
+    """Return the minimum host roots needed by the frozen Python launcher."""
+
+    candidates = (
+        Path(sys.base_prefix).resolve(),
+        Path(sys.prefix).resolve(),
+        (Path(__file__).resolve().parents[2] / "src").resolve(),
+    )
+    return tuple(dict.fromkeys(candidates))
+
+
+def _permission_filesystem_rules() -> dict[str, str]:
+    rules = {
+        ":root": "deny",
+        ":minimal": "read",
+        ":tmpdir": "deny",
+        ":slash_tmp": "deny",
+    }
+    rules.update({str(path): "read" for path in _permission_read_roots()})
+    return rules
+
+
+def _permission_profile_toml() -> str:
+    filesystem = ",".join(
+        f"{json.dumps(path)}={json.dumps(access)}"
+        for path, access in _permission_filesystem_rules().items()
+    )
+    return (
+        '{extends=":workspace",filesystem={'
+        + filesystem
+        + "},network={enabled=false}}"
+    )
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str], *, timeout_seconds: float = 10
+) -> None:
+    """Terminate the App Server session and non-detached descendants.
+
+    A command that deliberately creates a new session can escape this process
+    group; the runner's exact-command policy rejects such shell activity, but
+    process-group cleanup alone is not an operating-system process jail.
+    """
+
+    process_group = process.pid
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + timeout_seconds
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        # Polling reaps the leader promptly so its zombie does not make the
+        # process group look alive for the entire grace period.
+        process.poll()
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout_seconds)
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _copy_auth_file(isolated_home: Path) -> None:
@@ -366,7 +447,7 @@ def _thread_start_params(
 ) -> dict[str, Any]:
     return {
         "cwd": workspace,
-        "sandbox": "workspace-write",
+        "permissions": _PERMISSION_PROFILE,
         "runtimeWorkspaceRoots": [workspace],
         "approvalPolicy": "never",
         "dynamicTools": [],
@@ -374,14 +455,6 @@ def _thread_start_params(
         # and silently downgrades this thread to read-only. The isolated
         # CODEX_HOME has no configured remote environments, so omission can
         # select only App Server's built-in local execution environment.
-        "config": {
-            "sandbox_workspace_write": {
-                "writable_roots": [],
-                "network_access": False,
-                "exclude_tmpdir_env_var": True,
-                "exclude_slash_tmp": True,
-            },
-        },
         "developerInstructions": developer_instructions,
         "ephemeral": True,
         "model": model,
@@ -417,7 +490,9 @@ def _validate_thread_boundary(response: dict[str, Any], workspace: str) -> None:
         and response.get("cwd") == workspace
         and response.get("approvalPolicy") == "never"
         and response.get("approvalsReviewer") == "user"
-        and response.get("activePermissionProfile") is None
+        and _validate_active_permission_profile(
+            response.get("activePermissionProfile")
+        )
         and response.get("runtimeWorkspaceRoots") == [workspace]
         and _instruction_sources_are_local(instruction_sources, workspace)
         and _validate_sandbox_boundary(response.get("sandbox"))
@@ -433,13 +508,23 @@ def _validate_settings_boundary(settings: dict[str, Any], workspace: str) -> Non
         settings.get("cwd") == workspace
         and settings.get("approvalPolicy") == "never"
         and settings.get("approvalsReviewer") == "user"
-        and settings.get("activePermissionProfile") is None
+        and _validate_active_permission_profile(
+            settings.get("activePermissionProfile")
+        )
         and _validate_sandbox_boundary(settings.get("sandboxPolicy"))
     )
     if not valid:
         raise CodexProtocolError(
             "app-server changed the requested workspace/network boundary"
         )
+
+
+def _validate_active_permission_profile(profile: Any) -> bool:
+    return (
+        isinstance(profile, dict)
+        and profile.get("id") == _PERMISSION_PROFILE
+        and profile.get("extends") == ":workspace"
+    )
 
 
 def _instruction_sources_are_local(sources: Any, workspace: str) -> bool:
@@ -500,6 +585,7 @@ def _validate_external_tool_boundary(
             and features.get("apps") is False
             and features.get("plugins") is False
             and config.get("plugins") == {}
+            and _validate_permission_profile_config(config)
             and _validate_shell_environment_policy(
                 config.get("shell_environment_policy"), workspace
             )
@@ -514,6 +600,41 @@ def _validate_external_tool_boundary(
             "app-server retained an external tool source or process policy; "
             "refusing to start a turn"
         )
+
+
+def _validate_permission_profile_config(config: dict[str, Any]) -> bool:
+    profiles = config.get("permissions")
+    profile = profiles.get(_PERMISSION_PROFILE) if isinstance(profiles, dict) else None
+    filesystem = {
+        "glob_scan_max_depth": None,
+        **_permission_filesystem_rules(),
+    }
+    network = {
+        "enabled": False,
+        "proxy_url": None,
+        "enable_socks5": None,
+        "socks_url": None,
+        "enable_socks5_udp": None,
+        "allow_upstream_proxy": None,
+        "dangerously_allow_non_loopback_proxy": None,
+        "dangerously_allow_all_unix_sockets": None,
+        "mode": None,
+        "domains": None,
+        "unix_sockets": None,
+        "allow_local_binding": None,
+        "mitm": None,
+    }
+    return (
+        config.get("default_permissions") == _PERMISSION_PROFILE
+        and profile
+        == {
+            "description": None,
+            "extends": ":workspace",
+            "workspace_roots": None,
+            "filesystem": filesystem,
+            "network": network,
+        }
+    )
 
 
 def _validate_shell_environment_policy(policy: Any, workspace: str) -> bool:

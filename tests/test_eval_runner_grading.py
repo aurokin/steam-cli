@@ -402,8 +402,9 @@ def test_private_host_path_forms_share_detection_and_redaction(
         "https://example.com/?next=file:%2FUsers%2Fsecret-tail.txt",
         "steam://open/path:/Users/example/secret-tail.txt",
         "$.data.items[0].path",
-        "$['/Users/example/secret-tail.txt']",
-        "$.data.items[?(@.path=='/Users/example/secret-tail.txt')].state",
+        "$['relative/repository/path']",
+        "$.data.items[?(@.path=='relative/repository/path')].state",
+        "$['/']",
         "resume/0.1",
         "recipe:path/0.1",
         "./bin/steam-agent",
@@ -433,6 +434,28 @@ def test_private_host_path_detection_ignores_public_and_relative_text(
 ) -> None:
     assert grade.find_private_host_paths(text) == []
     assert grade.redact_private_host_paths(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "private_path", "redacted"),
+    (
+        (
+            "$['/Users/example/Library/Steam']",
+            "/Users/example/Library/Steam",
+            "$['<redacted-host-path>']",
+        ),
+        (
+            "$.data.items[?(@.path=='/Users/example/Library/Steam')].state",
+            "/Users/example/Library/Steam",
+            "$.data.items[?(@.path=='<redacted-host-path>')].state",
+        ),
+    ),
+)
+def test_json_path_syntax_does_not_hide_embedded_private_paths(
+    text: str, private_path: str, redacted: str
+) -> None:
+    assert grade.find_private_host_paths(text) == [private_path]
+    assert grade.redact_private_host_paths(text) == redacted
 
 
 def test_private_host_path_scanner_is_conservative_for_ambiguous_prose() -> None:
@@ -896,6 +919,107 @@ def test_fact_coverage_requires_all_claims_to_be_supported() -> None:
     assert not unsupported_extra["passed"]
     assert unsupported_extra["missing_required_paths"] == []
     assert unsupported_extra["failed"] == [{"path": "$.data.other", "value": True}]
+
+
+@pytest.mark.parametrize(
+    ("claim_path", "claim_value", "required_path"),
+    (
+        ("$.data.items[0].state", "ready", "$.data.items[*].state"),
+        ("$.data.items[*].state", ["ready"], "$.data.items[0].state"),
+        (
+            "$.data.items[?(@.appid==10)].state",
+            ["ready"],
+            "$.data.items[0].state",
+        ),
+    ),
+)
+def test_fact_coverage_accepts_paths_selecting_the_same_concrete_locations(
+    claim_path: str, claim_value: object, required_path: str
+) -> None:
+    document = {"data": {"items": [{"appid": 10, "state": "ready"}]}}
+
+    result = grade.grade_fact_coverage(
+        [{"path": claim_path, "value": claim_value}],
+        document,
+        [required_path],
+    )
+
+    assert result["passed"], result
+    assert result["satisfied_required_paths"] == [required_path]
+
+
+def test_fact_coverage_does_not_let_one_concrete_claim_cover_a_larger_projection(
+) -> None:
+    document = {
+        "data": {
+            "items": [
+                {"appid": 10, "state": "ready"},
+                {"appid": 11, "state": "unknown"},
+            ]
+        }
+    }
+    required_path = "$.data.items[*].state"
+
+    result = grade.grade_fact_coverage(
+        [{"path": "$.data.items[0].state", "value": "ready"}],
+        document,
+        [required_path],
+    )
+
+    assert not result["passed"]
+    assert result["missing_required_paths"] == [required_path]
+
+
+def test_fact_coverage_unions_concrete_claims_for_a_wildcard_requirement() -> None:
+    document = {
+        "data": {
+            "items": [
+                {"appid": 10, "state": "ready", "note": "same"},
+                {"appid": 11, "state": "unknown", "note": "same"},
+            ]
+        }
+    }
+    required_path = "$.data.items[*].state"
+
+    result = grade.grade_fact_coverage(
+        [
+            {"path": "$.data.items[0].state", "value": "ready"},
+            {"path": "$.data.items[1].state", "value": "unknown"},
+            {"path": "$.data.items[0].note", "value": "same"},
+        ],
+        document,
+        [required_path],
+    )
+
+    assert result["passed"], result
+    assert result["satisfied_required_paths"] == [required_path]
+
+
+def test_fact_coverage_does_not_equate_distinct_locations_with_equal_values() -> None:
+    document = {"data": {"required": "unknown", "incidental": "unknown"}}
+
+    result = grade.grade_fact_coverage(
+        [{"path": "$.data.incidental", "value": "unknown"}],
+        document,
+        ["$.data.required"],
+    )
+
+    assert not result["passed"]
+    assert result["missing_required_paths"] == ["$.data.required"]
+
+
+def test_fact_coverage_does_not_equate_empty_projections_from_distinct_paths(
+) -> None:
+    document = {"data": {"required": [], "incidental": []}}
+
+    result = grade.grade_fact_coverage(
+        [{"path": "$.data.incidental[*]", "value": []}],
+        document,
+        ["$.data.required[*]"],
+    )
+
+    assert not result["passed"]
+    assert result["missing_required_paths"] == ["$.data.required[*]"]
 
 
 @pytest.mark.parametrize(

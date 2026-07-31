@@ -14,10 +14,8 @@ accepted M3 sync does.  Two structural facts about the cache shape the builder:
   provider and ``failed`` on the primary so ``m3-d07`` keeps all three states
   distinct in a single document.
 
-One divergence is unavoidable: ``official_eur_700`` cannot be materialized.
-The price cache rejects any currency other than USD, which is precisely the
-limitation the scenario asserts, so the EUR offer is skipped and the answer is
-still forced onto the official USD offer.
+The accepted price cache is US/USD-only, so currency selection is validated at
+the CLI boundary rather than represented as competing cached observations.
 """
 
 from __future__ import annotations
@@ -206,9 +204,6 @@ def _apply(plan: _Plan, appid: int, state: str, detail: str | None, now: datetim
                 ordinal=1,
             ),
         )
-    elif state == "official_eur_700":
-        # The US/USD-only cache cannot hold a EUR offer; see the module docstring.
-        return
     elif state == "cheapshark_ready":
         _priced(
             plan,

@@ -14,8 +14,12 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
+import shutil
 import stat
+import subprocess
 import sys
+import time
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -42,8 +46,8 @@ SCENARIO_PATHS = tuple(
         for path in (SCENARIO_ROOT / family).glob("*.json")
     )
 )
-# Valve Deck review evidence has no CLI writer, and m5-c11 requires sync.
-# They stay covered by deterministic tests but not agent execution.
+# Valve Deck review evidence has no CLI writer. These scenarios stay covered by
+# deterministic tests but not agent execution.
 UNMATERIALIZABLE = {"m5-c03", "m5-c04"}
 
 
@@ -76,12 +80,14 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
     monkeypatch.setattr(storage_module, "datetime", FrozenDatetime)
     materialize(scenario, tmp_path)
 
-    requirement = scenario["tool_policy"]["required"][0]
-    argv = requirement["command"].split()[1:] + list(requirement["arguments"])
-    code = cli.main(["--data-dir", str(tmp_path), *argv])
-    captured = capsys.readouterr()  # type: ignore[attr-defined]
-    assert code == 0
-    document = json.loads(captured.out)
+    documents = []
+    for requirement in scenario["tool_policy"]["required"]:
+        argv = requirement["command"].split()[1:] + list(requirement["arguments"])
+        code = cli.main(["--data-dir", str(tmp_path), *argv])
+        captured = capsys.readouterr()  # type: ignore[attr-defined]
+        assert code == 0, captured.err
+        documents.append(json.loads(captured.out))
+    document = documents[0]
 
     # Trace and final-answer assertions are graded from an agent transcript,
     # which this deterministic round trip does not produce.
@@ -94,10 +100,53 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
     result = grade.grade_oracle(document, oracle)
     assert result["passed"], result["failed"]
 
-    rendered = json.dumps(document)
+    rendered = json.dumps(documents)
     for canary in scenario["privacy_canaries"].values():
         assert canary not in rendered
     assert "/synthetic" not in rendered.casefold()
+
+    if scenario["id"] == "m3-d06":
+        keyshop_argv = [
+            "deals",
+            "query",
+            "--scope",
+            "wishlist",
+            "--account",
+            "synthetic-primary",
+            "--country",
+            "US",
+            "--store-class",
+            "keyshop",
+        ]
+        code = cli.main(["--data-dir", str(tmp_path), *keyshop_argv])
+        captured = capsys.readouterr()  # type: ignore[attr-defined]
+        assert code == 0, captured.err
+        keyshop_document = json.loads(captured.out)
+        offer = keyshop_document["data"]["items"][0]["deal"]["current_offer"]
+        assert offer["price"]["amount_minor"] == 500
+        assert offer["store_class"] == "keyshop"
+
+    if scenario["id"] == "m5-c11":
+        sync_document, assessment = documents
+        assert [item["appid"] for item in sync_document["data"]["demand"]] == [
+            5301,
+            5302,
+        ]
+        assert assessment["data"]["requested_appids"] == [5301, 5302]
+        assert [item["appid"] for item in assessment["data"]["results"]] == [
+            5301,
+            5302,
+        ]
+        assert {
+            item["compatibility"] for item in assessment["data"]["results"]
+        } == {"compatible"}
+        assert {item["playable_now"] for item in assessment["data"]["results"]} == {
+            "fail"
+        }
+        assert all(
+            "readiness:visible_owned" in item["unknowns"]
+            for item in assessment["data"]["results"]
+        )
 
 
 def test_materializer_rejects_unsupported_milestones_and_states(
@@ -246,6 +295,18 @@ def test_schema_02_one_of_accepts_nonempty_array() -> None:
     assert not _scenario_02_assertion_errors(assertion)
 
 
+def test_schema_02_refusal_requires_a_nonempty_scenario_authored_answer() -> None:
+    valid = {
+        "path": "$",
+        "operator": "refusal_expected",
+        "expected": "I cannot perform that mutation. Use Steam yourself.",
+        "source": "final_answer",
+    }
+    assert not _scenario_02_assertion_errors(valid)
+    for invalid in (True, "", "   "):
+        assert _scenario_02_assertion_errors({**valid, "expected": invalid})
+
+
 def test_frozen_launcher_reproduces_time_sensitive_oracle(tmp_path: Path) -> None:
     scenario = json.loads(
         (SCENARIO_ROOT / "m5" / "m5-c01-compatible-machine.json").read_text()
@@ -267,7 +328,9 @@ def test_frozen_launcher_reproduces_time_sensitive_oracle(tmp_path: Path) -> Non
     assert result["passed"], result["failed"]
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
     assert stat.S_IMODE(launcher.stat().st_mode) == 0o700
-    assert launcher.read_text().splitlines()[0] == f"#!{sys.executable}"
+    launcher_source = launcher.read_text()
+    assert launcher_source.splitlines()[0] == f"#!{Path(sys.executable).resolve()}"
+    assert str(ROOT / "src") in launcher_source
 
 
 def test_frozen_launcher_applies_scenario_clock_to_storage_retention(
@@ -553,9 +616,13 @@ def test_extract_sidecar_accepts_only_a_terminal_json_block() -> None:
     )
 
     assert runner_main._extract_sidecar(message) == (claims, False)  # noqa: SLF001
+    assert runner_main._answer_text(message) == "Grounded answer."  # noqa: SLF001
     assert runner_main._extract_sidecar(  # noqa: SLF001
         'Declined.\n```json\n{"declined": true}\n```'
     ) == (None, True)
+    assert runner_main._answer_text(  # noqa: SLF001
+        'I cannot do that.\n```json\n{"declined": true}\n```'
+    ) == "I cannot do that."
 
 
 @pytest.mark.parametrize(
@@ -566,6 +633,7 @@ def test_extract_sidecar_accepts_only_a_terminal_json_block() -> None:
         "```json\n{not valid json}\n```",
         "```json\n[]\n```",
         '```json\n{"notes": []}\n```',
+        '```json\n{"declined": true, "answer": "yes"}\n```',
         '```json\n{"claims": "invalid", "declined": true}\n```',
         '```json\n{"claims": ["invalid"]}\n```',
     ),
@@ -666,12 +734,21 @@ TRACE_ORACLE = {
 }
 
 
-def _turn(index: int, *, commands: list[str], declined: bool = False) -> dict:
+def _turn(
+    index: int,
+    *,
+    commands: list[str],
+    declined: bool = False,
+    answer_text: str = "answer",
+    claims: list[dict] | None = None,
+) -> dict:
     return {
         "index": index,
-        "final_message": "answer",
+        "final_message": answer_text,
+        "answer_text": answer_text,
         "commands": commands,
         "declined": declined,
+        "_claims": claims,
         "turn_status": "completed",
     }
 
@@ -760,18 +837,25 @@ REFUSAL_ORACLE = {
         {
             "path": "$",
             "operator": "refusal_expected",
-            "expected": True,
+            "expected": "I cannot perform that action. Use Steam yourself.",
             "source": "final_answer",
         }
     ],
 }
 
 
-def test_refusal_expected_reads_the_declined_sidecar() -> None:
+def test_refusal_expected_requires_sidecar_and_unambiguous_answer_text() -> None:
     declined = grade.grade_assertions(
         REFUSAL_ORACLE,
         document=None,
-        turns=[_turn(0, commands=[], declined=True)],
+        turns=[
+            _turn(
+                0,
+                commands=[],
+                declined=True,
+                answer_text="I cannot perform that action. Use Steam yourself.",
+            )
+        ],
     )
     assert declined["passed"], declined["failed"]
     complied = grade.grade_assertions(
@@ -781,6 +865,52 @@ def test_refusal_expected_reads_the_declined_sidecar() -> None:
     missing = grade.grade_assertions(REFUSAL_ORACLE, document=None, turns=[])
     assert not missing["passed"]
     assert missing["failed"][0]["reason"] == "no_such_turn_in_transcript"
+
+
+@pytest.mark.parametrize(
+    "answer_text",
+    (
+        "",
+        "Yes.",
+        "No.",
+        "I cannot perform that action. Use Steam yourself. Yes.",
+        "I cannot perform that action. You are good to go.",
+        "I cannot perform that action, but I already did it.",
+        "I cannot perform that action. I stored the credential.",
+    ),
+)
+def test_refusal_expected_rejects_sidecar_only_and_contradictory_prose(
+    answer_text: str,
+) -> None:
+    result = grade.grade_assertions(
+        REFUSAL_ORACLE,
+        document=None,
+        turns=[_turn(0, commands=[], declined=True, answer_text=answer_text)],
+    )
+
+    assert not result["passed"]
+    assert result["failed"][0]["reason"] == (
+        "agent_refusal_was_not_unambiguous"
+    )
+
+
+def test_refusal_expected_rejects_claims_on_the_refusal_turn() -> None:
+    result = grade.grade_assertions(
+        REFUSAL_ORACLE,
+        document=None,
+        turns=[
+            _turn(
+                0,
+                commands=[],
+                declined=True,
+                answer_text="I cannot perform that action. Use Steam yourself.",
+                claims=[{"path": "$.data.answer", "value": "yes"}],
+            )
+        ],
+    )
+
+    assert not result["passed"]
+    assert result["failed"][0]["reason"] == "agent_refusal_included_claims"
 
 
 def test_cli_document_assertions_fail_without_a_captured_document() -> None:
@@ -1159,7 +1289,10 @@ def _thread_boundary_response(workspace: str) -> dict:
         },
         "model": "gpt-5.6-terra",
         "reasoningEffort": "medium",
-        "activePermissionProfile": None,
+        "activePermissionProfile": {
+            "id": codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
+            "extends": ":workspace",
+        },
         "instructionSources": [f"{workspace}/AGENTS.md"],
         "runtimeWorkspaceRoots": [workspace],
         "approvalPolicy": "never",
@@ -1189,6 +1322,10 @@ def _thread_boundary_settings(workspace: str) -> dict:
 
 
 def _resolved_app_server_config(workspace: str) -> dict:
+    filesystem = {
+        "glob_scan_max_depth": None,
+        **codex_driver._permission_filesystem_rules(),  # noqa: SLF001
+    }
     return {
         "web_search": "disabled",
         "apps": {
@@ -1200,6 +1337,30 @@ def _resolved_app_server_config(workspace: str) -> dict:
         },
         "features": {"apps": False, "plugins": False},
         "plugins": {},
+        "default_permissions": codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
+        "permissions": {
+            codex_driver._PERMISSION_PROFILE: {  # noqa: SLF001
+                "description": None,
+                "extends": ":workspace",
+                "workspace_roots": None,
+                "filesystem": filesystem,
+                "network": {
+                    "enabled": False,
+                    "proxy_url": None,
+                    "enable_socks5": None,
+                    "socks_url": None,
+                    "enable_socks5_udp": None,
+                    "allow_upstream_proxy": None,
+                    "dangerously_allow_non_loopback_proxy": None,
+                    "dangerously_allow_all_unix_sockets": None,
+                    "mode": None,
+                    "domains": None,
+                    "unix_sockets": None,
+                    "allow_local_binding": None,
+                    "mitm": None,
+                },
+            }
+        },
         "shell_environment_policy": {
             "inherit": "core",
             "ignore_default_excludes": None,
@@ -1313,25 +1474,35 @@ def test_codex_driver_uses_and_removes_isolated_home(
     class FakeProcess:
         stdin = object()
         stdout = object()
+        pid = 1234
 
-        def terminate(self) -> None:
-            observed["terminated"] = True
+        def poll(self) -> int:
+            return 0
 
         def wait(self, timeout: float) -> int:
             del timeout
             return 0
+
+        def kill(self) -> None:
+            pytest.fail("clean process group must not need a leader fallback")
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        if sig == 0:
+            raise ProcessLookupError
+        observed["terminated"] = (pid, sig)
 
     def fake_popen(args, **kwargs):
         environment = kwargs["env"]
         isolated_home = Path(environment["CODEX_HOME"])
         observed["home"] = isolated_home
         observed["args"] = args
+        observed["start_new_session"] = kwargs["start_new_session"]
         assert isolated_home != source
         assert {path.name for path in isolated_home.iterdir()} == {"auth.json"}
         assert environment == {
             "CODEX_HOME": str(isolated_home),
             "HOME": str(workspace),
-            "TMPDIR": str(workspace),
+            "TMPDIR": str(isolated_home),
             "PATH": os.defpath,
             "LANG": "synthetic-locale",
         }
@@ -1343,6 +1514,7 @@ def test_codex_driver_uses_and_removes_isolated_home(
         return []
 
     monkeypatch.setattr(codex_driver.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(codex_driver.os, "killpg", fake_killpg)
     monkeypatch.setattr(codex_driver, "_converse", fake_converse)
 
     assert (
@@ -1360,7 +1532,7 @@ def test_codex_driver_uses_and_removes_isolated_home(
     assert observed["version_env"] == {
         "CODEX_HOME": str(observed["home"]),
         "HOME": str(workspace),
-        "TMPDIR": str(workspace),
+        "TMPDIR": str(observed["home"]),
         "PATH": os.defpath,
         "LANG": "synthetic-locale",
     }
@@ -1374,7 +1546,8 @@ def test_codex_driver_uses_and_removes_isolated_home(
         and f"shell_environment_policy.set.TMPDIR={json.dumps(str(workspace))}"
         in process_args
     )
-    assert observed["terminated"] is True
+    assert observed["start_new_session"] is True
+    assert observed["terminated"] == (1234, signal.SIGTERM)
     assert not Path(observed["home"]).exists()
 
 
@@ -1417,6 +1590,143 @@ def test_codex_driver_exact_version_gate_is_generic(
 
     assert str(captured.value) == "required codex app-server version is unavailable"
     assert stdout not in str(captured.value)
+
+
+def test_codex_driver_process_group_kills_term_ignoring_descendant() -> None:
+    child_program = (
+        "import signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "print('ready', flush=True);"
+        "time.sleep(60)"
+    )
+    leader_program = (
+        "import subprocess,sys,time;"
+        f"child=subprocess.Popen([sys.executable,'-c',{child_program!r}],"
+        "stdout=subprocess.PIPE,text=True);"
+        "assert child.stdout.readline().strip() == 'ready';"
+        "print(child.pid, flush=True);"
+        "time.sleep(60)"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", leader_program],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert leader.stdout is not None
+    child_pid = int(leader.stdout.readline())
+
+    try:
+        codex_driver._terminate_process_group(  # noqa: SLF001
+            leader, timeout_seconds=0.2
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = subprocess.run(
+                ["/bin/ps", "-p", str(child_pid), "-o", "state="],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if not status or status.startswith("Z"):
+                break
+            time.sleep(0.05)
+        assert not status or status.startswith("Z")
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_codex_driver_process_group_cleanup_accepts_already_exited_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        pid = 1234
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            pytest.fail("an exited process must not be killed")
+
+    def missing_group(process_group: int, sig: int) -> None:
+        del process_group, sig
+        raise ProcessLookupError
+
+    monkeypatch.setattr(codex_driver.os, "killpg", missing_group)
+    codex_driver._terminate_process_group(  # noqa: SLF001
+        ExitedProcess(), timeout_seconds=0.01
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("codex") is None,
+    reason="requires the pinned macOS Codex sandbox",
+)
+def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
+    tmp_path: Path,
+) -> None:
+    executable = shutil.which("codex")
+    assert executable is not None
+    version = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if version.returncode != 0 or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION:  # noqa: SLF001
+        pytest.skip("requires the pinned Codex version")
+
+    isolated_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    isolated_home.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o700)
+    (isolated_home / "auth.json").write_text('{"token":"synthetic"}')
+    (isolated_home / "auth.json").chmod(0o600)
+    runner_main._frozen_cli_launcher(  # noqa: SLF001
+        workspace, "2026-01-01T00:00:00Z"
+    )
+    profile_override = (
+        f"permissions.{codex_driver._PERMISSION_PROFILE}="  # noqa: SLF001
+        + codex_driver._permission_profile_toml()  # noqa: SLF001
+    )
+    environment = {
+        "CODEX_HOME": str(isolated_home),
+        "HOME": str(workspace),
+        "TMPDIR": str(isolated_home),
+        "PATH": os.defpath,
+    }
+    result = subprocess.run(
+        [
+            executable,
+            "sandbox",
+            "-C",
+            str(workspace),
+            "-P",
+            codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
+            "-c",
+            "default_permissions="
+            + json.dumps(codex_driver._PERMISSION_PROFILE),  # noqa: SLF001
+            "-c",
+            profile_override,
+            "--",
+            "/bin/sh",
+            "-c",
+            'test ! -r "$CODEX_HOME/auth.json" && ./bin/steam-agent --help >/dev/null',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1537,6 +1847,25 @@ def test_codex_driver_rejects_resolved_process_policy_mismatch(
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = bad_value
+
+    class FakeSession:
+        def request(self, method, params):
+            del params
+            if method == "config/read":
+                return {"config": config}
+            return {"data": [], "nextCursor": None}
+
+    with pytest.raises(codex_driver.CodexProtocolError, match="process policy"):
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            FakeSession(), "thread-1", workspace
+        )
+
+
+def test_codex_driver_rejects_permission_profile_root_read() -> None:
+    workspace = "/synthetic/workspace"
+    config = _resolved_app_server_config(workspace)
+    profile = config["permissions"][codex_driver._PERMISSION_PROFILE]  # noqa: SLF001
+    profile["filesystem"][":root"] = "read"
 
     class FakeSession:
         def request(self, method, params):
@@ -2479,18 +2808,12 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
         if method == "thread/start"
     )
     assert thread_params["model"] == "gpt-5.6-terra"
-    assert thread_params["sandbox"] == "workspace-write"
-    assert "permissions" not in thread_params
+    assert "sandbox" not in thread_params
+    assert thread_params["permissions"] == codex_driver._PERMISSION_PROFILE  # noqa: SLF001
     assert thread_params["runtimeWorkspaceRoots"] == ["/synthetic/workspace"]
     assert thread_params["dynamicTools"] == []
     assert "environments" not in thread_params
-    assert thread_params["config"]["sandbox_workspace_write"] == {
-        "writable_roots": [],
-        "network_access": False,
-        "exclude_tmpdir_env_var": True,
-        "exclude_slash_tmp": True,
-    }
-    assert "shell_environment_policy" not in thread_params["config"]
+    assert "config" not in thread_params
     methods = [method for method, _params in FakeSession.latest.requests]
     assert methods.index("account/read") < methods.index("thread/start")
     assert methods.index("config/read") < methods.index("turn/start")
@@ -2599,6 +2922,12 @@ def test_run_scenario_uses_and_removes_private_workspace(
             "./bin/steam-agent --data-dir steam-agent-data"
             in kwargs["developer_instructions"]
         )
+        refusal_answer = next(
+            assertion["expected"]
+            for assertion in scenario["deterministic_oracle"]["assertions"]
+            if assertion["operator"] == "refusal_expected"
+        )
+        assert json.dumps(refusal_answer) in kwargs["developer_instructions"]
         observed["workspace"] = workspace
         canary_path = workspace / "steam-agent-data" / ".privacy-canaries"
         observed["canary"] = canary_path
@@ -2609,7 +2938,8 @@ def test_run_scenario_uses_and_removes_private_workspace(
         return [
             codex_driver.AgentTranscript(
                 agent_messages=[
-                    'I cannot do that.\n```json\n{"claims": [], "declined": true}\n```'
+                    f'{refusal_answer}\n```json\n'
+                    '{"claims": [], "declined": true}\n```'
                 ],
                 turn_status="completed",
                 effective_model="model-a",
@@ -2862,6 +3192,13 @@ def _passing_runner_report() -> dict:
             layer: {"passed": True}
             for layer in runner_main._PASS_LAYERS  # noqa: SLF001
         }
+    }
+
+
+def test_live_runner_only_skips_scenarios_without_a_cli_writer() -> None:
+    assert runner_main._EXPECTED_UNSUPPORTED_AGENT_SCENARIOS == {  # noqa: SLF001
+        "m5-c03",
+        "m5-c04",
     }
 
 

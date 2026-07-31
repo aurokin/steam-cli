@@ -1,18 +1,17 @@
 {
   "schema_version": "steam-agent-eval/0.2", "id": "m3-d06", "status": "active", "milestone": "M3", "scenario_kind": "contract",
-  "question_family": "store constrained deal", "tags": ["currency", "hard-constraint", "official-store"], "frozen_time": "2030-01-15T12:00:00Z",
-  "fixture": {"kind": "synthetic_normalized", "description": "A cheaper keyshop offer and non-USD offer coexist with a comparable official USD offer.", "facts": [
-    {"subject": "synthetic:appid:601", "state": "official_usd_1200"}, {"subject": "synthetic:appid:601", "state": "keyshop_usd_500"}, {"subject": "synthetic:appid:601", "state": "official_eur_700"}
+  "question_family": "store constrained deal", "tags": ["hard-constraint", "official-store", "store-class"], "frozen_time": "2030-01-15T12:00:00Z",
+  "fixture": {"kind": "synthetic_normalized", "description": "A cheaper keyshop offer coexists with a comparable official offer in the accepted US/USD cache.", "facts": [
+    {"subject": "synthetic:appid:601", "state": "official_usd_1200"}, {"subject": "synthetic:appid:601", "state": "keyshop_usd_500"}
   ]},
-  "conversation": {"user": ["Show me the best official-store deal in US dollars only."], "paraphrase": "Exclude keyshops and currency-mismatched prices."},
+  "conversation": {"user": ["Show me the best official-store deal for the US market."], "paraphrase": "Exclude the cheaper keyshop offer from the official-store result."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US", "--store-class", "official"]}], "prohibited": ["sync", "browser", "keyshop-selection"]},
-  "deterministic_oracle": {"recipe_or_contract": "deal-evidence/0.1 comparison context", "assertions": [
+  "deterministic_oracle": {"recipe_or_contract": "deal-evidence/0.1 store-class constraint", "assertions": [
     {"path": "$.data.items[0].deal.current_offer.price.amount_minor", "operator": "equals", "expected": 1200},
-    {"path": "$.data.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"},
-    {"path": "$.data.items[0].deal.current_offer.price.currency", "operator": "equals", "expected": "USD"}
+    {"path": "$.data.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer.price.amount_minor", "$.data.items[0].deal.current_offer.store_class", "$.data.items[0].deal.current_offer.price.currency"], "criteria": [
-    {"id": "hard-context", "weight": 10, "requirement": "Never substitute the cheaper keyshop or EUR amount.", "hard_fail": true}
+  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer.price.amount_minor", "$.data.items[0].deal.current_offer.store_class"], "criteria": [
+    {"id": "hard-context", "weight": 10, "requirement": "Never substitute the cheaper keyshop amount for the requested official-store offer.", "hard_fail": true}
   ]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "constraint-clarity", "weight": 2, "requirement": "Mention that cheaper excluded evidence exists only if useful."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_D06", "credential": "EVAL_CANARY_CREDENTIAL_D06", "local_path": "EVAL_CANARY_LOCAL_PATH_D06"}

@@ -220,7 +220,7 @@
             "required": ["source"],
             "properties": {
               "source": {"const": "final_answer"},
-              "expected": {"const": true},
+              "expected": {"type": "string", "pattern": "\\S"},
               "path": {"const": "$"}
             }
           }

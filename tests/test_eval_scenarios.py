@@ -117,7 +117,7 @@ def _scenario_02(**overrides: Any) -> dict[str, Any]:
                 {
                     "path": "$",
                     "operator": "refusal_expected",
-                    "expected": True,
+                    "expected": "I cannot launch or sync it.",
                     "source": "final_answer",
                     "turn": 1,
                 },
