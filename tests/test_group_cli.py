@@ -652,6 +652,61 @@ def test_group_fresh_empty_authoritative_member_preserves_unknown_ownership(
     )
 
 
+def test_group_inaccessible_with_irrelevant_authoritative_snapshot_is_unavailable_v02(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    configure(tmp_path)
+    configure_second_account(tmp_path, "other", "76561198999999998")
+    seed_failed_owned_sync(
+        tmp_path,
+        "primary",
+        error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
+    )
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("other")
+        assert account is not None
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=account.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            run.id,
+            (OwnedObservation(401, 0, "visible_owned", NOW, "Unrelated title"),),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=1,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+
+    default_code, default, default_stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query("account:primary", "account:other"),
+    )
+    flagged_code, flagged, flagged_stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "account:other", include_member_evidence=True
+        ),
+    )
+
+    assert default_code == flagged_code == 0
+    assert default_stderr == flagged_stderr == ""
+    assert default["data"]["schema"] == "group-eligibility/0.1"
+    assert default["completeness"]["status"] == "partial"
+    assert flagged["data"]["schema"] == "group-eligibility/0.2"
+    assert [
+        item["state"]
+        for item in flagged["data"]["results"][0]["ownership"]["members"]
+    ] == ["unknown", "unknown"]
+    assert flagged["completeness"]["status"] == "unavailable"
+
+
 @pytest.mark.parametrize("usable_state", ("owned", "not_owned"))
 def test_group_member_inaccessible_with_other_usable_assertion_is_partial(
     tmp_path: Path,

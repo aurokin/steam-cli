@@ -2928,7 +2928,10 @@ def _group_ownership_by_app(
     ownership_any_evidence = account_evidence or any(
         any(appid in states for appid in appids) for states in synthetic_states.values()
     )
-    ownership_usable_evidence = account_evidence or any(
+    ownership_usable_evidence = any(
+        values is not None and any(appid in values for appid in appids)
+        for values in account_owned.values()
+    ) or any(
         any(states.get(appid) in {"owned", "not_owned"} for appid in appids)
         for states in synthetic_states.values()
     )
