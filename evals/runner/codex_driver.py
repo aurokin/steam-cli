@@ -56,6 +56,10 @@ _SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
 _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
 _VERSION_ERROR = "required codex app-server version is unavailable"
 _PERMISSION_PROFILE = "steam-agent-eval"
+_MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
+_MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
+_MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
+_PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
 
 
 @dataclass
@@ -174,6 +178,7 @@ def run_agent_conversation(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            cwd=workspace,
             env=child_environment,
             start_new_session=True,
         )
@@ -1190,12 +1195,19 @@ class _Session:
         self._next_id = 0
         self._pending_notifications: list[Any] = []
         self._server_requests: dict[tuple[type[Any], Any], bool] = {}
-        self._buffer = b""
+        self._buffer = bytearray()
+        self._turn_input_bytes = 0
+        self._conversation_input_bytes = 0
+
+    def begin_turn(self) -> None:
+        self._turn_input_bytes = 0
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "turn/start":
+            self.begin_turn()
         self._next_id += 1
         request_id = self._next_id
         self._write(
@@ -1301,7 +1313,18 @@ class _Session:
     def _read_line(self) -> Any:
         # Raw fd reads with a private buffer: select() on the fd cannot see
         # lines already sitting in a buffered stream, so buffering is ours.
-        while b"\n" not in self._buffer:
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                if newline > _MAX_JSONL_FRAME_BYTES:
+                    self._raise_input_limit()
+                consumed = newline + 1
+                self._charge_input(consumed)
+                line = bytes(self._buffer[:newline])
+                del self._buffer[:consumed]
+                return json.loads(line)
+            if len(self._buffer) > _MAX_JSONL_FRAME_BYTES:
+                self._raise_input_limit()
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise CodexProtocolError("timed out waiting for app-server")
@@ -1311,6 +1334,19 @@ class _Session:
             chunk = os.read(self._stdout.fileno(), 65536)
             if not chunk:
                 raise CodexProtocolError("app-server closed its stdout")
-            self._buffer += chunk
-        line, _, self._buffer = self._buffer.partition(b"\n")
-        return json.loads(line)
+            self._buffer.extend(chunk)
+
+    def _charge_input(self, consumed: int) -> None:
+        if (
+            self._turn_input_bytes + consumed > _MAX_TURN_INPUT_BYTES
+            or self._conversation_input_bytes + consumed
+            > _MAX_CONVERSATION_INPUT_BYTES
+        ):
+            self._raise_input_limit()
+        self._turn_input_bytes += consumed
+        self._conversation_input_bytes += consumed
+
+    def _raise_input_limit(self) -> None:
+        self._buffer.clear()
+        self._pending_notifications.clear()
+        raise CodexProtocolError(_PROTOCOL_INPUT_LIMIT_ERROR)

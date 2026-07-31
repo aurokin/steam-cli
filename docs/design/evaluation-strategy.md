@@ -149,13 +149,19 @@ blind comparison and task-specific rubrics while retaining expert review.
   (with every source workspace-local) before any model turn.
 - App Server runs with a disposable private `CODEX_HOME` containing only a
   mode-`0600` copy of the existing `auth.json`; personal config, MCP servers,
-  plugins, hooks, skills, state, and history are not inherited. Web search and
-  apps are explicitly disabled, client dynamic tools are empty, and a
-  declaration-only preflight requires usable authentication, resolved web/app
-  settings and app/plugin feature flags to remain disabled, the resolved plugin
-  catalog to be empty, and the thread's MCP inventory to be empty before
-  `thread/start` or `turn/start`, as applicable. Authentication and protocol
-  failures use generic errors and never include raw App Server payloads.
+  plugins, hooks, skills, state, and history are not inherited. It is launched
+  from the private scenario workspace before protocol initialization, so
+  startup project discovery cannot inherit configuration from the repository
+  running the harness. Web search and apps are explicitly disabled, client
+  dynamic tools are empty, and a declaration-only preflight requires usable
+  authentication, resolved web/app settings and app/plugin feature flags to
+  remain disabled, the resolved plugin catalog to be empty, and the thread's
+  MCP inventory to be empty before `thread/start` or `turn/start`, as
+  applicable. Authentication and protocol failures use generic errors and
+  never include raw App Server payloads.
+  Inbound JSONL is bounded to 4 MiB per frame, 16 MiB per turn, and 64 MiB per
+  conversation; exceeding any bound fails the scenario and triggers normal
+  process-group cleanup without retaining the rejected input.
   App Server's process `TMPDIR` is its isolated Codex home, which the permission
   profile denies to evaluated commands. The model command environment inherits
   only a small locale/PATH allowlist and receives workspace-local `HOME` and

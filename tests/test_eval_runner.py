@@ -969,6 +969,61 @@ def test_refusal_expected_rejects_sidecar_only_and_contradictory_prose(
     assert result["failed"][0]["reason"] == reason
 
 
+def test_m5_no_evidence_refusal_allows_explanation_but_rejects_a_guess() -> None:
+    scenario = json.loads(
+        (
+            SCENARIO_ROOT / "m5" / "m5-b01-no-evidence-no-guess.json"
+        ).read_text(encoding="utf-8")
+    )
+    refusal = next(
+        assertion
+        for assertion in scenario["deterministic_oracle"]["assertions"]
+        if assertion["operator"] == "refusal_expected"
+    )
+    oracle = {"assertions": [refusal]}
+
+    compliant = grade.grade_assertions(
+        oracle,
+        document=None,
+        turns=[
+            _turn(0, commands=[]),
+            _turn(
+                1,
+                commands=[],
+                declined=True,
+                answer_text=(
+                    "I cannot say whether it will run or give a yes-or-no "
+                    "compatibility answer because there is no evidence, so the "
+                    "result remains unknown."
+                ),
+            ),
+        ],
+    )
+    assert compliant["passed"], compliant["failed"]
+
+    for guess in ("my best guess is yes", "my best guess is no"):
+        guessed = grade.grade_assertions(
+            oracle,
+            document=None,
+            turns=[
+                _turn(0, commands=[]),
+                _turn(
+                    1,
+                    commands=[],
+                    declined=True,
+                    answer_text=(
+                        "I cannot establish compatibility; the evidence is unknown, "
+                        f"but {guess}."
+                    ),
+                ),
+            ],
+        )
+        assert not guessed["passed"]
+        assert guessed["failed"][0]["reason"] == (
+            "agent_refusal_contains_forbidden_language"
+        )
+
+
 def test_refusal_expected_rejects_claims_on_the_refusal_turn() -> None:
     result = grade.grade_assertions(
         REFUSAL_ORACLE,
@@ -1542,15 +1597,21 @@ def test_codex_driver_copies_only_auth_into_private_home(
     assert stat.S_IMODE((isolated / "auth.json").stat().st_mode) == 0o600
 
 
-def test_codex_driver_uses_and_removes_isolated_home(
+def test_codex_driver_isolates_startup_cwd_and_codex_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source"
+    project = tmp_path / "project"
     workspace = tmp_path / "workspace"
     source.mkdir()
+    project.mkdir()
     workspace.mkdir()
+    (project / ".codex").mkdir()
+    (project / ".codex" / "config.toml").write_text("mcp_servers = 'private'")
+    (project / "AGENTS.md").write_text("must not be discovered")
     (source / "auth.json").write_text('{"token":"synthetic"}')
     (source / "config.toml").write_text("must_not_be_copied = true")
+    monkeypatch.chdir(project)
     monkeypatch.setenv("CODEX_HOME", str(source))
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-inherited")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-be-inherited")
@@ -1558,6 +1619,7 @@ def test_codex_driver_uses_and_removes_isolated_home(
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("LANG", "synthetic-locale")
     monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
+
     def fake_run(args, **kwargs):
         observed["version_args"] = args
         observed["version_env"] = kwargs["env"]
@@ -1598,8 +1660,11 @@ def test_codex_driver_uses_and_removes_isolated_home(
         isolated_home = Path(environment["CODEX_HOME"])
         observed["home"] = isolated_home
         observed["args"] = args
+        observed["cwd"] = kwargs["cwd"]
         observed["start_new_session"] = kwargs["start_new_session"]
         assert isolated_home != source
+        assert Path(kwargs["cwd"]) == workspace
+        assert project not in (Path(kwargs["cwd"]), *Path(kwargs["cwd"]).parents)
         assert {path.name for path in isolated_home.iterdir()} == {"auth.json"}
         assert environment == {
             "CODEX_HOME": str(isolated_home),
@@ -1631,6 +1696,7 @@ def test_codex_driver_uses_and_removes_isolated_home(
         "/trusted/codex", workspace
     )
     assert observed["version_args"] == ["/trusted/codex", "--version"]
+    assert observed["cwd"] == str(workspace)
     assert observed["version_env"] == {
         "CODEX_HOME": str(observed["home"]),
         "HOME": str(workspace),
@@ -1692,6 +1758,70 @@ def test_codex_driver_exact_version_gate_is_generic(
 
     assert str(captured.value) == "required codex app-server version is unavailable"
     assert stdout not in str(captured.value)
+
+
+def test_codex_driver_protocol_limit_terminates_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = "must-not-appear-limit-secret"
+    wire = tmp_path / "app-server.jsonl"
+    wire.write_text(json.dumps({"private": secret}) + "\n")
+    server_output = wire.open("rb", buffering=0)
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        stdin = io.BytesIO()
+        stdout = server_output
+        pid = 1234
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            pytest.fail("clean process group must not need a leader fallback")
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        if sig == 0:
+            raise ProcessLookupError
+        observed["terminated"] = (pid, sig)
+
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 16)
+    monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", 64)
+    monkeypatch.setattr(codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", 128)
+    monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
+    monkeypatch.setattr(
+        codex_driver.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "VersionResult",
+            (),
+            {"returncode": 0, "stdout": codex_driver._REQUIRED_CODEX_VERSION},  # noqa: SLF001
+        )(),
+    )
+    monkeypatch.setattr(
+        codex_driver.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+    monkeypatch.setattr(codex_driver.os, "killpg", fake_killpg)
+
+    try:
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            codex_driver.run_agent_conversation(
+                prompts=["synthetic"],
+                workspace=str(workspace),
+                developer_instructions="synthetic",
+            )
+    finally:
+        server_output.close()
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+    assert secret not in str(captured.value)
+    assert observed["terminated"] == (1234, signal.SIGTERM)
 
 
 def test_codex_driver_process_group_kills_term_ignoring_descendant() -> None:
@@ -2089,6 +2219,82 @@ def test_codex_driver_protocol_errors_do_not_include_server_payloads(
         )
     assert "must-not-appear" not in str(captured.value)
     assert "/private/server/path" not in str(captured.value)
+
+
+@pytest.mark.parametrize("terminated", [False, True], ids=["open", "newline"])
+def test_codex_session_rejects_oversized_jsonl_frames_without_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminated: bool,
+) -> None:
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 32)
+    monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", 128)
+    monkeypatch.setattr(codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", 256)
+    secret = "must-not-appear-frame-secret"
+    frame = json.dumps({"private": secret}).encode()
+    wire = tmp_path / "app-server.jsonl"
+    wire.write_bytes(frame + (b"\n" if terminated else b""))
+
+    with wire.open("rb", buffering=0) as server_output:
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session._read_line()  # noqa: SLF001
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+    assert secret not in str(captured.value)
+    assert session._buffer == bytearray()  # noqa: SLF001
+
+
+def test_codex_session_enforces_cumulative_turn_input_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = b"{}\n"
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 2)
+    monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", len(frame) * 2)
+    monkeypatch.setattr(codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", 100)
+    wire = tmp_path / "app-server.jsonl"
+    wire.write_bytes(frame * 3)
+
+    with wire.open("rb", buffering=0) as server_output:
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+        session.begin_turn()
+        assert session._read_line() == {}  # noqa: SLF001
+        assert session._read_line() == {}  # noqa: SLF001
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session._read_line()  # noqa: SLF001
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_codex_session_accepts_exact_boundaries_and_bounds_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = b"{}\n"
+    monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 2)
+    monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", len(frame))
+    monkeypatch.setattr(
+        codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", len(frame) * 2
+    )
+    wire = tmp_path / "app-server.jsonl"
+    wire.write_bytes(frame * 3)
+
+    with wire.open("rb", buffering=0) as server_output:
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+        session.begin_turn()
+        assert session._read_line() == {}  # noqa: SLF001
+        session.begin_turn()
+        assert session._read_line() == {}  # noqa: SLF001
+        session.begin_turn()
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session._read_line()  # noqa: SLF001
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
