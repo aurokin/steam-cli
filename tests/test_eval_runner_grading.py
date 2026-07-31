@@ -625,6 +625,68 @@ def test_help_discovery_is_allowed_outside_the_allowlist() -> None:
     assert result["passed"], result
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "./bin/steam-agent sync --help",
+        "./bin/steam-agent sync installed --help",
+        "./bin/steam-agent sync --help installed --machine synthetic-machine",
+        "./bin/steam-agent data delete --help",
+        "./bin/steam-agent data delete --provider steam-web-api --help --all --yes",
+        "./bin/steam-agent --help sync installed",
+    ),
+)
+def test_live_cache_only_boundary_exempts_argparse_help_calls(command: str) -> None:
+    result = grade.grade_tool_policy(
+        [command],
+        {"allowed": [], "required": [], "prohibited": []},
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+    )
+
+    assert result["passed"], result
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "./bin/steam-agent sync installed",
+        "./bin/steam-agent data delete --provider steam-web-api --all --yes",
+        "./bin/steam-agent sync installed -- --help",
+        "./bin/steam-agent data delete --help=true",
+    ),
+)
+def test_help_lookalikes_do_not_exempt_mutating_heads(command: str) -> None:
+    result = grade.grade_tool_policy(
+        [command],
+        {"allowed": [], "required": [], "prohibited": []},
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+    )
+
+    assert not result["passed"]
+    assert result["violations"][0]["reason"] == "cache_only_boundary"
+
+
+def test_help_call_does_not_satisfy_a_required_mutating_command() -> None:
+    result = grade.grade_tool_policy(
+        ["./bin/steam-agent sync installed --help"],
+        {
+            "allowed": ["steam-agent sync installed"],
+            "required": [
+                {"command": "steam-agent sync installed", "arguments": []}
+            ],
+            "prohibited": [],
+        },
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+    )
+
+    assert not result["passed"]
+    assert result["violations"] == []
+    assert result["required"][0]["satisfied"] is False
+
+
 def test_required_options_accept_equal_form_but_reject_duplicates() -> None:
     equal_form = grade.grade_tool_policy(
         ["steam-agent operations observe --machine=synthetic-machine"], POLICY
@@ -949,6 +1011,61 @@ def test_fact_coverage_requires_all_claims_to_be_supported() -> None:
     assert not unsupported_extra["passed"]
     assert unsupported_extra["missing_required_paths"] == []
     assert unsupported_extra["failed"] == [{"path": "$.data.other", "value": True}]
+
+
+def test_fact_coverage_fails_closed_on_unevaluated_hard_criteria() -> None:
+    document = {"data": {"required": "unknown"}}
+    criteria = [
+        {
+            "id": "do-not-invent-motive",
+            "weight": 10,
+            "requirement": "Do not invent a user motive.",
+            "hard_fail": True,
+        }
+    ]
+
+    result = grade.grade_fact_coverage(
+        [{"path": "$.data.required", "value": "unknown"}],
+        document,
+        ["$.data.required"],
+        criteria=criteria,
+    )
+
+    assert result["missing_required_paths"] == []
+    assert result["criteria_evaluated"] is False
+    assert result["unevaluated_criteria"] == ["do-not-invent-motive"]
+    assert result["unevaluated_hard_fail_criteria"] == ["do-not-invent-motive"]
+    assert result["deterministic_passed"] is True
+    assert result["review_status"] == "pending_hard_fail_review"
+    assert result["limitation"] == (
+        "natural_language_fact_criteria_require_model_or_human_review"
+    )
+    assert not result["passed"]
+
+
+def test_fact_coverage_keeps_non_hard_criteria_informational() -> None:
+    document = {"data": {"required": "unknown"}}
+    criteria = [
+        {
+            "id": "prefer-brief-wording",
+            "weight": 1,
+            "requirement": "Prefer concise wording.",
+            "hard_fail": False,
+        }
+    ]
+
+    result = grade.grade_fact_coverage(
+        [{"path": "$.data.required", "value": "unknown"}],
+        document,
+        ["$.data.required"],
+        criteria=criteria,
+    )
+
+    assert result["unevaluated_criteria"] == ["prefer-brief-wording"]
+    assert result["unevaluated_hard_fail_criteria"] == []
+    assert result["deterministic_passed"] is True
+    assert result["review_status"] == "not_pending"
+    assert result["passed"], result
 
 
 @pytest.mark.parametrize(

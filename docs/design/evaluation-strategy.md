@@ -177,8 +177,14 @@ blind comparison and task-specific rubrics while retaining expert review.
   claim to be a process jail. The driver records every completed item, permits
   command execution and explicitly informational item types, and fails the
   tool-policy gate on file changes, MCP/dynamic calls, web search,
-  collaboration, and unknown activity. Clean
-  artifacts redact host paths and privacy canaries. If turn completion,
+  collaboration, and unknown activity. Final-answer policy and privacy grading
+  cover every ordered user-visible agent-message item in a turn; only the last
+  item may supply the terminal claims sidecar. When deterministic safety,
+  path-coverage, oracle, and privacy gates pass, artifacts retain that
+  sanitized ordered message list and the exact sanitized required CLI JSON
+  document used by oracle and claim grading so pending qualitative review can
+  audit or replay the decision without rerunning the model. Clean artifacts
+  redact host paths and privacy canaries. If turn completion,
   required evidence, tool policy, or privacy fails, the transcript and report
   retain only structural activity plus content hashes and lengths; raw prompts,
   reasoning, answers, commands, and tool output are omitted.

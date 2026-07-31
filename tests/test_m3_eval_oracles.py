@@ -142,7 +142,7 @@ def _snapshots(item: dict[str, Any]) -> tuple[DealEvidenceSnapshot, ...]:
     return tuple(snapshots)
 
 
-def _reranked(document: dict[str, Any]) -> dict[int, Any]:
+def _reranked(document: dict[str, Any]) -> tuple[Any, ...]:
     context = DealComparisonContext(
         country=document["context"]["country"],
         currency=document["context"]["currency"],
@@ -166,7 +166,31 @@ def _reranked(document: dict[str, Any]) -> dict[int, Any]:
         for item in document["data"]["items"]
     ]
     ranking = rank_deals(candidates, context=context)
-    return {candidate.steam_appid: candidate for candidate in ranking.candidates}
+    return ranking.candidates
+
+
+def _assert_document_ranking(document: dict[str, Any]) -> None:
+    ranked = _reranked(document)
+    assert ranked, "every M3 scenario retains at least one wishlist candidate"
+    items = document["data"]["items"]
+    assert [item["appid"] for item in items] == [
+        candidate.steam_appid for candidate in ranked
+    ], "document AppIDs differ from exact rank_deals order"
+    for item, candidate in zip(items, ranked, strict=True):
+        assert candidate.bucket == item["deal"]["bucket"]
+        assert candidate.evidence_grade == item["deal"]["evidence_grade"]
+        assert candidate.fallback_rung == item["deal"]["fallback_rung"]
+        assert list(candidate.reasons) == item["deal"]["reasons"]
+        offer = item["deal"]["current_offer"]
+        if offer is None:
+            assert candidate.current_offer is None
+        else:
+            assert candidate.current_offer is not None
+            assert (
+                candidate.current_offer.price.amount_minor
+                == offer["price"]["amount_minor"]
+            )
+            assert candidate.current_offer.provider == offer["provider"]
 
 
 @pytest.mark.parametrize("path", SCENARIO_PATHS, ids=lambda path: path.stem)
@@ -204,21 +228,24 @@ def test_m3_document_ranking_is_rank_deals_over_its_own_evidence(
     materialize(scenario, tmp_path)
     document = _run(scenario, tmp_path, capsys)
 
-    ranked = _reranked(document)
-    assert ranked, "every M3 scenario retains at least one wishlist candidate"
-    for item in document["data"]["items"]:
-        candidate = ranked[item["appid"]]
-        assert candidate.bucket == item["deal"]["bucket"]
-        assert candidate.evidence_grade == item["deal"]["evidence_grade"]
-        assert candidate.fallback_rung == item["deal"]["fallback_rung"]
-        assert list(candidate.reasons) == item["deal"]["reasons"]
-        offer = item["deal"]["current_offer"]
-        if offer is None:
-            assert candidate.current_offer is None
-        else:
-            assert candidate.current_offer is not None
-            assert (
-                candidate.current_offer.price.amount_minor
-                == offer["price"]["amount_minor"]
-            )
-            assert candidate.current_offer.provider == offer["provider"]
+    _assert_document_ranking(document)
+
+
+def test_m3_reranking_rejects_reversed_document_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = json.loads(
+        (
+            ROOT / "evals" / "scenarios" / "m3" / "m3-d01-best-official-deals.json"
+        ).read_text(encoding="utf-8")
+    )
+    _freeze_cli_clock(monkeypatch, scenario)
+    materialize(scenario, tmp_path)
+    document = _run(scenario, tmp_path, capsys)
+    assert len(document["data"]["items"]) > 1
+    document["data"]["items"].reverse()
+
+    with pytest.raises(AssertionError, match="exact rank_deals order"):
+        _assert_document_ranking(document)

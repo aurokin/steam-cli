@@ -320,6 +320,10 @@ def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
     for turn in report["turns"]:
         if turn.get("final_message") is not None:
             turn["final_message"] = _omitted_content(turn["final_message"])
+        turn["visible_messages"] = [
+            _omitted_content(message)
+            for message in turn.get("visible_messages", ())
+        ]
         turn["commands"] = [
             _omitted_content(command) for command in turn.get("commands", ())
         ]
@@ -335,6 +339,10 @@ def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
     for violation in tool_policy["violations"]:
         if "command" in violation:
             violation["command"] = _omitted_content(violation["command"])
+    report["required_cli_documents"] = [
+        _omitted_content(document)
+        for document in report.get("required_cli_documents", ())
+    ]
     _omit_failed_claim_values(report["metrics"]["claims"])
 
 
@@ -427,6 +435,38 @@ def _answer_text(message: str | None) -> str:
     if match is None or match.group("language").casefold() != "json":
         return message.strip()
     return message[: match.start()].strip()
+
+
+def _visible_answer_text(messages: list[str]) -> str:
+    """Join visible prose, stripping a sidecar only from the last message."""
+
+    answers = [
+        _answer_text(message) if index == len(messages) - 1 else message.strip()
+        for index, message in enumerate(messages)
+    ]
+    return "\n\n".join(answer for answer in answers if answer)
+
+
+def _answer_policy_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose all visible messages to final-answer assertions."""
+
+    return [
+        {**turn, "final_message": turn["_visible_message_text"]}
+        for turn in turns
+    ]
+
+
+def _safe_to_retain_content(metrics: dict[str, dict[str, Any]]) -> bool:
+    """Keep auditable content when every deterministic safety gate passes."""
+
+    claims = metrics["claims"]
+    deterministic_claims_passed = claims.get(
+        "deterministic_passed", claims["passed"]
+    )
+    return bool(deterministic_claims_passed) and all(
+        metrics[layer]["passed"]
+        for layer in ("agent_turns", "tool_policy", "oracle", "privacy")
+    )
 
 
 def _grade_tool_policy(
@@ -605,11 +645,14 @@ def run_scenario(
         turns: list[dict[str, Any]] = []
         for index, transcript in enumerate(transcripts):
             claims, declined = _extract_sidecar(transcript.final_message)
+            visible_messages = list(transcript.agent_messages)
             turns.append(
                 {
                     "index": index,
                     "final_message": transcript.final_message,
-                    "answer_text": _answer_text(transcript.final_message),
+                    "visible_messages": visible_messages,
+                    "answer_text": _visible_answer_text(visible_messages),
+                    "_visible_message_text": "\n\n".join(visible_messages),
                     "commands": [entry["command"] for entry in transcript.commands],
                     "_command_results": transcript.commands,
                     "_activity_violations": transcript.activity_violations,
@@ -673,7 +716,7 @@ def run_scenario(
     oracle_metric = grade.grade_assertions(
         scenario["deterministic_oracle"],
         document=oracle_document,
-        turns=turns,
+        turns=_answer_policy_turns(turns),
     )
     metrics = {
         "agent_turns": agent_turns_metric,
@@ -682,9 +725,7 @@ def run_scenario(
         "claims": claims_metric,
         "privacy": privacy_metric,
     }
-    retain_transcript_content = all(
-        metrics[layer]["passed"] for layer in _PASS_LAYERS
-    )
+    retain_transcript_content = _safe_to_retain_content(metrics)
 
     rendered_turns = [
         _sanitize_artifact(
@@ -696,6 +737,7 @@ def run_scenario(
                     "_activity_violations",
                     "_claims",
                     "_command_results",
+                    "_visible_message_text",
                     "answer_text",
                 }
             },
@@ -731,6 +773,9 @@ def run_scenario(
             allow_data_delete=allow_data_delete,
         ),
         "turns": rendered_turns,
+        "required_cli_documents": (
+            [oracle_document] if oracle_document is not None else []
+        ),
         "metrics": metrics,
         "operational": {
             "duration_seconds": (finished - started).total_seconds(),
@@ -759,6 +804,14 @@ def run_scenario(
                 prompts[index]
                 if retain_transcript_content
                 else _omitted_content(prompts[index])
+            ),
+            "visible_messages": (
+                list(transcript.agent_messages)
+                if retain_transcript_content
+                else [
+                    _omitted_content(message)
+                    for message in transcript.agent_messages
+                ]
             ),
         }
         transcript_lines.append(

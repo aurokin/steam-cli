@@ -97,6 +97,9 @@ def scenario_machine_key(scenario: Mapping[str, Any]) -> str:
     explicit = required_argument_value(scenario, "--machine", "")
     if explicit:
         return explicit
+    context = required_argument_value(scenario, "--context-machine", "")
+    if context:
+        return context
     target = required_argument_value(scenario, "--target", "")
     match = _TARGET_MACHINE.match(target)
     if match is not None:

@@ -1057,6 +1057,8 @@ def grade_tool_policy(
         if argv is None:
             continue
         steam_agent_calls.append(argv)
+        if _is_help_call(argv):
+            continue
         if (
             enforce_cache_only
             and (prohibited_head := cache_only_prohibited_head(argv)) is not None
@@ -1075,8 +1077,6 @@ def grade_tool_policy(
                     "action": " ".join(prohibited_head),
                 }
             )
-            continue
-        if _is_help_call(argv):
             continue
         if expected_data_dir is not None and not _has_expected_data_dir(
             argv, expected_data_dir
@@ -1178,7 +1178,12 @@ def _cache_only_call_is_exception(
 
 
 def _is_help_call(argv: Sequence[str]) -> bool:
-    return "--help" in argv or "-h" in argv
+    for argument in argv:
+        if argument == "--":
+            return False
+        if argument in {"--help", "-h"}:
+            return True
+    return False
 
 
 def _cli_command_tail(argv: Sequence[str]) -> list[str] | None:
@@ -1517,6 +1522,12 @@ def grade_fact_coverage(
             ]
             covered = frozenset().union(*compatible) == required_locations
         (satisfied if covered else missing).append(path)
+    unevaluated_hard_fail_criteria = [
+        criterion["id"]
+        for criterion in criteria
+        if criterion.get("hard_fail") is True
+    ]
+    deterministic_passed = claim_result["passed"] and not missing
     return {
         **claim_result,
         "required": len(required),
@@ -1524,6 +1535,13 @@ def grade_fact_coverage(
         "missing_required_paths": missing,
         "criteria_evaluated": False,
         "unevaluated_criteria": [criterion["id"] for criterion in criteria],
+        "unevaluated_hard_fail_criteria": unevaluated_hard_fail_criteria,
+        "deterministic_passed": deterministic_passed,
+        "review_status": (
+            "pending_hard_fail_review"
+            if deterministic_passed and unevaluated_hard_fail_criteria
+            else "not_pending"
+        ),
         "limitation": "natural_language_fact_criteria_require_model_or_human_review",
-        "passed": claim_result["passed"] and not missing,
+        "passed": deterministic_passed and not unevaluated_hard_fail_criteria,
     }
