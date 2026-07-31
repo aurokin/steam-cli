@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import shutil
 import stat
@@ -281,6 +282,51 @@ def test_m5_requested_without_evidence_keeps_system_profile_missing(
     assert document["data"]["results"][0]["playable_now"] == "unknown"
 
 
+def test_m4_wishlist_only_candidates_remain_absent_from_visible_owned(
+    tmp_path: Path,
+) -> None:
+    scenario = json.loads(
+        (
+            SCENARIO_ROOT
+            / "m4"
+            / "m4-w01-wishlist-fit-without-deal-evidence.json"
+        ).read_text(encoding="utf-8")
+    )
+    workspace = tmp_path / "workspace"
+    data_dir = workspace / "steam-agent-data"
+    runner_main._ensure_private_dir(workspace)  # noqa: SLF001
+    runner_main._ensure_private_dir(data_dir)  # noqa: SLF001
+    materialize(scenario, data_dir)
+
+    with storage_module.Storage(data_dir / "steam-agent.sqlite3") as storage:
+        account = storage.get_account("synthetic")
+        assert account is not None
+        owned = storage.read_owned_snapshot(account.id)
+        wishlist = storage.read_wishlist_snapshot(account.id)
+
+    assert owned.latest_complete is not None
+    assert owned.latest_complete_provenance is not None
+    assert owned.latest_complete_provenance.base_reported_count == 0
+    assert owned.latest_complete_provenance.expanded_reported_count == 0
+    assert owned.games == ()
+    assert [game.appid for game in wishlist.games] == [1801, 1802]
+
+    launcher = runner_main._frozen_cli_launcher(  # noqa: SLF001
+        workspace, scenario["frozen_time"]
+    )
+    document = runner_main._oracle_document(  # noqa: SLF001
+        data_dir, scenario["tool_policy"]["required"][0], launcher
+    )
+    ranked = document["data"]["ranked"]
+    assert [item["appid"] for item in ranked] == [1801, 1802]
+    assert document["data"]["purchase_recommendation_supported"] is False
+    assert all(item["deal_value"]["state"] == "unknown" for item in ranked)
+    assert all(item["compatibility"]["state"] == "unknown" for item in ranked)
+    assert all("no_deal_evidence" in item["tradeoffs"] for item in ranked)
+    result = grade.grade_oracle(document, scenario["deterministic_oracle"])
+    assert result["passed"], result["failed"]
+
+
 def _scenario_02_assertion_errors(assertion: dict[str, object]) -> list[object]:
     schema = json.loads(
         (ROOT / "evals" / "schema" / "scenario-0.2.json").read_text(
@@ -389,8 +435,45 @@ def test_frozen_launcher_reproduces_time_sensitive_oracle(tmp_path: Path) -> Non
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
     assert stat.S_IMODE(launcher.stat().st_mode) == 0o700
     launcher_source = launcher.read_text()
-    assert launcher_source.splitlines()[0] == f"#!{Path(sys.executable).resolve()}"
-    assert str(ROOT / "src") in launcher_source
+    payload = launcher.with_name(".steam-agent-frozen.py")
+    assert launcher_source.splitlines()[0] == "#!/bin/sh"
+    assert stat.S_IMODE(payload.stat().st_mode) == 0o600
+    assert str(ROOT / "src") in payload.read_text()
+
+
+def test_frozen_launcher_executes_with_spaced_interpreter_and_workspace_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m5" / "m5-c01-compatible-machine.json").read_text()
+    )
+    real_interpreter = str(Path(sys.executable).resolve())
+    interpreter_dir = tmp_path / "interpreter path with spaces"
+    interpreter_dir.mkdir()
+    spaced_interpreter = interpreter_dir / "python"
+    spaced_interpreter.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(real_interpreter)} "$@"\n'
+    )
+    spaced_interpreter.chmod(0o700)
+    monkeypatch.setattr(runner_main.sys, "executable", str(spaced_interpreter))
+    workspace = tmp_path / "workspace path with spaces"
+    data_dir = workspace / "steam-agent-data"
+    runner_main._ensure_private_dir(workspace)  # noqa: SLF001
+    runner_main._ensure_private_dir(data_dir)  # noqa: SLF001
+    materialize(scenario, data_dir)
+
+    launcher = runner_main._frozen_cli_launcher(  # noqa: SLF001
+        workspace, scenario["frozen_time"]
+    )
+    requirement = scenario["tool_policy"]["required"][0]
+    document = runner_main._oracle_document(  # noqa: SLF001
+        data_dir, requirement, launcher
+    )
+
+    result = grade.grade_oracle(document, scenario["deterministic_oracle"])
+    assert result["passed"], result["failed"]
+    assert spaced_interpreter.resolve() in codex_driver._permission_read_roots()  # noqa: SLF001
+    assert shlex.quote(str(spaced_interpreter.resolve())) in launcher.read_text()
 
 
 def test_frozen_launcher_applies_scenario_clock_to_storage_retention(
@@ -1571,10 +1654,12 @@ def _item_notification(
     turn_id: str = "turn-1",
     **item_fields,
 ) -> dict:
-    if item_type == "commandExecution" and "status" not in item_fields:
-        item_fields["status"] = (
-            "inProgress" if method == "item/started" else "completed"
-        )
+    if item_type == "commandExecution":
+        if "status" not in item_fields:
+            item_fields["status"] = (
+                "inProgress" if method == "item/started" else "completed"
+            )
+        item_fields.setdefault("command", "./bin/steam-agent --help")
     return {
         "method": method,
         "params": {
@@ -2903,6 +2988,46 @@ def test_codex_session_rejects_oversized_jsonl_frames_without_payload(
     assert session._buffer == bytearray()  # noqa: SLF001
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b'{"id":1,"id":2,"result":{"private":"must-not-appear"}}',
+        b'{"id":1,"result":{},"result":{"private":"must-not-appear"}}',
+        b'{"id":1,"error":{"code":1},"error":{"private":"must-not-appear"}}',
+        b'{"method":"x","params":{},"params":{"private":"must-not-appear"}}',
+        (
+            b'{"method":"x","params":{"item":{"command":"safe",'
+            b'"command":"must-not-appear"}}}'
+        ),
+        (
+            b'{"id":1,"result":{"params":{},'
+            b'"params":{"private":"must-not-appear"}}}'
+        ),
+    ],
+    ids=("id", "result", "error", "params", "nested-command", "nested-params"),
+)
+def test_codex_session_rejects_duplicate_json_members_recursively(
+    frame: bytes, tmp_path: Path
+) -> None:
+    wire = tmp_path / "app-server.jsonl"
+    wire.write_bytes(frame + b'\n{"private":"trailing-must-not-appear"}\n')
+
+    with wire.open("rb", buffering=0) as server_output:
+        session = codex_driver._Session(  # noqa: SLF001
+            io.BytesIO(), server_output, 1
+        )
+        session._pending_notifications.append("private-pending")  # noqa: SLF001
+        session._server_requests[(str, "private-request")] = False  # noqa: SLF001
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session._read_line()  # noqa: SLF001
+
+    assert str(captured.value) == codex_driver._INVALID_JSON_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+    assert session._buffer == bytearray()  # noqa: SLF001
+    assert session._pending_notifications == []  # noqa: SLF001
+    assert session._server_requests == {}  # noqa: SLF001
+
+
 def test_codex_session_enforces_cumulative_turn_input_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2956,6 +3081,10 @@ def test_codex_session_accepts_exact_boundaries_and_bounds_conversation(
 @pytest.mark.parametrize(
     ("path", "bad_value"),
     [
+        (("thread", "id"), ""),
+        (("thread", "id"), 1),
+        (("thread", "id"), True),
+        (("thread", "id"), None),
         (("thread", "cwd"), "/other"),
         (("thread", "ephemeral"), False),
         (("thread", "path"), "/persisted/thread.jsonl"),
@@ -3022,10 +3151,13 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
                     )
                 )
             self.messages.extend(
-                [
-                    _item_notification(
-                        "item/started", "command", "commandExecution"
-                    ),
+                    [
+                        _item_notification(
+                            "item/started",
+                            "command",
+                            "commandExecution",
+                            command="steam-agent --help",
+                        ),
                     _item_notification(
                         "item/completed",
                         "command",
@@ -3396,6 +3528,88 @@ def test_codex_driver_rejects_foreign_command_completion() -> None:
     assert "private-foreign-command" not in rendered
     assert "private-foreign-output" not in rendered
     assert "foreign-thread" not in rendered
+
+
+@pytest.mark.parametrize(
+    "completed_command",
+    ["private-mismatched-command", None, 7, "<missing>"],
+)
+def test_codex_driver_requires_exact_command_across_item_lifecycle(
+    completed_command: object,
+) -> None:
+    completion = _item_notification(
+        "item/completed",
+        "command",
+        "commandExecution",
+        command=completed_command,
+        aggregatedOutput="private-mismatched-output",
+        exitCode=0,
+    )
+    if completed_command == "<missing>":
+        completion["params"]["item"].pop("command")
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification(
+                "item/started",
+                "command",
+                "commandExecution",
+                command="./bin/steam-agent --help",
+            ),
+            completion,
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == []
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_completion_order_or_scope",
+        "incomplete_item_activity",
+    ]
+    metric = runner_main._grade_tool_policy(  # noqa: SLF001
+        [
+            {
+                "_command_results": transcript.commands,
+                "_activity_violations": transcript.activity_violations,
+            }
+        ],
+        {"allowed": ["steam-agent"], "required": []},
+    )
+    assert not metric["passed"]
+    rendered = json.dumps(
+        {
+            "commands": transcript.commands,
+            "events": transcript.events,
+            "violations": transcript.activity_violations,
+        }
+    )
+    assert "private-mismatched" not in rendered
+
+
+@pytest.mark.parametrize("started_command", [None, "", 7])
+def test_codex_driver_rejects_command_start_without_nonempty_text(
+    started_command: object,
+) -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification(
+                "item/started",
+                "command",
+                "commandExecution",
+                command=started_command,
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == []
+    assert transcript.activity_violations == [
+        {
+            "item_type": "protocolNotification",
+            "reason": "invalid_item_started_order_or_scope",
+        }
+    ]
 
 
 def test_codex_driver_rejects_stale_turn_completion() -> None:
@@ -3975,6 +4189,129 @@ def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
         for violation in transcripts[1].activity_violations
     ] == ["invalid_item_started_order_or_scope"]
     assert "must-not-appear-late-command" not in transcripts[1].rendered()
+
+
+@pytest.mark.parametrize(
+    "scenario_id",
+    [
+        "/tmp/m7-z99",
+        "../m7-z99",
+        "m7/z99",
+        "m7\\z99",
+        "m7-z99\n",
+        "m7-z99\x00",
+        "M7-Z99",
+        "m7-z9",
+        "m0-z99",
+        7,
+        None,
+    ],
+)
+def test_run_scenario_rejects_noncanonical_id_before_workspace_or_artifacts(
+    scenario_id: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_workspace(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("temporary workspace created for an invalid scenario")
+
+    monkeypatch.setattr(runner_main.tempfile, "TemporaryDirectory", unexpected_workspace)
+    run_dir = tmp_path / "run"
+
+    with pytest.raises(ValueError) as captured:
+        runner_main.run_scenario(
+            {"id": scenario_id},
+            run_dir,
+            model=None,
+            effort=None,
+            timeout_seconds=1,
+        )
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    if isinstance(scenario_id, str):
+        assert scenario_id not in str(captured.value)
+    assert not run_dir.exists()
+
+
+def test_load_scenarios_rejects_noncanonical_selection_without_echoing_it() -> None:
+    hostile = "../../must-not-appear"
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios(None, hostile)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert hostile not in str(captured.value)
+
+
+def test_scenario_id_runtime_grammar_allows_multidigit_milestones_and_suffixes() -> None:
+    assert runner_main._validated_scenario_id("m10-z123") == "m10-z123"  # noqa: SLF001
+
+
+def test_load_scenarios_rejects_noncanonical_document_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    hostile = "../../must-not-appear"
+    (family / "scenario.json").write_text(json.dumps({"id": hostile}))
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert hostile not in str(captured.value)
+
+
+def test_load_scenarios_rejects_symlinked_source_outside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    outside = tmp_path / "private-must-not-appear.json"
+    outside.write_text('{"id":"m7-z99"}')
+    (family / "m7-z99.json").symlink_to(outside)
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert outside.name not in str(captured.value)
+
+
+def test_run_scenario_rejects_symlinked_artifact_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_path = SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json"
+    scenario = json.loads(scenario_path.read_text())
+    scenario["_path"] = scenario_path
+    run_dir = tmp_path / "run"
+    outside = tmp_path / "outside"
+    run_dir.mkdir()
+    outside.mkdir()
+    (run_dir / scenario["id"]).symlink_to(outside, target_is_directory=True)
+
+    def unexpected_workspace(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("temporary workspace created before containment validation")
+
+    monkeypatch.setattr(runner_main.tempfile, "TemporaryDirectory", unexpected_workspace)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main.run_scenario(
+            scenario,
+            run_dir,
+            model=None,
+            effort=None,
+            timeout_seconds=1,
+        )
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert list(outside.iterdir()) == []
 
 
 def test_run_scenario_uses_and_removes_private_workspace(
@@ -4584,12 +4921,36 @@ def test_main_expected_skip_is_nonzero_when_nothing_executes(
     assert "reports: evals/results/" in error
 
 
+def test_main_revalidates_loaded_scenario_id_before_creating_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: object,
+) -> None:
+    hostile = "../../must-not-appear"
+    results_root = tmp_path / "evals" / "results"
+    monkeypatch.setattr(runner_main, "ROOT", tmp_path)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", results_root)
+    monkeypatch.setattr(
+        runner_main,
+        "_load_scenarios",
+        lambda *args: [{"id": hostile}],
+    )
+
+    with pytest.raises(SystemExit):
+        runner_main.main(["--scenario", "m7-z99"])
+
+    error = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert runner_main._INVALID_SCENARIO_ERROR in error  # noqa: SLF001
+    assert hostile not in error
+    assert not results_root.exists()
+
+
 def test_main_unexpected_unsupported_fails_but_family_expected_skip_is_neutral(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
-    unexpected = {"id": "m7-new"}
+    unexpected = {"id": "m7-z99"}
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: [unexpected])
     monkeypatch.setattr(
         runner_main,
@@ -4598,7 +4959,7 @@ def test_main_unexpected_unsupported_fails_but_family_expected_skip_is_neutral(
             UnsupportedScenarioError("unexpected state")
         ),
     )
-    assert runner_main.main(["--scenario", "m7-new"]) == 1
+    assert runner_main.main(["--scenario", "m7-z99"]) == 1
 
     scenarios = [{"id": "m5-c04"}, {"id": "m5-c01"}]
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: scenarios)
@@ -4626,8 +4987,8 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     canary = "exception-canary-value"
     private_path = tmp_path / "private" / canary
     scenarios = [
-        {"id": "m7-fails", "privacy_canaries": {"exception": canary}},
-        {"id": "m7-passes", "privacy_canaries": {}},
+        {"id": "m7-z98", "privacy_canaries": {"exception": canary}},
+        {"id": "m7-z99", "privacy_canaries": {}},
     ]
     attempted: list[str] = []
 
@@ -4638,14 +4999,14 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     def run_family(scenario, *args, **kwargs):
         del args, kwargs
         attempted.append(scenario["id"])
-        if scenario["id"] == "m7-fails":
+        if scenario["id"] == "m7-z98":
             raise error_type(f"failure at {private_path}\nraw response body")
         return _passing_runner_report()
 
     monkeypatch.setattr(runner_main, "run_scenario", run_family)
 
     assert runner_main.main(["--family", "m7"]) == 1
-    assert attempted == ["m7-fails", "m7-passes"]
+    assert attempted == ["m7-z98", "m7-z99"]
     error = capsys.readouterr().err  # type: ignore[attr-defined]
     assert str(private_path) not in error
     assert canary not in error
@@ -4662,7 +5023,7 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     assert stat.S_IMODE(run_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(summary_path.stat().st_mode) == 0o600
     summary = json.loads(summary_text)
-    assert summary[0]["scenario"] == "m7-fails"
+    assert summary[0]["scenario"] == "m7-z98"
     assert summary[0]["passed"] is False
     error_summary = summary[0]["error"]
     assert error_summary["type"] == error_type.__name__
@@ -4673,7 +5034,7 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     assert error_summary["content"]["omitted"] == "unsafe-trace-content"
     assert len(error_summary["content"]["sha256"]) == 64
     assert error_summary["content"]["length"] > 0
-    assert summary[1]["scenario"] == "m7-passes"
+    assert summary[1]["scenario"] == "m7-z99"
     assert summary[1]["passed"] is True
 
 
@@ -4686,7 +5047,7 @@ def test_main_does_not_catch_process_control_exceptions(
     monkeypatch.setattr(
         runner_main,
         "_load_scenarios",
-        lambda *args: [{"id": "m7-control", "privacy_canaries": {}}],
+        lambda *args: [{"id": "m7-z97", "privacy_canaries": {}}],
     )
     monkeypatch.setattr(
         runner_main,
@@ -4695,4 +5056,4 @@ def test_main_does_not_catch_process_control_exceptions(
     )
 
     with pytest.raises(type(error)):
-        runner_main.main(["--scenario", "m7-control"])
+        runner_main.main(["--scenario", "m7-z97"])

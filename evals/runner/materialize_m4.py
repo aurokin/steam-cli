@@ -7,6 +7,8 @@ reflects the fixture's intent rather than incidental cache gaps:
   it, ``is_game`` is unknown and every candidate becomes conditional),
 * one complete installed scan (omitted AppIDs are then known-false, not
   unknown),
+* one complete visible-owned snapshot with wishlist-only candidates omitted
+  (that omission is not a non-ownership assertion),
 * one complete activity sync -- even with no games -- so ``activity.read`` is
   never a missing capability, and
 * an explicit ``play_state`` of ``active`` for every candidate, because the
@@ -106,6 +108,7 @@ class _Plan:
 
     def __init__(self, appid: int) -> None:
         self.appid = appid
+        self.visible_owned = True
         self.installed = True
         self.wishlisted = False
         self.activity: dict[str, Any] | None = None
@@ -180,6 +183,7 @@ def _plan(appid: int, state: str, now: datetime) -> _Plan:
         plan.installed = False
         plan.activity = _activity_row(appid, now, lifetime=180, recent=0, days_ago=3)
     elif state == "wishlisted_without_deal_evidence":
+        plan.visible_owned = False
         plan.installed = False
         plan.wishlisted = True
     elif state == "score_60":
@@ -386,7 +390,12 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
                 observed_at=now - _OWNED_PLAYTIME_LAG,
             )
         else:
-            write_owned_snapshot(storage, account.id, appids, now)
+            write_owned_snapshot(
+                storage,
+                account.id,
+                [plan.appid for plan in plans if plan.visible_owned],
+                now,
+            )
         _write_catalog(
             storage,
             account_id=account.id,

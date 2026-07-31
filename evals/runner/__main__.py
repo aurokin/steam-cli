@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import site
 import shutil
 import subprocess
@@ -53,6 +54,8 @@ _CONFIRMED_DATA_DELETE_ARGUMENTS = (
     "--yes",
 )
 _LIVE_EXECUTABLE = "./bin/steam-agent"
+_SCENARIO_ID = re.compile(r"m[1-9][0-9]*-[a-z][0-9]{2,}\Z", re.ASCII)
+_INVALID_SCENARIO_ERROR = "invalid eval scenario input"
 
 DEVELOPER_INSTRUCTIONS_VERSION = "agent-instructions/0.8"
 DEVELOPER_INSTRUCTIONS = """\
@@ -104,6 +107,27 @@ def _write_private_text(path: Path, content: str, *, mode: int = 0o600) -> None:
             os.close(descriptor)
 
 
+def _validated_scenario_id(value: Any) -> str:
+    if not isinstance(value, str) or _SCENARIO_ID.fullmatch(value) is None:
+        raise ValueError(_INVALID_SCENARIO_ERROR)
+    return value
+
+
+def _resolved_contained_path(root: Path, candidate: Path) -> Path:
+    """Return a canonical child path without accepting symlink aliases."""
+
+    try:
+        lexical_root = root.absolute()
+        relative = candidate.absolute().relative_to(lexical_root)
+        resolved_root = root.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(_INVALID_SCENARIO_ERROR) from None
+    if resolved_candidate != resolved_root / relative:
+        raise ValueError(_INVALID_SCENARIO_ERROR)
+    return resolved_candidate
+
+
 def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
     """Create a PATH launcher that gives cache readers the scenario clock."""
 
@@ -111,6 +135,7 @@ def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
     bin_dir = workspace / "bin"
     _ensure_private_dir(bin_dir)
     launcher = bin_dir / "steam-agent"
+    payload = bin_dir / ".steam-agent-frozen.py"
     modules = (
         "steam_agent.activity",
         "steam_agent.application",
@@ -131,9 +156,9 @@ def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
     import_paths = tuple(
         dict.fromkeys((str(ROOT / "src"), *site.getsitepackages()))
     )
-    source = f"""#!{Path(sys.executable).resolve()}
-import sys as _sys
+    source = f"""import sys as _sys
 _sys.path[:0] = {import_paths!r}
+_sys.argv[0] = {str(launcher)!r}
 
 from datetime import datetime as _datetime
 import importlib as _importlib
@@ -155,7 +180,11 @@ for _name in {modules!r}:
 from steam_agent.cli import main as _main
 raise SystemExit(_main())
 """
-    _write_private_text(launcher, source, mode=0o700)
+    _write_private_text(payload, source)
+    interpreter = shlex.quote(str(Path(sys.executable).resolve()))
+    payload_argument = shlex.quote(str(payload))
+    wrapper = f'#!/bin/sh\nexec {interpreter} {payload_argument} "$@"\n'
+    _write_private_text(launcher, wrapper, mode=0o700)
     return launcher
 
 
@@ -361,11 +390,17 @@ def _omit_failed_claim_values(value: Any) -> None:
 def _load_scenarios(
     family: str | None, scenario_id: str | None
 ) -> list[dict[str, Any]]:
+    if scenario_id is not None:
+        scenario_id = _validated_scenario_id(scenario_id)
     scenarios = []
     for path in sorted(SCENARIO_ROOT.glob("*/*.json")):
-        scenario = json.loads(path.read_text())
-        scenario["_path"] = path
-        if scenario_id is not None and scenario["id"] != scenario_id:
+        scenario_path = _resolved_contained_path(SCENARIO_ROOT, path)
+        scenario = json.loads(scenario_path.read_text())
+        if not isinstance(scenario, dict):
+            raise ValueError(_INVALID_SCENARIO_ERROR)
+        loaded_id = _validated_scenario_id(scenario.get("id"))
+        scenario["_path"] = scenario_path
+        if scenario_id is not None and loaded_id != scenario_id:
             continue
         if family is not None and path.parent.name != family:
             continue
@@ -604,12 +639,13 @@ def run_scenario(
     effort: str | None,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    scenario_id = _validated_scenario_id(scenario.get("id"))
+    scenario_dir = _resolved_contained_path(run_dir, run_dir / scenario_id)
     _validate_runner_requirements(scenario)
-    scenario_dir = run_dir / scenario["id"]
     sensitive_values = tuple(scenario["privacy_canaries"].values())
     allow_data_delete = _allows_confirmed_data_delete(scenario)
     with tempfile.TemporaryDirectory(
-        prefix=f"steam-agent-eval-{scenario['id']}-"
+        prefix=f"steam-agent-eval-{scenario_id}-"
     ) as workspace_name:
         workspace = Path(workspace_name)
         workspace.chmod(0o700)
@@ -748,7 +784,7 @@ def run_scenario(
     ]
 
     report = {
-        "scenario": scenario["id"],
+        "scenario": scenario_id,
         "milestone": scenario["milestone"],
         "fixture_sha256": hashlib.sha256(scenario["_path"].read_bytes()).hexdigest(),
         "generator": {
@@ -865,7 +901,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.family is None and args.scenario is None:
         parser.error("pass --family and/or --scenario")
 
-    scenarios = _load_scenarios(args.family, args.scenario)
+    try:
+        scenarios = _load_scenarios(args.family, args.scenario)
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                raise ValueError(_INVALID_SCENARIO_ERROR)
+            _validated_scenario_id(scenario.get("id"))
+    except (json.JSONDecodeError, OSError, UnicodeError, ValueError):
+        parser.error(_INVALID_SCENARIO_ERROR)
     if not scenarios:
         parser.error("no matching scenarios")
 

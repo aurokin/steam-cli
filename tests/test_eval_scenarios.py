@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -182,6 +183,48 @@ def test_schema_02_turn_indexes_and_document_assertions_stay_answerable() -> Non
     ]
     with pytest.raises(AssertionError):
         _check_version_specific(Path("boundary"), without_command)
+
+
+def test_wishlist_compatibility_prompt_exposes_context_without_discovery() -> None:
+    checked: list[str] = []
+    for path in sorted((EVAL_ROOT / "scenarios").glob("**/*.json")):
+        scenario = json.loads(path.read_text(encoding="utf-8"))
+        if "wishlist" not in scenario["tags"] or scenario["tool_policy"][
+            "allowed"
+        ] != ["steam-agent compatibility assess"]:
+            continue
+        requirement = next(
+            item
+            for item in scenario["tool_policy"]["required"]
+            if item["command"] == "steam-agent compatibility assess"
+        )
+        arguments = requirement["arguments"]
+        first_option = next(
+            (
+                index
+                for index, argument in enumerate(arguments)
+                if argument.startswith("--")
+            ),
+            len(arguments),
+        )
+        exposed_values = list(arguments[:first_option])
+        for option in ("--country", "--language"):
+            option_index = arguments.index(option)
+            exposed_values.append(arguments[option_index + 1])
+
+        prompt = " ".join(scenario["conversation"]["user"])
+        missing = [
+            value
+            for value in exposed_values
+            if re.search(
+                rf"(?<!\w){re.escape(value)}(?!\w)", prompt, re.IGNORECASE
+            )
+            is None
+        ]
+        assert not missing, f"{path}: prompt hides required context {missing}"
+        checked.append(scenario["id"])
+
+    assert checked, "expected a wishlist compatibility scenario without discovery"
 
 
 def test_scenarios_do_not_embed_live_or_personal_fixture_sources() -> None:

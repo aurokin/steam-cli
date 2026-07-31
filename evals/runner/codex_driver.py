@@ -35,6 +35,19 @@ class CodexProtocolError(RuntimeError):
     pass
 
 
+class _DuplicateJsonMemberError(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonMemberError
+        value[key] = item
+    return value
+
+
 _APP_SERVER_ARGS = (
     "codex",
     "app-server",
@@ -65,6 +78,7 @@ _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
+_INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
 _INVALID_RESPONSE_ERROR = "app-server returned an invalid response"
 _HOOK_ACTIVITY_ERROR = "app-server emitted disallowed hook activity"
 _POST_TURN_ACTIVITY_ERROR = "app-server emitted activity after turn completion"
@@ -97,12 +111,18 @@ class AgentTranscript:
         return json.dumps(self.events)
 
 
+@dataclass(frozen=True)
+class _StartedItem:
+    item_type: str
+    command: str | None = None
+
+
 @dataclass
 class _TurnCollectionState:
     thread_id: str
     turn_id: str
     started: bool = False
-    started_items: dict[str, str] = field(default_factory=dict)
+    started_items: dict[str, _StartedItem] = field(default_factory=dict)
     completed_items: set[str] = field(default_factory=set)
 
     def matches_turn(self, params: dict[str, Any]) -> bool:
@@ -115,6 +135,7 @@ class _TurnCollectionState:
         item_id = item.get("id")
         item_type = item.get("type")
         status = item.get("status")
+        command = item.get("command")
         if not (
             self.started
             and self.matches_turn(params)
@@ -124,26 +145,44 @@ class _TurnCollectionState:
             and item_id not in self.started_items
             and item_id not in self.completed_items
             and (status is None or status == "inProgress")
-            and (item_type != "commandExecution" or status == "inProgress")
+            and (
+                item_type != "commandExecution"
+                or (
+                    status == "inProgress"
+                    and isinstance(command, str)
+                    and bool(command)
+                )
+            )
         ):
             return False
-        self.started_items[item_id] = item_type
+        self.started_items[item_id] = _StartedItem(
+            item_type=item_type,
+            command=command if item_type == "commandExecution" else None,
+        )
         return True
 
     def complete_item(self, params: dict[str, Any], item: dict[str, Any]) -> bool:
         item_id = item.get("id")
         item_type = item.get("type")
         status = item.get("status")
+        command = item.get("command")
+        started_item = self.started_items.get(item_id)
         if not (
             self.started
             and self.matches_turn(params)
             and isinstance(item_id, str)
             and isinstance(item_type, str)
-            and self.started_items.get(item_id) == item_type
+            and started_item is not None
+            and started_item.item_type == item_type
             and (status is None or status in _ITEM_TERMINAL_STATUSES)
             and (
                 item_type != "commandExecution"
-                or status in _ITEM_TERMINAL_STATUSES
+                or (
+                    status in _ITEM_TERMINAL_STATUSES
+                    and isinstance(command, str)
+                    and bool(command)
+                    and command == started_item.command
+                )
             )
         ):
             return False
@@ -569,9 +608,11 @@ def _validate_sandbox_boundary(sandbox: Any) -> bool:
 def _validate_thread_boundary(response: dict[str, Any], workspace: str) -> None:
     thread = response.get("thread") or {}
     instruction_sources = response.get("instructionSources")
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
     valid = (
         isinstance(thread, dict)
-        and thread.get("id")
+        and isinstance(thread_id, str)
+        and bool(thread_id)
         and thread.get("cwd") == workspace
         and thread.get("ephemeral") is True
         and thread.get("path") is None
@@ -1147,8 +1188,8 @@ def _collect_turn(
             transcript.activity_violations.extend(
                 {
                     "item_type": (
-                        item_type
-                        if item_type
+                        started_item.item_type
+                        if started_item.item_type
                         in _INFORMATIONAL_ITEM_TYPES
                         | _DISALLOWED_ITEM_TYPES
                         | {"commandExecution"}
@@ -1156,7 +1197,7 @@ def _collect_turn(
                     ),
                     "reason": "incomplete_item_activity",
                 }
-                for _item_id, item_type in sorted(state.started_items.items())
+                for _item_id, started_item in sorted(state.started_items.items())
             )
             transcript.turn_status = status
             transcript.turn_error = turn.get("error")
@@ -1478,7 +1519,17 @@ class _Session:
                 self._charge_input(consumed)
                 line = bytes(self._buffer[:newline])
                 del self._buffer[:consumed]
-                return True, json.loads(line)
+                try:
+                    message = json.loads(
+                        line, object_pairs_hook=_unique_json_object
+                    )
+                except (
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    _DuplicateJsonMemberError,
+                ):
+                    self._raise_invalid_json()
+                return True, message
             if len(self._buffer) > _MAX_JSONL_FRAME_BYTES:
                 self._raise_input_limit()
             remaining = max(0, deadline - time.monotonic())
@@ -1505,6 +1556,12 @@ class _Session:
         self._pending_notifications.clear()
         self._server_requests.clear()
         raise CodexProtocolError(_PROTOCOL_INPUT_LIMIT_ERROR)
+
+    def _raise_invalid_json(self) -> None:
+        self._buffer.clear()
+        self._pending_notifications.clear()
+        self._server_requests.clear()
+        raise CodexProtocolError(_INVALID_JSON_ERROR) from None
 
     def _raise_post_turn_activity(self) -> None:
         self._buffer.clear()

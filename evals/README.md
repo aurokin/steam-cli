@@ -31,12 +31,14 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git. New run directories are mode `0700`, artifact files are
   mode `0600`, unrelated command output is omitted, and host paths are
-  redacted before persistence. Each scenario's writable agent workspace is a
-  private temporary directory that is removed before its sanitized transcript
-  and report are written; caches and agent-created files never persist under
-  `results/`. Runs that fail a turn, evidence, tool, or privacy gate persist
-  only structural activity plus content hashes and lengths, not raw prompts,
-  reasoning, commands, answers, or tool output.
+  redacted before persistence. The live runner revalidates canonical scenario
+  identifiers and resolved source/result containment before creating a
+  workspace or writing artifacts. Each scenario's writable agent workspace is
+  a private temporary directory that is removed before its sanitized
+  transcript and report are written; caches and agent-created files never
+  persist under `results/`. Runs that fail a turn, evidence, tool, or privacy
+  gate persist only structural activity plus content hashes and lengths, not
+  raw prompts, reasoning, commands, answers, or tool output.
   Evaluated commands run under the named `steam-agent-eval` permission
   profile. It denies the host root by default, inherits workspace writes, and
   reopens read access only for Codex's minimal platform set, the resolved
