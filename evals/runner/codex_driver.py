@@ -124,6 +124,10 @@ class AgentTranscript:
     turn_error: dict[str, Any] | None = None
     effective_model: str | None = None
     effective_reasoning_effort: str | None = None
+    observed_models: list[str] = field(default_factory=list)
+    observed_reasoning_efforts: list[str] = field(default_factory=list)
+    pre_activity_models: list[str] = field(default_factory=list)
+    pre_activity_reasoning_efforts: list[str] = field(default_factory=list)
     activity_violations: list[dict[str, str]] = field(default_factory=list)
     confirmed_model: str | None = None
     confirmed_reasoning_effort: str | None = None
@@ -295,6 +299,7 @@ def run_agent_conversation(
     model: str | None = None,
     effort: str | None = None,
     timeout_seconds: float = 900.0,
+    source_root: str | None = None,
 ) -> list[AgentTranscript]:
     """Run every prompt as a sequential turn on one thread.
 
@@ -318,7 +323,11 @@ def run_agent_conversation(
         launch_prefix = _app_server_launch_prefix(app_server)
         _validate_codex_version(launch_prefix, environment=child_environment)
         process = subprocess.Popen(
-            _app_server_process_args(launch_prefix, Path(workspace)),
+            _app_server_process_args(
+                launch_prefix,
+                Path(workspace),
+                source_root=Path(source_root) if source_root is not None else None,
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -335,6 +344,7 @@ def run_agent_conversation(
                 model=model,
                 effort=effort,
                 timeout_seconds=timeout_seconds,
+                source_root=Path(source_root) if source_root is not None else None,
             )
         finally:
             _terminate_process_group(process)
@@ -420,7 +430,10 @@ def _validate_codex_version(
 
 
 def _app_server_process_args(
-    launch_prefix: str | Sequence[str], workspace: Path
+    launch_prefix: str | Sequence[str],
+    workspace: Path,
+    *,
+    source_root: Path | None = None,
 ) -> list[str]:
     policy_overrides = (
         'shell_environment_policy.inherit="core"',
@@ -429,7 +442,8 @@ def _app_server_process_args(
         "shell_environment_policy.set.HOME=" + json.dumps(str(workspace)),
         "shell_environment_policy.set.TMPDIR=" + json.dumps(str(workspace)),
         "default_permissions=" + json.dumps(_PERMISSION_PROFILE),
-        f"permissions.{_PERMISSION_PROFILE}=" + _permission_profile_toml(),
+        f"permissions.{_PERMISSION_PROFILE}="
+        + _permission_profile_toml(source_root=source_root),
     )
     args = [*_launch_args(launch_prefix), *_APP_SERVER_ARGS[1:]]
     for override in policy_overrides:
@@ -437,7 +451,7 @@ def _app_server_process_args(
     return args
 
 
-def _permission_read_roots() -> tuple[Path, ...]:
+def _permission_read_roots(*, source_root: Path | None = None) -> tuple[Path, ...]:
     """Return the minimum host roots needed by the frozen Python launcher."""
 
     scheme_paths = sysconfig.get_paths()
@@ -459,7 +473,11 @@ def _permission_read_roots() -> tuple[Path, ...]:
             if (value := scheme_paths.get(name))
         ),
         *(Path(value).resolve() for value in site.getsitepackages()),
-        (Path(__file__).resolve().parents[2] / "src").resolve(),
+        (
+            source_root.resolve()
+            if source_root is not None
+            else (Path(__file__).resolve().parents[2] / "src").resolve()
+        ),
     ]
     broad_prefixes = {
         Path(sys.base_prefix).resolve(),
@@ -490,21 +508,30 @@ def _python_framework_binary() -> Path | None:
     ).resolve()
 
 
-def _permission_filesystem_rules() -> dict[str, str]:
+def _permission_filesystem_rules(
+    *, source_root: Path | None = None
+) -> dict[str, str]:
     rules = {
         ":root": "deny",
         ":minimal": "read",
         ":tmpdir": "deny",
         ":slash_tmp": "deny",
     }
-    rules.update({str(path): "read" for path in _permission_read_roots()})
+    rules.update(
+        {
+            str(path): "read"
+            for path in _permission_read_roots(source_root=source_root)
+        }
+    )
     return rules
 
 
-def _permission_profile_toml() -> str:
+def _permission_profile_toml(*, source_root: Path | None = None) -> str:
     filesystem = ",".join(
         f"{json.dumps(path)}={json.dumps(access)}"
-        for path, access in _permission_filesystem_rules().items()
+        for path, access in _permission_filesystem_rules(
+            source_root=source_root
+        ).items()
     )
     return (
         '{extends=":workspace",filesystem={' + filesystem + "},network={enabled=false}}"
@@ -617,6 +644,7 @@ def _converse(
     model: str | None,
     effort: str | None,
     timeout_seconds: float,
+    source_root: Path | None = None,
 ) -> list[AgentTranscript]:
     assert process.stdin is not None and process.stdout is not None
     session = _Session(process.stdin, process.stdout, timeout_seconds)
@@ -634,7 +662,9 @@ def _converse(
     )
     session.notify("initialized", {})
     _validate_account_boundary(session)
-    _validate_external_tool_boundary(session, workspace)
+    _validate_external_tool_boundary(
+        session, workspace, source_root=source_root
+    )
     thread = session.request(
         "thread/start",
         _thread_start_params(workspace, developer_instructions, model),
@@ -849,7 +879,9 @@ def _validate_account_boundary(session: _Session) -> None:
         )
 
 
-def _validate_external_tool_boundary(session: _Session, workspace: str) -> None:
+def _validate_external_tool_boundary(
+    session: _Session, workspace: str, *, source_root: Path | None = None
+) -> None:
     """Fail before thread creation if App Server retained an external source."""
 
     response = session.request(
@@ -873,7 +905,9 @@ def _validate_external_tool_boundary(session: _Session, workspace: str) -> None:
             and features.get("plugins") is False
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
-            and _validate_permission_profile_config(config)
+            and _validate_permission_profile_config(
+                config, source_root=source_root
+            )
             and _validate_shell_environment_policy(
                 config.get("shell_environment_policy"), workspace
             )
@@ -902,12 +936,14 @@ def _validate_external_tool_boundary(session: _Session, workspace: str) -> None:
         raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
 
 
-def _validate_permission_profile_config(config: dict[str, Any]) -> bool:
+def _validate_permission_profile_config(
+    config: dict[str, Any], *, source_root: Path | None = None
+) -> bool:
     profiles = config.get("permissions")
     profile = profiles.get(_PERMISSION_PROFILE) if isinstance(profiles, dict) else None
     filesystem = {
         "glob_scan_max_depth": None,
-        **_permission_filesystem_rules(),
+        **_permission_filesystem_rules(source_root=source_root),
     }
     network = {
         "enabled": False,
@@ -1110,8 +1146,25 @@ def _collect_turn(
     transcript = AgentTranscript(
         effective_model=effective_model,
         effective_reasoning_effort=effective_reasoning_effort,
+        observed_models=(
+            [effective_model] if effective_model is not None else []
+        ),
+        observed_reasoning_efforts=(
+            [effective_reasoning_effort]
+            if effective_reasoning_effort is not None
+            else []
+        ),
+        pre_activity_models=(
+            [effective_model] if effective_model is not None else []
+        ),
+        pre_activity_reasoning_efforts=(
+            [effective_reasoning_effort]
+            if effective_reasoning_effort is not None
+            else []
+        ),
     )
     state = _TurnCollectionState(thread_id=thread_id, turn_id=turn_id)
+    activity_started = False
     while True:
         message = session.read_message()
         if isinstance(message, _MalformedWireEvidence):
@@ -1252,6 +1305,7 @@ def _collect_turn(
                     "invalid_item_started_order_or_scope",
                 )
                 continue
+            activity_started = True
             transcript.events.append(_item_event(method, item))
             if (
                 item_type != "commandExecution"
@@ -1281,18 +1335,27 @@ def _collect_turn(
             completion_sequence = len(transcript.events) - 1
             if item_type == "commandExecution":
                 output = item.get("aggregatedOutput")
+                output_source = "aggregate" if isinstance(output, str) else "absent"
+                output_delta_count = (
+                    len(started_item.command_output_deltas)
+                    if started_item is not None
+                    else 0
+                )
                 if (
                     output is None
                     and started_item is not None
                     and started_item.command_output_deltas
                 ):
                     output = "".join(started_item.command_output_deltas)
+                    output_source = "deltas"
                 transcript.commands.append(
                     {
                         "command": item.get("command", ""),
                         "exit_code": item.get("exitCode"),
                         "status": item.get("status"),
                         "output": output,
+                        "output_source": output_source,
+                        "output_delta_count": output_delta_count,
                     }
                 )
                 transcript.command_completion_sequences.append(completion_sequence)
@@ -1320,6 +1383,11 @@ def _collect_turn(
             )
             transcript.effective_model = confirmed_model
             transcript.effective_reasoning_effort = confirmed_effort
+            transcript.observed_models.append(confirmed_model)
+            transcript.observed_reasoning_efforts.append(confirmed_effort)
+            if not activity_started:
+                transcript.pre_activity_models.append(confirmed_model)
+                transcript.pre_activity_reasoning_efforts.append(confirmed_effort)
             transcript.confirmed_model = confirmed_model
             transcript.confirmed_reasoning_effort = confirmed_effort
             transcript.thread_settings_confirmed = True
@@ -1331,10 +1399,15 @@ def _collect_turn(
                 "invalid_thread_settings_scope",
             )
         elif method == "model/rerouted" and state.matches_turn(params):
-            _validated_server_model(params.get("fromModel"))
+            prior_model = _validated_server_model(params.get("fromModel"))
             rerouted_model = _validated_server_model(params.get("toModel"))
+            if prior_model != transcript.effective_model:
+                raise CodexProtocolError(_INVALID_MODEL_METADATA_ERROR)
             transcript.events.append({"method": "model/rerouted"})
             transcript.effective_model = rerouted_model
+            transcript.observed_models.append(rerouted_model)
+            if not activity_started:
+                transcript.pre_activity_models.append(rerouted_model)
         elif method == "model/rerouted":
             _record_invalid_notification(
                 transcript,

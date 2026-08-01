@@ -24,9 +24,23 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   a runner limitation, not a claim about platform support for the product CLI.
   Reproducible model comparisons should pin both dimensions, for
   example `--model gpt-5.6-sol --effort high`; supported effort values are
-  `low`, `medium`, `high`, and `xhigh`. Normal CI covers only its materializer
-  and grader. Agent execution explicitly expects `m5-c03`, `m5-c04`, and
-  `m5-c11` to be unsupported; the first two lack a CLI writer, while `m5-c11`
+  `low`, `medium`, `high`, and `xhigh`. A pinned route must be attested before
+  subject activity, and every observed setting or reroute must remain equal to
+  it; otherwise the cohort fails structurally. Runs also name a run-level evaluation
+  track: `legacy` is the default and preserves the original instructions,
+  `answer` discloses the exact required command manifest, and `discovery`
+  leaves command selection to the subject. Answer results are diagnostic and
+  are not the headline product score. In discovery, only fully validated Steam
+  Agent reads whose command head is in the runner's explicit positive set of
+  known cache-only reads can be counted as exploration cost. They never
+  satisfy the required command or provide oracle or claim evidence; unknown
+  future command heads fail closed. All ambiguous, mutating, networked,
+  filesystem, client, and other unvalidated activity remains a hard failure.
+  Normal CI covers the runner's materializer, grader, and eight integrated
+  scripted layer controls; it does not execute a live model. Deterministic
+  preflight validates, materializes, and executes CLI assertions for 51 current
+  scenarios. Agent execution treats `m5-c03`, `m5-c04`, and `m5-c11` as
+  deterministic-only; the first two lack a CLI writer, while `m5-c11`
   requires a sync plus multiple required CLI documents that the cache-only,
   single-document live runner intentionally rejects. Any other materialization
   failure fails the run.
@@ -45,7 +59,31 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git. New run directories are mode `0700`, artifact files are
   mode `0600`, unrelated command output is omitted, and host paths are
-  redacted before persistence. The live runner revalidates canonical scenario
+  redacted before persistence. A qualification cohort starts only from a known
+  clean Git revision. The already-loaded runner seals the product `src/` tree,
+  its `evals/runner` bytes, selected scenarios, and schema into an immutable
+  input snapshot. Scenario CLI execution uses the snapshot's product source;
+  the harness is not relaunched from its snapshot copy. Cross-file checks
+  establish that the sealed bytes match the clean worktree, and revision,
+  cleanliness, live input inventories, and the snapshot seal are rechecked
+  throughout the cohort. Deterministic preflight precedes a versioned set of
+  eight scripted positive/negative controls that call the integrated
+  production-layer grading functions. Its versioned run manifest records a
+  bounded snapshot digest, per-scenario input digests, ordered selection,
+  track, route, control, and completion provenance without private paths or
+  account identifiers.
+  Manifest updates use a private `0600` temporary file followed by atomic
+  replacement. Only `completed` cohorts are eligible for qualification;
+  `failed`, `interrupted`, and `contaminated` cohorts are quarantined from
+  denominators and comparisons. The lifecycle also includes `initializing`,
+  `controls`, and `running`; non-completed states, including stale nonterminal
+  manifests, are ineligible. Failed, interrupted, and contaminated manifests
+  carry a bounded terminal reason. There is no stale-run recovery in this
+  slice. Each accounted scenario publishes either a mode-`0600` report and
+  transcript or a mode-`0600` deterministic-only skip record. The runner
+  verifies their hashes and records them in the summary; artifact failure
+  fails the cohort.
+  The live runner revalidates canonical scenario
   identifiers and resolved source/result containment before creating a
   workspace or writing artifacts. Each scenario's writable agent workspace is
   a private temporary directory that is removed before its sanitized
@@ -75,6 +113,9 @@ tool-use policy, a fact rubric, and an opt-in qualitative answer rubric. Normal
 CI schema- and privacy-validates every scenario without network access or a
 model API. Executable deterministic CLI coverage spans every family: oracle
 modules for M3, M4, M5, and M7, and the materializer round trip for M2 and
-M6 contract scenarios. See the
+M6 contract scenarios. The first qualification slice leaves scenario schema
+`0.2` and its claim semantics unchanged. Schema `0.3`, execution-support
+metadata, claim-salience fields, and scenario splits remain deferred outside
+the accepted qualification slice. See the
 [evaluation strategy](../docs/design/evaluation-strategy.md) for scoring,
 privacy, volatility, and future judge rules.

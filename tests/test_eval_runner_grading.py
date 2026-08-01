@@ -1035,6 +1035,131 @@ def test_owned_capability_is_read_only_but_still_requires_allowlisting() -> None
     assert allowed["passed"], allowed
 
 
+def test_discovery_cost_downgrades_only_safe_unlisted_reads() -> None:
+    required = (
+        "./bin/steam-agent --data-dir steam-agent-data --format json "
+        "operations observe --machine synthetic-machine"
+    )
+    misroute = (
+        "./bin/steam-agent --data-dir steam-agent-data --format json "
+        "accounts status --alias synthetic"
+    )
+
+    strict = grade.grade_tool_policy(
+        [required, misroute],
+        POLICY,
+        expected_data_dir="steam-agent-data",
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+    )
+    discovery = grade.grade_tool_policy(
+        [required, misroute],
+        POLICY,
+        expected_data_dir="steam-agent-data",
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+        unlisted_mode="discovery_cost",
+    )
+
+    assert not strict["passed"]
+    assert strict["discovery_misroute_count"] == 0
+    assert strict["unlisted_calls"] == [misroute]
+    assert discovery["passed"], discovery
+    assert discovery["discovery_misroute_count"] == 1
+    assert discovery["unlisted_calls"] == []
+    assert discovery["required"] == [
+        {"command": "steam-agent operations observe", "satisfied": True}
+    ]
+
+
+def test_discovery_cost_fails_closed_for_unknown_future_command_heads() -> None:
+    command = (
+        "./bin/steam-agent --data-dir steam-agent-data --format json "
+        "future-unknown-mutation --yes"
+    )
+
+    result = grade.grade_tool_policy(
+        [command],
+        {"allowed": [], "required": [], "prohibited": []},
+        expected_data_dir="steam-agent-data",
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+        unlisted_mode="discovery_cost",
+    )
+
+    assert not result["passed"]
+    assert result["discovery_misroute_count"] == 0
+    assert result["unlisted_calls"] == [command]
+    assert result["violations"] == [
+        {"command": command, "reason": "not_allowed"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    (
+        (
+            "./bin/steam-agent --data-dir steam-agent-data --format json "
+            "sync installed",
+            "cache_only_boundary",
+        ),
+        (
+            "./bin/steam-agent --data-dir other --format json "
+            "accounts status --alias synthetic",
+            "unexpected_data_dir",
+        ),
+        (
+            "./bin/steam-agent --data-dir steam-agent-data --format table "
+            "accounts status --alias synthetic",
+            "non_json_format",
+        ),
+        ("python -c 'print(1)'", "execution_boundary"),
+    ),
+)
+def test_discovery_cost_preserves_live_safety_failures(
+    command: str, reason: str
+) -> None:
+    result = grade.grade_tool_policy(
+        [command],
+        {"allowed": [], "required": [], "prohibited": []},
+        expected_data_dir="steam-agent-data",
+        expected_executable="./bin/steam-agent",
+        enforce_cache_only=True,
+        unlisted_mode="discovery_cost",
+    )
+
+    assert not result["passed"]
+    assert result["discovery_misroute_count"] == 0
+    assert result["violations"][0]["reason"] == reason
+
+
+@pytest.mark.parametrize("unlisted_mode", ("", "allow", None))
+def test_tool_policy_rejects_invalid_unlisted_modes(unlisted_mode: object) -> None:
+    with pytest.raises(ValueError, match="invalid unlisted command mode"):
+        grade.grade_tool_policy(
+            [],
+            {"allowed": [], "required": [], "prohibited": []},
+            unlisted_mode=unlisted_mode,  # type: ignore[arg-type]
+        )
+
+
+def test_discovery_cost_requires_every_live_command_boundary() -> None:
+    policy = {"allowed": [], "required": [], "prohibited": []}
+    base = {
+        "expected_data_dir": "steam-agent-data",
+        "expected_executable": "./bin/steam-agent",
+        "enforce_cache_only": True,
+    }
+    for omitted in base:
+        kwargs = {**base, omitted: None if omitted != "enforce_cache_only" else False}
+        with pytest.raises(
+            ValueError, match="discovery cost requires live command boundaries"
+        ):
+            grade.grade_tool_policy(
+                [], policy, unlisted_mode="discovery_cost", **kwargs
+            )
+
+
 def test_help_discovery_is_allowed_outside_the_allowlist() -> None:
     result = grade.grade_tool_policy(
         ["steam-agent owned --help"],
@@ -1042,6 +1167,8 @@ def test_help_discovery_is_allowed_outside_the_allowlist() -> None:
     )
 
     assert result["passed"], result
+    assert result["help_calls"] == 1
+    assert result["discovery_misroute_count"] == 0
 
 
 @pytest.mark.parametrize(

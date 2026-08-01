@@ -1,8 +1,8 @@
 # Cross-milestone common-question evaluation strategy
 
-Status: working quality strategy; deterministic scenario, materializer, and
-applicable CLI-oracle coverage for M2–M7 is in normal CI, while live model
-execution and judging remain opt-in.
+Status: working quality strategy; deterministic scenario, materializer,
+scripted-control, and applicable CLI-oracle coverage for M2–M7 is in normal
+CI, while live model execution and judging remain opt-in.
 
 ## Purpose and boundary
 
@@ -58,7 +58,86 @@ Report a metric vector and per-scenario failures rather than one blended score:
 - consistency across paraphrase and metamorphic variants.
 
 Cost, latency, and tool-call counts are useful operational measurements but do
-not increase a quality score.
+not increase a quality score. Typed capture and runner diagnostics may describe
+an observed condition such as missing output, a nonzero exit, multiple
+candidate documents, or invalid JSON. They are additive to the canonical
+metric vector: they do not replace a layer value, convert a failure to a pass,
+or assign the condition to the model, harness, transport, or product without
+separate evidence.
+
+## Qualification cohorts and run tracks
+
+The unit of model qualification is a complete cohort, not an individual
+scenario report. A cohort starts only from an identified Git revision with a
+clean worktree. The already-loaded runner process seals the product `src/`
+tree, its `evals/runner` tree, the selected scenario bytes, and the applicable
+schema bytes into an immutable input snapshot with a canonical digest.
+Scenario CLI execution imports the product from that snapshot. The harness is
+not relaunched from the snapshot; it continues as the already-loaded
+clean-revision process.
+
+In a subject cohort, deterministic preflight runs before controls or subject
+execution. It validates every selection and, for each supported scenario,
+materializes its fixture, invokes the snapshot-backed CLI, and grades its CLI
+assertions. The current corpus has 51 supported scenarios. M5-c03, M5-c04, and
+M5-c11 are explicitly deterministic-only. Any other unsupported scenario
+aborts preflight. Cross-file inventory checks establish that the snapshot
+copies match the bytes read from the clean worktree. Before each subject and
+at completion, the runner rechecks the live product source, harness, selected
+scenarios, schema, Git revision, and cleanliness, as well as the snapshot seal.
+Changed live inputs contaminate the cohort; an invalid snapshot does the same.
+
+Each cohort has a versioned run manifest containing bounded reproducibility
+metadata: manifest schema and run identifier, snapshot and per-scenario input
+digests, ordered scenario selection and track, requested route, tool versions,
+control-set version and outcome, expected and completed work, timestamps, and
+lifecycle state. It omits host paths, account identifiers, secrets, and raw
+protocol or model content. Manifest updates use a mode-`0600`
+temporary file inside the private run directory followed by atomic replacement.
+The lifecycle distinguishes `initializing`, `controls`, `running`, `completed`,
+`failed`, `interrupted`, and `contaminated`. Only a `completed` cohort from the
+verified inputs can enter qualification denominators or route comparisons;
+other terminal states are quarantined. A stale nonterminal manifest is also
+ineligible. The current implementation does not recover or terminalize stale
+runs.
+
+A versioned scripted control set runs through the integrated production-layer
+grading functions in the already-loaded runner. After deterministic preflight,
+eight controls exercise a fully passing case and isolated defects in agent-turn
+completion, unlisted tool policy, wrong arguments, prohibited mutation, oracle
+assertions, unsupported claims, and privacy. Each must produce its declared
+canonical layer vector. Controls validate the harness and remain outside
+subject pass rates.
+
+After each accounted scenario, the runner verifies the private mode and
+content hash of its report and transcript, or of its deterministic-only skip
+record. The summary records those hashes. Missing, substituted, or
+unexpectedly permissive artifacts fail the cohort with a bounded terminal
+reason.
+
+The run manifest names one of three run-level tracks:
+
+- `legacy` is the default and preserves the existing subject instructions and
+  tool-policy behavior for historical comparison.
+- `answer` discloses the scenario's exact required command manifest. It
+  isolates evidence use, claims, prose, and refusal quality, but is a diagnostic
+  control rather than the headline product score.
+- `discovery` withholds the required command. Exact validated help calls and
+  fully validated Steam Agent reads whose command head is in an explicit
+  positive set of known cache-only reads may count as discovery cost outside
+  the scenario allowlist, but never as required evidence, oracle input, or
+  claim support.
+
+A discovery read is a cost rather than a hard failure only when the existing
+parser proves an unambiguous invocation of the exact runner executable and data
+directory, a cache-only/read-only command class, and the absence of shell,
+network, mutation, filesystem, Steam-client, or other activity violations.
+Anything not fully validated remains a hard policy failure. There is no global
+allowance for `capabilities`, `doctor`, arbitrary or future unknown
+subcommands, or another tool's output. Required-command matching, privacy, M1
+last-good behavior, and the M7 no-execution boundary do not vary by track. This
+qualification contract is recorded in
+[ADR 0018](../adr/0018-eval-qualification-cohorts-and-tracks.md).
 
 ## Corpus and volatility
 
@@ -107,6 +186,23 @@ blind comparison and task-specific rubrics while retaining expert review.
   (`refusal_expected`, `contains`, `omits`), or the executed-command trace
   (`must_not_execute`). A boundary scenario may therefore carry no fixture
   facts and no required command.
+  The first qualification slice leaves schema `0.2` and its existing claim
+  semantics unchanged. Schema `0.3`, `execution_support`, `must_mention`,
+  `support_if_claimed`, required-claim reclassification, and scenario splits
+  remain deferred outside the accepted qualification slice.
+- Qualification cohorts require a known clean Git revision before preflight
+  and recheck the revision, worktree, selected input inventories, and snapshot
+  seal throughout the run. The snapshot attests the product source, loaded
+  harness bytes, selected scenarios, and schema; only the product source is
+  executed from the snapshot. Deterministic preflight supports 51 current
+  scenarios and classifies M5-c03, M5-c04, and M5-c11 as deterministic-only.
+  Eight scripted controls call the integrated production-layer evaluators.
+  Scenario publication verifies mode-`0600` reports and transcripts or skip
+  records and puts their content hashes in the summary. Lifecycle states are
+  `initializing`, `controls`, `running`, `completed`, `failed`, `interrupted`,
+  and `contaminated`; every non-completed terminal state carries one bounded
+  reason. Stale nonterminal manifests are ineligible, with no recovery
+  implementation in this slice.
 - M3, M4, M5, and M7 oracle modules execute installed command behavior
   against deterministic scenarios; M2 and M6 contract scenarios are executed
   through the materializer round trip, and boundary probes (refusal,
@@ -158,9 +254,9 @@ blind comparison and task-specific rubrics while retaining expert review.
   loaded or artifacts are created. That runner boundary does not narrow the
   product CLI's platform contract. A local `codex` binary is required; normal
   CI exercises only the platform-independent materializers and grader. Agent
-  execution expects only `m5-c03`, `m5-c04`, and `m5-c11` to
-  be unsupported. An unexpected unsupported scenario or a selection in which
-  every scenario is skipped fails the run.
+  execution treats only `m5-c03`, `m5-c04`, and `m5-c11` as
+  deterministic-only. An unexpected unsupported scenario or a selection in
+  which every scenario is skipped fails the run.
 - The runner selects a named `steam-agent-eval` permission profile, one runtime
   workspace root, no network, and no approvals. The profile extends
   `:workspace`, denies the host root by default, retains Codex's minimal
@@ -266,6 +362,10 @@ blind comparison and task-specific rubrics while retaining expert review.
   confirm an effective turn override, the effective value remains null rather
   than being inferred from the request. A turn-scoped reroute is reported for
   that turn but is not carried forward without a thread-settings confirmation.
+  When model or effort is pinned, every observed value must match it and both
+  dimensions must be attested before command or answer activity. A missing,
+  late, transient, or reverted mismatch fails the cohort before that scenario
+  is accounted. Reproducible qualification therefore pins both dimensions.
 - M2, M3, M4, M5, M6, and M7 fixtures are materializable today through the
   per-milestone `evals/runner/materialize_*.py` modules. The two Valve Deck
   scenarios stay pure-oracle-only because no CLI writer produces

@@ -36,6 +36,7 @@ product and provider choices open until evidence supports them.
 | D027 | Agent-execution eval driver: Codex App Server with deterministic-only grading | Implemented opt-in development tooling; not a product surface | Easy; driver is isolated in `evals/runner/` | M2–M7 materializer and deterministic-grader tests run in normal CI; live model execution and qualitative judging remain opt-in |
 | D028 | Owned playtime truth state and backlog filtering | [Accepted ADR 0016](0016-owned-playtime-truth-state.md) | Easy; derived fields, lineage, and one flag | Zero-versus-null, authority-lineage/privacy, activity upgrade/never-downgrade, expiry, non-authoritative, and filter/limitation tests |
 | D029 | Eval required-command alternatives and qualitative review retention | [Accepted ADR 0017](0017-eval-command-equivalence-and-review-retention.md) | Easy; additive scenario/report fields | Exact optional-option matching, malformed-sidecar visibility, privacy and unsafe-tool suppression, and corpus runner tests |
+| D030 | Eval qualification cohorts, controls, and answer/discovery tracks | [Accepted ADR 0018](0018-eval-qualification-cohorts-and-tracks.md) | Moderate; run manifests and cohort provenance become comparison inputs | Clean-revision and preflight tests, sealed-input consistency checks, terminal-reason and artifact-publication tests, integrated layer controls, and legacy/answer/discovery policy tests |
 
 ## When to create an ADR
 

@@ -1188,6 +1188,31 @@ _CACHE_ONLY_PROHIBITED_HEADS = (
     ("data", "delete"),
 )
 
+# Discovery may count only command classes that are already known to be
+# cache-only reads. Unknown future command heads fail closed even when their
+# invocation happens to satisfy today's executable/data-dir/JSON boundaries.
+_DISCOVERY_SAFE_READ_HEADS = frozenset(
+    {
+        ("accounts", "status"),
+        ("compatibility", "assess"),
+        ("deals", "query"),
+        ("discovery", "query"),
+        ("games", "query"),
+        ("group", "eligibility"),
+        ("group", "recommend"),
+        ("operations", "observe"),
+        ("operations", "plan"),
+        ("recommendations", "query"),
+        ("recommendations", "wishlist"),
+        ("storage", "rank"),
+    }
+)
+
+
+def _is_discovery_safe_read(argv: Sequence[str]) -> bool:
+    tail = _cli_command_tail(argv)
+    return tail is not None and tuple(tail[:2]) in _DISCOVERY_SAFE_READ_HEADS
+
 
 def cache_only_prohibited_head(
     argv: Sequence[str], *, allow_data_delete: bool = False
@@ -1345,17 +1370,34 @@ def grade_tool_policy(
     expected_executable: str | None = None,
     enforce_cache_only: bool = False,
     allow_data_delete: bool = False,
+    unlisted_mode: str = "fail",
 ) -> dict[str, Any]:
     """Check executed shell commands against the scenario tool policy.
 
     ``allowed`` is a real allowlist. Safe ``--help`` discovery is the sole
     exception. ``expected_data_dir`` lets live grading require a single exact
     global ``--data-dir`` value while pure policy unit tests can opt out.
+
+    ``discovery_cost`` may downgrade only otherwise-safe, cache-only, JSON
+    ``steam-agent`` reads outside the allowlist to an operational count. It is
+    intentionally available only with every live boundary enabled; mutating,
+    non-JSON, wrong-data-dir, and non-``steam-agent`` calls remain violations.
     """
+
+    if unlisted_mode not in {"fail", "discovery_cost"}:
+        raise ValueError("invalid unlisted command mode")
+    if unlisted_mode == "discovery_cost" and (
+        not enforce_cache_only
+        or expected_data_dir is None
+        or expected_executable is None
+    ):
+        raise ValueError("discovery cost requires live command boundaries")
 
     violations: list[dict[str, str]] = []
     unlisted_calls: list[str] = []
     steam_agent_calls: list[list[str]] = []
+    help_calls = 0
+    discovery_misroute_count = 0
     violations.extend(
         execution_boundary_violations(
             executed_commands, expected_executable=expected_executable
@@ -1369,6 +1411,7 @@ def grade_tool_policy(
             continue
         steam_agent_calls.append(argv)
         if _is_help_call(argv):
+            help_calls += 1
             continue
         if (
             enforce_cache_only
@@ -1401,14 +1444,21 @@ def grade_tool_policy(
             _call_matches_allowed(argv, allowed)
             for allowed in policy.get("allowed", ())
         ):
-            unlisted_calls.append(command)
             command_tail = _cli_command_tail(argv) or []
             reason = (
                 "mutating_or_network"
                 if command_tail[:1] in (["sync"], ["auth"], ["feedback"])
                 else "not_allowed"
             )
-            violations.append({"command": command, "reason": reason})
+            if (
+                unlisted_mode == "discovery_cost"
+                and reason == "not_allowed"
+                and _is_discovery_safe_read(argv)
+            ):
+                discovery_misroute_count += 1
+            else:
+                unlisted_calls.append(command)
+                violations.append({"command": command, "reason": reason})
 
     required_satisfied = []
     for requirement in policy.get("required", ()):
@@ -1459,6 +1509,8 @@ def grade_tool_policy(
 
     return {
         "steam_agent_calls": len(steam_agent_calls),
+        "help_calls": help_calls,
+        "discovery_misroute_count": discovery_misroute_count,
         "violations": violations,
         "unlisted_calls": unlisted_calls,
         "required": required_satisfied,

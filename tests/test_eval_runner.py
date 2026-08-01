@@ -5211,6 +5211,8 @@ def test_codex_driver_reconstructs_command_output_when_aggregate_is_absent_or_nu
             "exit_code": 0,
             "status": "completed",
             "output": "first second\nthird",
+            "output_source": "deltas",
+            "output_delta_count": 3,
         }
     ]
     assert transcript.activity_violations == []
@@ -5452,6 +5454,50 @@ def test_codex_driver_rejects_invalid_metadata_notifications(
 
     assert str(captured.value) == codex_driver._INVALID_MODEL_METADATA_ERROR  # noqa: SLF001
     assert private_identifier not in str(captured.value)
+
+
+def test_codex_driver_rejects_reroute_without_model_continuity() -> None:
+    notification = {
+        "method": "model/rerouted",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "fromModel": "unexpected-prior-model",
+            "toModel": "model-a",
+        },
+    }
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        _collect_messages([_turn_started_notification(), notification])
+
+    assert str(captured.value) == codex_driver._INVALID_MODEL_METADATA_ERROR  # noqa: SLF001
+    assert "unexpected-prior-model" not in str(captured.value)
+
+
+def test_codex_driver_does_not_attest_settings_after_completed_activity() -> None:
+    settings = _thread_boundary_settings("/synthetic/workspace")
+    settings["model"] = "model-a"
+    settings["effort"] = "high"
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "agent", "agentMessage"),
+            _item_notification(
+                "item/completed", "agent", "agentMessage", text="done"
+            ),
+            {
+                "method": "thread/settings/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "threadSettings": settings,
+                },
+            },
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.observed_reasoning_efforts == ["medium", "high"]
+    assert transcript.pre_activity_reasoning_efforts == ["medium"]
 
 
 def test_codex_driver_rejects_foreign_command_completion() -> None:
@@ -6852,8 +6898,15 @@ def test_failed_artifact_hashes_private_required_cli_document(
     monkeypatch.setattr(codex_driver, "codex_version", lambda: "codex-cli test")
     monkeypatch.setattr(
         runner_main,
-        "_captured_required_document",
-        lambda *args, **kwargs: ({"private": private_value}, None, 0),
+        "_capture_required_document",
+        lambda *args, **kwargs: runner_main.EvidenceCapture(
+            state="captured",
+            source="aggregate",
+            matching_attempts=1,
+            successful_candidates=1,
+            turn=0,
+            document={"private": private_value},
+        ),
     )
     monkeypatch.setattr(
         codex_driver,
@@ -7283,6 +7336,7 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
 
 def _passing_runner_report() -> dict:
     return {
+        "generator": {"requested_route_confirmed": True},
         "metrics": {
             layer: {"passed": True}
             for layer in runner_main._PASS_LAYERS  # noqa: SLF001
@@ -7300,6 +7354,22 @@ def _pending_runner_report() -> dict:
     return report
 
 
+def _stub_qualification_cohort(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        runner_main,
+        "_source_revision_and_cleanliness",
+        lambda: ("a" * 40, "clean"),
+    )
+    monkeypatch.setattr(
+        runner_main, "_preflight_scenario", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "_published_scenario_artifacts",
+        lambda *args, **kwargs: {"report.json": "b" * 64},
+    )
+
+
 def test_main_reports_pending_review_without_calling_it_pass_or_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7307,6 +7377,7 @@ def test_main_reports_pending_review_without_calling_it_pass_or_failure(
 ) -> None:
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     monkeypatch.setattr(
         runner_main, "_load_scenarios", lambda *args: [{"id": "m7-z99"}]
     )
@@ -7330,6 +7401,7 @@ def test_main_real_failure_dominates_pending_review(
     scenarios = [{"id": "m7-z98"}, {"id": "m7-z99"}]
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: scenarios)
 
     def run_scenario(scenario, *args, **kwargs):
@@ -7343,6 +7415,32 @@ def test_main_real_failure_dominates_pending_review(
     monkeypatch.setattr(runner_main, "run_scenario", run_scenario)
 
     assert runner_main.main(["--family", "m7"]) == 1
+
+
+def test_main_rejects_unconfirmed_requested_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner_main, "ROOT", tmp_path)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
+    monkeypatch.setattr(
+        runner_main, "_load_scenarios", lambda *args: [{"id": "m7-z99"}]
+    )
+    report = _passing_runner_report()
+    report["generator"]["requested_route_confirmed"] = False
+    monkeypatch.setattr(
+        runner_main, "run_scenario", lambda *args, **kwargs: report
+    )
+
+    assert runner_main.main(
+        ["--scenario", "m7-z99", "--model", "gpt-5.6-sol", "--effort", "high"]
+    ) == 1
+
+    [run_dir] = (tmp_path / "evals" / "results").iterdir()
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["terminal_reason"] == "runner_error"
+    assert manifest["completed_scenario_ids"] == []
 
 
 def test_live_runner_expected_unsupported_set_matches_known_boundaries() -> None:
@@ -7361,6 +7459,7 @@ def test_main_expected_skip_is_nonzero_when_nothing_executes(
     scenario = {"id": "m5-c03"}
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: [scenario])
     monkeypatch.setattr(
         runner_main,
@@ -7452,6 +7551,7 @@ def test_main_unexpected_unsupported_fails_but_family_expected_skip_is_neutral(
 ) -> None:
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     unexpected = {"id": "m7-z99"}
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: [unexpected])
     monkeypatch.setattr(
@@ -7480,7 +7580,7 @@ def test_main_unexpected_unsupported_fails_but_family_expected_skip_is_neutral(
     "error_type",
     (codex_driver.CodexProtocolError, OSError, ValueError),
 )
-def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
+def test_main_sanitizes_scenario_exceptions_and_terminalizes_family_run(
     error_type: type[Exception],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7496,6 +7596,7 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
 
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     monkeypatch.setattr(runner_main, "_load_scenarios", lambda *args: scenarios)
 
     def run_family(scenario, *args, **kwargs):
@@ -7508,7 +7609,7 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     monkeypatch.setattr(runner_main, "run_scenario", run_family)
 
     assert runner_main.main(["--family", "m7"]) == 1
-    assert attempted == ["m7-z98", "m7-z99"]
+    assert attempted == ["m7-z98"]
     error = capsys.readouterr().err  # type: ignore[attr-defined]
     assert str(private_path) not in error
     assert canary not in error
@@ -7536,8 +7637,10 @@ def test_main_sanitizes_scenario_exceptions_and_continues_family_run(
     assert error_summary["content"]["omitted"] == "unsafe-trace-content"
     assert len(error_summary["content"]["sha256"]) == 64
     assert error_summary["content"]["length"] > 0
-    assert summary[1]["scenario"] == "m7-z99"
-    assert summary[1]["passed"] is True
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["state"] == "failed"
+    assert manifest["terminal_reason"] == "runner_error"
+    assert manifest["completed_scenario_ids"] == []
 
 
 @pytest.mark.parametrize("error", (KeyboardInterrupt(), SystemExit(2)))
@@ -7546,6 +7649,7 @@ def test_main_does_not_catch_process_control_exceptions(
 ) -> None:
     monkeypatch.setattr(runner_main, "ROOT", tmp_path)
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "evals" / "results")
+    _stub_qualification_cohort(monkeypatch)
     monkeypatch.setattr(
         runner_main,
         "_load_scenarios",
