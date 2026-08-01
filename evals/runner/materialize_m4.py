@@ -374,13 +374,14 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
     plans = [_plan(appid, state, now) for appid, state in facts]
     appids = [plan.appid for plan in plans]
     states = {state for _, state in facts}
+    history_start = now - STALE_OFFSET
 
     with Storage(data_dir / "steam-agent.sqlite3") as storage:
         account = seed_identity(
             storage,
             machine_key=machine_key,
             account_alias=account_alias,
-            now=now,
+            now=history_start,
         )
         if states & _PLAYTIME_STATES:
             _write_owned_playtime(
@@ -413,7 +414,7 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         storage.record_activity_data_consent(
             account_id=account.id,
             disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
-            accepted_at=now,
+            accepted_at=history_start,
             backups_acknowledged=True,
         )
         activity_run = storage.begin_activity_sync(

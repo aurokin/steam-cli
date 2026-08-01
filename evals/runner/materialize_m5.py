@@ -46,7 +46,13 @@ COMPARABLE_MINIMUM = (
     "Storage: 4 GiB available space\n"
     "Architecture: x86_64"
 )
-OPAQUE_MINIMUM = "Processor: OPAQUE CPU X\nGraphics: OPAQUE GPU Y"
+OPAQUE_MINIMUM = (
+    "Memory: 4 GiB RAM\n"
+    "Storage: 4 GiB available space\n"
+    "Architecture: x86_64\n"
+    "Processor: OPAQUE CPU X\n"
+    "Graphics: OPAQUE GPU Y"
+)
 
 _COMPARABLE_STATES = {
     "machine_mandatory_pass",
@@ -262,13 +268,15 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         for fact_entry in scenario["fixture"]["facts"]
         if (plan := _plan(subject_appid(fact_entry), fact_entry["state"])) is not None
     ]
+    wishlisted = [plan.appid for plan in plans if plan.wishlisted]
+    identity_at = now - _STALE_WISHLIST_OFFSET if wishlisted else now
 
     with Storage(data_dir / "steam-agent.sqlite3") as storage:
         account = seed_identity(
             storage,
             machine_key=machine_key,
             account_alias=account_alias,
-            now=now,
+            now=identity_at,
         )
         if plans:
             storage.record_system_profile_consent(
@@ -309,7 +317,6 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             plans=plans,
             now=now,
         )
-        wishlisted = [plan.appid for plan in plans if plan.wishlisted]
         if wishlisted:
             _write_stale_wishlist(
                 storage,

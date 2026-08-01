@@ -214,6 +214,26 @@ def test_schema_02_rejects_unsupported_required_claim_paths(
     assert list(validator.iter_errors(scenario))
 
 
+@pytest.mark.parametrize(
+    "unsupported_path",
+    (
+        "$.data.items[²]",
+        "$.data.items[" + "1" * 4301 + "]",
+        "$.data.items[?(@.id==" + "1" * 4301 + ")]",
+    ),
+    ids=("unicode-digit", "huge-index", "huge-filter-number"),
+)
+def test_schema_and_runtime_reject_oversized_or_non_ascii_path_numbers(
+    unsupported_path: str,
+) -> None:
+    validator = _validators()["steam-agent-eval/0.2"]
+    scenario = _scenario_02()
+    scenario["fact_rubric"]["required_claim_paths"] = [unsupported_path]
+
+    assert list(validator.iter_errors(scenario))
+    assert not runner_grade.is_supported_path(unsupported_path)
+
+
 def test_schema_02_rejects_unsupported_cli_document_assertion_path() -> None:
     validator = _validators()["steam-agent-eval/0.2"]
     scenario = _scenario_02()

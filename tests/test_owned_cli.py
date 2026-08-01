@@ -857,7 +857,7 @@ def owned_synced(
 
 def seed_activity(
     data_dir: Path, games: tuple[dict[str, object], ...], observed_at: datetime
-) -> None:
+) -> int:
     with Storage(data_dir / "steam-agent.sqlite3") as storage:
         account = storage.get_account("primary")
         assert account is not None
@@ -881,11 +881,19 @@ def seed_activity(
             completed_at=observed_at,
             disclosure_version=ACTIVITY_DISCLOSURE_VERSION,
         )
+        return run.id
 
 
 def playtime_states(envelope: dict[str, object]) -> dict[int, tuple[str, str]]:
     return {
         item["appid"]: (item["playtime_state"], item["playtime_reason"])
+        for item in envelope["data"]["items"]  # type: ignore[index]
+    }
+
+
+def owned_items_by_appid(envelope: dict[str, object]) -> dict[int, dict[str, object]]:
+    return {
+        item["appid"]: item
         for item in envelope["data"]["items"]  # type: ignore[index]
     }
 
@@ -914,6 +922,21 @@ def test_owned_query_playtime_zero_vs_null_distinct(
         "unknown": 1,
     }
     assert queried["context"]["playtime_filter"] == "any"  # type: ignore[index]
+    source = queried["data"]["source"]  # type: ignore[index]
+    for item in owned_items_by_appid(queried).values():
+        assert item["playtime_lineage"] == {
+            "authority": "owned",
+            "provider": source["provider"],
+            "retrieved_at": source["expanded"]["retrieved_at"],
+            "observed_at": item["observed_at"],
+            "context": {
+                "capability": "owned.visible.read",
+                "field": "playtime_forever_minutes",
+                "sync_run_id": source["sync_run_id"],
+            },
+            "support_level": source["support_level"],
+            "evidence_ids": [f"owned:{item['evidence_ids'][0]}"],
+        }
 
 
 def test_owned_query_activity_newer_positive_upgrades_zero(
@@ -922,7 +945,7 @@ def test_owned_query_activity_newer_positive_upgrades_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = owned_synced(tmp_path, capsys, monkeypatch)
-    seed_activity(
+    activity_run_id = seed_activity(
         data_dir,
         (
             {"appid": 10, "playtime_forever_minutes": 45},
@@ -941,6 +964,27 @@ def test_owned_query_activity_newer_positive_upgrades_zero(
         20: ("positive", "owned_positive_minutes"),
         30: ("positive", "activity_newer_positive"),
     }
+    items = owned_items_by_appid(queried)
+    observed_at = items[10]["playtime_lineage"]["observed_at"]  # type: ignore[index]
+    for appid in (10, 30):
+        assert items[appid]["playtime_lineage"] == {
+            "authority": "activity",
+            "provider": "steam_web_api",
+            "retrieved_at": observed_at,
+            "observed_at": observed_at,
+            "context": {
+                "capability": "activity.read",
+                "field": "playtime_forever_minutes",
+                "sync_run_id": activity_run_id,
+            },
+            "support_level": "official_documented",
+            "evidence_ids": [f"activity:{activity_run_id}:{appid}"],
+        }
+    assert items[20]["playtime_lineage"]["authority"] == "owned"  # type: ignore[index]
+    rendered_lineage = json.dumps(
+        [item["playtime_lineage"] for item in items.values()], sort_keys=True
+    )
+    assert "76561198000000000" not in rendered_lineage
 
 
 def test_owned_query_activity_older_than_owned_is_ignored(
@@ -961,6 +1005,9 @@ def test_owned_query_activity_older_than_owned_is_ignored(
 
     assert code == 0
     assert playtime_states(queried)[10] == ("zero", "owned_zero_minutes")
+    assert owned_items_by_appid(queried)[10]["playtime_lineage"][  # type: ignore[index]
+        "authority"
+    ] == "owned"
 
 
 def test_owned_query_future_activity_is_ignored_after_clock_correction(
@@ -1101,6 +1148,45 @@ def test_owned_query_playtime_filter_zero_excludes_unknown_and_reports_counts_an
     )
 
 
+def test_owned_query_marks_an_authoritative_filtered_projection_empty(
+    tmp_path: Path,
+    capsys: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = owned_synced(tmp_path, capsys, monkeypatch)
+    seed_activity(
+        data_dir,
+        (
+            {"appid": 10, "playtime_forever_minutes": 45},
+            {"appid": 30, "playtime_forever_minutes": 5},
+        ),
+        NOW - timedelta(hours=1),
+    )
+
+    code, queried, stderr = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "games",
+            "query",
+            "--scope",
+            "owned",
+            "--playtime",
+            "zero",
+        ],
+        capsys,
+    )
+
+    assert code == 0 and stderr == ""
+    assert queried["data"]["items"] == []  # type: ignore[index]
+    assert queried["data"]["empty"] is True  # type: ignore[index]
+    assert queried["data"]["playtime_state_counts"] == {  # type: ignore[index]
+        "zero": 0,
+        "positive": 3,
+        "unknown": 0,
+    }
+
+
 def test_owned_query_zero_filter_keeps_limitations_when_account_is_unavailable(
     tmp_path: Path,
     capsys: object,
@@ -1145,11 +1231,45 @@ def test_owned_query_stale_owned_snapshot_yields_unknown_no_authoritative_snapsh
     assert set(playtime_states(queried).values()) == {
         ("unknown", "no_authoritative_snapshot")
     }
+    assert {
+        json.dumps(item["playtime_lineage"], sort_keys=True)
+        for item in owned_items_by_appid(queried).values()
+    } == {
+        json.dumps(
+            {
+                "authority": "none",
+                "provider": None,
+                "retrieved_at": None,
+                "observed_at": None,
+                "context": {"required_capability": "owned.visible.read"},
+                "support_level": None,
+                "evidence_ids": [],
+            },
+            sort_keys=True,
+        )
+    }
     assert queried["data"]["playtime_state_counts"] == {  # type: ignore[index]
         "zero": 0,
         "positive": 0,
         "unknown": 3,
     }
+
+    code, filtered, _ = invoke(
+        [
+            "--data-dir",
+            str(data_dir),
+            "games",
+            "query",
+            "--scope",
+            "owned",
+            "--playtime",
+            "zero",
+        ],
+        capsys,
+    )
+    assert code == 0
+    assert filtered["data"]["items"] == []  # type: ignore[index]
+    assert filtered["data"]["empty"] is False  # type: ignore[index]
 
 
 def test_playtime_flag_rejected_for_installed_scope(

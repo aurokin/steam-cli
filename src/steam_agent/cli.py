@@ -89,6 +89,7 @@ from steam_agent.deal_query import build_deal_query_from_snapshot
 from steam_agent.feedback import FeedbackService
 from steam_agent.activity import (
     ACTIVITY_DISCLOSURE_VERSION,
+    ACTIVITY_SUPPORT_LEVEL,
     HARD_RETENTION,
     ActivitySyncError,
     query_activity,
@@ -2301,22 +2302,105 @@ def _playtime_state(
     return derived
 
 
+@dataclass(frozen=True, slots=True)
+class _ActivityPlaytimeEvidence:
+    lifetime_minutes: int | None
+    observed_at: str
+    observed_time: datetime
+    sync_run_id: int
+    provider: str
+    capability: str
+
+
 def _unexpired_activity_playtime(
     storage: Storage, account_id: int, *, now: datetime
-) -> dict[int, tuple[int | None, datetime]]:
+) -> dict[int, _ActivityPlaytimeEvidence]:
     """Return lifetime activity minutes still inside the hard retention window."""
 
     snapshot = storage.read_activity_snapshot(account_id)
-    evidence: dict[int, tuple[int | None, datetime]] = {}
+    evidence: dict[int, _ActivityPlaytimeEvidence] = {}
+    sync_runs: dict[int, Any] = {}
     for row in snapshot["items"]:
+        sync_run_id = int(row["promoted_sync_run_id"])
+        run = sync_runs.get(sync_run_id)
+        if run is None:
+            run = storage.get_sync_run(sync_run_id)
+            sync_runs[sync_run_id] = run
+        if (
+            run.account_id != account_id
+            or run.capability != "activity.read"
+            or run.status != "complete"
+            or not run.promoted
+        ):
+            continue
         observed_at = datetime.fromisoformat(
             str(row["observed_at"]).replace("Z", "+00:00")
         )
         age = now - observed_at
         if age < timedelta(0) or age > HARD_RETENTION:
             continue
-        evidence[int(row["appid"])] = (row["playtime_forever_minutes"], observed_at)
+        evidence[int(row["appid"])] = _ActivityPlaytimeEvidence(
+            lifetime_minutes=row["playtime_forever_minutes"],
+            observed_at=str(row["observed_at"]),
+            observed_time=observed_at,
+            sync_run_id=sync_run_id,
+            provider=run.provider,
+            capability=run.capability,
+        )
     return evidence
+
+
+def _playtime_lineage(
+    *,
+    appid: int,
+    reason: str,
+    owned_evidence_id: int,
+    owned_observed_at: str,
+    owned_provenance: Any,
+    activity: _ActivityPlaytimeEvidence | None,
+) -> dict[str, Any]:
+    """Describe only the evidence authoritative for the derived playtime state."""
+
+    context: dict[str, Any]
+    if reason == "activity_newer_positive" and activity is not None:
+        context = {
+            "capability": activity.capability,
+            "field": "playtime_forever_minutes",
+            "sync_run_id": activity.sync_run_id,
+        }
+        return {
+            "authority": "activity",
+            "provider": activity.provider,
+            "retrieved_at": activity.observed_at,
+            "observed_at": activity.observed_at,
+            "context": context,
+            "support_level": ACTIVITY_SUPPORT_LEVEL,
+            "evidence_ids": [f"activity:{activity.sync_run_id}:{appid}"],
+        }
+    if reason != "no_authoritative_snapshot" and owned_provenance is not None:
+        context = {
+            "capability": "owned.visible.read",
+            "field": "playtime_forever_minutes",
+            "sync_run_id": owned_provenance.sync_run_id,
+        }
+        return {
+            "authority": "owned",
+            "provider": owned_provenance.provider,
+            "retrieved_at": owned_provenance.expanded_retrieved_at,
+            "observed_at": owned_observed_at,
+            "context": context,
+            "support_level": owned_provenance.support_level,
+            "evidence_ids": [f"owned:{owned_evidence_id}"],
+        }
+    return {
+        "authority": "none",
+        "provider": None,
+        "retrieved_at": None,
+        "observed_at": None,
+        "context": {"required_capability": "owned.visible.read"},
+        "support_level": None,
+        "evidence_ids": [],
+    }
 
 
 def _declared_scope_appids(
@@ -2872,6 +2956,7 @@ def _group_ownership_by_app(
     *,
     refs: tuple[MemberRef, ...],
     appids: tuple[int, ...],
+    now: datetime,
 ) -> tuple[
     dict[int, tuple[OwnershipFact, ...]],
     bool,
@@ -2898,7 +2983,6 @@ def _group_ownership_by_app(
         if account is None:
             raise ValueError("selected account is not configured")
         snapshot = storage.read_owned_snapshot(account.id)
-        now = _utc_now()
         missing, stale, authoritative = _owned_scope_state(snapshot, now=now)
         ownership_missing = ownership_missing or missing
         ownership_stale = ownership_stale or stale
@@ -3169,6 +3253,7 @@ def _group_declared_payloads(
     language: str,
     candidate_appids: tuple[int, ...],
     seed_appids: tuple[int, ...],
+    now: datetime,
 ) -> tuple[dict[int, Mapping[str, Any] | None], frozenset[int]]:
     """Read independently bounded candidate and seed projections."""
 
@@ -3191,7 +3276,6 @@ def _group_declared_payloads(
         payloads.update(
             {int(item["appid"]): item.get("facts") for item in snapshot["items"]}
         )
-        now = _utc_now()
         stale_appids.update(
             int(item["appid"])
             for item, demand in zip(
@@ -3278,6 +3362,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
     if args.group_command == "recommend":
         return _dispatch_group_recommend(args, database_path)
     command = f"group.{args.group_command}"
+    evaluated_at = _utc_now()
     try:
         appids = tuple(sorted(set(args.appid)))
         if (
@@ -3340,7 +3425,9 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 scope_state_by_ref,
                 evidence_by_ref,
                 last_attempt_by_ref,
-            ) = _group_ownership_by_app(storage, refs=refs, appids=appids)
+            ) = _group_ownership_by_app(
+                storage, refs=refs, appids=appids, now=evaluated_at
+            )
             if args.include_member_evidence:
                 ownership_missing, ownership_stale = (
                     _group_v02_generic_ownership_state(
@@ -3370,7 +3457,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
                 0
                 if declared is None
                 else sum(
-                    _declared_item_is_stale(item, demand, now=_utc_now())
+                    _declared_item_is_stale(item, demand, now=evaluated_at)
                     for item, demand in zip(
                         declared["items"], declared["latest_demand"], strict=True
                     )
@@ -3510,6 +3597,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
 
 def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> int:
     command = "group.recommend"
+    evaluated_at = _utc_now()
     try:
         explicit = tuple(sorted(set(args.appid)))
         if any(not 1 <= appid <= (1 << 32) - 1 for appid in explicit):
@@ -3593,7 +3681,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
             )
             if args.scope in {"library", "known"}:
                 scope_owned_missing, scope_owned_stale, _ = _owned_scope_state(
-                    storage.read_owned_snapshot(context_account.id), now=_utc_now()
+                    storage.read_owned_snapshot(context_account.id), now=evaluated_at
                 )
             else:
                 scope_owned_missing = scope_owned_stale = False
@@ -3617,6 +3705,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 language=args.language,
                 candidate_appids=candidate_appids,
                 seed_appids=seed_appids,
+                now=evaluated_at,
             )
             (
                 ownership_by_app,
@@ -3627,7 +3716,12 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
                 scope_state_by_ref,
                 evidence_by_ref,
                 last_attempt_by_ref,
-            ) = _group_ownership_by_app(storage, refs=refs, appids=candidate_appids)
+            ) = _group_ownership_by_app(
+                storage,
+                refs=refs,
+                appids=candidate_appids,
+                now=evaluated_at,
+            )
             context_ref = MemberRef("account", context_account.alias)
             context_is_inaccessible_member = (
                 args.include_member_evidence
@@ -6889,17 +6983,24 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
             now = _utc_now()
             _, _, authoritative = _owned_scope_state(owned_snapshot, now=now)
             activity = _unexpired_activity_playtime(storage, account.id, now=now)
+            owned_provenance = owned_snapshot.latest_complete_provenance
             items: list[dict[str, Any]] = []
             state_counts = {"zero": 0, "positive": 0, "unknown": 0}
             for game in owned_snapshot.games:
-                activity_minutes, activity_observed_at = activity.get(
-                    game.appid, (None, None)
-                )
+                activity_evidence = activity.get(game.appid)
                 state, reason = _playtime_state(
                     game.playtime_forever_minutes,
                     datetime.fromisoformat(game.observed_at.replace("Z", "+00:00")),
-                    activity_minutes,
-                    activity_observed_at,
+                    (
+                        None
+                        if activity_evidence is None
+                        else activity_evidence.lifetime_minutes
+                    ),
+                    (
+                        None
+                        if activity_evidence is None
+                        else activity_evidence.observed_time
+                    ),
                     authoritative,
                 )
                 state_counts[state] += 1
@@ -6909,6 +7010,14 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                         "game_id": f"game:{owned_game_ids[game.appid]}",
                         "playtime_state": state,
                         "playtime_reason": reason,
+                        "playtime_lineage": _playtime_lineage(
+                            appid=game.appid,
+                            reason=reason,
+                            owned_evidence_id=game.evidence_id,
+                            owned_observed_at=game.observed_at,
+                            owned_provenance=owned_provenance,
+                            activity=activity_evidence,
+                        ),
                     }
                 )
             limitations = [
@@ -6937,10 +7046,7 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                 completeness_value=owned_completeness,
                 data={
                     "items": items,
-                    "empty": bool(
-                        owned_snapshot.latest_complete is not None
-                        and not owned_snapshot.games
-                    ),
+                    "empty": bool(authoritative and not items),
                     "limitations": limitations,
                     "next_cursor": None,
                     "playtime_state_counts": state_counts,

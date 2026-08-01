@@ -834,6 +834,10 @@ def test_dense_literal_path_surface_fails_closed_at_span_bound() -> None:
         "C:%5CUsers%5Calice%5CSteam%5Cconfig",
         "%43%3A%5CUsers%5Calice%5CSteam%5Cconfig",
         "%5C%5Cserver%5Cshare%5CSteam%5Cconfig",
+        "C%3A/Users/alice/Steam/config",
+        "%43:/Users/alice/Steam/config",
+        "%43%3A/Users/alice/Steam/config",
+        r"C%3A\Users\alice\Steam\config",
     ),
 )
 def test_standalone_percent_encoded_absolute_paths_are_private(
@@ -1259,6 +1263,9 @@ def test_must_not_execute_does_not_match_quoted_command_text() -> None:
     (
         "steam-agent operations observe && steam-agent storage rank",
         "ONLY_AN_ASSIGNMENT=value",
+        "steam-agent sync '",
+        "steam-agent sync > /tmp/private",
+        "steam-agent sync $(rm -rf /)",
     ),
 )
 def test_must_not_execute_rejects_invalid_command_signatures(
@@ -1272,6 +1279,27 @@ def test_must_not_execute_rejects_invalid_command_signatures(
 
     assert not result["passed"]
     assert result["failed"][0]["reason"] == ("invalid_must_not_execute_signature")
+
+
+def test_path_selection_rejects_excessive_selected_locations() -> None:
+    document = {"data": {"items": list(range(grade._MAX_SELECTED_PATH_NODES + 1))}}
+
+    with pytest.raises(ValueError, match="safety limits"):
+        grade.select_path(document, "$.data.items[*]")
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "$.data.items[²]",
+        "$.data.items[" + "1" * 4301 + "]",
+        "$.data.items[?(@.id==" + "1" * 4301 + ")]",
+    ),
+)
+def test_supported_paths_reject_unicode_and_oversized_numeric_indices(
+    path: str,
+) -> None:
+    assert not grade.is_supported_path(path)
 
 
 def test_fact_coverage_rejects_a_trivial_supported_claim() -> None:

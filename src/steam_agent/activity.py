@@ -15,6 +15,7 @@ from steam_agent.storage import Storage, SyncRun, steam_application_stable_id
 
 
 ACTIVITY_DISCLOSURE_VERSION = "2026-07-11.m4"
+ACTIVITY_SUPPORT_LEVEL = "official_documented"
 ACTIVITY_FRESH = timedelta(hours=6)
 RECENT_FRESH = timedelta(hours=1)
 RECENT_CURRENT_USE = timedelta(hours=24)
@@ -428,7 +429,7 @@ def _evidence_freshness(
 
 
 __all__ = [
-    "ACTIVITY_DISCLOSURE_VERSION", "ActivitySyncError", "ActivitySyncResult",
-    "AchievementSyncResult", "query_activity", "query_achievements", "sync_activity",
-    "sync_achievements",
+    "ACTIVITY_DISCLOSURE_VERSION", "ACTIVITY_SUPPORT_LEVEL", "ActivitySyncError",
+    "ActivitySyncResult", "AchievementSyncResult", "query_activity",
+    "query_achievements", "sync_activity", "sync_achievements",
 ]

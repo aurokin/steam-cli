@@ -83,6 +83,8 @@ _APP_SERVER_ARGS = (
 _APP_SERVER_LOCALE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM")
 _SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
 _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
+_ENV_NODE_SHEBANG = b"#!/usr/bin/env node"
+_MAX_SHEBANG_BYTES = 256
 _VERSION_ERROR = "required codex app-server version is unavailable"
 _POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
 _PROCESS_CLEANUP_ERROR = "app-server process group did not terminate"
@@ -96,6 +98,7 @@ _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
 # limited queue prevents small valid frames from amplifying into unbounded
 # Python objects or post-response drain work.
 _MAX_PENDING_NOTIFICATIONS = 4096
+_QUIESCENCE_GRACE_SECONDS = 0.05
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
 _PROTOCOL_WRITE_ERROR = "failed to write app-server protocol message"
 _INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
@@ -113,7 +116,9 @@ _EXTERNAL_SOURCE_ERROR = (
 @dataclass
 class AgentTranscript:
     commands: list[dict[str, Any]] = field(default_factory=list)
+    command_completion_sequences: list[int] = field(default_factory=list)
     agent_messages: list[str] = field(default_factory=list)
+    agent_message_completion_sequences: list[int] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     turn_status: str = "unknown"
     turn_error: dict[str, Any] | None = None
@@ -127,6 +132,14 @@ class AgentTranscript:
     @property
     def final_message(self) -> str | None:
         return self.agent_messages[-1] if self.agent_messages else None
+
+    @property
+    def final_message_completion_sequence(self) -> int | None:
+        if not self.agent_messages or len(self.agent_messages) != len(
+            self.agent_message_completion_sequences
+        ):
+            return None
+        return self.agent_message_completion_sequences[-1]
 
     def rendered(self) -> str:
         return json.dumps(self.events, allow_nan=False)
@@ -271,9 +284,10 @@ def run_agent_conversation(
         app_server = shutil.which(_APP_SERVER_ARGS[0])
         if app_server is None:
             raise CodexProtocolError(_VERSION_ERROR)
-        _validate_codex_version(app_server, environment=child_environment)
+        launch_prefix = _app_server_launch_prefix(app_server)
+        _validate_codex_version(launch_prefix, environment=child_environment)
         process = subprocess.Popen(
-            _app_server_process_args(app_server, Path(workspace)),
+            _app_server_process_args(launch_prefix, Path(workspace)),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -299,8 +313,9 @@ def _app_server_environment(isolated_home: Path, workspace: Path) -> dict[str, s
     """Build a non-secret process environment independent of thread policy.
 
     The App Server gets only authentication copied into its isolated
-    ``CODEX_HOME`` and the small non-secret set below. The executable is
-    resolved before launch, so its child PATH does not need a workspace entry.
+    ``CODEX_HOME`` and the small non-secret set below. The executable and any
+    exact supported shebang interpreter are resolved before launch, so its
+    child PATH does not need a workspace entry.
     """
 
     environment = {
@@ -321,14 +336,46 @@ def _app_server_environment(isolated_home: Path, workspace: Path) -> dict[str, s
     return environment
 
 
+def _app_server_launch_prefix(executable: str) -> tuple[str, ...]:
+    """Resolve only the interpreter required by an exact env-node wrapper.
+
+    Invoking Node directly is equivalent to the supported shebang without
+    adding its host directory to the App Server environment. Evaluated commands
+    therefore continue to inherit only the fixed minimal PATH.
+    """
+
+    try:
+        with Path(executable).open("rb") as stream:
+            first_line = stream.readline(_MAX_SHEBANG_BYTES + 1)
+    except OSError:
+        # The version probe below retains the generic fail-closed error.
+        return (executable,)
+    if first_line.rstrip(b"\r\n") != _ENV_NODE_SHEBANG:
+        return (executable,)
+    node = shutil.which("node")
+    if node is None:
+        raise CodexProtocolError(_VERSION_ERROR)
+    try:
+        resolved_node = Path(node).resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CodexProtocolError(_VERSION_ERROR) from None
+    if not resolved_node.is_file() or not os.access(resolved_node, os.X_OK):
+        raise CodexProtocolError(_VERSION_ERROR)
+    return (str(resolved_node), executable)
+
+
+def _launch_args(launch_prefix: str | Sequence[str]) -> list[str]:
+    return [launch_prefix] if isinstance(launch_prefix, str) else list(launch_prefix)
+
+
 def _validate_codex_version(
-    executable: str, *, environment: dict[str, str] | None
+    launch_prefix: str | Sequence[str], *, environment: dict[str, str] | None
 ) -> None:
     """Exact-gate the protocol implementation without retaining its output."""
 
     try:
         result = subprocess.run(
-            [executable, "--version"],
+            [*_launch_args(launch_prefix), "--version"],
             capture_output=True,
             text=True,
             check=False,
@@ -341,7 +388,9 @@ def _validate_codex_version(
         raise CodexProtocolError(_VERSION_ERROR)
 
 
-def _app_server_process_args(executable: str, workspace: Path) -> list[str]:
+def _app_server_process_args(
+    launch_prefix: str | Sequence[str], workspace: Path
+) -> list[str]:
     policy_overrides = (
         'shell_environment_policy.inherit="core"',
         "shell_environment_policy.include_only="
@@ -351,7 +400,7 @@ def _app_server_process_args(executable: str, workspace: Path) -> list[str]:
         "default_permissions=" + json.dumps(_PERMISSION_PROFILE),
         f"permissions.{_PERMISSION_PROFILE}=" + _permission_profile_toml(),
     )
-    args = [executable, *_APP_SERVER_ARGS[1:]]
+    args = [*_launch_args(launch_prefix), *_APP_SERVER_ARGS[1:]]
     for override in policy_overrides:
         args.extend(("-c", override))
     return args
@@ -1197,6 +1246,7 @@ def _collect_turn(
                 )
                 continue
             transcript.events.append(_item_event(method, item))
+            completion_sequence = len(transcript.events) - 1
             if item_type == "commandExecution":
                 transcript.commands.append(
                     {
@@ -1206,8 +1256,12 @@ def _collect_turn(
                         "output": item.get("aggregatedOutput"),
                     }
                 )
+                transcript.command_completion_sequences.append(completion_sequence)
             elif item_type == "agentMessage":
                 transcript.agent_messages.append(item.get("text", ""))
+                transcript.agent_message_completion_sequences.append(
+                    completion_sequence
+                )
             elif item_type not in _INFORMATIONAL_ITEM_TYPES:
                 transcript.activity_violations.append(
                     {
@@ -1486,17 +1540,25 @@ class _Session:
     def assert_quiescent(self) -> None:
         """Drain already ordered input and reject non-global activity."""
 
+        drained_notifications = 0
+        settle_deadline = min(
+            self._deadline, time.monotonic() + _QUIESCENCE_GRACE_SECONDS
+        )
         while True:
+            if time.monotonic() >= self._deadline:
+                self._raise_timeout()
             if self._pending_notifications:
                 message = self._pending_notifications.popleft()
             else:
-                # thread/read is the ordering barrier. Polling once at zero
-                # timeout drains only bytes that are already observable after
-                # its response, without adding an arbitrary sleep window.
+                # thread/read is the ordering barrier. A short bounded settling
+                # window catches activity whose pipe delivery trails its
+                # response without extending the conversation deadline.
                 found, raw_message = self._read_line_until(
-                    time.monotonic(), drain_observable=True
+                    settle_deadline, accept_frame_after_deadline=True
                 )
                 if not found:
+                    if time.monotonic() >= self._deadline:
+                        self._raise_timeout()
                     if self._buffer:
                         buffered = len(self._buffer)
                         self._buffer.clear()
@@ -1504,10 +1566,11 @@ class _Session:
                         self._raise_post_turn_activity()
                     return
                 message = self._prepare_incoming(raw_message)
+            drained_notifications += 1
+            if drained_notifications > _MAX_PENDING_NOTIFICATIONS:
+                self._raise_input_limit()
             if not _is_harmless_global_notification(message):
                 self._raise_post_turn_activity()
-            if time.monotonic() >= self._deadline:
-                raise CodexProtocolError("timed out waiting for app-server")
 
     def _prepare_incoming(self, message: Any) -> Any:
         if not isinstance(message, dict):
@@ -1644,7 +1707,11 @@ class _Session:
         return message
 
     def _read_line_until(
-        self, deadline: float, *, drain_observable: bool = False
+        self,
+        deadline: float,
+        *,
+        drain_observable: bool = False,
+        accept_frame_after_deadline: bool = False,
     ) -> tuple[bool, Any]:
         # Raw fd reads with a private buffer: select() on the fd cannot see
         # lines already sitting in a buffered stream, so buffering is ours.
@@ -1676,7 +1743,11 @@ class _Session:
                     _InvalidJsonConstantError,
                 ):
                     self._raise_invalid_json()
-                if not drain_observable and time.monotonic() >= deadline:
+                if (
+                    not drain_observable
+                    and not accept_frame_after_deadline
+                    and time.monotonic() >= deadline
+                ):
                     return False, None
                 return True, message
             if len(self._buffer) > _MAX_JSONL_FRAME_BYTES:
@@ -1709,6 +1780,12 @@ class _Session:
         self._pending_notifications.clear()
         self._server_requests.clear()
         raise CodexProtocolError(_PROTOCOL_INPUT_LIMIT_ERROR)
+
+    def _raise_timeout(self) -> None:
+        self._buffer.clear()
+        self._pending_notifications.clear()
+        self._server_requests.clear()
+        raise CodexProtocolError("timed out waiting for app-server")
 
     def _raise_invalid_json(self) -> None:
         self._buffer.clear()

@@ -47,6 +47,7 @@ def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
         language="english",
         candidate_appids=candidates,
         seed_appids=(1, 10_001),
+        now=NOW,
     )
 
     assert [len(call) for call in storage.calls] == [10_000, 1]

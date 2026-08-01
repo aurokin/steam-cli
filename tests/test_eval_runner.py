@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 from jsonschema import Draft202012Validator
@@ -695,6 +696,19 @@ def test_identifier_carve_out_comes_from_exact_values_in_approved_document() -> 
     assert not runner_main._approved_identifier_values(opted_in, None)  # noqa: SLF001
 
 
+def test_retained_command_identifiers_never_use_answer_privacy_exemption() -> None:
+    approved = "76561198000000000"
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        f"Approved answer identifier {approved}",
+        f"./bin/steam-agent inspect --account {approved}",
+        {},
+        allowed_identifier_values=frozenset({approved}),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
 @pytest.mark.parametrize(
     "private_path",
     (
@@ -845,6 +859,19 @@ def test_extract_sidecar_rejects_excessive_claim_count() -> None:
     message = "answer\n```json\n" + json.dumps({"claims": claims}) + "\n```"
 
     assert runner_main._extract_sidecar(message) == (None, False)  # noqa: SLF001
+
+
+def test_extract_sidecar_enforces_remaining_conversation_claim_count() -> None:
+    message = (
+        "answer\n```json\n"
+        + json.dumps({"claims": [{"path": "$.data.state", "value": "present"}]})
+        + "\n```"
+    )
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._extract_sidecar(message, remaining_claims=0)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -1618,7 +1645,40 @@ def test_later_required_document_does_not_ground_an_earlier_turn() -> None:
     assert metric["passed"] is False
 
 
-def test_required_document_rejects_boolean_false_exit_code() -> None:
+def test_same_turn_required_document_must_precede_final_claim_message() -> None:
+    command = (
+        "./bin/steam-agent --data-dir steam-agent-data operations observe "
+        "--machine synthetic-machine"
+    )
+    claim = {"path": "$.data.state", "value": "ready"}
+    turns = [
+        {
+            **_turn(0, commands=[command], claims=[claim]),
+            "_command_results": [_captured_result(command)],
+            "_command_completion_sequences": [4],
+            "_final_message_sequence": 2,
+        }
+    ]
+
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
+        turns, POLICY["required"]
+    )
+    metric = runner_main._grade_claims_by_turn(  # noqa: SLF001
+        turns,
+        document,
+        {"required_claim_paths": ["$.data.state"], "criteria": []},
+        oracle_document_turn=capture_turn,
+        oracle_document_sequence=turns[0]["_required_document_sequence"],
+    )
+
+    assert error is None
+    assert metric["aggregate_deterministic_passed"] is True
+    assert metric["turns"][0]["evidence_available"] is False
+    assert metric["passed"] is False
+
+
+@pytest.mark.parametrize("exit_code", (False, 0.0), ids=("boolean", "float"))
+def test_required_document_requires_integer_zero_exit_code(exit_code: object) -> None:
     command = (
         "./bin/steam-agent --data-dir steam-agent-data operations observe "
         "--machine synthetic-machine"
@@ -1626,17 +1686,19 @@ def test_required_document_rejects_boolean_false_exit_code() -> None:
     turns = [
         {
             **_turn(0, commands=[command]),
-            "_command_results": [_captured_result(command, exit_code=False)],
+            "_command_results": [_captured_result(command, exit_code=exit_code)],
         }
     ]
 
     document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
+    metric = runner_main._grade_tool_policy(turns, POLICY)  # noqa: SLF001
 
     assert document is None
     assert capture_turn is None
     assert error == "expected one successful required command, captured 0"
+    assert not metric["passed"]
 
 
 @pytest.mark.parametrize(
@@ -1768,6 +1830,57 @@ def test_claim_grading_rejects_multiplicative_selection_work() -> None:
     assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
 
 
+def test_claim_grading_charges_concrete_location_depth() -> None:
+    value: object = list(range(35_000))
+    for _ in range(64):
+        value = [value]
+    document = {"data": {"items": value}}
+    path = "$.data.items" + "[0]" * 64 + "[*]"
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._grade_claims_by_turn(  # noqa: SLF001
+            [{"index": 0, "_claims": [{"path": path, "value": list(range(35_000))}]}],
+            document,
+            {"required_claim_paths": [], "criteria": []},
+        )
+
+    assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_claim_grading_charges_claim_required_location_cross_product() -> None:
+    path = "$.data.items[*]"
+    values = list(range(300))
+    document = {"data": {"items": values}}
+    claims = [{"path": path, "value": values} for _ in range(128)]
+    required_paths = [path] * 2_000
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._grade_claims_by_turn(  # noqa: SLF001
+            [{"index": 0, "_claims": claims}],
+            document,
+            {"required_claim_paths": required_paths, "criteria": []},
+        )
+
+    assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_oracle_grading_rejects_multiplicative_document_work() -> None:
+    document = {"data": {"items": list(range(20_000))}}
+    assertion = {
+        "path": "$.data.items[*]",
+        "operator": "ordered_equals",
+        "expected": [],
+    }
+    oracle = {"assertions": [dict(assertion) for _ in range(140)]}
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._validate_oracle_evaluation_budget(  # noqa: SLF001
+            oracle, document, []
+        )
+
+    assert str(captured.value) == runner_main._ORACLE_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
 def test_document_backed_turn_rejects_a_vacuous_empty_selection() -> None:
     document = {"data": {"results": [{"appid": 1, "state": "ready"}]}}
     turns = [
@@ -1877,9 +1990,7 @@ def test_runner_skips_sync_and_ambiguous_multi_document_scenarios() -> None:
     (
         {
             "tool_policy": {"allowed": [], "required": []},
-            "fact_rubric": {
-                "required_claim_paths": ['$.data["private-path"]']
-            },
+            "fact_rubric": {"required_claim_paths": ['$.data["private-path"]']},
         },
         {
             "tool_policy": {"allowed": [], "required": []},
@@ -2032,6 +2143,9 @@ def test_runner_preflight_rejects_unparseable_allowed_declaration() -> None:
     (
         "steam-agent operations observe && steam-agent storage rank",
         "PRIVATE_ASSIGNMENT=value",
+        "steam-agent sync '",
+        "steam-agent sync > /tmp/private",
+        "steam-agent sync $(rm -rf /)",
     ),
 )
 def test_runner_preflight_rejects_invalid_must_not_execute_signatures(
@@ -2059,6 +2173,29 @@ def test_runner_preflight_rejects_invalid_must_not_execute_signatures(
         "agent runner requires one valid must-not-execute command signature"
     )
     assert "PRIVATE_ASSIGNMENT" not in str(captured.value)
+
+
+def test_runner_preflight_rejects_excessive_oracle_assertions() -> None:
+    assertion = {
+        "path": "$",
+        "operator": "must_not_execute",
+        "expected": "steam-agent sync",
+        "source": "trace",
+    }
+    scenario = {
+        "tool_policy": {"allowed": [], "required": []},
+        "deterministic_oracle": {
+            "assertions": [
+                dict(assertion)
+                for _ in range(runner_main._MAX_ORACLE_ASSERTIONS + 1)  # noqa: SLF001
+            ]
+        },
+    }
+
+    with pytest.raises(UnsupportedScenarioError) as captured:
+        runner_main._validate_runner_requirements(scenario)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._ORACLE_EVALUATION_LIMIT_ERROR  # noqa: SLF001
 
 
 def test_runner_data_delete_exception_is_exactly_the_confirmed_scenario() -> None:
@@ -2407,6 +2544,81 @@ def test_codex_driver_copies_only_auth_into_private_home(
     assert [path.name for path in isolated.iterdir()] == ["auth.json"]
     assert (isolated / "auth.json").read_text() == '{"token":"synthetic"}'
     assert stat.S_IMODE((isolated / "auth.json").stat().st_mode) == 0o600
+
+
+def test_codex_driver_resolves_exact_env_node_wrapper_without_expanding_child_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper = tmp_path / "codex"
+    wrapper.write_text("#!/usr/bin/env node\nprocess.exit(0)\n")
+    wrapper.chmod(0o700)
+    node_dir = tmp_path / "host-node-bin"
+    node_dir.mkdir(mode=0o700)
+    node = node_dir / "node"
+    node.write_text("synthetic node")
+    node.chmod(0o700)
+    workspace = tmp_path / "workspace"
+    isolated_home = tmp_path / "isolated-home"
+    workspace.mkdir(mode=0o700)
+    isolated_home.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        codex_driver.shutil,
+        "which",
+        lambda command: str(node) if command == "node" else None,
+    )
+    launch_prefix = codex_driver._app_server_launch_prefix(  # noqa: SLF001
+        str(wrapper)
+    )
+
+    assert launch_prefix == (str(node.resolve()), str(wrapper))
+    environment = codex_driver._app_server_environment(  # noqa: SLF001
+        isolated_home, workspace
+    )
+    assert environment["PATH"] == os.defpath
+    assert str(node_dir) not in environment["PATH"].split(os.pathsep)
+
+    observed: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        observed["version_args"] = args
+        observed["version_env"] = kwargs["env"]
+        return type(
+            "VersionResult",
+            (),
+            {
+                "returncode": 0,
+                "stdout": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+            },
+        )()
+
+    monkeypatch.setattr(codex_driver.subprocess, "run", fake_run)
+    codex_driver._validate_codex_version(  # noqa: SLF001
+        launch_prefix, environment=environment
+    )
+    assert observed["version_args"] == [*launch_prefix, "--version"]
+    assert observed["version_env"] == environment
+
+    process_args = codex_driver._app_server_process_args(  # noqa: SLF001
+        launch_prefix, workspace
+    )
+    assert process_args[:3] == [*launch_prefix, "app-server"]
+    assert not any(str(node_dir) in value for value in process_args[2:])
+    assert str(node_dir) not in codex_driver._permission_profile_toml()  # noqa: SLF001
+
+
+def test_codex_driver_env_node_wrapper_without_node_fails_generically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper = tmp_path / "codex"
+    wrapper.write_text("#!/usr/bin/env node\nprocess.exit(0)\n")
+    wrapper.chmod(0o700)
+    monkeypatch.setattr(codex_driver.shutil, "which", lambda command: None)
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._app_server_launch_prefix(str(wrapper))  # noqa: SLF001
+
+    assert str(captured.value) == codex_driver._VERSION_ERROR  # noqa: SLF001
 
 
 def test_codex_driver_isolates_startup_cwd_and_codex_home(
@@ -3661,7 +3873,7 @@ def test_codex_session_rejects_buffered_activity_after_turn_completion() -> None
     with pytest.raises(codex_driver.CodexProtocolError) as captured:
         session.assert_quiescent()
 
-    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+    assert str(captured.value) == "timed out waiting for app-server"
     assert "must-not-appear-buffered" not in str(captured.value)
     assert session._buffer == bytearray()  # noqa: SLF001
 
@@ -3691,6 +3903,55 @@ def test_codex_session_drains_ready_global_notification_at_clean_boundary() -> N
         assert session._buffer == bytearray()  # noqa: SLF001
         assert not session._pending_notifications  # noqa: SLF001
     finally:
+        server_input.close()
+        server_output.close()
+
+
+def test_codex_session_caps_post_response_global_notifications() -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    frame = (
+        json.dumps({"method": "account/rateLimits/updated", "params": {}}).encode()
+        + b"\n"
+    )
+    session._buffer.extend(  # noqa: SLF001
+        frame * (codex_driver._MAX_PENDING_NOTIFICATIONS + 1)  # noqa: SLF001
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+    assert session._buffer == bytearray()  # noqa: SLF001
+
+
+def test_codex_session_settling_window_rejects_delayed_activity() -> None:
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+
+    def send_delayed_activity() -> None:
+        time.sleep(codex_driver._QUIESCENCE_GRACE_SECONDS / 2)  # noqa: SLF001
+        server_input.write(
+            json.dumps(
+                {
+                    "method": "turn/started",
+                    "params": {"private": "must-not-appear-delayed"},
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    writer = threading.Thread(target=send_delayed_activity)
+    writer.start()
+    try:
+        session = codex_driver._Session(io.BytesIO(), server_output, 1)  # noqa: SLF001
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session.assert_quiescent()
+
+        assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+        assert "must-not-appear" not in str(captured.value)
+    finally:
+        writer.join()
         server_input.close()
         server_output.close()
 
@@ -4222,6 +4483,14 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
 
     assert transcript.agent_messages == ["info"]
     assert transcript.commands[0]["command"] == "steam-agent --help"
+    assert (
+        transcript.agent_message_completion_sequences[0]
+        < transcript.command_completion_sequences[0]
+    )
+    assert (
+        transcript.final_message_completion_sequence
+        == (transcript.agent_message_completion_sequences[0])
+    )
     disallowed_types = [
         "fileChange",
         "mcpToolCall",
@@ -5349,6 +5618,29 @@ def test_load_scenarios_rejects_noncanonical_document_id(
     assert hostile not in str(captured.value)
 
 
+@pytest.mark.parametrize("empty_field", ("assertions", "criteria"))
+def test_load_scenarios_runtime_validates_schema_before_execution(
+    empty_field: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json").read_text()
+    )
+    if empty_field == "assertions":
+        scenario["deterministic_oracle"]["assertions"] = []
+    else:
+        scenario["fact_rubric"]["criteria"] = []
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    (family / "m7-b01.json").write_text(json.dumps(scenario))
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "document",
     (
@@ -5820,7 +6112,9 @@ def test_passing_deterministic_run_retains_exact_required_cli_document(
                         "output": json.dumps(document),
                     }
                 ],
+                command_completion_sequences=[1],
                 agent_messages=visible_messages,
+                agent_message_completion_sequences=[2, 3],
                 turn_status="completed",
                 effective_model="model-a",
                 effective_reasoning_effort="high",

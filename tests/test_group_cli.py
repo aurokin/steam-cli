@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -299,7 +299,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
             evidence_by_ref,
             _last_attempt_by_ref,
         ) = cli._group_ownership_by_app(  # noqa: SLF001
-            storage, refs=refs, appids=(400,)
+            storage, refs=refs, appids=(400,), now=NOW
         )
 
     assert ownership[400][0].state == "unknown"
@@ -610,6 +610,63 @@ def test_group_members_block_authoritative_and_asserted(
             "member_evidence": "asserted",
             "last_attempt_at": None,
         },
+    ]
+
+
+def test_group_member_freshness_uses_one_command_timestamp(
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(tmp_path, with_owned=True)
+    configure_second_account(tmp_path, "other", "76561198999999998")
+    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+        other = storage.get_account("other")
+        assert other is not None
+        run = storage.begin_sync(
+            provider="steam_web_api",
+            capability="owned.visible.read",
+            account_id=other.id,
+            started_at=NOW,
+        )
+        storage.complete_owned_snapshot(
+            run.id,
+            (OwnedObservation(400, 0, "visible_owned", NOW, "Other title"),),
+            base_retrieved_at=NOW,
+            expanded_retrieved_at=NOW,
+            base_reported_count=1,
+            expanded_reported_count=1,
+            completed_at=NOW,
+        )
+        boundary = NOW - timedelta(hours=24)
+        rendered_boundary = boundary.isoformat().replace("+00:00", "Z")
+        storage._connection.execute(  # noqa: SLF001
+            """UPDATE sync_runs SET started_at=?, completed_at=?
+               WHERE capability='owned.visible.read'""",
+            (rendered_boundary, rendered_boundary),
+        )
+        storage._connection.commit()  # noqa: SLF001
+
+    calls = 0
+
+    def command_time() -> datetime:
+        nonlocal calls
+        calls += 1
+        return NOW if calls == 1 else NOW + timedelta(microseconds=1)
+
+    monkeypatch.setattr(cli, "_utc_now", command_time)
+
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        *ownership_query(
+            "account:primary", "account:other", include_member_evidence=True
+        ),
+    )
+
+    assert code == 0 and stderr == ""
+    assert calls == 1
+    assert [member["member_evidence"] for member in value["data"]["members"]] == [
+        "authoritative",
+        "authoritative",
     ]
 
 

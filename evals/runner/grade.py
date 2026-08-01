@@ -14,7 +14,7 @@ import re
 import shlex
 from typing import Any, Iterable, Mapping, Sequence
 
-_FILTER = re.compile(r"\?\(@\.([a-z_]+)==(?:(\d+)|'([^']+)')\)\Z")
+_FILTER = re.compile(r"\?\(@\.([a-z_]+)==(?:([0-9]+)|'([^']+)')\)\Z")
 _SEGMENT = re.compile(r"([a-z_][a-z0-9_]*)((?:\[[^]]+\])*)\Z")
 _BRACKET = re.compile(r"\[([^]]+)\]")
 _PUBLIC_URL_PATH = re.compile(r"(?i)\b(?:https?|steam)://[^\s\"'`<>?#]+")
@@ -32,6 +32,8 @@ _MAX_ESCAPED_PATH_VIEW_CHARACTERS = 64 * 1024
 # Bound both retained span tuples and redaction-token expansion. Surfaces with
 # more distinct path spans fail closed as one private span.
 _MAX_PRIVATE_PATH_SPANS = 4096
+_MAX_GRADING_PATH_CHARACTERS = 1024
+_MAX_SELECTED_PATH_NODES = 16 * 1024
 
 
 def _has_path_boundary(text: str, index: int, *, posix: bool = False) -> bool:
@@ -75,9 +77,11 @@ def _encoded_drive_root_end(text: str, index: int) -> int | None:
         cursor += 3
     else:
         return None
-    if not _encoded_separator_at(text, cursor):
-        return None
-    return cursor + 3
+    if _encoded_separator_at(text, cursor):
+        return cursor + 3
+    if text[cursor : cursor + 1] in {"/", "\\"}:
+        return cursor + 1
+    return None
 
 
 def _uri_has_path_root(text: str, index: int, *, allow_drive: bool = False) -> bool:
@@ -464,14 +468,16 @@ def _select_path_nodes(
         nodes = [(value[key], location + (key,)) for value, location in nodes]
         for bracket in _BRACKET.findall(brackets):
             if bracket == "*":
-                nodes = [
-                    (item, location + (index,))
-                    for value, location in nodes
-                    for index, item in enumerate(value)
-                ]
+                expanded = []
+                for value, location in nodes:
+                    for index, item in enumerate(value):
+                        if len(expanded) >= _MAX_SELECTED_PATH_NODES:
+                            raise ValueError("path selection exceeded safety limits")
+                        expanded.append((item, location + (index,)))
+                nodes = expanded
                 plural = True
                 continue
-            if bracket.isdigit():
+            if bracket.isascii() and bracket.isdecimal():
                 index = int(bracket)
                 nodes = [
                     (value[index], location + (index,)) for value, location in nodes
@@ -482,14 +488,18 @@ def _select_path_nodes(
                 raise ValueError(f"unsupported bracket {bracket!r}")
             field, number, text = condition.groups()
             expected = int(number) if number is not None else text
-            nodes = [
-                (item, location + (index,))
-                for value, location in nodes
-                for index, item in enumerate(value)
-                if isinstance(item, Mapping)
-                and field in item
-                and json_semantically_equal(item[field], expected)
-            ]
+            expanded = []
+            for value, location in nodes:
+                for index, item in enumerate(value):
+                    if (
+                        isinstance(item, Mapping)
+                        and field in item
+                        and json_semantically_equal(item[field], expected)
+                    ):
+                        if len(expanded) >= _MAX_SELECTED_PATH_NODES:
+                            raise ValueError("path selection exceeded safety limits")
+                        expanded.append((item, location + (index,)))
+            nodes = expanded
             plural = True
     return nodes, plural
 
@@ -509,7 +519,7 @@ def select_path(document: Any, path: str) -> tuple[list[Any], bool]:
 def is_supported_path(path: str) -> bool:
     """Whether ``path`` is valid in the evaluator's small JSON-path subset."""
 
-    if not path.startswith("$."):
+    if len(path) > _MAX_GRADING_PATH_CHARACTERS or not path.startswith("$."):
         return False
     try:
         segments = _path_segments(path[2:])
@@ -520,10 +530,26 @@ def is_supported_path(path: str) -> bool:
         if match is None:
             return False
         for bracket in _BRACKET.findall(match.group(2)):
-            if bracket == "*" or bracket.isdigit() or _FILTER.fullmatch(bracket):
+            if (
+                bracket == "*"
+                or (bracket.isascii() and bracket.isdecimal())
+                or _FILTER.fullmatch(bracket)
+            ):
                 continue
             return False
     return True
+
+
+def path_selection_steps(path: str) -> int:
+    """Return bounded key/index/projection work for one supported path."""
+
+    if not is_supported_path(path):
+        raise ValueError(f"unsupported path {path!r}")
+    return sum(
+        1 + len(_BRACKET.findall(match.group(2)))
+        for raw_segment in _path_segments(path[2:])
+        if (match := _SEGMENT.fullmatch(raw_segment)) is not None
+    )
 
 
 def evaluate_assertion(document: Any, assertion: Mapping[str, Any]) -> bool:
@@ -763,10 +789,29 @@ def _command_invocations(command: str) -> list[list[str]]:
 def is_single_command_signature(signature: Any) -> bool:
     """Whether a trace assertion names exactly one nonempty invocation."""
 
-    if not isinstance(signature, str):
+    if not isinstance(signature, str) or not _strict_command_signature(signature):
         return False
     invocations = _command_invocations(signature)
     return len(invocations) == 1 and bool(invocations[0])
+
+
+def _strict_command_signature(command: str) -> bool:
+    """Reject malformed or executable shell structure in an oracle signature."""
+
+    if not command.strip() or _has_forbidden_shell_syntax(command):
+        return False
+    try:
+        tokens = shlex.split(command, posix=True, comments=False)
+    except ValueError:
+        return False
+    normalized = _unwrap_command_prefix(tokens)
+    if not normalized:
+        return False
+    if _executable_name(normalized[0]) in _TRACE_SHELL_EXECUTABLES:
+        payload = _shell_payload(normalized[1:])
+        if payload is not None:
+            return _strict_command_signature(payload)
+    return True
 
 
 def _unwrap_command_prefix(tokens: Sequence[str]) -> list[str]:

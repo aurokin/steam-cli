@@ -192,12 +192,47 @@ changes nothing. Activity rows past the seven-day hard retention are not
 consulted. A missing or non-authoritative owned snapshot makes every item
 `unknown` with `no_authoritative_snapshot`.
 
+Every owned-scope item also includes this additive schema `0.1` object:
+
+```json
+{
+  "playtime_lineage": {
+    "authority": "owned | activity | none",
+    "provider": "steam_web_api | null",
+    "retrieved_at": "RFC 3339 timestamp | null",
+    "observed_at": "RFC 3339 timestamp | null",
+    "context": {
+      "capability": "owned.visible.read | activity.read",
+      "field": "playtime_forever_minutes",
+      "sync_run_id": 123
+    },
+    "support_level": "official_documented | null",
+    "evidence_ids": ["owned:456"]
+  }
+}
+```
+
+`owned_zero_minutes`, `owned_positive_minutes`, and
+`owned_playtime_absent` name `owned` as authority. `activity_newer_positive`
+names `activity`, with an ID shaped `activity:<sync-run-id>:<appid>`.
+`no_authoritative_snapshot` names `none`, uses null provider/times/support,
+an empty evidence-ID list, and the nonprivate context
+`{"required_capability":"owned.visible.read"}`. The normal owned and activity
+contexts above are allowlisted; stored account identifiers and raw evidence
+context are never copied. Activity persistence records one post-fetch
+observation boundary, so its `retrieved_at` and `observed_at` are equal. The
+existing item-level `evidence_ids` continues to identify the owned record;
+`playtime_lineage.evidence_ids` identifies only the evidence authoritative for
+the derived playtime state. Table output is unchanged.
+
 `--playtime` filters owned-scope items by that state. A state-selecting value
 (`zero`, `positive`, or `unknown`) is rejected with `INVALID_ARGUMENT` for any
 other scope. The neutral `any`, which is also the value used when the flag is
 omitted, is accepted on every scope and changes nothing. `playtime_state_counts`
 is computed before filtering, so the excluded states stay visible, and an
-owned query's context always reports the requested `playtime_filter`. A `zero`
+owned query's context always reports the requested `playtime_filter`. `empty`
+is true only when the authoritative post-filter projection is empty; it remains
+false when owned evidence is unavailable or stale. A `zero`
 filter adds the
 `never_played_list_is_a_lower_bound` and
 `zero_recorded_minutes_is_not_proof_of_never_launched` limitations: private
