@@ -2776,6 +2776,24 @@ def _item_notification(
     }
 
 
+def _command_output_delta(
+    item_id: object,
+    delta: object,
+    *,
+    thread_id: str = "thread-1",
+    turn_id: str = "turn-1",
+) -> dict:
+    return {
+        "method": "item/commandExecution/outputDelta",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "itemId": item_id,
+            "delta": delta,
+        },
+    }
+
+
 def test_codex_driver_copies_only_auth_into_private_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4823,7 +4841,20 @@ def test_codex_driver_allows_known_benign_notifications() -> None:
                     }
                     for method in sorted(
                         codex_driver._ITEM_SCOPED_NOTIFICATION_METHODS  # noqa: SLF001
+                        - {"item/commandExecution/outputDelta"}
                     )
+                )
+            )
+            self.messages.extend(
+                (
+                    _item_notification("item/started", "command", "commandExecution"),
+                    _command_output_delta("command", "opaque"),
+                    _item_notification(
+                        "item/completed",
+                        "command",
+                        "commandExecution",
+                        aggregatedOutput="terminal-output",
+                    ),
                 )
             )
             self.messages.extend(
@@ -5068,6 +5099,219 @@ def _collect_messages(messages: list[object]) -> codex_driver.AgentTranscript:
         effective_model="model-a",
         effective_reasoning_effort="medium",
     )
+
+
+@pytest.mark.parametrize("aggregate_present", (False, True))
+def test_codex_driver_reconstructs_command_output_when_aggregate_is_absent_or_null(
+    aggregate_present: bool,
+) -> None:
+    completion = _item_notification(
+        "item/completed", "command", "commandExecution", exitCode=0
+    )
+    if aggregate_present:
+        completion["params"]["item"]["aggregatedOutput"] = None
+
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _command_output_delta("command", "first "),
+            _command_output_delta("command", "second"),
+            _command_output_delta("command", "\nthird"),
+            completion,
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == [
+        {
+            "command": "./bin/steam-agent --help",
+            "exit_code": 0,
+            "status": "completed",
+            "output": "first second\nthird",
+        }
+    ]
+    assert transcript.activity_violations == []
+
+
+def test_codex_driver_prefers_terminal_aggregate_without_duplicating_deltas() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _command_output_delta("command", "streamed-copy"),
+            _item_notification(
+                "item/completed",
+                "command",
+                "commandExecution",
+                aggregatedOutput="terminal-output",
+                exitCode=0,
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands[0]["output"] == "terminal-output"
+    assert "streamed-copy" not in json.dumps(transcript.commands)
+
+
+def test_codex_driver_isolates_command_output_deltas() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification(
+                "item/started", "command-a", "commandExecution", command="command-a"
+            ),
+            _item_notification(
+                "item/started", "command-b", "commandExecution", command="command-b"
+            ),
+            _command_output_delta("command-a", "a-1"),
+            _command_output_delta("command-b", "b-1"),
+            _command_output_delta("command-a", "a-2"),
+            _item_notification(
+                "item/completed",
+                "command-b",
+                "commandExecution",
+                command="command-b",
+            ),
+            _command_output_delta("command-b", "private-late-delta"),
+            _item_notification(
+                "item/completed",
+                "command-a",
+                "commandExecution",
+                command="command-a",
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert [command["command"] for command in transcript.commands] == [
+        "command-b",
+        "command-a",
+    ]
+    assert [command["output"] for command in transcript.commands] == ["b-1", "a-1a-2"]
+    assert transcript.command_completion_sequences == [6, 8]
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_notification_order_or_scope"
+    ]
+    assert "private-late-delta" not in transcript.rendered()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "deltas"),
+    [
+        ("_MAX_TURN_INPUT_BYTES", 5, ("abc", "def")),
+        ("_MAX_PENDING_NOTIFICATIONS", 2, ("", "", "")),
+    ],
+)
+def test_codex_driver_bounds_command_delta_fallback_with_existing_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    deltas: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(codex_driver, limit_name, limit_value)
+    messages = [
+        _turn_started_notification(),
+        _item_notification("item/started", "command", "commandExecution"),
+        *(_command_output_delta("command", delta) for delta in deltas),
+    ]
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        _collect_messages(messages)
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_codex_driver_rejects_non_string_command_delta_without_using_it() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _command_output_delta("command", 7),
+            _command_output_delta("command", "valid-output"),
+            _item_notification("item/completed", "command", "commandExecution"),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands[0]["output"] == "valid-output"
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_notification_order_or_scope"
+    ]
+
+
+def test_codex_driver_rejects_command_delta_for_non_command_item() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "reasoning", "reasoning"),
+            _command_output_delta("reasoning", "must-not-be-command-output"),
+            _item_notification("item/completed", "reasoning", "reasoning"),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == []
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_notification_order_or_scope"
+    ]
+    assert "must-not-be-command-output" not in transcript.rendered()
+
+
+@pytest.mark.parametrize(
+    "unhashable_item_id",
+    (["private-list-item-id"], {"private-dict-item-id": True}),
+)
+def test_codex_driver_rejects_unhashable_command_delta_item_id(
+    unhashable_item_id: object,
+) -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _command_output_delta(unhashable_item_id, "private-delta-content"),
+            _item_notification("item/completed", "command", "commandExecution"),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands[0]["output"] is None
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_notification_order_or_scope"
+    ]
+    retained = json.dumps(
+        {
+            "commands": transcript.commands,
+            "events": transcript.events,
+            "violations": transcript.activity_violations,
+        }
+    )
+    assert "private-" not in retained
+
+
+def test_codex_driver_rejects_non_string_terminal_command_aggregate() -> None:
+    transcript = _collect_messages(
+        [
+            _turn_started_notification(),
+            _item_notification("item/started", "command", "commandExecution"),
+            _command_output_delta("command", "must-not-be-evidence"),
+            _item_notification(
+                "item/completed",
+                "command",
+                "commandExecution",
+                aggregatedOutput=7,
+            ),
+            _turn_completed_notification(),
+        ]
+    )
+
+    assert transcript.commands == []
+    assert [item["reason"] for item in transcript.activity_violations] == [
+        "invalid_item_completion_order_or_scope",
+        "incomplete_item_activity",
+    ]
+    assert "must-not-be-evidence" not in transcript.rendered()
 
 
 def test_codex_driver_excludes_failed_agent_message_from_visible_evidence() -> None:

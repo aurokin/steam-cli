@@ -651,6 +651,132 @@ def test_private_host_path_detection_ignores_public_and_relative_text(
 
 
 @pytest.mark.parametrize(
+    "command",
+    (
+        "command /bin/zsh -lc "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations query --help'",
+        "command /bin/zsh \"-lc\" "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations query --help'",
+        "/bin/zsh -'l'c "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations query --help'",
+        "/bin/zsh \\-lc "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations query --help'",
+        "/bin/'zsh' -lc "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations query --help'",
+        "/usr/bin/bash -c "
+        "'./bin/steam-agent --data-dir steam-agent-data recommendations --help'",
+        "exec '/bin/sh' -c "
+        "'./bin/steam-agent --data-dir steam-agent-data --help'",
+    ),
+)
+def test_private_host_path_detection_ignores_trusted_shell_wrappers(
+    command: str,
+) -> None:
+    decoded = runner_main._strict_shell_decoded_command_surface([command])  # noqa: SLF001
+
+    assert grade.normalized_steam_agent_argv(command) is not None
+    assert grade.find_private_host_paths(command) == []
+    assert grade.find_private_host_paths(decoded) == []
+    assert runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "", [command], {}, allowed_identifier_values=frozenset()
+    )["passed"]
+
+
+def test_trusted_shell_wrapper_does_not_hide_adjacent_private_paths() -> None:
+    private_path = "/Users/example/private/cache.json"
+    command = (
+        "command /bin/zsh -lc "
+        "'./bin/steam-agent --help --data-dir /Users/example/private/cache.json'"
+    )
+    decoded = runner_main._strict_shell_decoded_command_surface([command])  # noqa: SLF001
+
+    assert grade.find_private_host_paths(command) == [private_path]
+    assert grade.find_private_host_paths(decoded) == [private_path]
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "", [command], {}, allowed_identifier_values=frozenset()
+    )
+    assert not metric["passed"]
+    assert metric["private_host_paths"] == [private_path]
+
+
+def test_trusted_shell_executable_prefix_does_not_hide_a_private_path() -> None:
+    private_path = "/bin/zsh/private/config"
+
+    assert grade.find_private_host_paths(private_path) == [private_path]
+    assert grade.redact_private_host_paths(private_path) == "<redacted-host-path>"
+
+
+@pytest.mark.parametrize(
+    ("command", "private_fragment"),
+    (
+        (
+            "/bin/zsh/private -lc './bin/steam-agent --help'",
+            "/bin/zsh/private",
+        ),
+        (
+            "/bin/zsh-private -lc './bin/steam-agent --help'",
+            "/bin/zsh-private",
+        ),
+        (
+            "/bin/zsh -lc "
+            '"./bin/steam-agent --help --data-dir /Us\'ers\'/example/private"',
+            "/Us'ers'/example/private",
+        ),
+        (
+            "command /bin/zsh -lc "
+            "'./bin/steam-agent --help --data-dir %2FUsers%2Fexample%2Fprivate'",
+            "%2FUsers%2Fexample%2Fprivate",
+        ),
+        (
+            "command /bin/zsh -lc './bin/steam-agent --help' "
+            "# /Users/example/private",
+            "/Users/example/private",
+        ),
+    ),
+)
+def test_trusted_shell_exemption_does_not_hide_private_path_attacks(
+    command: str, private_fragment: str
+) -> None:
+    found = grade.find_private_host_paths(command)
+    redacted = grade.redact_private_host_paths(command)
+
+    assert found
+    assert any(private_fragment in path for path in found)
+    assert private_fragment not in redacted
+    assert not grade.grade_privacy(command, {})["passed"]
+    assert not runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "", [command], {}, allowed_identifier_values=frozenset()
+    )["passed"]
+
+
+def test_trusted_shell_protected_spans_fail_closed_at_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grade, "_MAX_PRIVATE_PATH_SPANS", 2)
+    command = "/bin/zsh -lc './bin/steam-agent --help'"
+    text = "\n".join((command, command, command))
+
+    assert grade.find_private_host_paths(text) == [text]
+    assert grade.redact_private_host_paths(text) == "<redacted-host-path>"
+
+
+def test_trusted_shell_exemption_does_not_hide_folded_private_path() -> None:
+    private_path = "/Users/example/private"
+    command = (
+        "/bin/zsh -lc "
+        "'./bin/steam-agent --help --data-dir /Users/example/pri\\\nvate'"
+    )
+    folded = runner_main._bounded_folded_shell_commands([command])  # noqa: SLF001
+
+    assert any(
+        private_path in path for path in grade.find_private_host_paths(folded[0])
+    )
+    assert not runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "", [command], {}, allowed_identifier_values=frozenset()
+    )["passed"]
+
+
+@pytest.mark.parametrize(
     ("text", "private_path", "redacted"),
     (
         (

@@ -34,6 +34,7 @@ _MAX_ESCAPED_PATH_VIEW_CHARACTERS = 64 * 1024
 _MAX_PRIVATE_PATH_SPANS = 4096
 _MAX_GRADING_PATH_CHARACTERS = 1024
 _MAX_SELECTED_PATH_NODES = 16 * 1024
+_SHELL_WORD_WHITESPACE = frozenset(" \t\r\n")
 
 
 def _has_path_boundary(text: str, index: int, *, posix: bool = False) -> bool:
@@ -243,13 +244,96 @@ def _private_path_is_complete(
     return False
 
 
-def _protected_path_spans(text: str) -> list[tuple[int, int]] | None:
+def _literal_trusted_shell_executable_spans(
+    text: str,
+) -> Iterable[tuple[int, int]]:
+    """Return literal public shell tokens, including in a decoded token view."""
+
+    for executable in _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES:
+        start = 0
+        while (start := text.find(executable, start)) >= 0:
+            end = start + len(executable)
+            if (
+                _has_path_boundary(text, start, posix=True)
+                and (end == len(text) or text[end].isspace())
+            ):
+                yield start, end
+            start = end
+
+
+def _shell_word_source_spans(text: str) -> list[tuple[int, int]] | None:
+    """Map POSIX shell words to source spans using the policy lexer's grammar."""
+
     spans: list[tuple[int, int]] = []
-    for match in _PUBLIC_URL_PATH.finditer(text):
-        if len(spans) >= _MAX_PRIVATE_PATH_SPANS:
-            return None
-        spans.append(match.span())
+    word_start: int | None = None
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(text):
+        if word_start is None:
+            if character in _SHELL_WORD_WHITESPACE:
+                continue
+            word_start = index
+        if escaped:
+            escaped = False
+        elif character == "\\" and quote != "'":
+            escaped = True
+        elif character in {"'", '"'}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+        elif quote is None and character in _SHELL_WORD_WHITESPACE:
+            spans.append((word_start, index))
+            word_start = None
+    if quote is not None or escaped:
+        return None
+    if word_start is not None:
+        spans.append((word_start, len(text)))
     return spans
+
+
+def _approved_raw_shell_wrapper_spans(text: str) -> Iterable[tuple[int, int]]:
+    """Map approved wrapper executables back to their raw quoted source span."""
+
+    offset = 0
+    while offset < len(text):
+        newline = text.find("\n", offset)
+        source_end = len(text) if newline < 0 else newline + 1
+        line_end = source_end
+        while line_end > offset and text[line_end - 1] in "\r\n":
+            line_end -= 1
+        line = text[offset:line_end]
+        try:
+            tokens = shlex.split(line, posix=True, comments=False)
+        except ValueError:
+            tokens = []
+        wrapper_index = 1 if tokens and tokens[0] in _COMMAND_BUILTINS else 0
+        if (
+            len(tokens) == wrapper_index + 3
+            and tokens[wrapper_index] in _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES
+            and tokens[wrapper_index + 1] in {"-c", "-lc"}
+            and normalized_steam_agent_argv(line) is not None
+        ):
+            spans = _shell_word_source_spans(line)
+            if spans is not None and len(spans) == len(tokens):
+                start, end = spans[wrapper_index]
+                yield offset + start, offset + end
+        offset = source_end
+
+
+def _protected_path_spans(text: str) -> list[tuple[int, int]] | None:
+    spans: set[tuple[int, int]] = set()
+    sources = (
+        (match.span() for match in _PUBLIC_URL_PATH.finditer(text)),
+        _literal_trusted_shell_executable_spans(text),
+        _approved_raw_shell_wrapper_spans(text),
+    )
+    for source in sources:
+        for span in source:
+            if span not in spans and len(spans) >= _MAX_PRIVATE_PATH_SPANS:
+                return None
+            spans.add(span)
+    return sorted(spans)
 
 
 def _literal_private_host_path_spans(text: str) -> Iterable[tuple[int, int]]:

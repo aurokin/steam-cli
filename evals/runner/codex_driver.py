@@ -149,6 +149,7 @@ class AgentTranscript:
 class _StartedItem:
     item_type: str
     command: str | None = None
+    command_output_deltas: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +159,8 @@ class _TurnCollectionState:
     started: bool = False
     started_items: dict[str, _StartedItem] = field(default_factory=dict)
     completed_items: set[str] = field(default_factory=set)
+    command_output_delta_bytes: int = 0
+    command_output_delta_events: int = 0
 
     def matches_turn(self, params: dict[str, Any]) -> bool:
         return (
@@ -217,12 +220,40 @@ class _TurnCollectionState:
                     and isinstance(command, str)
                     and bool(command)
                     and command == started_item.command
+                    and (
+                        item.get("aggregatedOutput") is None
+                        or isinstance(item.get("aggregatedOutput"), str)
+                    )
                 )
             )
         ):
             return False
         self.started_items.pop(item_id)
         self.completed_items.add(item_id)
+        return True
+
+    def append_command_output_delta(self, params: dict[str, Any]) -> bool:
+        item_id = params.get("itemId")
+        delta = params.get("delta")
+        if not (
+            self.started
+            and self.matches_turn(params)
+            and isinstance(item_id, str)
+            and isinstance(delta, str)
+        ):
+            return False
+        started_item = self.started_items.get(item_id)
+        if started_item is None or started_item.item_type != "commandExecution":
+            return False
+        delta_bytes = len(delta.encode(errors="surrogatepass"))
+        if (
+            self.command_output_delta_events >= _MAX_PENDING_NOTIFICATIONS
+            or self.command_output_delta_bytes + delta_bytes > _MAX_TURN_INPUT_BYTES
+        ):
+            raise CodexProtocolError(_PROTOCOL_INPUT_LIMIT_ERROR)
+        started_item.command_output_deltas.append(delta)
+        self.command_output_delta_events += 1
+        self.command_output_delta_bytes += delta_bytes
         return True
 
 
@@ -1236,6 +1267,7 @@ def _collect_turn(
             raw_item = params.get("item")
             item = raw_item if isinstance(raw_item, dict) else {}
             item_type = item.get("type")
+            started_item = state.started_items.get(item.get("id"))
             valid = state.complete_item(params, item)
             if not valid:
                 _record_invalid_notification(
@@ -1248,12 +1280,19 @@ def _collect_turn(
             transcript.events.append(_item_event(method, item))
             completion_sequence = len(transcript.events) - 1
             if item_type == "commandExecution":
+                output = item.get("aggregatedOutput")
+                if (
+                    output is None
+                    and started_item is not None
+                    and started_item.command_output_deltas
+                ):
+                    output = "".join(started_item.command_output_deltas)
                 transcript.commands.append(
                     {
                         "command": item.get("command", ""),
                         "exit_code": item.get("exitCode"),
                         "status": item.get("status"),
-                        "output": item.get("aggregatedOutput"),
+                        "output": output,
                     }
                 )
                 transcript.command_completion_sequences.append(completion_sequence)
@@ -1381,6 +1420,16 @@ def _collect_turn(
                         "item_type": "threadStarted",
                         "reason": "unexpected_thread_started_activity",
                     }
+                )
+        elif method == "item/commandExecution/outputDelta":
+            if state.append_command_output_delta(params):
+                transcript.events.append({"method": method})
+            else:
+                _record_invalid_notification(
+                    transcript,
+                    method,
+                    message,
+                    "invalid_item_notification_order_or_scope",
                 )
         elif method in _ITEM_SCOPED_NOTIFICATION_METHODS:
             item_id = params.get("itemId")
