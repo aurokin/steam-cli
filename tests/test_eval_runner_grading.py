@@ -1136,6 +1136,155 @@ def test_required_matching_rejects_any_extra_semantic_argument(extra: str) -> No
     assert not grade.grade_tool_policy([command], POLICY)["passed"]
 
 
+def _recommendation_requirement_with_optional_options() -> dict[str, object]:
+    return {
+        "command": "steam-agent recommendations query",
+        "arguments": [
+            "--account",
+            "synthetic-primary",
+            "--recipe",
+            "resume/0.1",
+            "--unknown",
+            "include",
+        ],
+        "accepted_optional_options": [
+            {"name": "--machine", "value": "local"},
+            {"name": "--scope", "value": "owned"},
+            {"name": "--explain"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "",
+        " --machine local",
+        " --machine=local --scope=owned",
+        " --explain",
+        " --scope owned --explain --machine local",
+        " --format json --machine=local --explain",
+    ),
+    ids=("absent", "split", "equals", "flag", "all-reordered", "json-format"),
+)
+def test_required_matching_accepts_declared_optional_options(suffix: str) -> None:
+    requirement = _recommendation_requirement_with_optional_options()
+    command = (
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include" + suffix
+    )
+    policy = {
+        "allowed": ["steam-agent recommendations query"],
+        "required": [requirement],
+        "prohibited": [],
+    }
+
+    assert grade.command_satisfies_requirement(command, requirement)
+    assert grade.grade_tool_policy([command], policy)["passed"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown exclude",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe preference-fit/0.1 --unknown include",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --machine other",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --scope wishlist",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --explain=true",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --explain --explain",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --machine local --machine local",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --time-minutes 30",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --require installed=true",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include unexpected-positional",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --format table",
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include --format json --format json",
+    ),
+    ids=(
+        "missing-required",
+        "wrong-required-value",
+        "wrong-recipe",
+        "wrong-optional-value",
+        "unsupported-scope",
+        "value-on-flag",
+        "duplicate-flag",
+        "duplicate-valued-option",
+        "undeclared-time",
+        "undeclared-requirement",
+        "extra-positional",
+        "non-json-format",
+        "duplicate-format",
+    ),
+)
+def test_required_matching_rejects_non_equivalent_optional_variants(
+    command: str,
+) -> None:
+    requirement = _recommendation_requirement_with_optional_options()
+
+    assert not grade.command_satisfies_requirement(command, requirement)
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    (
+        "--machine",
+        [None],
+        [{}],
+        [{"name": "--machine", "unexpected": True}],
+        [{"name": 1}],
+        [{"name": "--9machine"}],
+        [{"name": "--format", "value": "json"}],
+        [{"name": "--recipe", "value": "resume/0.1"}],
+        [{"name": "--machine"}, {"name": "--machine", "value": "local"}],
+        [{"name": "--machine", "value": 1}],
+        [{"name": "--machine", "value": ""}],
+        [{"name": "--machine", "value": "--local"}],
+        [{"name": "--machine", "value": "x" * 257}],
+        [{"name": f"--option-{index}"} for index in range(17)],
+    ),
+    ids=(
+        "not-an-array",
+        "non-object",
+        "missing-name",
+        "extra-property",
+        "non-string-name",
+        "invalid-name",
+        "format",
+        "required-overlap",
+        "duplicate-name",
+        "non-string-value",
+        "empty-value",
+        "option-like-value",
+        "oversized-value",
+        "too-many",
+    ),
+)
+def test_required_matching_fails_closed_on_invalid_optional_declarations(
+    declarations: object,
+) -> None:
+    requirement = _recommendation_requirement_with_optional_options()
+    requirement["accepted_optional_options"] = declarations
+    command = (
+        "steam-agent recommendations query --account synthetic-primary "
+        "--recipe resume/0.1 --unknown include"
+    )
+
+    assert not grade.command_satisfies_requirement(command, requirement)
+
+
 def test_required_repeated_append_options_match_exactly() -> None:
     policy = {
         "allowed": ["steam-agent discovery query"],

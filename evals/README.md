@@ -50,9 +50,13 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   workspace or writing artifacts. Each scenario's writable agent workspace is
   a private temporary directory that is removed before its sanitized
   transcript and report are written; caches and agent-created files never
-  persist under `results/`. Runs that fail a turn, evidence, tool, or privacy
-  gate persist only structural activity plus content hashes and lengths, not
-  raw prompts, reasoning, commands, answers, or tool output.
+  persist under `results/`. Runs that fail a full-retention gate persist only
+  structural activity plus content hashes and lengths in the transcript and
+  ordinary report fields. A separate, untrusted qualitative-answer projection
+  may remain available after a required-evidence-only failure, but never after
+  an incomplete turn, privacy failure, unlisted command, or unsafe activity.
+  The canonical retention and sanitization rules are in the
+  [evaluation strategy](../docs/design/evaluation-strategy.md#current-implementation).
   Evaluated commands run under the named `steam-agent-eval` permission
   profile. It denies the host root by default, inherits workspace writes, and
   reopens read access only for Codex's minimal platform set, the resolved

@@ -608,20 +608,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_leaf_format(recommendation_query)
     recommendation_query.add_argument("--account", required=True)
-    recommendation_query.add_argument("--machine", default="local")
-    recommendation_query.add_argument("--scope", choices=("owned",), default="owned")
+    recommendation_query.add_argument(
+        "--machine",
+        default="local",
+        help="Select the cached machine key (default: local).",
+    )
+    recommendation_query.add_argument(
+        "--scope",
+        choices=("owned",),
+        default="owned",
+        help="Rank visible-owned games (default and only supported value: owned).",
+    )
     recommendation_query.add_argument(
         "--recipe",
         choices=("resume/0.1", "finishability/0.1", "preference-fit/0.1"),
         required=True,
+        help=(
+            "Choose intent: resume/0.1 to continue something, "
+            "finishability/0.1 for bounded finishing evidence, or "
+            "preference-fit/0.1 for explicit preferences."
+        ),
     )
     recommendation_query.add_argument("--time-minutes", type=int)
     recommendation_query.add_argument("--require", action="append", default=[])
     recommendation_query.add_argument(
-        "--unknown", choices=("include", "exclude"), default="exclude"
+        "--unknown",
+        choices=("include", "exclude"),
+        default="exclude",
+        help=(
+            "Unknown hard eligibility: exclude filters those candidates; include "
+            "retains them as conditional (default: exclude)."
+        ),
     )
     recommendation_query.add_argument("--override", action="append", default=[])
-    recommendation_query.add_argument("--explain", action="store_true")
+    recommendation_query.add_argument(
+        "--explain",
+        action="store_true",
+        help=(
+            "Record explain=true in the returned context so table output includes "
+            "factor details; ranking is unchanged."
+        ),
+    )
     wishlist_recommendation = recommendation_commands.add_parser(
         "wishlist", help="Rank wishlist fit from one cached evidence snapshot."
     )

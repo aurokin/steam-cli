@@ -200,6 +200,69 @@ def test_schema_02_refusal_requires_semantic_hard_fail_review() -> None:
     assert list(validator.iter_errors(without_hard_fail))
 
 
+def _scenario_with_optional_options(options: object) -> dict[str, Any]:
+    scenario = _scenario_02()
+    scenario["tool_policy"]["required"] = [
+        {
+            "command": "steam-agent recommendations query",
+            "arguments": ["--recipe", "resume/0.1"],
+            "accepted_optional_options": options,
+        }
+    ]
+    scenario["fact_rubric"]["required_claim_paths"] = ["$.data.state"]
+    return scenario
+
+
+def test_schema_02_accepts_bounded_optional_option_declarations() -> None:
+    scenario = _scenario_with_optional_options(
+        [
+            {"name": "--machine", "value": "local"},
+            {"name": "--explain"},
+        ]
+    )
+
+    assert not list(_validators()["steam-agent-eval/0.2"].iter_errors(scenario))
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        "--machine",
+        [{}],
+        [{"name": "machine"}],
+        [{"name": "--9machine"}],
+        [{"name": "--format", "value": "json"}],
+        [{"name": "--machine", "extra": True}],
+        [{"name": "--machine", "value": ""}],
+        [{"name": "--machine", "value": "--local"}],
+        [{"name": "--machine", "value": "x" * 257}],
+        [{"name": "--a" + "b" * 64}],
+        [{"name": "--machine"}, {"name": "--machine"}],
+        [{"name": f"--option-{index}"} for index in range(17)],
+    ),
+    ids=(
+        "not-array",
+        "missing-name",
+        "missing-prefix",
+        "digit-first",
+        "format",
+        "extra-property",
+        "empty-value",
+        "option-like-value",
+        "oversized-value",
+        "oversized-name",
+        "duplicate-object",
+        "too-many",
+    ),
+)
+def test_schema_02_rejects_malformed_optional_option_declarations(
+    options: object,
+) -> None:
+    scenario = _scenario_with_optional_options(options)
+
+    assert list(_validators()["steam-agent-eval/0.2"].iter_errors(scenario))
+
+
 @pytest.mark.parametrize(
     "unsupported_path",
     ('$.data["state"]', "$.Data.state", "$.data[]", "$.data[?(@.id)]"),
@@ -378,6 +441,27 @@ def test_prompts_expose_opaque_required_command_inputs() -> None:
             if not exposed:
                 missing.append(value)
         assert not missing, f"{path}: prompt hides required inputs {missing}"
+
+
+def test_m4_r07_prompt_exposes_intent_without_oracle_facts() -> None:
+    path = EVAL_ROOT / "scenarios" / "m4" / "m4-r07-stale-missing-activity.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    prompt = " ".join(scenario["conversation"]["user"]).casefold()
+    requirement = scenario["tool_policy"]["required"][0]
+
+    assert {"resume", "include", "eligibility", "unknown", "confident"} <= set(
+        re.findall(r"[a-z]+", prompt)
+    )
+    assert "resume/0.1" not in prompt
+    assert "stale" not in prompt
+    assert "achievement" not in prompt
+    assert "1702" not in prompt
+    assert "1703" not in prompt
+    assert requirement["accepted_optional_options"] == [
+        {"name": "--machine", "value": "local"},
+        {"name": "--scope", "value": "owned"},
+        {"name": "--explain"},
+    ]
 
 
 def test_m5_named_override_prompt_exposes_the_required_override_name() -> None:

@@ -35,6 +35,7 @@ product and provider choices open until evidence supports them.
 | D026 | Local operational evidence and safe-plan surface | [Accepted with M7](0013-m7-read-only-operation-plans.md) | Moderate; schemas are versioned | Installed freshness/last-good, ranking truthfulness, official-reference allowlists, and no-I/O tests |
 | D027 | Agent-execution eval driver: Codex App Server with deterministic-only grading | Implemented opt-in development tooling; not a product surface | Easy; driver is isolated in `evals/runner/` | M2–M7 materializer and deterministic-grader tests run in normal CI; live model execution and qualitative judging remain opt-in |
 | D028 | Owned playtime truth state and backlog filtering | [Accepted ADR 0016](0016-owned-playtime-truth-state.md) | Easy; derived fields, lineage, and one flag | Zero-versus-null, authority-lineage/privacy, activity upgrade/never-downgrade, expiry, non-authoritative, and filter/limitation tests |
+| D029 | Eval required-command alternatives and qualitative review retention | [Accepted ADR 0017](0017-eval-command-equivalence-and-review-retention.md) | Easy; additive scenario/report fields | Exact optional-option matching, malformed-sidecar visibility, privacy and unsafe-tool suppression, and corpus runner tests |
 
 ## When to create an ADR
 

@@ -30,6 +30,23 @@ def invoke(tmp_path, capsys, *args: str):
     return code, json.loads(captured.out) if captured.out.startswith("{") else captured.out, captured.err
 
 
+def test_recommendation_query_help_explains_semantic_choices(capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["recommendations", "query", "--help"])
+
+    assert exit_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "Select the cached machine key (default: local)." in help_text
+    assert "default and only supported value: owned" in help_text
+    assert "resume/0.1 to continue something" in help_text
+    assert "finishability/0.1 for bounded finishing evidence" in help_text
+    assert "preference-fit/0.1 for explicit preferences" in help_text
+    assert "exclude filters those candidates" in help_text
+    assert "include retains them as conditional (default: exclude)" in help_text
+    assert "Record explain=true in the returned context" in help_text
+    assert "ranking is unchanged" in help_text
+
+
 def stream(kind: str) -> CatalogStreamInput:
     games = kind == "games"
     return CatalogStreamInput(

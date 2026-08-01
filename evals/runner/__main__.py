@@ -84,6 +84,20 @@ _MAX_COMMAND_PRIVACY_CHARACTERS = 4 * 1024 * 1024
 _MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND = 64 * 1024
 _MAX_COMMAND_PRIVACY_TOKENS = 16 * 1024
 _COMMAND_PRIVACY_DECODING_ERROR = "command privacy decoding failed"
+_MAX_ACCEPTED_OPTIONAL_OPTIONS = 16
+_MAX_ACCEPTED_OPTION_VALUE_CHARACTERS = 256
+_ACCEPTED_OPTION_NAME = re.compile(
+    r"--[a-z][a-z0-9-]{0,63}\Z", re.ASCII
+)
+_INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR = (
+    "agent runner requires valid accepted optional command options"
+)
+# The projection cannot exceed the App Server's existing per-turn and
+# per-conversation input budgets. The driver enforces these limits on live
+# input; this duplicate boundary also protects direct runner callers.
+_MAX_QUALITATIVE_REVIEW_TURN_BYTES = 16 * 1024 * 1024
+_MAX_QUALITATIVE_REVIEW_CONVERSATION_BYTES = 64 * 1024 * 1024
+_QUALITATIVE_REVIEW_LIMIT_ERROR = "qualitative review answer exceeded safety limits"
 _MAX_REFUSAL_PHRASES_PER_GROUP = 64
 _MAX_REFUSAL_PHRASE_CHARACTERS = 256
 _ORACLE_EVALUATION_LIMIT_ERROR = "oracle evaluation exceeded safety limits"
@@ -368,6 +382,45 @@ def _allows_confirmed_data_delete(scenario: dict[str, Any]) -> bool:
     )
 
 
+def _validate_accepted_optional_options(requirement: dict[str, Any]) -> None:
+    """Validate one bounded, exact set of scenario-declared command options."""
+
+    options = requirement.get("accepted_optional_options", [])
+    if not isinstance(options, list) or len(options) > _MAX_ACCEPTED_OPTIONAL_OPTIONS:
+        raise UnsupportedScenarioError(_INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR)
+
+    arguments = requirement.get("arguments", [])
+    required_option_names = {
+        argument.partition("=")[0]
+        for argument in arguments
+        if isinstance(argument, str) and argument.startswith("--")
+    }
+    accepted_names: set[str] = set()
+    for option in options:
+        if not isinstance(option, dict) or set(option) not in (
+            {"name"},
+            {"name", "value"},
+        ):
+            raise UnsupportedScenarioError(_INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR)
+        name = option.get("name")
+        if (
+            not isinstance(name, str)
+            or _ACCEPTED_OPTION_NAME.fullmatch(name) is None
+            or name == "--format"
+            or name in required_option_names
+            or name in accepted_names
+        ):
+            raise UnsupportedScenarioError(_INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR)
+        if "value" in option and (
+            not isinstance(option["value"], str)
+            or not option["value"]
+            or option["value"].startswith("--")
+            or len(option["value"]) > _MAX_ACCEPTED_OPTION_VALUE_CHARACTERS
+        ):
+            raise UnsupportedScenarioError(_INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR)
+        accepted_names.add(name)
+
+
 def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
     fact_rubric = scenario.get("fact_rubric") or {}
     if "required_claim_paths" in fact_rubric:
@@ -378,6 +431,8 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
         ):
             raise UnsupportedScenarioError(_UNSUPPORTED_GRADING_PATH_ERROR)
     requirements = scenario["tool_policy"].get("required") or []
+    for requirement in requirements:
+        _validate_accepted_optional_options(requirement)
     oracle = scenario.get("deterministic_oracle") or {}
     assertions = oracle.get("assertions", [])
     if not isinstance(assertions, list) or len(assertions) > _MAX_ORACLE_ASSERTIONS:
@@ -704,12 +759,15 @@ def _extract_sidecar(
 
 
 def _answer_text(message: str | None) -> str:
-    """Return prose before a terminal JSON sidecar, preserving its meaning."""
+    """Strip only a terminal JSON block accepted as the claims sidecar."""
 
     if not message:
         return ""
     match = _TERMINAL_FENCED_BLOCK.search(message)
     if match is None or match.group("language").casefold() != "json":
+        return message.strip()
+    claims, declined = _extract_sidecar(message)
+    if claims is None and not declined:
         return message.strip()
     return message[: match.start()].strip()
 
@@ -739,6 +797,65 @@ def _safe_to_retain_content(metrics: dict[str, dict[str, Any]]) -> bool:
         metrics[layer]["passed"]
         for layer in ("agent_turns", "tool_policy", "oracle", "privacy")
     )
+
+
+def _qualitative_review_answers(
+    turns: list[dict[str, Any]],
+    metrics: dict[str, dict[str, Any]],
+    *,
+    sensitive_values: tuple[str, ...],
+) -> list[dict[str, Any]] | None:
+    """Project prose only when its source trace crossed the safe review boundary."""
+
+    if (
+        metrics["agent_turns"].get("passed") is not True
+        or metrics["privacy"].get("passed") is not True
+        or not _tool_policy_allows_qualitative_review(metrics["tool_policy"])
+    ):
+        return None
+
+    answers: list[dict[str, Any]] = []
+    total_bytes = 0
+    for turn in turns:
+        text = _sanitize_text(turn.get("answer_text", ""), sensitive_values).strip()
+        if not text:
+            continue
+        encoded_bytes = len(text.encode())
+        total_bytes += encoded_bytes
+        if (
+            encoded_bytes > _MAX_QUALITATIVE_REVIEW_TURN_BYTES
+            or total_bytes > _MAX_QUALITATIVE_REVIEW_CONVERSATION_BYTES
+        ):
+            raise ValueError(_QUALITATIVE_REVIEW_LIMIT_ERROR)
+        answers.append({"turn": turn["index"], "text": text})
+    return answers
+
+
+def _tool_policy_allows_qualitative_review(metric: dict[str, Any]) -> bool:
+    """Allow a failed policy only for missing or unusable required evidence."""
+
+    unlisted_calls = metric.get("unlisted_calls")
+    violations = metric.get("violations")
+    required = metric.get("required")
+    if not all(isinstance(value, list) for value in (unlisted_calls, violations, required)):
+        return False
+    if unlisted_calls or any(
+        not isinstance(violation, dict)
+        or violation.get("reason") != "invalid_required_command_evidence"
+        for violation in violations
+    ):
+        return False
+    if any(
+        not isinstance(item, dict) or not isinstance(item.get("satisfied"), bool)
+        for item in required
+    ):
+        return False
+    evidence_insufficient = bool(violations) or any(
+        not item["satisfied"] for item in required
+    )
+    if metric.get("passed") is True:
+        return not evidence_insufficient
+    return metric.get("passed") is False and evidence_insufficient
 
 
 def _scenario_passed(metrics: dict[str, dict[str, Any]]) -> bool | None:
@@ -1426,6 +1543,11 @@ def run_scenario(
         "privacy": privacy_metric,
     }
     retain_transcript_content = _safe_to_retain_content(metrics)
+    qualitative_review_answers = _qualitative_review_answers(
+        turns,
+        metrics,
+        sensitive_values=sensitive_values,
+    )
 
     rendered_turns = [
         _sanitize_artifact(
@@ -1475,6 +1597,7 @@ def run_scenario(
             sensitive_values=sensitive_values,
             allow_data_delete=allow_data_delete,
         ),
+        "qualitative_review_answers": qualitative_review_answers,
         "turns": rendered_turns,
         "required_cli_documents": (
             [oracle_document] if oracle_document is not None else []

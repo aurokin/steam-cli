@@ -35,6 +35,8 @@ _MAX_PRIVATE_PATH_SPANS = 4096
 _MAX_GRADING_PATH_CHARACTERS = 1024
 _MAX_SELECTED_PATH_NODES = 16 * 1024
 _SHELL_WORD_WHITESPACE = frozenset(" \t\r\n")
+_OPTION_NAME = re.compile(r"--[a-z][a-z0-9-]{0,63}\Z")
+_MAX_OPTION_VALUE_CHARACTERS = 256
 
 
 def _has_path_boundary(text: str, index: int, *, posix: bool = False) -> bool:
@@ -1611,19 +1613,83 @@ def command_satisfies_requirement(
     ):
         return False
     arguments = list(requirement.get("arguments", ()))
-    return _arguments_present(actual_tail[len(expected_tail) :], arguments)
-
-
-def _arguments_present(call_tail: Sequence[str], arguments: Sequence[str]) -> bool:
-    """Match the exact semantic argument vector, normalizing option syntax."""
-
     expected_options, expected_positionals = _required_arguments(arguments)
-    normalized = _normalize_actual_arguments(call_tail, expected_options)
+    accepted_options = _accepted_optional_options(requirement, expected_options)
+    if accepted_options is None:
+        return False
+    return _arguments_present(
+        actual_tail[len(expected_tail) :],
+        expected_options,
+        expected_positionals,
+        accepted_options,
+    )
+
+
+def _accepted_optional_options(
+    requirement: Mapping[str, Any],
+    required_options: Mapping[str, Sequence[str | None]],
+) -> dict[str, list[str | None]] | None:
+    """Return scenario-declared equivalent options, failing closed on ambiguity."""
+
+    declarations = requirement.get("accepted_optional_options", ())
+    if (
+        not isinstance(declarations, Sequence)
+        or isinstance(declarations, (str, bytes))
+        or len(declarations) > 16
+    ):
+        return None
+    accepted: dict[str, list[str | None]] = {}
+    for declaration in declarations:
+        if not isinstance(declaration, Mapping) or not set(declaration) <= {
+            "name",
+            "value",
+        }:
+            return None
+        if "name" not in declaration:
+            return None
+        name = declaration["name"]
+        if (
+            not isinstance(name, str)
+            or _OPTION_NAME.fullmatch(name) is None
+            or name == "--format"
+            or name in required_options
+            or name in accepted
+        ):
+            return None
+        value = declaration.get("value")
+        if "value" in declaration and (
+            not isinstance(value, str)
+            or not value
+            or len(value) > _MAX_OPTION_VALUE_CHARACTERS
+            or value.startswith("--")
+        ):
+            return None
+        accepted[name] = [value]
+    return accepted
+
+
+def _arguments_present(
+    call_tail: Sequence[str],
+    expected_options: Mapping[str, Sequence[str | None]],
+    expected_positionals: Sequence[str],
+    accepted_options: Mapping[str, Sequence[str | None]],
+) -> bool:
+    """Match exact required arguments plus declared scenario-equivalent options."""
+
+    recognized_options = {**expected_options, **accepted_options}
+    normalized = _normalize_actual_arguments(call_tail, recognized_options)
     if normalized is None:
         return False
     actual_options, actual_positionals = normalized
     return (
-        actual_options == expected_options
+        all(
+            actual_options.get(name) == values
+            for name, values in expected_options.items()
+        )
+        and all(
+            name not in actual_options or actual_options[name] == values
+            for name, values in accepted_options.items()
+        )
         and actual_positionals == expected_positionals
     )
 
