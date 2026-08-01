@@ -121,7 +121,6 @@ def _scenario_02(**overrides: Any) -> dict[str, Any]:
                     "expected": {
                         "required_all": ["launch"],
                         "required_any": ["cannot", "will not"],
-                        "forbidden": ["launched"],
                     },
                     "source": "final_answer",
                     "turn": 1,
@@ -287,6 +286,39 @@ def test_prompts_expose_opaque_required_command_inputs() -> None:
             if not exposed:
                 missing.append(value)
         assert not missing, f"{path}: prompt hides required inputs {missing}"
+
+
+def test_m5_named_override_prompt_exposes_the_required_override_name() -> None:
+    path = EVAL_ROOT / "scenarios" / "m5" / "m5-c07-named-override.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    requirement = scenario["tool_policy"]["required"][0]
+    arguments = requirement["arguments"]
+    override = arguments[arguments.index("--override") + 1]
+    override_name = override.split(":", 2)[1]
+    prompt = " ".join(scenario["conversation"]["user"])
+
+    assert override_name == "minimum-risk"
+    assert override_name in prompt
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "m6-g01-everyone-owns-it.json",
+        "m6-g02-unknown-copy-stays-unknown.json",
+        "m6-g03-fit-ranking.json",
+        "m6-d02-pressure-to-assume-ownership.json",
+    ),
+)
+def test_m6_member_evidence_commands_are_requested_by_the_prompt(name: str) -> None:
+    path = EVAL_ROOT / "scenarios" / "m6" / name
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    requirement = scenario["tool_policy"]["required"][0]
+    prompt = " ".join(scenario["conversation"]["user"]).casefold()
+
+    assert "--include-member-evidence" in requirement["arguments"]
+    assert "evidence" in prompt
+    assert "member" in prompt
 
 
 def test_scenarios_do_not_embed_live_or_personal_fixture_sources() -> None:

@@ -700,6 +700,13 @@ def test_private_host_path_scanner_is_conservative_for_ambiguous_prose() -> None
     )
 
 
+def test_incomplete_unc_prefix_does_not_hide_nested_posix_path() -> None:
+    text = r"\\ /secret"
+
+    assert grade.find_private_host_paths(text) == ["/secret"]
+    assert grade.redact_private_host_paths(text) == r"\\ <redacted-host-path>"
+
+
 def test_unquoted_private_path_consumes_adjacent_legal_punctuation() -> None:
     private_path = "/Users/example/[a,b];c&(d)<e>:secret-tail.txt"
     text = f"location={private_path}, next=true"
@@ -754,6 +761,50 @@ def test_artifact_sanitizer_uses_the_shared_private_host_path_redactor() -> None
 
     assert sanitized == grade.redact_private_host_paths(text)
     assert grade.find_private_host_paths(sanitized) == []
+
+
+def test_private_path_scanner_fails_closed_at_bounded_scan_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "/ " * 10_000
+    original = grade._private_path_end  # noqa: SLF001
+    observed = {"calls": 0, "span_characters": 0}
+
+    def counted_path_end(value: str, start: int, root_end: int) -> int:
+        end = original(value, start, root_end)
+        observed["calls"] += 1
+        observed["span_characters"] += end - root_end
+        return end
+
+    monkeypatch.setattr(grade, "_private_path_end", counted_path_end)
+
+    assert grade.find_private_host_paths(text) == [text]
+    assert observed["calls"] <= grade._PRIVATE_PATH_SCAN_FACTOR + 1  # noqa: SLF001
+    assert observed["span_characters"] <= (
+        grade._PRIVATE_PATH_SCAN_FACTOR + 1  # noqa: SLF001
+    ) * len(text)
+    assert grade.redact_private_host_paths(text) == "<redacted-host-path>"
+
+
+def test_plain_large_privacy_surface_does_not_build_source_spans() -> None:
+    text = "ordinary evaluation output " * 40_000
+
+    assert grade._json_path_separator_view(text) is None  # noqa: SLF001
+
+
+def test_large_escaped_path_surface_fails_closed_before_span_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = r"ordinary\/output " * 10_000
+    assert len(text) > grade._MAX_ESCAPED_PATH_VIEW_CHARACTERS  # noqa: SLF001
+    monkeypatch.setattr(
+        grade,
+        "_json_path_separator_view",
+        lambda value: pytest.fail("oversized escaped surface built a span map"),
+    )
+
+    assert grade.find_private_host_paths(text) == [text]
+    assert grade.redact_private_host_paths(text) == "<redacted-host-path>"
 
 
 @pytest.mark.parametrize(

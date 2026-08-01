@@ -91,6 +91,7 @@ _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
+_PROTOCOL_WRITE_ERROR = "failed to write app-server protocol message"
 _INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
 _INVALID_RESPONSE_ERROR = "app-server returned an invalid response"
 _INVALID_MODEL_METADATA_ERROR = "app-server returned invalid model metadata"
@@ -207,10 +208,8 @@ class _TurnCollectionState:
 
 
 def codex_version() -> str:
-    executable = shutil.which(_APP_SERVER_ARGS[0])
-    if executable is None:
-        raise CodexProtocolError(_VERSION_ERROR)
-    _validate_codex_version(executable, environment=None)
+    """Return the version exact-gated before the App Server was launched."""
+
     return _REQUIRED_CODEX_VERSION
 
 
@@ -1595,8 +1594,54 @@ class _Session:
         )
 
     def _write(self, message: dict[str, Any]) -> None:
-        self._stdin.write(json.dumps(message, allow_nan=False).encode() + b"\n")
-        self._stdin.flush()
+        payload = json.dumps(message, allow_nan=False).encode() + b"\n"
+        if time.monotonic() >= self._deadline:
+            raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
+        try:
+            descriptor = self._stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            self._write_buffered(payload)
+            return
+        try:
+            os.set_blocking(descriptor, False)
+        except (OSError, ValueError):
+            raise CodexProtocolError(_PROTOCOL_WRITE_ERROR) from None
+
+        remaining_payload = memoryview(payload)
+        while remaining_payload:
+            remaining_seconds = self._deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
+            try:
+                _, writable, _ = select.select(
+                    [], [descriptor], [], remaining_seconds
+                )
+            except InterruptedError:
+                continue
+            except (OSError, ValueError):
+                raise CodexProtocolError(_PROTOCOL_WRITE_ERROR) from None
+            if not writable:
+                raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
+            try:
+                written = os.write(descriptor, remaining_payload)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                raise CodexProtocolError(_PROTOCOL_WRITE_ERROR) from None
+            if written <= 0:
+                raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
+            remaining_payload = remaining_payload[written:]
+
+    def _write_buffered(self, payload: bytes) -> None:
+        """Retain support for non-file streams used by protocol unit tests."""
+
+        try:
+            written = self._stdin.write(payload)
+            self._stdin.flush()
+        except (OSError, ValueError):
+            raise CodexProtocolError(_PROTOCOL_WRITE_ERROR) from None
+        if written != len(payload) or time.monotonic() >= self._deadline:
+            raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
 
     def _read_line(self) -> Any:
         found, message = self._read_line_until(self._deadline)

@@ -254,11 +254,23 @@ raise SystemExit(_main())
 def _cache_only_prohibited_requirement(
     requirement: dict[str, Any], *, allow_data_delete: bool = False
 ) -> tuple[str, ...] | None:
-    argv = grade.normalized_steam_agent_argv(requirement["command"])
+    command = requirement.get("command")
+    arguments = requirement.get("arguments")
+    if (
+        not isinstance(command, str)
+        or not isinstance(arguments, list)
+        or not all(isinstance(argument, str) for argument in arguments)
+    ):
+        raise UnsupportedScenarioError(
+            "agent runner requires one valid steam-agent command declaration"
+        )
+    argv = grade.normalized_steam_agent_argv(command)
     if argv is None:
-        return None
+        raise UnsupportedScenarioError(
+            "agent runner requires one valid steam-agent command declaration"
+        )
     return grade.cache_only_prohibited_head(
-        [*argv, *requirement.get("arguments", ())],
+        [*argv, *arguments],
         allow_data_delete=allow_data_delete,
     )
 
@@ -289,8 +301,9 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
         *(
             (
                 "allowed",
-                grade.cache_only_prohibited_command(
-                    command, allow_data_delete=allow_data_delete
+                _cache_only_prohibited_requirement(
+                    {"command": command, "arguments": []},
+                    allow_data_delete=allow_data_delete,
                 ),
             )
             for command in scenario["tool_policy"].get("allowed", ())
@@ -382,12 +395,18 @@ def _sanitize_artifact(
             )
             for key, item in value.items()
         }
-        item = sanitized.get("params", {}).get("item", {})
+        params = sanitized.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        command = item.get("command") if isinstance(item, dict) else None
         if (
             sanitized.get("method") == "item/completed"
+            and isinstance(item, dict)
             and item.get("type") == "commandExecution"
-            and not _safe_to_persist_command_output(
-                item.get("command", ""), allow_data_delete=allow_data_delete
+            and (
+                not isinstance(command, str)
+                or not _safe_to_persist_command_output(
+                    command, allow_data_delete=allow_data_delete
+                )
             )
         ):
             for key in ("aggregatedOutput", "output", "stdout", "stderr"):
@@ -488,7 +507,7 @@ def _load_scenarios(
     scenarios = []
     for path in sorted(SCENARIO_ROOT.glob("*/*.json")):
         scenario_path = _resolved_contained_path(SCENARIO_ROOT, path)
-        scenario = json.loads(scenario_path.read_text())
+        scenario = _strict_json_loads(scenario_path.read_text())
         if not isinstance(scenario, dict):
             raise ValueError(_INVALID_SCENARIO_ERROR)
         loaded_id = _validated_scenario_id(scenario.get("id"))
@@ -545,7 +564,11 @@ def _extract_sidecar(
     if "claims" in payload:
         claims = payload["claims"]
         if not isinstance(claims, list) or not all(
-            isinstance(claim, dict) for claim in claims
+            isinstance(claim, dict)
+            and set(claim) == {"path", "value"}
+            and isinstance(claim["path"], str)
+            and grade.is_supported_path(claim["path"])
+            for claim in claims
         ):
             return None, False
         return claims, declined
@@ -714,9 +737,28 @@ def _grade_claims_by_turn(
         {"index": turn["index"], **grade.grade_claims(turn["_claims"], oracle_document)}
         for turn in turns
     ]
+    failed_turns = [turn["index"] for turn in per_turn if not turn["passed"]]
+    aggregate_deterministic_passed = aggregate["deterministic_passed"]
+    per_turn_deterministic_passed = not failed_turns
+    deterministic_passed = bool(
+        aggregate_deterministic_passed and per_turn_deterministic_passed
+    )
+    pending_hard_fail_review = bool(
+        deterministic_passed and aggregate["unevaluated_hard_fail_criteria"]
+    )
     return {
         "applicable": True,
         **aggregate,
+        "aggregate_deterministic_passed": aggregate_deterministic_passed,
+        "per_turn_deterministic_passed": per_turn_deterministic_passed,
+        "failed_turns": failed_turns,
+        "deterministic_passed": deterministic_passed,
+        "review_status": (
+            "pending_hard_fail_review"
+            if pending_hard_fail_review
+            else "not_pending"
+        ),
+        "passed": None if pending_hard_fail_review else deterministic_passed,
         "turns": per_turn,
     }
 
