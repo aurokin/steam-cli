@@ -1571,6 +1571,9 @@ class _Session:
                 self._raise_input_limit()
             if not _is_harmless_global_notification(message):
                 self._raise_post_turn_activity()
+            settle_deadline = min(
+                self._deadline, time.monotonic() + _QUIESCENCE_GRACE_SECONDS
+            )
 
     def _prepare_incoming(self, message: Any) -> Any:
         if not isinstance(message, dict):

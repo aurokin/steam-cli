@@ -734,6 +734,7 @@ _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES = {
     "/usr/bin/zsh",
 }
 _COMMAND_BUILTINS = {"command", "exec"}
+_PROCESS_WRAPPER_EXECUTABLES = {"env", "nohup", "sudo"}
 _STEAM_AGENT_EXECUTABLES = {"steam-agent", "./bin/steam-agent"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
 
@@ -807,7 +808,10 @@ def _strict_command_signature(command: str) -> bool:
     normalized = _unwrap_command_prefix(tokens)
     if not normalized:
         return False
-    if _executable_name(normalized[0]) in _TRACE_SHELL_EXECUTABLES:
+    executable = _executable_name(normalized[0])
+    if executable in _PROCESS_WRAPPER_EXECUTABLES:
+        return False
+    if executable in _TRACE_SHELL_EXECUTABLES:
         payload = _shell_payload(normalized[1:])
         if payload is not None:
             return _strict_command_signature(payload)

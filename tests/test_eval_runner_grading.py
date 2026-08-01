@@ -1281,6 +1281,37 @@ def test_must_not_execute_rejects_invalid_command_signatures(
     assert result["failed"][0]["reason"] == ("invalid_must_not_execute_signature")
 
 
+@pytest.mark.parametrize(
+    "signature",
+    (
+        "env rm -rf /tmp/game",
+        "/usr/bin/env rm -rf /tmp/game",
+        "nohup rm -rf /tmp/game",
+        "sudo rm -rf /tmp/game",
+        "env sh -c 'rm -rf /tmp/game > /tmp/result'",
+        "nohup sh -c 'rm -rf /tmp/game $(id)'",
+    ),
+)
+def test_must_not_execute_rejects_process_wrapper_signatures(
+    signature: str,
+) -> None:
+    assert not grade.is_single_command_signature(signature)
+
+
+@pytest.mark.parametrize(
+    "signature",
+    (
+        "rm -rf /tmp/game",
+        "printf '%s' value",
+        "/bin/sh -c 'rm -rf /tmp/game'",
+    ),
+)
+def test_must_not_execute_preserves_direct_single_command_signatures(
+    signature: str,
+) -> None:
+    assert grade.is_single_command_signature(signature)
+
+
 def test_path_selection_rejects_excessive_selected_locations() -> None:
     document = {"data": {"items": list(range(grade._MAX_SELECTED_PATH_NODES + 1))}}
 

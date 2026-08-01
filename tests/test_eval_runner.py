@@ -446,6 +446,24 @@ def test_schema_02_refusal_requires_a_bounded_language_contract() -> None:
         {},
         {**valid["expected"], "required_all": []},
         {**valid["expected"], "required_any": ["   "]},
+        {
+            **valid["expected"],
+            "required_all": [
+                f"phrase-{index}"
+                for index in range(
+                    runner_main._MAX_REFUSAL_PHRASES_PER_GROUP + 1  # noqa: SLF001
+                )
+            ],
+        },
+        {
+            **valid["expected"],
+            "required_any": [
+                "x"
+                * (
+                    runner_main._MAX_REFUSAL_PHRASE_CHARACTERS + 1  # noqa: SLF001
+                )
+            ],
+        },
         {**valid["expected"], "forbidden": ["done"]},
         {**valid["expected"], "extra": ["leak"]},
     ):
@@ -700,13 +718,48 @@ def test_retained_command_identifiers_never_use_answer_privacy_exemption() -> No
     approved = "76561198000000000"
     metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
         f"Approved answer identifier {approved}",
-        f"./bin/steam-agent inspect --account {approved}",
+        [f"./bin/steam-agent inspect --account {approved}"],
         {},
         allowed_identifier_values=frozenset({approved}),
     )
 
     assert not metric["passed"]
     assert metric["personal_patterns"] == ["7656119"]
+
+
+def test_retained_command_privacy_scans_adjacent_shell_quotes() -> None:
+    command = "printf '%s' '7656''1198000000000'"
+    assert "7656119" not in command
+
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "",
+        [command],
+        {},
+        allowed_identifier_values=frozenset(),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "printf 'unterminated-private-command",
+        "x" * (runner_main._MAX_COMMAND_PRIVACY_CHARACTERS + 1),  # noqa: SLF001
+    ),
+)
+def test_retained_command_privacy_decode_failures_are_generic(command: str) -> None:
+    with pytest.raises(ValueError) as error:
+        runner_main._grade_privacy_surfaces(  # noqa: SLF001
+            "",
+            [command],
+            {},
+            allowed_identifier_values=frozenset(),
+        )
+
+    assert str(error.value) == runner_main._COMMAND_PRIVACY_DECODING_ERROR  # noqa: SLF001
+    assert command not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -1879,6 +1932,86 @@ def test_oracle_grading_rejects_multiplicative_document_work() -> None:
         )
 
     assert str(captured.value) == runner_main._ORACLE_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_oracle_grading_rejects_refusal_phrase_answer_cross_product() -> None:
+    phrases = [f"p{index:05d}" for index in range(5_000)]
+    answer = " ".join(phrases)
+    oracle = {
+        "assertions": [
+            {
+                "path": "$",
+                "operator": "refusal_expected",
+                "expected": {
+                    "required_all": phrases,
+                    "required_any": [phrases[0]],
+                },
+                "source": "final_answer",
+            }
+        ]
+    }
+    turns = [
+        {
+            "commands": [],
+            "final_message": answer,
+            "_visible_message_text": answer,
+        }
+    ]
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._validate_oracle_evaluation_budget(  # noqa: SLF001
+            oracle, None, turns
+        )
+
+    assert str(captured.value) == runner_main._ORACLE_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_oracle_grading_charges_each_bounded_refusal_phrase_scan() -> None:
+    phrases = [f"phrase-{index}" for index in range(64)]
+    answer = "x" * 70_000
+    oracle = {
+        "assertions": [
+            {
+                "path": "$",
+                "operator": "refusal_expected",
+                "expected": {
+                    "required_all": phrases,
+                    "required_any": ["fallback"],
+                },
+                "source": "final_answer",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._validate_oracle_evaluation_budget(  # noqa: SLF001
+            oracle,
+            None,
+            [
+                {
+                    "commands": [],
+                    "final_message": answer,
+                    "_visible_message_text": answer,
+                }
+            ],
+        )
+
+    assert str(captured.value) == runner_main._ORACLE_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_shipped_refusal_oracles_fit_runtime_phrase_limits() -> None:
+    for path in SCENARIO_PATHS:
+        scenario = json.loads(path.read_text(encoding="utf-8"))
+        has_refusal_oracle = False
+        for assertion in scenario["deterministic_oracle"]["assertions"]:
+            if assertion["operator"] != "refusal_expected":
+                continue
+            has_refusal_oracle = True
+            phrase_count = runner_main._refusal_phrase_count(assertion)  # noqa: SLF001
+            assert phrase_count is not None, path
+            assert phrase_count <= 2 * runner_main._MAX_REFUSAL_PHRASES_PER_GROUP  # noqa: SLF001
+        if has_refusal_oracle:
+            runner_main._validate_runner_requirements(scenario)  # noqa: SLF001
 
 
 def test_document_backed_turn_rejects_a_vacuous_empty_selection() -> None:
@@ -3956,6 +4089,58 @@ def test_codex_session_settling_window_rejects_delayed_activity() -> None:
         server_output.close()
 
 
+def test_codex_session_settles_after_queued_harmless_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    server_output = os.fdopen(read_fd, "rb", buffering=0)
+    server_input = os.fdopen(write_fd, "wb", buffering=0)
+    session = codex_driver._Session(io.BytesIO(), server_output, 1)  # noqa: SLF001
+    session._pending_notifications.append(  # noqa: SLF001
+        {"method": "account/rateLimits/updated", "params": {}}
+    )
+    original_is_harmless = codex_driver._is_harmless_global_notification  # noqa: SLF001
+    first_notification = True
+
+    def slow_first_harmless_notification(message: object) -> bool:
+        nonlocal first_notification
+        if first_notification:
+            first_notification = False
+            time.sleep(0.04)
+        return original_is_harmless(message)
+
+    monkeypatch.setattr(
+        codex_driver,
+        "_is_harmless_global_notification",
+        slow_first_harmless_notification,
+    )
+
+    def send_trailing_activity() -> None:
+        time.sleep(0.07)
+        server_input.write(
+            json.dumps(
+                {
+                    "method": "turn/started",
+                    "params": {"private": "must-not-appear-trailing"},
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    writer = threading.Thread(target=send_trailing_activity)
+    writer.start()
+    try:
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session.assert_quiescent()
+
+        assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+        assert "must-not-appear" not in str(captured.value)
+    finally:
+        writer.join()
+        server_input.close()
+        server_output.close()
+
+
 def test_codex_session_quiescence_honors_expired_conversation_deadline() -> None:
     session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
     session._deadline = time.monotonic() - 1  # noqa: SLF001
@@ -5639,6 +5824,75 @@ def test_load_scenarios_runtime_validates_schema_before_execution(
         runner_main._load_scenarios("m7", None)  # noqa: SLF001
 
     assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "hostile_path",
+    ("/private/must-not-appear", {"private": "must-not-appear"}),
+    ids=("string", "object"),
+)
+def test_load_scenarios_rejects_schema_forbidden_path_metadata(
+    hostile_path: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json").read_text()
+    )
+    scenario["_path"] = hostile_path
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    (family / "m7-b01.json").write_text(json.dumps(scenario))
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "hostile_path",
+    ("/private/must-not-appear", {"private": "must-not-appear"}),
+    ids=("string", "object"),
+)
+def test_run_scenario_rejects_untrusted_internal_path_before_workspace(
+    hostile_path: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json").read_text()
+    )
+    scenario["_path"] = hostile_path
+
+    def unexpected_workspace(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("temporary workspace created for invalid internal metadata")
+
+    monkeypatch.setattr(
+        runner_main.tempfile, "TemporaryDirectory", unexpected_workspace
+    )
+
+    with pytest.raises(ValueError) as captured:
+        runner_main.run_scenario(
+            scenario,
+            tmp_path / "run",
+            model=None,
+            effort=None,
+            timeout_seconds=1,
+        )
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
+
+
+def test_runtime_schema_validation_accepts_trusted_internal_path() -> None:
+    scenario_path = SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json"
+    scenario = json.loads(scenario_path.read_text())
+    scenario["_path"] = scenario_path
+
+    runner_main._validate_scenario_schema(  # noqa: SLF001
+        scenario, allow_internal_path=True
+    )
 
 
 @pytest.mark.parametrize(

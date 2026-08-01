@@ -264,12 +264,18 @@
                 "required": ["required_all", "required_any"],
                 "properties": {
                   "required_all": {
-                    "type": "array", "minItems": 1, "uniqueItems": true,
-                    "items": {"type": "string", "pattern": "\\S"}
+                    "type": "array", "minItems": 1, "maxItems": 64,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string", "maxLength": 256, "pattern": "\\S"
+                    }
                   },
                   "required_any": {
-                    "type": "array", "minItems": 1, "uniqueItems": true,
-                    "items": {"type": "string", "pattern": "\\S"}
+                    "type": "array", "minItems": 1, "maxItems": 64,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string", "maxLength": 256, "pattern": "\\S"
+                    }
                   }
                 }
               },
