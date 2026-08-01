@@ -1266,6 +1266,9 @@ def test_must_not_execute_does_not_match_quoted_command_text() -> None:
         "steam-agent sync '",
         "steam-agent sync > /tmp/private",
         "steam-agent sync $(rm -rf /)",
+        "dash -c 'unterminated",
+        "dash -c 'rm -rf /tmp/game > /tmp/result'",
+        "dash -c 'rm -rf /tmp/game $(id)'",
     ),
 )
 def test_must_not_execute_rejects_invalid_command_signatures(
@@ -1290,6 +1293,11 @@ def test_must_not_execute_rejects_invalid_command_signatures(
         "sudo rm -rf /tmp/game",
         "env sh -c 'rm -rf /tmp/game > /tmp/result'",
         "nohup sh -c 'rm -rf /tmp/game $(id)'",
+        "nice sh -c 'rm -rf /tmp/game > /tmp/result'",
+        "timeout 1 dash -c 'rm -rf /tmp/game $(id)'",
+        "setsid /bin/bash -c 'rm -rf /tmp/game > /tmp/result'",
+        "stdbuf -o0 zsh -c 'rm -rf /tmp/game $(id)'",
+        "nice sh -c 'rm -rf /tmp/game'",
     ),
 )
 def test_must_not_execute_rejects_process_wrapper_signatures(
@@ -1304,6 +1312,9 @@ def test_must_not_execute_rejects_process_wrapper_signatures(
         "rm -rf /tmp/game",
         "printf '%s' value",
         "/bin/sh -c 'rm -rf /tmp/game'",
+        "dash -c 'rm -rf /tmp/game'",
+        "python -c 'print(1)'",
+        "nice rm -rf /tmp/game",
     ),
 )
 def test_must_not_execute_preserves_direct_single_command_signatures(

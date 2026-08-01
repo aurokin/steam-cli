@@ -724,7 +724,18 @@ def _grade_trace(
 
 
 _COMMAND_SEPARATORS = {"&", "&&", "||", ";", "|"}
-_TRACE_SHELL_EXECUTABLES = {"bash", "sh", "zsh"}
+_TRACE_SHELL_EXECUTABLES = {
+    "ash",
+    "bash",
+    "csh",
+    "dash",
+    "fish",
+    "ksh",
+    "mksh",
+    "sh",
+    "tcsh",
+    "zsh",
+}
 _TRUSTED_ABSOLUTE_SHELL_EXECUTABLES = {
     "/bin/bash",
     "/bin/sh",
@@ -815,6 +826,12 @@ def _strict_command_signature(command: str) -> bool:
         payload = _shell_payload(normalized[1:])
         if payload is not None:
             return _strict_command_signature(payload)
+    elif _has_nested_shell_payload(normalized[1:]):
+        # A shell payload behind another executable is structurally ambiguous:
+        # process wrappers have executable-specific option grammars, so the
+        # payload cannot be reduced to one direct signature without executing
+        # or emulating that wrapper.
+        return False
     return True
 
 
@@ -831,14 +848,33 @@ def _unwrap_command_prefix(tokens: Sequence[str]) -> list[str]:
 
 def _shell_payload(arguments: Sequence[str]) -> str | None:
     for index, argument in enumerate(arguments):
-        is_command_option = argument == "-c" or (
-            argument.startswith("-")
-            and not argument.startswith("--")
-            and "c" in argument[1:]
-        )
-        if is_command_option and index + 1 < len(arguments):
+        if _is_shell_command_option(argument) and index + 1 < len(arguments):
             return arguments[index + 1]
     return None
+
+
+def _has_nested_shell_payload(arguments: Sequence[str]) -> bool:
+    """Detect one later shell command payload in a single linear scan."""
+
+    shell_seen = False
+    for index, argument in enumerate(arguments):
+        if _executable_name(argument) in _TRACE_SHELL_EXECUTABLES:
+            shell_seen = True
+        elif (
+            shell_seen
+            and _is_shell_command_option(argument)
+            and index + 1 < len(arguments)
+        ):
+            return True
+    return False
+
+
+def _is_shell_command_option(argument: str) -> bool:
+    return argument == "-c" or (
+        argument.startswith("-")
+        and not argument.startswith("--")
+        and "c" in argument[1:]
+    )
 
 
 def _executable_name(token: str) -> str:

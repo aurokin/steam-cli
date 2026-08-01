@@ -20,7 +20,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import threading
 import time
 
 from jsonschema import Draft202012Validator
@@ -742,11 +741,66 @@ def test_retained_command_privacy_scans_adjacent_shell_quotes() -> None:
     assert metric["personal_patterns"] == ["7656119"]
 
 
+@pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
+def test_retained_command_privacy_scans_shell_line_continuations(
+    line_ending: str,
+) -> None:
+    command = f"printf '%s' 7656\\{line_ending}1198000000000"
+    assert "7656119" not in command
+
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "",
+        [command],
+        {},
+        allowed_identifier_values=frozenset(),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
+def test_retained_command_privacy_ignores_quotes_in_shell_comments() -> None:
+    command = "printf '%s' safe # O'Connor left an unmatched ' quote"
+
+    assert runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
+        [command]
+    ) == "printf\n%s\nsafe"
+
+
+def test_retained_command_privacy_raw_surface_scans_shell_comments() -> None:
+    identifier = "76561198000000000"
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "",
+        [f"printf '%s' safe # retained identifier {identifier}"],
+        {},
+        allowed_identifier_values=frozenset(),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
+def test_retained_command_privacy_preserves_hash_inside_shell_words() -> None:
+    command = "printf '%s' prefix#'7656''1198000000000'"
+    assert "7656119" not in command
+
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "",
+        [command],
+        {},
+        allowed_identifier_values=frozenset(),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
 @pytest.mark.parametrize(
     "command",
     (
         "printf 'unterminated-private-command",
-        "x" * (runner_main._MAX_COMMAND_PRIVACY_CHARACTERS + 1),  # noqa: SLF001
+        "x"
+        * (runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND + 1),  # noqa: SLF001
     ),
 )
 def test_retained_command_privacy_decode_failures_are_generic(command: str) -> None:
@@ -760,6 +814,52 @@ def test_retained_command_privacy_decode_failures_are_generic(command: str) -> N
 
     assert str(error.value) == runner_main._COMMAND_PRIVACY_DECODING_ERROR  # noqa: SLF001
     assert command not in str(error.value)
+
+
+def test_retained_command_privacy_accepts_exact_per_command_limit() -> None:
+    command = "x" * runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND  # noqa: SLF001
+
+    assert runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
+        [command]
+    ) == command
+
+
+def test_retained_command_privacy_rejects_one_mib_before_shell_lexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = "x" * (1024 * 1024)
+
+    def unexpected_shell_lex(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("oversized command reached shell lexer")
+
+    monkeypatch.setattr(runner_main.shlex, "shlex", unexpected_shell_lex)
+
+    with pytest.raises(ValueError) as error:
+        runner_main._strict_shell_decoded_command_surface([command])  # noqa: SLF001
+
+    assert str(error.value) == runner_main._COMMAND_PRIVACY_DECODING_ERROR  # noqa: SLF001
+    assert command not in str(error.value)
+
+
+def test_retained_command_privacy_checks_aggregate_limit_before_shell_lexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = "x" * runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND  # noqa: SLF001
+    commands = [command] * (
+        runner_main._MAX_COMMAND_PRIVACY_CHARACTERS // len(command)  # noqa: SLF001
+    )
+
+    def unexpected_shell_lex(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("oversized command surface reached shell lexer")
+
+    monkeypatch.setattr(runner_main.shlex, "shlex", unexpected_shell_lex)
+
+    with pytest.raises(ValueError) as error:
+        runner_main._strict_shell_decoded_command_surface(commands)  # noqa: SLF001
+
+    assert str(error.value) == runner_main._COMMAND_PRIVACY_DECODING_ERROR  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -4057,88 +4157,75 @@ def test_codex_session_caps_post_response_global_notifications() -> None:
     assert session._buffer == bytearray()  # noqa: SLF001
 
 
-def test_codex_session_settling_window_rejects_delayed_activity() -> None:
-    read_fd, write_fd = os.pipe()
-    server_output = os.fdopen(read_fd, "rb", buffering=0)
-    server_input = os.fdopen(write_fd, "wb", buffering=0)
+def test_codex_session_settling_window_rejects_delayed_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._deadline = 101.0  # noqa: SLF001
+    monkeypatch.setattr(codex_driver.time, "monotonic", lambda: 100.0)
+    read_deadlines: list[float] = []
 
-    def send_delayed_activity() -> None:
-        time.sleep(codex_driver._QUIESCENCE_GRACE_SECONDS / 2)  # noqa: SLF001
-        server_input.write(
-            json.dumps(
-                {
-                    "method": "turn/started",
-                    "params": {"private": "must-not-appear-delayed"},
-                }
-            ).encode()
-            + b"\n"
-        )
+    def scripted_read(deadline: float, **kwargs):
+        assert kwargs == {"accept_frame_after_deadline": True}
+        read_deadlines.append(deadline)
+        return True, {
+            "method": "turn/started",
+            "params": {"private": "must-not-appear-delayed"},
+        }
 
-    writer = threading.Thread(target=send_delayed_activity)
-    writer.start()
-    try:
-        session = codex_driver._Session(io.BytesIO(), server_output, 1)  # noqa: SLF001
-        with pytest.raises(codex_driver.CodexProtocolError) as captured:
-            session.assert_quiescent()
+    monkeypatch.setattr(session, "_read_line_until", scripted_read)
 
-        assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
-        assert "must-not-appear" not in str(captured.value)
-    finally:
-        writer.join()
-        server_input.close()
-        server_output.close()
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert read_deadlines == [pytest.approx(100.05)]
+    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
 
 
 def test_codex_session_settles_after_queued_harmless_notification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    read_fd, write_fd = os.pipe()
-    server_output = os.fdopen(read_fd, "rb", buffering=0)
-    server_input = os.fdopen(write_fd, "wb", buffering=0)
-    session = codex_driver._Session(io.BytesIO(), server_output, 1)  # noqa: SLF001
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._deadline = 101.0  # noqa: SLF001
     session._pending_notifications.append(  # noqa: SLF001
         {"method": "account/rateLimits/updated", "params": {}}
     )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(codex_driver.time, "monotonic", lambda: clock["now"])
     original_is_harmless = codex_driver._is_harmless_global_notification  # noqa: SLF001
-    first_notification = True
 
-    def slow_first_harmless_notification(message: object) -> bool:
-        nonlocal first_notification
-        if first_notification:
-            first_notification = False
-            time.sleep(0.04)
-        return original_is_harmless(message)
+    def advance_after_harmless_notification(message: object) -> bool:
+        harmless = original_is_harmless(message)
+        if harmless:
+            clock["now"] = 100.04
+        return harmless
 
     monkeypatch.setattr(
         codex_driver,
         "_is_harmless_global_notification",
-        slow_first_harmless_notification,
+        advance_after_harmless_notification,
     )
+    read_deadlines: list[float] = []
 
-    def send_trailing_activity() -> None:
-        time.sleep(0.07)
-        server_input.write(
-            json.dumps(
-                {
-                    "method": "turn/started",
-                    "params": {"private": "must-not-appear-trailing"},
-                }
-            ).encode()
-            + b"\n"
-        )
+    def scripted_read(deadline: float, **kwargs):
+        assert kwargs == {"accept_frame_after_deadline": True}
+        read_deadlines.append(deadline)
+        if deadline <= 100.05:
+            return False, None
+        return True, {
+            "method": "turn/started",
+            "params": {"private": "must-not-appear-trailing"},
+        }
 
-    writer = threading.Thread(target=send_trailing_activity)
-    writer.start()
-    try:
-        with pytest.raises(codex_driver.CodexProtocolError) as captured:
-            session.assert_quiescent()
+    monkeypatch.setattr(session, "_read_line_until", scripted_read)
 
-        assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
-        assert "must-not-appear" not in str(captured.value)
-    finally:
-        writer.join()
-        server_input.close()
-        server_output.close()
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert read_deadlines == [pytest.approx(100.09)]
+    assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
+    assert "must-not-appear" not in str(captured.value)
 
 
 def test_codex_session_quiescence_honors_expired_conversation_deadline() -> None:

@@ -81,6 +81,7 @@ _MAX_ORACLE_ASSERTIONS = 256
 _MAX_ORACLE_EVALUATION_WORK = 8 * 1024 * 1024
 _ORACLE_ASSERTION_PASSES = 2
 _MAX_COMMAND_PRIVACY_CHARACTERS = 4 * 1024 * 1024
+_MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND = 64 * 1024
 _MAX_COMMAND_PRIVACY_TOKENS = 16 * 1024
 _COMMAND_PRIVACY_DECODING_ERROR = "command privacy decoding failed"
 _MAX_REFUSAL_PHRASES_PER_GROUP = 64
@@ -1127,6 +1128,50 @@ def _approved_identifier_values(
     return grade.steam_id64_values(document)
 
 
+def _shell_command_privacy_source(command: str) -> str:
+    """Remove continuations and actual shell comments before strict lexing."""
+
+    command = command.replace("\\\r\n", "").replace("\\\n", "")
+    characters: list[str] = []
+    quote: str | None = None
+    escaped = False
+    word_start = True
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            characters.append(character)
+            escaped = False
+            word_start = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            characters.append(character)
+            escaped = True
+            word_start = False
+            index += 1
+            continue
+        if quote is None and character in {"'", '"'}:
+            quote = character
+        elif quote == character:
+            quote = None
+        elif quote is None and character == "#" and word_start:
+            newline = command.find("\n", index)
+            if newline < 0:
+                break
+            characters.append("\n")
+            word_start = True
+            index = newline + 1
+            continue
+        characters.append(character)
+        if quote is None:
+            word_start = character in " \t\r\n;&|()<>"
+        else:
+            word_start = False
+        index += 1
+    return "".join(characters)
+
+
 def _strict_shell_decoded_command_surface(commands: Sequence[str]) -> str:
     """Return a bounded token view without exposing rejected command content."""
 
@@ -1135,10 +1180,13 @@ def _strict_shell_decoded_command_surface(commands: Sequence[str]) -> str:
     tokens: list[str] = []
     try:
         for command in commands:
+            if len(command) > _MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND:
+                raise ValueError
             source_characters += len(command) + 1
             if source_characters > _MAX_COMMAND_PRIVACY_CHARACTERS:
                 raise ValueError
-            lexer = shlex.shlex(command, posix=True)
+        for command in commands:
+            lexer = shlex.shlex(_shell_command_privacy_source(command), posix=True)
             lexer.whitespace_split = True
             lexer.commenters = ""
             for token in lexer:
