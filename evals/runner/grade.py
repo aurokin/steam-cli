@@ -790,7 +790,7 @@ def _command_invocations(command: str) -> list[list[str]]:
             continue
         executable = _executable_name(normalized[0])
         if executable in _TRACE_SHELL_EXECUTABLES:
-            payload = _shell_payload(normalized[1:])
+            payload = _shell_payload(executable, normalized[1:])
             if payload is not None:
                 invocations.extend(_command_invocations(payload))
                 continue
@@ -823,7 +823,7 @@ def _strict_command_signature(command: str) -> bool:
     if executable in _PROCESS_WRAPPER_EXECUTABLES:
         return False
     if executable in _TRACE_SHELL_EXECUTABLES:
-        payload = _shell_payload(normalized[1:])
+        payload = _shell_payload(executable, normalized[1:])
         if payload is not None:
             return _strict_command_signature(payload)
     elif _has_nested_shell_payload(normalized[1:]):
@@ -846,9 +846,15 @@ def _unwrap_command_prefix(tokens: Sequence[str]) -> list[str]:
     return remaining
 
 
-def _shell_payload(arguments: Sequence[str]) -> str | None:
+def _shell_payload(executable: str, arguments: Sequence[str]) -> str | None:
     for index, argument in enumerate(arguments):
-        if _is_shell_command_option(argument) and index + 1 < len(arguments):
+        attached = _attached_shell_payload(executable, argument)
+        if attached is not None:
+            return attached
+        if (
+            _is_shell_command_option(executable, argument)
+            and index + 1 < len(arguments)
+        ):
             return arguments[index + 1]
     return None
 
@@ -856,21 +862,33 @@ def _shell_payload(arguments: Sequence[str]) -> str | None:
 def _has_nested_shell_payload(arguments: Sequence[str]) -> bool:
     """Detect one later shell command payload in a single linear scan."""
 
-    shell_seen = False
+    shell: str | None = None
     for index, argument in enumerate(arguments):
-        if _executable_name(argument) in _TRACE_SHELL_EXECUTABLES:
-            shell_seen = True
+        executable = _executable_name(argument)
+        if executable in _TRACE_SHELL_EXECUTABLES:
+            shell = executable
         elif (
-            shell_seen
-            and _is_shell_command_option(argument)
-            and index + 1 < len(arguments)
+            shell is not None
+            and (
+                _attached_shell_payload(shell, argument) is not None
+                or (
+                    _is_shell_command_option(shell, argument)
+                    and index + 1 < len(arguments)
+                )
+            )
         ):
             return True
     return False
 
 
-def _is_shell_command_option(argument: str) -> bool:
-    return argument == "-c" or (
+def _attached_shell_payload(executable: str, argument: str) -> str | None:
+    if executable == "fish" and argument.startswith("--command="):
+        return argument.removeprefix("--command=")
+    return None
+
+
+def _is_shell_command_option(executable: str, argument: str) -> bool:
+    return (executable == "fish" and argument == "--command") or argument == "-c" or (
         argument.startswith("-")
         and not argument.startswith("--")
         and "c" in argument[1:]

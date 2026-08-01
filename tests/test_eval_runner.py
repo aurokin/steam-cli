@@ -759,6 +759,21 @@ def test_retained_command_privacy_scans_shell_line_continuations(
     assert metric["personal_patterns"] == ["7656119"]
 
 
+def test_retained_command_privacy_scans_folded_heredoc_content() -> None:
+    command = "cat <<EOF\n#7656\\\n1198000000000\nEOF"
+    assert "7656119" not in command
+
+    metric = runner_main._grade_privacy_surfaces(  # noqa: SLF001
+        "",
+        [command],
+        {},
+        allowed_identifier_values=frozenset(),
+    )
+
+    assert not metric["passed"]
+    assert metric["personal_patterns"] == ["7656119"]
+
+
 def test_retained_command_privacy_ignores_quotes_in_shell_comments() -> None:
     command = "printf '%s' safe # O'Connor left an unmatched ' quote"
 

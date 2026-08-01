@@ -1269,6 +1269,8 @@ def test_must_not_execute_does_not_match_quoted_command_text() -> None:
         "dash -c 'unterminated",
         "dash -c 'rm -rf /tmp/game > /tmp/result'",
         "dash -c 'rm -rf /tmp/game $(id)'",
+        "fish --command 'rm -rf /tmp/game > /tmp/result'",
+        "fish --command='rm -rf /tmp/game $(id)'",
     ),
 )
 def test_must_not_execute_rejects_invalid_command_signatures(
@@ -1298,6 +1300,8 @@ def test_must_not_execute_rejects_invalid_command_signatures(
         "setsid /bin/bash -c 'rm -rf /tmp/game > /tmp/result'",
         "stdbuf -o0 zsh -c 'rm -rf /tmp/game $(id)'",
         "nice sh -c 'rm -rf /tmp/game'",
+        "nice fish --command 'rm -rf /tmp/game > /tmp/result'",
+        "nice fish --command='rm -rf /tmp/game $(id)'",
     ),
 )
 def test_must_not_execute_rejects_process_wrapper_signatures(
@@ -1315,6 +1319,9 @@ def test_must_not_execute_rejects_process_wrapper_signatures(
         "dash -c 'rm -rf /tmp/game'",
         "python -c 'print(1)'",
         "nice rm -rf /tmp/game",
+        "fish -c 'printf value'",
+        "fish --command 'printf value'",
+        "fish --command='printf value'",
     ),
 )
 def test_must_not_execute_preserves_direct_single_command_signatures(
