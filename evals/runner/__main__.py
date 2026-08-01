@@ -59,6 +59,22 @@ _SCENARIO_ID = re.compile(r"m[1-9][0-9]*-[a-z][0-9]{2,}\Z", re.ASCII)
 _INVALID_SCENARIO_ERROR = "invalid eval scenario input"
 _INVALID_RESULTS_ROOT_ERROR = "eval results root is outside the repository"
 _POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
+# Scenario files, CLI documents, and terminal sidecars all stay within the
+# App Server's 4 MiB frame contract. Bound nesting separately before calling
+# the platform JSON decoder so valid-but-adversarial input cannot hit its
+# recursion limit and escape generic invalid-input handling.
+_MAX_STRICT_JSON_CHARACTERS = 4 * 1024 * 1024
+_MAX_STRICT_JSON_DEPTH = 128
+# Claims are model-controlled. Bound both retained objects and conservative
+# worst-case full-document path selections before deterministic grading.
+_MAX_CLAIMS_PER_TURN = 128
+_MAX_CLAIMS_PER_CONVERSATION = 256
+_MAX_CLAIM_SELECTION_WORK = 8 * 1024 * 1024
+_CLAIM_SELECTION_PASSES = 4
+_CLAIM_EVALUATION_LIMIT_ERROR = "claim evaluation exceeded safety limits"
+_UNSUPPORTED_GRADING_PATH_ERROR = (
+    "agent runner requires supported deterministic JSON paths"
+)
 
 DEVELOPER_INSTRUCTIONS_VERSION = "agent-instructions/0.8"
 DEVELOPER_INSTRUCTIONS = """\
@@ -136,11 +152,36 @@ def _reject_json_constant(_value: str) -> None:
 def _strict_json_loads(value: str) -> Any:
     """Parse one standards-compliant JSON value without ambiguous objects."""
 
-    return json.loads(
-        value,
-        object_pairs_hook=_unique_json_object,
-        parse_constant=_reject_json_constant,
-    )
+    if len(value) > _MAX_STRICT_JSON_CHARACTERS:
+        raise ValueError("JSON input exceeded safety limits")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_STRICT_JSON_DEPTH:
+                raise ValueError("JSON input exceeded safety limits")
+        elif character in "]}":
+            depth -= 1
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except RecursionError:
+        raise ValueError("JSON input exceeded safety limits") from None
 
 
 def _validated_scenario_id(value: Any) -> str:
@@ -216,9 +257,7 @@ def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
         "steam_agent.system_profile",
         "steam_agent.wishlist_library",
     )
-    import_paths = tuple(
-        dict.fromkeys((str(ROOT / "src"), *site.getsitepackages()))
-    )
+    import_paths = tuple(dict.fromkeys((str(ROOT / "src"), *site.getsitepackages())))
     source = f"""import sys as _sys
 _sys.path[:0] = {import_paths!r}
 _sys.argv[0] = {str(launcher)!r}
@@ -286,7 +325,34 @@ def _allows_confirmed_data_delete(scenario: dict[str, Any]) -> bool:
 
 
 def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
+    fact_rubric = scenario.get("fact_rubric") or {}
+    if "required_claim_paths" in fact_rubric:
+        required_claim_paths = fact_rubric["required_claim_paths"]
+        if not isinstance(required_claim_paths, list) or any(
+            not isinstance(path, str) or not grade.is_supported_path(path)
+            for path in required_claim_paths
+        ):
+            raise UnsupportedScenarioError(_UNSUPPORTED_GRADING_PATH_ERROR)
     requirements = scenario["tool_policy"].get("required") or []
+    oracle = scenario.get("deterministic_oracle") or {}
+    for assertion in oracle.get("assertions", ()):
+        if (
+            not isinstance(assertion, dict)
+            or (
+                assertion.get("source", "cli_document") == "cli_document"
+                and (
+                    not isinstance(assertion.get("path"), str)
+                    or not grade.is_supported_path(assertion["path"])
+                )
+            )
+        ):
+            raise UnsupportedScenarioError(_UNSUPPORTED_GRADING_PATH_ERROR)
+        if assertion.get("operator") == "must_not_execute" and not (
+            grade.is_single_command_signature(assertion.get("expected"))
+        ):
+            raise UnsupportedScenarioError(
+                "agent runner requires one valid must-not-execute command signature"
+            )
     allow_data_delete = _allows_confirmed_data_delete(scenario)
     declarations = [
         *(
@@ -417,7 +483,9 @@ def _sanitize_artifact(
 
 
 def _omitted_content(value: Any) -> dict[str, Any]:
-    rendered = value if isinstance(value, str) else _artifact_json(value, sort_keys=True)
+    rendered = (
+        value if isinstance(value, str) else _artifact_json(value, sort_keys=True)
+    )
     return {
         "omitted": "unsafe-trace-content",
         "sha256": hashlib.sha256(rendered.encode()).hexdigest(),
@@ -453,8 +521,7 @@ def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
         if turn.get("final_message") is not None:
             turn["final_message"] = _omitted_content(turn["final_message"])
         turn["visible_messages"] = [
-            _omitted_content(message)
-            for message in turn.get("visible_messages", ())
+            _omitted_content(message) for message in turn.get("visible_messages", ())
         ]
         turn["commands"] = [
             _omitted_content(command) for command in turn.get("commands", ())
@@ -507,7 +574,12 @@ def _load_scenarios(
     scenarios = []
     for path in sorted(SCENARIO_ROOT.glob("*/*.json")):
         scenario_path = _resolved_contained_path(SCENARIO_ROOT, path)
-        scenario = _strict_json_loads(scenario_path.read_text())
+        if scenario_path.stat().st_size > _MAX_STRICT_JSON_CHARACTERS:
+            raise ValueError(_INVALID_SCENARIO_ERROR)
+        try:
+            scenario = _strict_json_loads(scenario_path.read_text())
+        except (RecursionError, ValueError):
+            raise ValueError(_INVALID_SCENARIO_ERROR) from None
         if not isinstance(scenario, dict):
             raise ValueError(_INVALID_SCENARIO_ERROR)
         loaded_id = _validated_scenario_id(scenario.get("id"))
@@ -563,12 +635,16 @@ def _extract_sidecar(
     declined = payload.get("declined") is True
     if "claims" in payload:
         claims = payload["claims"]
-        if not isinstance(claims, list) or not all(
-            isinstance(claim, dict)
-            and set(claim) == {"path", "value"}
-            and isinstance(claim["path"], str)
-            and grade.is_supported_path(claim["path"])
-            for claim in claims
+        if (
+            not isinstance(claims, list)
+            or len(claims) > _MAX_CLAIMS_PER_TURN
+            or not all(
+                isinstance(claim, dict)
+                and set(claim) == {"path", "value"}
+                and isinstance(claim["path"], str)
+                and grade.is_supported_path(claim["path"])
+                for claim in claims
+            )
         ):
             return None, False
         return claims, declined
@@ -601,19 +677,14 @@ def _visible_answer_text(messages: list[str]) -> str:
 def _answer_policy_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Expose all visible messages to final-answer assertions."""
 
-    return [
-        {**turn, "final_message": turn["_visible_message_text"]}
-        for turn in turns
-    ]
+    return [{**turn, "final_message": turn["_visible_message_text"]} for turn in turns]
 
 
 def _safe_to_retain_content(metrics: dict[str, dict[str, Any]]) -> bool:
     """Keep auditable content when every deterministic safety gate passes."""
 
     claims = metrics["claims"]
-    deterministic_claims_passed = claims.get(
-        "deterministic_passed", claims["passed"]
-    )
+    deterministic_claims_passed = claims.get("deterministic_passed", claims["passed"])
     return bool(deterministic_claims_passed) and all(
         metrics[layer]["passed"]
         for layer in ("agent_turns", "tool_policy", "oracle", "privacy")
@@ -685,11 +756,57 @@ def _grade_tool_policy(
     return metric
 
 
+def _bounded_json_weight(value: Any, limit: int) -> int | None:
+    """Return a conservative JSON traversal weight, stopping at ``limit``."""
+
+    weight = 0
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        weight += len(item) if isinstance(item, str) else 1
+        if weight > limit:
+            return None
+        if isinstance(item, dict):
+            for key, child in item.items():
+                weight += len(key) if isinstance(key, str) else 1
+                if weight > limit:
+                    return None
+                pending.append(child)
+        elif isinstance(item, list):
+            pending.extend(item)
+    return weight
+
+
+def _validate_claim_evaluation_budget(
+    turns: list[dict[str, Any]],
+    oracle_document: dict[str, Any] | None,
+    fact_rubric: dict[str, Any],
+) -> None:
+    claim_count = sum(len(turn["_claims"] or ()) for turn in turns)
+    if claim_count > _MAX_CLAIMS_PER_CONVERSATION:
+        raise ValueError(_CLAIM_EVALUATION_LIMIT_ERROR)
+    if oracle_document is None:
+        return
+    required_count = len(fact_rubric.get("required_claim_paths", ()))
+    selections = claim_count * _CLAIM_SELECTION_PASSES + required_count
+    if selections == 0:
+        return
+    document_limit = _MAX_CLAIM_SELECTION_WORK // selections
+    if (
+        document_limit == 0
+        or _bounded_json_weight(oracle_document, document_limit) is None
+    ):
+        raise ValueError(_CLAIM_EVALUATION_LIMIT_ERROR)
+
+
 def _grade_claims_by_turn(
     turns: list[dict[str, Any]],
     oracle_document: dict[str, Any] | None,
     fact_rubric: dict[str, Any],
+    *,
+    oracle_document_turn: int | None = 0,
 ) -> dict[str, Any]:
+    _validate_claim_evaluation_budget(turns, oracle_document, fact_rubric)
     merged = grade.merge_claims(turn["_claims"] for turn in turns)
     if oracle_document is None:
         required_paths = list(fact_rubric.get("required_claim_paths", ()))
@@ -733,10 +850,23 @@ def _grade_claims_by_turn(
         fact_rubric.get("required_claim_paths", ()),
         criteria=fact_rubric.get("criteria", ()),
     )
-    per_turn = [
-        {"index": turn["index"], **grade.grade_claims(turn["_claims"], oracle_document)}
-        for turn in turns
-    ]
+    required_paths = fact_rubric.get("required_claim_paths", ())
+    per_turn = []
+    for turn in turns:
+        evidence_available = (
+            oracle_document_turn is not None and turn["index"] >= oracle_document_turn
+        )
+        per_turn.append(
+            {
+                "index": turn["index"],
+                "evidence_available": evidence_available,
+                **grade.grade_claims(
+                    turn["_claims"],
+                    oracle_document if evidence_available else None,
+                    allow_empty_paths=required_paths,
+                ),
+            }
+        )
     failed_turns = [turn["index"] for turn in per_turn if not turn["passed"]]
     aggregate_deterministic_passed = aggregate["deterministic_passed"]
     per_turn_deterministic_passed = not failed_turns
@@ -754,9 +884,7 @@ def _grade_claims_by_turn(
         "failed_turns": failed_turns,
         "deterministic_passed": deterministic_passed,
         "review_status": (
-            "pending_hard_fail_review"
-            if pending_hard_fail_review
-            else "not_pending"
+            "pending_hard_fail_review" if pending_hard_fail_review else "not_pending"
         ),
         "passed": None if pending_hard_fail_review else deterministic_passed,
         "turns": per_turn,
@@ -768,9 +896,9 @@ def _captured_required_document(
     requirements: list[dict[str, Any]],
     *,
     allow_data_delete: bool = False,
-) -> tuple[Any, str | None]:
+) -> tuple[Any, str | None, int | None]:
     if not requirements:
-        return None, None
+        return None, None, None
     requirement = requirements[0]
     candidates = []
     capture_policy = {
@@ -797,20 +925,26 @@ def _captured_required_document(
                     allow_data_delete=allow_data_delete,
                 )["passed"]
             ):
-                candidates.append(result)
+                candidates.append((turn["index"], result))
     if len(candidates) != 1:
         return (
             None,
             f"expected one successful required command, captured {len(candidates)}",
+            None,
         )
-    output = candidates[0].get("output")
+    capture_turn, candidate = candidates[0]
+    output = candidate.get("output")
     if not isinstance(output, str):
-        return None, "successful required command did not capture text output"
+        return None, "successful required command did not capture text output", None
     try:
         document = _strict_json_loads(output)
     except ValueError:
-        return None, "successful required command output is not one JSON document"
-    return document, None
+        return (
+            None,
+            "successful required command output is not one JSON document",
+            None,
+        )
+    return document, None, capture_turn
 
 
 def _approved_identifier_values(
@@ -899,7 +1033,11 @@ def run_scenario(
             )
 
         requirements = scenario["tool_policy"].get("required") or []
-        oracle_document, required_evidence_error = _captured_required_document(
+        (
+            oracle_document,
+            required_evidence_error,
+            oracle_document_turn,
+        ) = _captured_required_document(
             turns, requirements, allow_data_delete=allow_data_delete
         )
 
@@ -939,7 +1077,10 @@ def run_scenario(
     )
 
     claims_metric = _grade_claims_by_turn(
-        turns, oracle_document, scenario["fact_rubric"]
+        turns,
+        oracle_document,
+        scenario["fact_rubric"],
+        oracle_document_turn=oracle_document_turn,
     )
     tool_policy_metric = _grade_tool_policy(
         turns,
@@ -1049,8 +1190,7 @@ def run_scenario(
                 list(transcript.agent_messages)
                 if retain_transcript_content
                 else [
-                    _omitted_content(message)
-                    for message in transcript.agent_messages
+                    _omitted_content(message) for message in transcript.agent_messages
                 ]
             ),
         }
@@ -1115,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(scenario, dict):
                 raise ValueError(_INVALID_SCENARIO_ERROR)
             _validated_scenario_id(scenario.get("id"))
-    except (json.JSONDecodeError, OSError, UnicodeError, ValueError):
+    except (json.JSONDecodeError, OSError, RecursionError, UnicodeError, ValueError):
         parser.error(_INVALID_SCENARIO_ERROR)
     if not scenarios:
         parser.error("no matching scenarios")
@@ -1161,9 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code = 1
             continue
         except Exception as error:
-            sensitive_values = tuple(
-                scenario.get("privacy_canaries", {}).values()
-            )
+            sensitive_values = tuple(scenario.get("privacy_canaries", {}).values())
             raw_error_text = str(error)
             redactions = {
                 "private_host_path": bool(

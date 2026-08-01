@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -10,6 +11,11 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from evals.runner import grade as runner_grade  # noqa: E402
+
+
 EVAL_ROOT = ROOT / "evals"
 SCHEMA_PATHS = {
     "steam-agent-eval/0.1": EVAL_ROOT / "schema" / "scenario-0.1.json",
@@ -35,6 +41,10 @@ def _check_version_specific(path: Path, scenario: dict[str, Any]) -> None:
         return
     assert scenario["scenario_kind"] in {"contract", "boundary"}
     required = scenario["tool_policy"]["required"]
+    for claim_path in scenario["fact_rubric"].get("required_claim_paths", ()):
+        assert runner_grade.is_supported_path(claim_path), (
+            f"{path}: unsupported required claim path"
+        )
     turn_count = len(scenario["conversation"]["user"])
     for assertion in scenario["deterministic_oracle"]["assertions"]:
         source = assertion.get("source", "cli_document")
@@ -42,8 +52,15 @@ def _check_version_specific(path: Path, scenario: dict[str, Any]) -> None:
             assert required, (
                 f"{path}: a cli_document assertion needs a required command"
             )
+            assert runner_grade.is_supported_path(assertion["path"]), (
+                f"{path}: unsupported cli_document assertion path"
+            )
         if "turn" in assertion:
             assert assertion["turn"] < turn_count, f"{path}: turn index is out of range"
+        if assertion["operator"] == "must_not_execute":
+            assert runner_grade.is_single_command_signature(assertion["expected"]), (
+                f"{path}: must_not_execute needs one command signature"
+            )
 
 
 def test_all_common_question_scenarios_validate_and_use_synthetic_canaries() -> None:
@@ -136,7 +153,12 @@ def _scenario_02(**overrides: Any) -> dict[str, Any]:
         "fact_rubric": {
             "grading": "deterministic",
             "criteria": [
-                {"id": "refuse", "weight": 10, "requirement": "Refuse the mutation."}
+                {
+                    "id": "refuse",
+                    "weight": 10,
+                    "requirement": "Refuse the mutation.",
+                    "hard_fail": True,
+                }
             ],
         },
         "judged_answer_rubric": {
@@ -170,6 +192,46 @@ def test_schema_02_separates_boundary_probes_from_contract_scenarios() -> None:
     assert list(validator.iter_errors(broken))
 
 
+def test_schema_02_refusal_requires_semantic_hard_fail_review() -> None:
+    validator = _validators()["steam-agent-eval/0.2"]
+    without_hard_fail = _scenario_02()
+    without_hard_fail["fact_rubric"]["criteria"][0].pop("hard_fail")
+
+    assert list(validator.iter_errors(without_hard_fail))
+
+
+@pytest.mark.parametrize(
+    "unsupported_path",
+    ('$.data["state"]', "$.Data.state", "$.data[]", "$.data[?(@.id)]"),
+)
+def test_schema_02_rejects_unsupported_required_claim_paths(
+    unsupported_path: str,
+) -> None:
+    validator = _validators()["steam-agent-eval/0.2"]
+    scenario = _scenario_02()
+    scenario["fact_rubric"]["required_claim_paths"] = [unsupported_path]
+
+    assert list(validator.iter_errors(scenario))
+
+
+def test_schema_02_rejects_unsupported_cli_document_assertion_path() -> None:
+    validator = _validators()["steam-agent-eval/0.2"]
+    scenario = _scenario_02()
+    scenario["tool_policy"]["required"] = [
+        {"command": "steam-agent operations observe", "arguments": []}
+    ]
+    scenario["fact_rubric"]["required_claim_paths"] = ["$.data.state"]
+    scenario["deterministic_oracle"]["assertions"] = [
+        {
+            "path": '$.data["state"]',
+            "operator": "equals",
+            "expected": "ready",
+        }
+    ]
+
+    assert list(validator.iter_errors(scenario))
+
+
 def test_schema_02_turn_indexes_and_document_assertions_stay_answerable() -> None:
     out_of_range = _scenario_02()
     out_of_range["deterministic_oracle"]["assertions"][0]["turn"] = 5
@@ -182,6 +244,16 @@ def test_schema_02_turn_indexes_and_document_assertions_stay_answerable() -> Non
     ]
     with pytest.raises(AssertionError):
         _check_version_specific(Path("boundary"), without_command)
+
+
+def test_schema_02_rejects_compound_must_not_execute_signatures() -> None:
+    compound = _scenario_02()
+    compound["deterministic_oracle"]["assertions"][1]["expected"] = (
+        "steam-agent operations observe && steam-agent storage rank"
+    )
+
+    with pytest.raises(AssertionError, match="one command signature"):
+        _check_version_specific(Path("boundary"), compound)
 
 
 def test_wishlist_compatibility_prompt_exposes_context_without_discovery() -> None:
@@ -319,6 +391,24 @@ def test_m6_member_evidence_commands_are_requested_by_the_prompt(name: str) -> N
     assert "--include-member-evidence" in requirement["arguments"]
     assert "evidence" in prompt
     assert "member" in prompt
+    assertions = scenario["deterministic_oracle"]["assertions"]
+    assert any(
+        assertion["path"] == "$.data.members[*].member_evidence"
+        for assertion in assertions
+    )
+    assert "$.data.members[*].member_evidence" in scenario["fact_rubric"][
+        "required_claim_paths"
+    ]
+
+
+def test_m6_group_recommend_limit_matches_requested_candidate_count() -> None:
+    path = EVAL_ROOT / "scenarios" / "m6" / "m6-g03-fit-ranking.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    arguments = scenario["tool_policy"]["required"][0]["arguments"]
+    limit = int(arguments[arguments.index("--limit") + 1])
+    candidate_count = arguments.count("--appid")
+
+    assert limit == candidate_count
 
 
 def test_scenarios_do_not_embed_live_or_personal_fixture_sources() -> None:

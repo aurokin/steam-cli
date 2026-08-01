@@ -115,7 +115,7 @@
         "required_claim_paths": {
           "type": "array",
           "uniqueItems": true,
-          "items": {"type": "string", "pattern": "^\\$\\."}
+          "items": {"$ref": "#/$defs/supportedPath"}
         },
         "criteria": {"$ref": "#/$defs/criteria"}
       }
@@ -172,9 +172,45 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "deterministic_oracle": {
+            "properties": {
+              "assertions": {
+                "contains": {
+                  "type": "object",
+                  "required": ["operator"],
+                  "properties": {"operator": {"const": "refusal_expected"}}
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "fact_rubric": {
+            "properties": {
+              "criteria": {
+                "contains": {
+                  "type": "object",
+                  "required": ["hard_fail"],
+                  "properties": {"hard_fail": {"const": true}}
+                }
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
+    "supportedPath": {
+      "type": "string",
+      "pattern": "^\\$\\.(?:[a-z_][a-z0-9_]*(?:\\[(?:\\*|\\d+|\\?\\(@\\.[a-z_]+==(?:\\d+|'[^'\\[\\]]+')\\))\\])*)(?:\\.(?:[a-z_][a-z0-9_]*(?:\\[(?:\\*|\\d+|\\?\\(@\\.[a-z_]+==(?:\\d+|'[^'\\[\\]]+')\\))\\])*))*(?![\\s\\S])"
+    },
     "assertion": {
       "type": "object",
       "additionalProperties": false,
@@ -262,7 +298,7 @@
           },
           "then": {
             "properties": {
-              "path": {"pattern": "^\\$\\."},
+              "path": {"$ref": "#/$defs/supportedPath"},
               "operator": {
                 "enum": [
                   "equals",

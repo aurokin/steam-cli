@@ -52,13 +52,27 @@ INVALID_DIRECT_TIMEOUTS = (
     pytest.param(-1.0, id="negative"),
     pytest.param(True, id="true"),
     pytest.param(False, id="false"),
+    pytest.param(
+        codex_driver._MAX_TIMEOUT_SECONDS + 1,  # noqa: SLF001
+        id="over-maximum",
+    ),
+    pytest.param(1e308, id="platform-overflow"),
     pytest.param("private-timeout-value", id="nonnumeric"),
 )
 
 
 @pytest.mark.parametrize(
     "timeout_value",
-    ("nan", "inf", "+inf", "-inf", "0", "-0.1", "private-timeout-value"),
+    (
+        "nan",
+        "inf",
+        "+inf",
+        "-inf",
+        "0",
+        "-0.1",
+        "1e308",
+        "private-timeout-value",
+    ),
 )
 def test_live_runner_rejects_invalid_timeout_before_loading_or_writing(
     timeout_value: str,
@@ -75,9 +89,7 @@ def test_live_runner_rejects_invalid_timeout_before_loading_or_writing(
     monkeypatch.setattr(runner_main, "RESULTS_ROOT", results_root)
 
     with pytest.raises(SystemExit) as captured:
-        runner_main.main(
-            ["--scenario", "m7-b01", f"--timeout-seconds={timeout_value}"]
-        )
+        runner_main.main(["--scenario", "m7-b01", f"--timeout-seconds={timeout_value}"])
 
     assert captured.value.code == 2
     stderr = capsys.readouterr().err  # type: ignore[attr-defined]
@@ -111,6 +123,12 @@ def test_codex_driver_rejects_invalid_timeout_before_process_setup(
         )
 
     assert str(captured.value) == codex_driver._INVALID_TIMEOUT_ERROR  # noqa: SLF001
+
+
+def test_codex_driver_accepts_maximum_timeout() -> None:
+    maximum = codex_driver._MAX_TIMEOUT_SECONDS  # noqa: SLF001
+
+    assert codex_driver.validate_timeout_seconds(maximum) == maximum
 
 
 @pytest.mark.parametrize("timeout_seconds", INVALID_DIRECT_TIMEOUTS)
@@ -350,9 +368,7 @@ def test_leading_assignments_cannot_poison_the_frozen_launcher(
     ),
 )
 @pytest.mark.parametrize("option", ("-c", "-lc"))
-def test_one_trusted_absolute_shell_wrapper_is_allowed(
-    shell: str, option: str
-) -> None:
+def test_one_trusted_absolute_shell_wrapper_is_allowed(shell: str, option: str) -> None:
     command = (
         f"{shell} {option} 'command ./bin/steam-agent operations observe "
         "--machine=synthetic-machine'"
@@ -435,9 +451,7 @@ def test_only_the_bare_frozen_path_executable_is_allowed(executable: str) -> Non
 def test_shell_wrapper_rejects_untrusted_absolute_and_relative_lookalikes(
     shell: str,
 ) -> None:
-    command = (
-        f"{shell} -c 'steam-agent operations observe --machine synthetic-machine'"
-    )
+    command = f"{shell} -c 'steam-agent operations observe --machine synthetic-machine'"
 
     assert grade.normalized_steam_agent_argv(command) is None
     assert not grade.grade_tool_policy([command], POLICY)["passed"]
@@ -445,8 +459,7 @@ def test_shell_wrapper_rejects_untrusted_absolute_and_relative_lookalikes(
 
 def test_bare_shell_wrapper_is_diagnostic_only_and_cannot_approve_a_call() -> None:
     command = (
-        "zsh -lc './bin/steam-agent operations observe "
-        "--machine synthetic-machine'"
+        "zsh -lc './bin/steam-agent operations observe --machine synthetic-machine'"
     )
 
     assert (
@@ -475,7 +488,9 @@ def test_bare_shell_wrapper_is_diagnostic_only_and_cannot_approve_a_call() -> No
         "sudo ./bin/steam-agent operations observe --machine synthetic-machine",
     ),
 )
-def test_trusted_absolute_shell_wrapper_preserves_fail_closed_payload(payload: str) -> None:
+def test_trusted_absolute_shell_wrapper_preserves_fail_closed_payload(
+    payload: str,
+) -> None:
     command = f'/bin/zsh -lc "{payload}"'
 
     assert (
@@ -695,9 +710,7 @@ def test_private_host_path_scanner_is_conservative_for_ambiguous_prose() -> None
     assert grade.find_private_host_paths(text) == [
         "/Users/example/My File notes continue"
     ]
-    assert grade.redact_private_host_paths(text) == (
-        "Observed <redacted-host-path>"
-    )
+    assert grade.redact_private_host_paths(text) == ("Observed <redacted-host-path>")
 
 
 def test_incomplete_unc_prefix_does_not_hide_nested_posix_path() -> None:
@@ -805,6 +818,30 @@ def test_large_escaped_path_surface_fails_closed_before_span_mapping(
 
     assert grade.find_private_host_paths(text) == [text]
     assert grade.redact_private_host_paths(text) == "<redacted-host-path>"
+
+
+def test_dense_literal_path_surface_fails_closed_at_span_bound() -> None:
+    text = "/a; " * (grade._MAX_PRIVATE_PATH_SPANS + 1)  # noqa: SLF001
+
+    assert grade.find_private_host_paths(text) == [text]
+    assert grade.redact_private_host_paths(text) == "<redacted-host-path>"
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    (
+        "%2FUsers%2Falice%2FSteam%2Fconfig",
+        "C:%5CUsers%5Calice%5CSteam%5Cconfig",
+        "%43%3A%5CUsers%5Calice%5CSteam%5Cconfig",
+        "%5C%5Cserver%5Cshare%5CSteam%5Cconfig",
+    ),
+)
+def test_standalone_percent_encoded_absolute_paths_are_private(
+    private_path: str,
+) -> None:
+    assert grade.find_private_host_paths(private_path) == [private_path]
+    assert grade.redact_private_host_paths(private_path) == "<redacted-host-path>"
+    assert not grade.grade_privacy(private_path, {})["passed"]
 
 
 @pytest.mark.parametrize(
@@ -925,9 +962,7 @@ def test_help_call_does_not_satisfy_a_required_mutating_command() -> None:
         ["./bin/steam-agent sync installed --help"],
         {
             "allowed": ["steam-agent sync installed"],
-            "required": [
-                {"command": "steam-agent sync installed", "arguments": []}
-            ],
+            "required": [{"command": "steam-agent sync installed", "arguments": []}],
             "prohibited": [],
         },
         expected_executable="./bin/steam-agent",
@@ -1219,6 +1254,26 @@ def test_must_not_execute_does_not_match_quoted_command_text() -> None:
     assert result["passed"], result["failed"]
 
 
+@pytest.mark.parametrize(
+    "signature",
+    (
+        "steam-agent operations observe && steam-agent storage rank",
+        "ONLY_AN_ASSIGNMENT=value",
+    ),
+)
+def test_must_not_execute_rejects_invalid_command_signatures(
+    signature: str,
+) -> None:
+    result = grade.grade_assertions(
+        _trace_oracle(signature),
+        document=None,
+        turns=[_turn("steam-agent operations observe --machine synthetic-machine")],
+    )
+
+    assert not result["passed"]
+    assert result["failed"][0]["reason"] == ("invalid_must_not_execute_signature")
+
+
 def test_fact_coverage_rejects_a_trivial_supported_claim() -> None:
     document = {"data": {"required": "unknown", "incidental": 1}}
     criteria = [
@@ -1347,8 +1402,9 @@ def test_fact_coverage_accepts_paths_selecting_the_same_concrete_locations(
     assert result["satisfied_required_paths"] == [required_path]
 
 
-def test_fact_coverage_does_not_let_one_concrete_claim_cover_a_larger_projection(
-) -> None:
+def test_fact_coverage_does_not_let_one_concrete_claim_cover_a_larger_projection() -> (
+    None
+):
     document = {
         "data": {
             "items": [
@@ -1407,8 +1463,7 @@ def test_fact_coverage_does_not_equate_distinct_locations_with_equal_values() ->
     assert result["missing_required_paths"] == ["$.data.required"]
 
 
-def test_fact_coverage_does_not_equate_empty_projections_from_distinct_paths(
-) -> None:
+def test_fact_coverage_does_not_equate_empty_projections_from_distinct_paths() -> None:
     document = {"data": {"required": [], "incidental": []}}
 
     result = grade.grade_fact_coverage(
@@ -1419,6 +1474,36 @@ def test_fact_coverage_does_not_equate_empty_projections_from_distinct_paths(
 
     assert not result["passed"]
     assert result["missing_required_paths"] == ["$.data.required[*]"]
+
+
+def test_fact_coverage_accepts_an_authored_truthful_empty_projection() -> None:
+    document = {"data": {"required": []}}
+    required_path = "$.data.required[*]"
+
+    result = grade.grade_fact_coverage(
+        [{"path": required_path, "value": []}],
+        document,
+        [required_path],
+    )
+
+    assert result["passed"], result
+    assert result["satisfied_required_paths"] == [required_path]
+
+
+def test_claims_reject_an_unauthored_empty_selection() -> None:
+    document = {"data": {"results": [{"appid": 1, "state": "ready"}]}}
+
+    result = grade.grade_claims(
+        [
+            {
+                "path": "$.data.results[?(@.appid==999)].state",
+                "value": [],
+            }
+        ],
+        document,
+    )
+
+    assert not result["passed"]
 
 
 @pytest.mark.parametrize(
@@ -1479,9 +1564,7 @@ def test_one_of_accepts_nonempty_arrays(expected: list[str], passed: bool) -> No
         "expected": expected,
     }
 
-    assert (
-        grade.evaluate_assertion({"data": {"state": "ready"}}, assertion) is passed
-    )
+    assert grade.evaluate_assertion({"data": {"state": "ready"}}, assertion) is passed
 
 
 def test_json_number_semantics_still_equate_integers_and_floats() -> None:

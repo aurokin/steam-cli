@@ -14,6 +14,7 @@ runtime and package paths needed by the frozen CLI launcher.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -85,11 +86,16 @@ _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
 _VERSION_ERROR = "required codex app-server version is unavailable"
 _POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
 _PROCESS_CLEANUP_ERROR = "app-server process group did not terminate"
-_INVALID_TIMEOUT_ERROR = "timeout must be a finite positive number"
+_INVALID_TIMEOUT_ERROR = "timeout is outside the supported range"
+_MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 _PERMISSION_PROFILE = "steam-agent-eval"
 _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
+# A response may be preceded by notifications, but retaining a frame-count
+# limited queue prevents small valid frames from amplifying into unbounded
+# Python objects or post-response drain work.
+_MAX_PENDING_NOTIFICATIONS = 4096
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
 _PROTOCOL_WRITE_ERROR = "failed to write app-server protocol message"
 _INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
@@ -228,7 +234,11 @@ def validate_timeout_seconds(value: str | int | float) -> float:
         timeout_seconds = float(value)
     except (OverflowError, TypeError, ValueError):
         raise ValueError(_INVALID_TIMEOUT_ERROR) from None
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+    if (
+        not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+        or timeout_seconds > _MAX_TIMEOUT_SECONDS
+    ):
         raise ValueError(_INVALID_TIMEOUT_ERROR)
     return timeout_seconds
 
@@ -285,9 +295,7 @@ def run_agent_conversation(
             _terminate_process_group(process)
 
 
-def _app_server_environment(
-    isolated_home: Path, workspace: Path
-) -> dict[str, str]:
+def _app_server_environment(isolated_home: Path, workspace: Path) -> dict[str, str]:
     """Build a non-secret process environment independent of thread policy.
 
     The App Server gets only authentication copied into its isolated
@@ -394,18 +402,11 @@ def _python_framework_binary() -> Path | None:
     prefix = sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX")
     version = sysconfig.get_config_var("VERSION")
     if not (
-        isinstance(prefix, str)
-        and prefix
-        and isinstance(version, str)
-        and version
+        isinstance(prefix, str) and prefix and isinstance(version, str) and version
     ):
         return None
     return (
-        Path(prefix)
-        / f"{framework}.framework"
-        / "Versions"
-        / version
-        / framework
+        Path(prefix) / f"{framework}.framework" / "Versions" / version / framework
     ).resolve()
 
 
@@ -426,9 +427,7 @@ def _permission_profile_toml() -> str:
         for path, access in _permission_filesystem_rules().items()
     )
     return (
-        '{extends=":workspace",filesystem={'
-        + filesystem
-        + "},network={enabled=false}}"
+        '{extends=":workspace",filesystem={' + filesystem + "},network={enabled=false}}"
     )
 
 
@@ -459,9 +458,7 @@ def _terminate_process_group(
         except ProcessLookupError:
             pass
         kill_deadline = time.monotonic() + timeout_seconds
-        group_gone = _wait_for_process_group_exit(
-            process, process_group, kill_deadline
-        )
+        group_gone = _wait_for_process_group_exit(process, process_group, kill_deadline)
     try:
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -679,9 +676,7 @@ def _validate_thread_boundary(response: dict[str, Any], workspace: str) -> None:
         and response.get("cwd") == workspace
         and response.get("approvalPolicy") == "never"
         and response.get("approvalsReviewer") == "user"
-        and _validate_active_permission_profile(
-            response.get("activePermissionProfile")
-        )
+        and _validate_active_permission_profile(response.get("activePermissionProfile"))
         and response.get("runtimeWorkspaceRoots") == [workspace]
         and _instruction_sources_are_local(instruction_sources, workspace)
         and _validate_sandbox_boundary(response.get("sandbox"))
@@ -697,9 +692,7 @@ def _validate_settings_boundary(settings: dict[str, Any], workspace: str) -> Non
         settings.get("cwd") == workspace
         and settings.get("approvalPolicy") == "never"
         and settings.get("approvalsReviewer") == "user"
-        and _validate_active_permission_profile(
-            settings.get("activePermissionProfile")
-        )
+        and _validate_active_permission_profile(settings.get("activePermissionProfile"))
         and _validate_sandbox_boundary(settings.get("sandboxPolicy"))
     )
     if not valid:
@@ -851,17 +844,13 @@ def _validate_permission_profile_config(config: dict[str, Any]) -> bool:
         "allow_local_binding": None,
         "mitm": None,
     }
-    return (
-        config.get("default_permissions") == _PERMISSION_PROFILE
-        and profile
-        == {
-            "description": None,
-            "extends": ":workspace",
-            "workspace_roots": None,
-            "filesystem": filesystem,
-            "network": network,
-        }
-    )
+    return config.get("default_permissions") == _PERMISSION_PROFILE and profile == {
+        "description": None,
+        "extends": ":workspace",
+        "workspace_roots": None,
+        "filesystem": filesystem,
+        "network": network,
+    }
 
 
 def _validate_shell_environment_policy(policy: Any, workspace: str) -> bool:
@@ -998,9 +987,9 @@ def _item_event(method: str, item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         return {"method": method, "item": {"type": "<unrecognized>"}}
     item_type = item.get("type")
-    known_types = _INFORMATIONAL_ITEM_TYPES | _DISALLOWED_ITEM_TYPES | {
-        "commandExecution"
-    }
+    known_types = (
+        _INFORMATIONAL_ITEM_TYPES | _DISALLOWED_ITEM_TYPES | {"commandExecution"}
+    )
     structural_type = item_type if item_type in known_types else "<unrecognized>"
     event: dict[str, Any] = {"method": method, "item": {"type": structural_type}}
     status = item.get("status")
@@ -1227,8 +1216,7 @@ def _collect_turn(
                     }
                 )
         elif (
-            method == "thread/settings/updated"
-            and params.get("threadId") == thread_id
+            method == "thread/settings/updated" and params.get("threadId") == thread_id
         ):
             settings = params.get("threadSettings", {})
             _validate_settings_boundary(settings, workspace)
@@ -1460,7 +1448,7 @@ class _Session:
         self._stdout = stdout
         self._deadline = time.monotonic() + timeout_seconds
         self._next_id = 0
-        self._pending_notifications: list[Any] = []
+        self._pending_notifications: deque[Any] = deque()
         self._server_requests: dict[tuple[type[Any], Any], bool] = {}
         self._buffer = bytearray()
         self._turn_input_bytes = 0
@@ -1484,11 +1472,15 @@ class _Session:
             message = self._prepare_incoming(self._read_line())
             if isinstance(message, dict) and "method" not in message:
                 return _validated_response_result(message, request_id, method)
+            if len(self._pending_notifications) >= _MAX_PENDING_NOTIFICATIONS:
+                self._raise_input_limit()
             self._pending_notifications.append(message)
 
     def read_message(self) -> Any:
+        if time.monotonic() >= self._deadline:
+            raise CodexProtocolError("timed out waiting for app-server")
         if self._pending_notifications:
-            return self._pending_notifications.pop(0)
+            return self._pending_notifications.popleft()
         return self._prepare_incoming(self._read_line())
 
     def assert_quiescent(self) -> None:
@@ -1496,7 +1488,7 @@ class _Session:
 
         while True:
             if self._pending_notifications:
-                message = self._pending_notifications.pop(0)
+                message = self._pending_notifications.popleft()
             else:
                 # thread/read is the ordering barrier. Polling once at zero
                 # timeout drains only bytes that are already observable after
@@ -1514,6 +1506,8 @@ class _Session:
                 message = self._prepare_incoming(raw_message)
             if not _is_harmless_global_notification(message):
                 self._raise_post_turn_activity()
+            if time.monotonic() >= self._deadline:
+                raise CodexProtocolError("timed out waiting for app-server")
 
     def _prepare_incoming(self, message: Any) -> Any:
         if not isinstance(message, dict):
@@ -1556,7 +1550,9 @@ class _Session:
         wire_id = request_id if request_key is not None else None
         self._write({"jsonrpc": "2.0", "id": wire_id, **response})
 
-        ordering_valid = request_key is not None and request_key not in self._server_requests
+        ordering_valid = (
+            request_key is not None and request_key not in self._server_requests
+        )
         if ordering_valid:
             self._server_requests[request_key] = False
         scoped = params if isinstance(params, dict) else {}
@@ -1613,12 +1609,10 @@ class _Session:
             if remaining_seconds <= 0:
                 raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
             try:
-                _, writable, _ = select.select(
-                    [], [descriptor], [], remaining_seconds
-                )
+                _, writable, _ = select.select([], [descriptor], [], remaining_seconds)
             except InterruptedError:
                 continue
-            except (OSError, ValueError):
+            except (OSError, OverflowError, ValueError):
                 raise CodexProtocolError(_PROTOCOL_WRITE_ERROR) from None
             if not writable:
                 raise CodexProtocolError(_PROTOCOL_WRITE_ERROR)
@@ -1704,8 +1698,7 @@ class _Session:
     def _charge_input(self, consumed: int) -> None:
         if (
             self._turn_input_bytes + consumed > _MAX_TURN_INPUT_BYTES
-            or self._conversation_input_bytes + consumed
-            > _MAX_CONVERSATION_INPUT_BYTES
+            or self._conversation_input_bytes + consumed > _MAX_CONVERSATION_INPUT_BYTES
         ):
             self._raise_input_limit()
         self._turn_input_bytes += consumed

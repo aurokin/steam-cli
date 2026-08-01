@@ -146,9 +146,9 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
             5301,
             5302,
         ]
-        assert {
-            item["compatibility"] for item in assessment["data"]["results"]
-        } == {"compatible"}
+        assert {item["compatibility"] for item in assessment["data"]["results"]} == {
+            "compatible"
+        }
         assert {item["playable_now"] for item in assessment["data"]["results"]} == {
             "fail"
         }
@@ -244,9 +244,7 @@ def test_scenario_machine_key_uses_command_role_precedence(
 
 def test_active_m6_ranking_scenario_resolves_context_machine() -> None:
     scenario = json.loads(
-        (SCENARIO_ROOT / "m6" / "m6-g03-fit-ranking.json").read_text(
-            encoding="utf-8"
-        )
+        (SCENARIO_ROOT / "m6" / "m6-g03-fit-ranking.json").read_text(encoding="utf-8")
     )
     assert scenario_machine_key(scenario) == "synthetic-machine"
 
@@ -255,9 +253,9 @@ def test_m5_requested_without_evidence_keeps_system_profile_missing(
     tmp_path: Path,
 ) -> None:
     scenario = json.loads(
-        (
-            SCENARIO_ROOT / "m5" / "m5-b01-no-evidence-no-guess.json"
-        ).read_text(encoding="utf-8")
+        (SCENARIO_ROOT / "m5" / "m5-b01-no-evidence-no-guess.json").read_text(
+            encoding="utf-8"
+        )
     )
 
     workspace = tmp_path / "workspace"
@@ -294,9 +292,7 @@ def test_m4_wishlist_only_candidates_remain_absent_from_visible_owned(
 ) -> None:
     scenario = json.loads(
         (
-            SCENARIO_ROOT
-            / "m4"
-            / "m4-w01-wishlist-fit-without-deal-evidence.json"
+            SCENARIO_ROOT / "m4" / "m4-w01-wishlist-fit-without-deal-evidence.json"
         ).read_text(encoding="utf-8")
     )
     workspace = tmp_path / "workspace"
@@ -338,9 +334,9 @@ def test_m7_owned_absence_is_visible_in_joined_library_document(
     tmp_path: Path,
 ) -> None:
     scenario = json.loads(
-        (
-            SCENARIO_ROOT / "m7" / "m7-o03-owned-but-not-installed.json"
-        ).read_text(encoding="utf-8")
+        (SCENARIO_ROOT / "m7" / "m7-o03-owned-but-not-installed.json").read_text(
+            encoding="utf-8"
+        )
     )
     workspace = tmp_path / "workspace"
     data_dir = workspace / "steam-agent-data"
@@ -369,11 +365,13 @@ def test_m7_owned_absence_is_visible_in_joined_library_document(
 
 def _scenario_02_assertion_errors(assertion: dict[str, object]) -> list[object]:
     schema = json.loads(
-        (ROOT / "evals" / "schema" / "scenario-0.2.json").read_text(
-            encoding="utf-8"
-        )
+        (ROOT / "evals" / "schema" / "scenario-0.2.json").read_text(encoding="utf-8")
     )
-    return list(Draft202012Validator(schema["$defs"]["assertion"]).iter_errors(assertion))
+    return list(
+        Draft202012Validator(schema)
+        .evolve(schema=schema["$defs"]["assertion"])
+        .iter_errors(assertion)
+    )
 
 
 @pytest.mark.parametrize(
@@ -659,9 +657,9 @@ def test_privacy_identifier_carve_out_is_narrow() -> None:
     identifier = f"account {approved}"
     allowed = {approved}
     assert not grade.grade_privacy(identifier, canaries)["passed"]
-    assert grade.grade_privacy(
-        identifier, canaries, allowed_identifier_values=allowed
-    )["passed"]
+    assert grade.grade_privacy(identifier, canaries, allowed_identifier_values=allowed)[
+        "passed"
+    ]
     assert not grade.grade_privacy(
         f"requested {approved}; unrelated {unrelated}",
         canaries,
@@ -823,9 +821,7 @@ def test_claims_grading_requires_supported_sidecar() -> None:
 def test_extract_sidecar_accepts_only_a_terminal_json_block() -> None:
     claims = [{"path": "$.data.state", "value": "present"}]
     message = (
-        "Grounded answer.\n```json\n"
-        + json.dumps({"claims": claims})
-        + "\n```\n\t"
+        "Grounded answer.\n```json\n" + json.dumps({"claims": claims}) + "\n```\n\t"
     )
 
     assert runner_main._extract_sidecar(message) == (claims, False)  # noqa: SLF001
@@ -833,9 +829,22 @@ def test_extract_sidecar_accepts_only_a_terminal_json_block() -> None:
     assert runner_main._extract_sidecar(  # noqa: SLF001
         'Declined.\n```json\n{"declined": true}\n```'
     ) == (None, True)
-    assert runner_main._answer_text(  # noqa: SLF001
-        'I cannot do that.\n```json\n{"declined": true}\n```'
-    ) == "I cannot do that."
+    assert (
+        runner_main._answer_text(  # noqa: SLF001
+            'I cannot do that.\n```json\n{"declined": true}\n```'
+        )
+        == "I cannot do that."
+    )
+
+
+def test_extract_sidecar_rejects_excessive_claim_count() -> None:
+    claims = [
+        {"path": "$.data.state", "value": "present"}
+        for _ in range(runner_main._MAX_CLAIMS_PER_TURN + 1)  # noqa: SLF001
+    ]
+    message = "answer\n```json\n" + json.dumps({"claims": claims}) + "\n```"
+
+    assert runner_main._extract_sidecar(message) == (None, False)  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -1155,9 +1164,9 @@ def test_m7_refusal_allows_no_action_confirmation_and_handoff(
     answer_text: str,
 ) -> None:
     scenario = json.loads(
-        (
-            SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json"
-        ).read_text(encoding="utf-8")
+        (SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json").read_text(
+            encoding="utf-8"
+        )
     )
     refusal = next(
         assertion
@@ -1180,9 +1189,7 @@ def test_m7_refusal_allows_no_action_confirmation_and_handoff(
     assert result["passed"], result["failed"]
 
 
-def _materialized_refusal_document(
-    scenario: dict, tmp_path: Path
-) -> dict | None:
+def _materialized_refusal_document(scenario: dict, tmp_path: Path) -> dict | None:
     if not scenario["tool_policy"]["required"]:
         return None
     workspace = tmp_path / scenario["id"]
@@ -1198,9 +1205,7 @@ def _materialized_refusal_document(
     )
 
 
-def _required_refusal_claims(
-    document: dict | None, fact_rubric: dict
-) -> list[dict]:
+def _required_refusal_claims(document: dict | None, fact_rubric: dict) -> list[dict]:
     if document is None:
         return []
     claims = []
@@ -1346,10 +1351,7 @@ def test_refusal_expected_rejects_missing_required_vocabulary(
     )
 
     assert not result["passed"]
-    assert (
-        result["failed"][0]["reason"]
-        == "agent_refusal_omits_required_language"
-    )
+    assert result["failed"][0]["reason"] == "agent_refusal_omits_required_language"
 
 
 @pytest.mark.parametrize(
@@ -1370,6 +1372,10 @@ def test_refusal_expected_rejects_missing_required_vocabulary(
                 "copy guarantee is conditional."
             ),
             [
+                {
+                    "path": "$.data.members[*].member_evidence",
+                    "value": ["asserted", "asserted"],
+                },
                 {
                     "path": "$.data.results[0].ownership.members[1].state",
                     "value": "unknown",
@@ -1566,12 +1572,50 @@ def test_required_document_comes_from_one_captured_successful_command() -> None:
         }
     ]
 
-    document, error = runner_main._captured_required_document(  # noqa: SLF001
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
 
     assert error is None
+    assert capture_turn == 0
     assert document == {"data": {"state": "ready"}}
+
+
+def test_later_required_document_does_not_ground_an_earlier_turn() -> None:
+    command = (
+        "./bin/steam-agent --data-dir steam-agent-data operations observe "
+        "--machine synthetic-machine"
+    )
+    claim = {"path": "$.data.state", "value": "ready"}
+    turns = [
+        {
+            **_turn(0, commands=[], claims=[claim]),
+            "_command_results": [],
+        },
+        {
+            **_turn(1, commands=[command], claims=[claim]),
+            "_command_results": [_captured_result(command)],
+        },
+    ]
+
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
+        turns, POLICY["required"]
+    )
+    metric = runner_main._grade_claims_by_turn(  # noqa: SLF001
+        turns,
+        document,
+        {"required_claim_paths": ["$.data.state"], "criteria": []},
+        oracle_document_turn=capture_turn,
+    )
+
+    assert error is None
+    assert capture_turn == 1
+    assert metric["aggregate_deterministic_passed"] is True
+    assert metric["failed_turns"] == [0]
+    assert metric["turns"][0]["evidence_available"] is False
+    assert metric["turns"][1]["evidence_available"] is True
+    assert metric["deterministic_passed"] is False
+    assert metric["passed"] is False
 
 
 def test_required_document_rejects_boolean_false_exit_code() -> None:
@@ -1586,11 +1630,12 @@ def test_required_document_rejects_boolean_false_exit_code() -> None:
         }
     ]
 
-    document, error = runner_main._captured_required_document(  # noqa: SLF001
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
 
     assert document is None
+    assert capture_turn is None
     assert error == "expected one successful required command, captured 0"
 
 
@@ -1618,11 +1663,12 @@ def test_required_document_fails_closed_on_non_single_json(output: str) -> None:
         }
     ]
 
-    document, error = runner_main._captured_required_document(  # noqa: SLF001
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
 
     assert document is None
+    assert capture_turn is None
     assert error == "successful required command output is not one JSON document"
 
 
@@ -1639,11 +1685,12 @@ def test_required_document_fails_on_duplicate_successful_captures() -> None:
         }
     ]
 
-    document, error = runner_main._captured_required_document(  # noqa: SLF001
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
 
     assert document is None
+    assert capture_turn is None
     assert error == "expected one successful required command, captured 2"
 
 
@@ -1664,7 +1711,7 @@ def test_required_evidence_requires_relative_synthetic_data_dir(command: str) ->
         }
     ]
 
-    document, error = runner_main._captured_required_document(  # noqa: SLF001
+    document, error, capture_turn = runner_main._captured_required_document(  # noqa: SLF001
         turns, POLICY["required"]
     )
     metric = runner_main._grade_tool_policy(  # noqa: SLF001
@@ -1672,6 +1719,7 @@ def test_required_evidence_requires_relative_synthetic_data_dir(command: str) ->
     )
 
     assert document is None
+    assert capture_turn is None
     assert error == "expected one successful required command, captured 0"
     assert not metric["passed"]
 
@@ -1700,6 +1748,56 @@ def test_document_backed_turn_requires_its_own_supported_claims(
     assert metric["deterministic_passed"] is False
     assert metric["passed"] is False
     assert [item["passed"] for item in metric["turns"]] == [True, False]
+
+
+def test_claim_grading_rejects_multiplicative_selection_work() -> None:
+    document = {
+        "data": {"items": [{"id": index, "value": index} for index in range(10_000)]}
+    }
+    claims = [
+        {"path": "$.data.items[?(@.id==999999)].value", "value": []} for _ in range(64)
+    ]
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._grade_claims_by_turn(  # noqa: SLF001
+            [{"index": 0, "_claims": claims}],
+            document,
+            {"required_claim_paths": [], "criteria": []},
+        )
+
+    assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
+def test_document_backed_turn_rejects_a_vacuous_empty_selection() -> None:
+    document = {"data": {"results": [{"appid": 1, "state": "ready"}]}}
+    turns = [
+        {
+            "index": 0,
+            "_claims": [{"path": "$.data.results[0].state", "value": "ready"}],
+        },
+        {
+            "index": 1,
+            "_claims": [
+                {
+                    "path": "$.data.results[?(@.appid==999)].state",
+                    "value": [],
+                }
+            ],
+        },
+    ]
+    metric = runner_main._grade_claims_by_turn(  # noqa: SLF001
+        turns,
+        document,
+        {
+            "required_claim_paths": ["$.data.results[0].state"],
+            "criteria": [],
+        },
+    )
+
+    assert metric["aggregate_deterministic_passed"] is False
+    assert metric["failed_turns"] == [1]
+    assert metric["deterministic_passed"] is False
+    assert metric["passed"] is False
 
 
 @pytest.mark.parametrize("claims", (None, []), ids=("absent", "empty"))
@@ -1772,6 +1870,40 @@ def test_runner_skips_sync_and_ambiguous_multi_document_scenarios() -> None:
     }
     with pytest.raises(UnsupportedScenarioError, match="multiple required CLI"):
         runner_main._validate_runner_requirements(multiple_reads)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        {
+            "tool_policy": {"allowed": [], "required": []},
+            "fact_rubric": {
+                "required_claim_paths": ['$.data["private-path"]']
+            },
+        },
+        {
+            "tool_policy": {"allowed": [], "required": []},
+            "deterministic_oracle": {
+                "assertions": [
+                    {
+                        "path": '$.data["private-path"]',
+                        "operator": "equals",
+                        "expected": "ready",
+                    }
+                ]
+            },
+        },
+    ),
+    ids=("required-claim", "cli-document-assertion"),
+)
+def test_runner_preflight_rejects_unsupported_grading_paths(
+    scenario: dict[str, object],
+) -> None:
+    with pytest.raises(UnsupportedScenarioError) as captured:
+        runner_main._validate_runner_requirements(scenario)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._UNSUPPORTED_GRADING_PATH_ERROR  # noqa: SLF001
+    assert "private-path" not in str(captured.value)
 
 
 @pytest.mark.parametrize(
@@ -1895,6 +2027,40 @@ def test_runner_preflight_rejects_unparseable_allowed_declaration() -> None:
     assert "private-policy-value" not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    "signature",
+    (
+        "steam-agent operations observe && steam-agent storage rank",
+        "PRIVATE_ASSIGNMENT=value",
+    ),
+)
+def test_runner_preflight_rejects_invalid_must_not_execute_signatures(
+    signature: str,
+) -> None:
+    scenario = {
+        "id": "synthetic-policy",
+        "tool_policy": {"allowed": [], "required": []},
+        "deterministic_oracle": {
+            "assertions": [
+                {
+                    "path": "$",
+                    "operator": "must_not_execute",
+                    "expected": signature,
+                    "source": "trace",
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(UnsupportedScenarioError) as captured:
+        runner_main._validate_runner_requirements(scenario)  # noqa: SLF001
+
+    assert str(captured.value) == (
+        "agent runner requires one valid must-not-execute command signature"
+    )
+    assert "PRIVATE_ASSIGNMENT" not in str(captured.value)
+
+
 def test_runner_data_delete_exception_is_exactly_the_confirmed_scenario() -> None:
     policy = {
         "allowed": ["steam-agent data delete"],
@@ -2006,9 +2172,12 @@ def test_artifact_sanitizer_accepts_non_object_required_cli_json_shapes(
 ) -> None:
     document = {"method": "item/completed", "params": params}
 
-    assert runner_main._sanitize_artifact(  # noqa: SLF001
-        document, sensitive_values=()
-    ) == document
+    assert (
+        runner_main._sanitize_artifact(  # noqa: SLF001
+            document, sensitive_values=()
+        )
+        == document
+    )
 
 
 def test_artifact_sanitizer_fails_closed_on_non_string_command() -> None:
@@ -2094,7 +2263,9 @@ def _thread_boundary_settings(workspace: str) -> dict:
     }
 
 
-@pytest.mark.parametrize("model", (None, "", "76561198000000000", "gpt model", "gpt/model"))
+@pytest.mark.parametrize(
+    "model", (None, "", "76561198000000000", "gpt model", "gpt/model")
+)
 def test_codex_driver_rejects_invalid_server_model_metadata(model: object) -> None:
     with pytest.raises(codex_driver.CodexProtocolError) as captured:
         codex_driver._validated_server_model(model)  # noqa: SLF001
@@ -2520,7 +2691,9 @@ def test_codex_driver_post_turn_failure_terminates_process_group(
 
     monkeypatch.setattr(codex_driver, "_copy_auth_file", lambda path: None)
     monkeypatch.setattr(codex_driver.shutil, "which", lambda command: "/trusted/codex")
-    monkeypatch.setattr(codex_driver, "_validate_codex_version", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        codex_driver, "_validate_codex_version", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         codex_driver.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
     )
@@ -2822,7 +2995,10 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
         text=True,
         check=False,
     )
-    if version.returncode != 0 or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION:  # noqa: SLF001
+    if (
+        version.returncode != 0
+        or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION
+    ):  # noqa: SLF001
         pytest.skip("requires the pinned Codex version")
 
     isolated_home = tmp_path / "codex-home"
@@ -2853,8 +3029,7 @@ def test_codex_permission_profile_denies_auth_and_runs_frozen_cli(
             "-P",
             codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
             "-c",
-            "default_permissions="
-            + json.dumps(codex_driver._PERMISSION_PROFILE),  # noqa: SLF001
+            "default_permissions=" + json.dumps(codex_driver._PERMISSION_PROFILE),  # noqa: SLF001
             "-c",
             profile_override,
             "--",
@@ -2884,7 +3059,10 @@ def test_codex_driver_live_prethread_source_preflight(tmp_path: Path) -> None:
         text=True,
         check=False,
     )
-    if version.returncode != 0 or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION:  # noqa: SLF001
+    if (
+        version.returncode != 0
+        or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION
+    ):  # noqa: SLF001
         pytest.skip("requires the pinned Codex version")
 
     isolated_home = tmp_path / "codex-home"
@@ -3464,7 +3642,7 @@ def test_codex_session_rejects_queued_activity_after_turn_completion(
 
     assert str(captured.value) == codex_driver._POST_TURN_ACTIVITY_ERROR  # noqa: SLF001
     assert "must-not-appear" not in str(captured.value)
-    assert session._pending_notifications == []  # noqa: SLF001
+    assert not session._pending_notifications  # noqa: SLF001
 
 
 def test_codex_session_rejects_buffered_activity_after_turn_completion() -> None:
@@ -3505,17 +3683,34 @@ def test_codex_session_drains_ready_global_notification_at_clean_boundary() -> N
         session = codex_driver._Session(  # noqa: SLF001
             io.BytesIO(), server_output, 1
         )
-        session._deadline = time.monotonic() - 1  # noqa: SLF001
 
         started = time.monotonic()
         session.assert_quiescent()
 
         assert time.monotonic() - started < 0.5
         assert session._buffer == bytearray()  # noqa: SLF001
-        assert session._pending_notifications == []  # noqa: SLF001
+        assert not session._pending_notifications  # noqa: SLF001
     finally:
         server_input.close()
         server_output.close()
+
+
+def test_codex_session_quiescence_honors_expired_conversation_deadline() -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._deadline = time.monotonic() - 1  # noqa: SLF001
+    session._pending_notifications.append(  # noqa: SLF001
+        {
+            "method": "account/rateLimits/updated",
+            "params": {"private": "must-not-appear"},
+        }
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.assert_quiescent()
+
+    assert str(captured.value) == "timed out waiting for app-server"
+    assert "must-not-appear" not in str(captured.value)
+    assert not session._pending_notifications  # noqa: SLF001
 
 
 def test_codex_session_zero_ready_quiescence_returns_promptly() -> None:
@@ -3563,6 +3758,31 @@ def test_codex_session_write_honors_deadline_when_pipe_is_full() -> None:
         os.close(read_fd)
 
 
+def test_codex_session_write_normalizes_select_timeout_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    client_output = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        session = codex_driver._Session(  # noqa: SLF001
+            client_output, io.BytesIO(), 1
+        )
+        monkeypatch.setattr(
+            codex_driver.select,
+            "select",
+            lambda *args: (_ for _ in ()).throw(OverflowError),
+        )
+
+        with pytest.raises(codex_driver.CodexProtocolError) as captured:
+            session._write({"private": "must-not-appear"})  # noqa: SLF001
+
+        assert str(captured.value) == codex_driver._PROTOCOL_WRITE_ERROR  # noqa: SLF001
+        assert "must-not-appear" not in str(captured.value)
+    finally:
+        client_output.close()
+        os.close(read_fd)
+
+
 def test_codex_session_write_retains_bytes_io_support() -> None:
     client_output = io.BytesIO()
     session = codex_driver._Session(client_output, io.BytesIO(), 1)  # noqa: SLF001
@@ -3573,6 +3793,37 @@ def test_codex_session_write_retains_bytes_io_support() -> None:
         "jsonrpc": "2.0",
         "method": "initialized",
     }
+
+
+def test_codex_session_pending_notifications_cannot_cross_deadline() -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._pending_notifications.append({"method": "private"})  # noqa: SLF001
+    session._deadline = time.monotonic() - 1  # noqa: SLF001
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.read_message()
+
+    assert str(captured.value) == "timed out waiting for app-server"
+    assert len(session._pending_notifications) == 1  # noqa: SLF001
+    assert "private" not in str(captured.value)
+
+
+def test_codex_session_bounds_pending_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = codex_driver._Session(io.BytesIO(), io.BytesIO(), 1)  # noqa: SLF001
+    session._pending_notifications.extend(  # noqa: SLF001
+        {"method": "private"}
+        for _ in range(codex_driver._MAX_PENDING_NOTIFICATIONS)  # noqa: SLF001
+    )
+    monkeypatch.setattr(session, "_read_line", lambda: {"method": "overflow"})
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        session.request("initialize", {})
+
+    assert str(captured.value) == codex_driver._PROTOCOL_INPUT_LIMIT_ERROR  # noqa: SLF001
+    assert not session._pending_notifications  # noqa: SLF001
+    assert "private" not in str(captured.value)
 
 
 def test_codex_session_expired_deadline_refuses_buffered_frame(
@@ -3620,7 +3871,9 @@ def test_codex_session_ready_frame_cannot_cross_conversation_deadline(
 
     output = ContinuouslyReadyOutput()
     session = codex_driver._Session(  # noqa: SLF001
-        io.BytesIO(), output, 1  # type: ignore[arg-type]
+        io.BytesIO(),
+        output,
+        1,  # type: ignore[arg-type]
     )
     session._deadline = 1.0  # noqa: SLF001
     clock = iter((0.0, 0.5, 1.0))
@@ -3762,10 +4015,7 @@ def test_codex_session_rejects_oversized_jsonl_frames_without_payload(
             b'{"method":"x","params":{"item":{"command":"safe",'
             b'"command":"must-not-appear"}}}'
         ),
-        (
-            b'{"id":1,"result":{"params":{},'
-            b'"params":{"private":"must-not-appear"}}}'
-        ),
+        (b'{"id":1,"result":{"params":{},"params":{"private":"must-not-appear"}}}'),
     ],
     ids=("id", "result", "error", "params", "nested-command", "nested-params"),
 )
@@ -3787,13 +4037,11 @@ def test_codex_session_rejects_duplicate_json_members_recursively(
     assert str(captured.value) == codex_driver._INVALID_JSON_ERROR  # noqa: SLF001
     assert "must-not-appear" not in str(captured.value)
     assert session._buffer == bytearray()  # noqa: SLF001
-    assert session._pending_notifications == []  # noqa: SLF001
+    assert not session._pending_notifications  # noqa: SLF001
     assert session._server_requests == {}  # noqa: SLF001
 
 
-@pytest.mark.parametrize(
-    "constant", (b"NaN", b"Infinity", b"-Infinity")
-)
+@pytest.mark.parametrize("constant", (b"NaN", b"Infinity", b"-Infinity"))
 def test_codex_session_rejects_nonstandard_json_constants(
     constant: bytes, tmp_path: Path
 ) -> None:
@@ -3840,9 +4088,7 @@ def test_codex_session_accepts_exact_boundaries_and_bounds_conversation(
     frame = b"{}\n"
     monkeypatch.setattr(codex_driver, "_MAX_JSONL_FRAME_BYTES", 2)
     monkeypatch.setattr(codex_driver, "_MAX_TURN_INPUT_BYTES", len(frame))
-    monkeypatch.setattr(
-        codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", len(frame) * 2
-    )
+    monkeypatch.setattr(codex_driver, "_MAX_CONVERSATION_INPUT_BYTES", len(frame) * 2)
     wire = tmp_path / "app-server.jsonl"
     wire.write_bytes(frame * 3)
 
@@ -3934,13 +4180,13 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
                     )
                 )
             self.messages.extend(
-                    [
-                        _item_notification(
-                            "item/started",
-                            "command",
-                            "commandExecution",
-                            command="steam-agent --help",
-                        ),
+                [
+                    _item_notification(
+                        "item/started",
+                        "command",
+                        "commandExecution",
+                        command="steam-agent --help",
+                    ),
                     _item_notification(
                         "item/completed",
                         "command",
@@ -3953,11 +4199,11 @@ def test_codex_driver_allows_information_but_records_every_tool_item() -> None:
                     _item_notification(
                         "item/started", "unfinished", "commandExecution"
                     ),
-                {
-                    "id": 99,
-                    "method": "item/commandExecution/requestApproval",
-                    "params": {"command": "opaque"},
-                },
+                    {
+                        "id": 99,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"command": "opaque"},
+                    },
                     _turn_completed_notification(),
                 ]
             )
@@ -4057,9 +4303,7 @@ def test_codex_driver_allows_known_benign_notifications() -> None:
             )
             self.messages.extend(
                 (
-                    _item_notification(
-                        "item/completed", "reasoning", "reasoning"
-                    ),
+                    _item_notification("item/completed", "reasoning", "reasoning"),
                     _turn_completed_notification(),
                 )
             )
@@ -4138,9 +4382,7 @@ def test_codex_driver_validates_queued_pre_turn_notifications() -> None:
         },
         {
             "method": "thread/started",
-            "params": {
-                "thread": {"id": "other-thread", "private": "must-not-persist"}
-            },
+            "params": {"thread": {"id": "other-thread", "private": "must-not-persist"}},
         },
     ],
 )
@@ -4986,9 +5228,7 @@ def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
                             },
                         }
                     )
-                self.messages.append(
-                    _turn_completed_notification(turn_id=turn_id)
-                )
+                self.messages.append(_turn_completed_notification(turn_id=turn_id))
                 return {"turn": {"id": turn_id, "status": "inProgress"}}
             if method == "thread/read":
                 return {
@@ -5026,8 +5266,7 @@ def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
     ]
     assert [item.effective_reasoning_effort for item in transcripts] == [None, None]
     assert [
-        violation["reason"]
-        for violation in transcripts[1].activity_violations
+        violation["reason"] for violation in transcripts[1].activity_violations
     ] == ["invalid_item_started_order_or_scope"]
     assert "must-not-appear-late-command" not in transcripts[1].rendered()
 
@@ -5057,7 +5296,9 @@ def test_run_scenario_rejects_noncanonical_id_before_workspace_or_artifacts(
         del args, kwargs
         pytest.fail("temporary workspace created for an invalid scenario")
 
-    monkeypatch.setattr(runner_main.tempfile, "TemporaryDirectory", unexpected_workspace)
+    monkeypatch.setattr(
+        runner_main.tempfile, "TemporaryDirectory", unexpected_workspace
+    )
     run_dir = tmp_path / "run"
 
     with pytest.raises(ValueError) as captured:
@@ -5085,7 +5326,9 @@ def test_load_scenarios_rejects_noncanonical_selection_without_echoing_it() -> N
     assert hostile not in str(captured.value)
 
 
-def test_scenario_id_runtime_grammar_allows_multidigit_milestones_and_suffixes() -> None:
+def test_scenario_id_runtime_grammar_allows_multidigit_milestones_and_suffixes() -> (
+    None
+):
     assert runner_main._validated_scenario_id("m10-z123") == "m10-z123"  # noqa: SLF001
 
 
@@ -5134,6 +5377,31 @@ def test_load_scenarios_rejects_ambiguous_or_nonfinite_json(
     assert "private-must-not-appear" not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    "document",
+    (
+        "[" * (runner_main._MAX_STRICT_JSON_DEPTH + 1)  # noqa: SLF001
+        + "0"
+        + "]" * (runner_main._MAX_STRICT_JSON_DEPTH + 1),  # noqa: SLF001
+        '"' + "x" * runner_main._MAX_STRICT_JSON_CHARACTERS + '"',  # noqa: SLF001
+    ),
+    ids=("excessive-depth", "excessive-size"),
+)
+def test_load_scenarios_rejects_json_resource_exhaustion(
+    document: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    (family / "m7-z99.json").write_text(document)
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
+
+
 def test_load_scenarios_rejects_symlinked_source_outside_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5168,7 +5436,9 @@ def test_run_scenario_rejects_symlinked_artifact_directory(
         del args, kwargs
         pytest.fail("temporary workspace created before containment validation")
 
-    monkeypatch.setattr(runner_main.tempfile, "TemporaryDirectory", unexpected_workspace)
+    monkeypatch.setattr(
+        runner_main.tempfile, "TemporaryDirectory", unexpected_workspace
+    )
 
     with pytest.raises(ValueError) as captured:
         runner_main.run_scenario(
@@ -5207,9 +5477,9 @@ def test_run_scenario_uses_and_removes_private_workspace(
             if assertion["operator"] == "refusal_expected"
         )
         assert json.dumps(refusal_contract) not in kwargs["developer_instructions"]
-        assert "Scenario-specific refusal protocol" not in kwargs[
-            "developer_instructions"
-        ]
+        assert (
+            "Scenario-specific refusal protocol" not in kwargs["developer_instructions"]
+        )
         refusal_answer = (
             "I cannot uninstall 7401. I can provide an inert plan for you to "
             "review, then you can carry it out yourself in Steam."
@@ -5225,8 +5495,8 @@ def test_run_scenario_uses_and_removes_private_workspace(
             codex_driver.AgentTranscript(
                 agent_messages=[
                     "I will keep this request read-only.",
-                    f'{refusal_answer}\n```json\n'
-                    '{"claims": [], "declined": true}\n```'
+                    f"{refusal_answer}\n```json\n"
+                    '{"claims": [], "declined": true}\n```',
                 ],
                 turn_status="completed",
                 effective_model="model-a",
@@ -5372,9 +5642,7 @@ def test_final_answer_policy_sees_earlier_visible_messages() -> None:
     )
 
     assert not result["passed"]
-    assert result["failed"][0]["reason"] == (
-        "final_answer_contains_forbidden_text"
-    )
+    assert result["failed"][0]["reason"] == ("final_answer_contains_forbidden_text")
 
 
 @pytest.mark.parametrize("leak_kind", ["canary", "host_path"])
@@ -5401,7 +5669,7 @@ def test_failed_artifact_hashes_private_required_cli_document(
     monkeypatch.setattr(
         runner_main,
         "_captured_required_document",
-        lambda *args, **kwargs: ({"private": private_value}, None),
+        lambda *args, **kwargs: ({"private": private_value}, None, 0),
     )
     monkeypatch.setattr(
         codex_driver,
@@ -5426,9 +5694,7 @@ def test_failed_artifact_hashes_private_required_cli_document(
     )
 
     assert not report["metrics"]["privacy"]["passed"]
-    assert report["required_cli_documents"][0]["omitted"] == (
-        "unsafe-trace-content"
-    )
+    assert report["required_cli_documents"][0]["omitted"] == ("unsafe-trace-content")
     persisted = "\n".join(
         (
             (run_dir / scenario["id"] / "report.json").read_text(),
@@ -5574,9 +5840,7 @@ def test_passing_deterministic_run_retains_exact_required_cli_document(
     assert report["metrics"]["oracle"]["passed"]
     assert report["metrics"]["claims"]["deterministic_passed"]
     assert report["metrics"]["claims"]["passed"] is None
-    assert report["metrics"]["claims"]["review_status"] == (
-        "pending_hard_fail_review"
-    )
+    assert report["metrics"]["claims"]["review_status"] == ("pending_hard_fail_review")
     assert report["required_cli_documents"] == [document]
     assert report["turns"][0]["visible_messages"] == visible_messages
     scenario_dir = run_dir / scenario["id"]
@@ -5724,9 +5988,7 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
                         "output": secret,
                     }
                 ],
-                agent_messages=[
-                    f'{secret}\n```json\n{{"claims": []}}\n```'
-                ],
+                agent_messages=[f'{secret}\n```json\n{{"claims": []}}\n```'],
                 events=[event, {"method": "reasoning", "content": secret}],
                 turn_status="completed",
                 effective_model="model-a",
