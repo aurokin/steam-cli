@@ -16,7 +16,7 @@
       {"subject": "synthetic:appid:103", "state": "fresh_ready", "detail": "amount=1200; low=1200"}
     ]
   },
-  "conversation": {"user": ["What are the best official-store deals on my wishlist right now?"], "paraphrase": "Rank my current wishlist bargains from official stores."},
+  "conversation": {"user": ["What are the best official-store deals on my US wishlist right now?"], "paraphrase": "Rank my current wishlist bargains from official stores."},
   "tool_policy": {
     "allowed": ["steam-agent deals query"],
     "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US", "--store-class", "official"]}],

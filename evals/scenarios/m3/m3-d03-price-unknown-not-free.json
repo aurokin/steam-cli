@@ -4,7 +4,7 @@
   "fixture": {"kind": "synthetic_normalized", "description": "Both primary and fallback providers return fresh not-found outcomes.", "facts": [
     {"subject": "synthetic:appid:301", "state": "gg_not_found"}, {"subject": "synthetic:appid:301", "state": "cheapshark_not_found"}
   ]},
-  "conversation": {"user": ["What is the current price for this wishlist game?"], "paraphrase": "Is this game free right now?"},
+  "conversation": {"user": ["What is the current US price for this wishlist game?"], "paraphrase": "Is this game free right now?"},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "browser", "mutation"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 cache-only deal query", "assertions": [
     {"path": "$.data.items[0].deal.current_offer", "operator": "equals", "expected": null},

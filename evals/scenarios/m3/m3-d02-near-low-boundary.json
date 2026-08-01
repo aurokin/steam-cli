@@ -12,12 +12,12 @@
     {"subject": "synthetic:appid:202", "state": "near_low_inside_boundary", "detail": "amount=1050; low=1000"},
     {"subject": "synthetic:appid:203", "state": "outside_near_low_boundary", "detail": "amount=1051; low=1000"}
   ]},
-  "conversation": {"user": ["Which wishlist games are at or near their historical low?"], "paraphrase": "Show only prices that match or nearly match the provider low."},
+  "conversation": {"user": ["Which games on my US wishlist are at or near their historical low?"], "paraphrase": "Show only prices that match or nearly match the provider low."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "full-history-claim", "browser"]},
   "deterministic_oracle": {"recipe_or_contract": "deal-evidence/0.1", "assertions": [
     {"path": "$.data.items[?(@.appid==201)].deal.bucket", "operator": "equals", "expected": "at_or_below_low"},
     {"path": "$.data.items[?(@.appid==202)].deal.bucket", "operator": "equals", "expected": "within_5_percent"},
-    {"path": "$.data.items[?(@.appid==203)].deal.bucket", "operator": "one_of", "expected": ["discounted", "current_only", "noncomparable", "unknown"]}
+    {"path": "$.data.items[?(@.appid==203)].deal.bucket", "operator": "equals", "expected": "current_only"}
   ]},
   "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[?(@.appid==201)].deal.bucket", "$.data.items[?(@.appid==202)].deal.bucket", "$.data.items[?(@.appid==203)].deal.bucket", "$.data.limitations[1]"], "criteria": [
     {"id": "boundary-fidelity", "weight": 5, "requirement": "Classify all three low-boundary cases exactly.", "hard_fail": true},

@@ -18,8 +18,11 @@ a contract corpus, not captured user data and not a live-provider benchmark.
 - `runner/` is the opt-in agent-execution runner: it materializes fixtures
   into a real `--data-dir` cache, drives every scenario turn through one
   Codex App Server thread, and grades the transcript deterministically. Run it
-  with `uv run python -m evals.runner --family m7` (requires a local `codex`
-  binary). Reproducible model comparisons should pin both dimensions, for
+  with `uv run python -m evals.runner --family m7`. Live execution requires a
+  POSIX host (macOS or Linux) and a local `codex` binary; on other hosts the
+  runner exits before loading scenarios or creating result artifacts. This is
+  a runner limitation, not a claim about platform support for the product CLI.
+  Reproducible model comparisons should pin both dimensions, for
   example `--model gpt-5.6-sol --effort high`; supported effort values are
   `low`, `medium`, `high`, and `xhigh`. Normal CI covers only its materializer
   and grader. Agent execution explicitly expects `m5-c03`, `m5-c04`, and
@@ -28,6 +31,12 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   single-document live runner intentionally rejects. Any other materialization
   failure fails the run.
   A run in which every selected scenario is skipped also fails.
+  Exit status `0` means every executed layer passed, `1` means at least one
+  deterministic or safety layer failed, and `3` means deterministic grading
+  passed but at least one hard natural-language fact criterion still needs
+  model or human review. Pending scenarios use JSON `null`, not `true` or
+  `false`, for their aggregate and claims-layer `passed` fields; any real
+  failure still makes the process exit `1`.
 - `results/` is reserved for generated traces, answers, and judge reports and
   is ignored by Git. New run directories are mode `0700`, artifact files are
   mode `0600`, unrelated command output is omitted, and host paths are

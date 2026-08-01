@@ -123,14 +123,23 @@ blind comparison and task-specific rubrics while retaining expert review.
   turn's claim/evidence
   sidecar aggregated into required fact-path coverage (with per-turn support
   diagnostics), and a binary privacy gate over the answer surface. Claims and
-  CLI-document assertions are graded against the JSON output captured from
+  path coverage can pass while a natural-language `hard_fail` fact criterion
+  remains unevaluated. That state is reported as pending review with JSON
+  `passed: null` and runner exit status `3`; it is neither a pass nor a
+  deterministic failure. A failed deterministic or safety layer takes
+  precedence and returns status `1`, while a fully passing run returns `0`.
+  Claims and CLI-document assertions are graded against the JSON output captured from
   exactly one successful required command in the transcript, with exact
   normalized arguments and the relative `--data-dir steam-agent-data`; the
   runner does not invoke the CLI again to manufacture grading evidence.
   Non-JSON or multiple-document output fails closed. Fixture and CLI clocks use
-  the scenario's `frozen_time`. It makes no provider requests and requires a
-  locally installed `codex` binary; normal CI exercises only its materializers
-  and grader. Agent execution expects only `m5-c03`, `m5-c04`, and `m5-c11` to
+  the scenario's `frozen_time`. It makes no provider requests. Live execution
+  is explicitly POSIX-only because the runner uses `/bin/sh`, pipe selection,
+  and process-group signals; non-POSIX hosts are rejected before scenarios are
+  loaded or artifacts are created. That runner boundary does not narrow the
+  product CLI's platform contract. A local `codex` binary is required; normal
+  CI exercises only the platform-independent materializers and grader. Agent
+  execution expects only `m5-c03`, `m5-c04`, and `m5-c11` to
   be unsupported. An unexpected unsupported scenario or a selection in which
   every scenario is skipped fails the run.
 - The runner selects a named `steam-agent-eval` permission profile, one runtime

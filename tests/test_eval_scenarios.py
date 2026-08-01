@@ -227,6 +227,68 @@ def test_wishlist_compatibility_prompt_exposes_context_without_discovery() -> No
     assert checked, "expected a wishlist compatibility scenario without discovery"
 
 
+def _required_visible_inputs(requirement: dict[str, Any]) -> set[tuple[str, str]]:
+    """Return opaque command inputs that cannot be inferred from CLI discovery."""
+
+    command = requirement["command"]
+    arguments = requirement["arguments"]
+    visible: set[tuple[str, str]] = set()
+    leading = []
+    for argument in arguments:
+        if argument.startswith("--"):
+            break
+        leading.append(argument)
+    if command == "steam-agent compatibility assess":
+        visible.update(("appid", value) for value in leading if value.isdigit())
+    elif command == "steam-agent group eligibility" and leading:
+        visible.add(("appid", leading[0]))
+    elif command == "steam-agent operations plan" and len(leading) >= 2:
+        visible.add(("appid", leading[1]))
+
+    exposed_options = {
+        "--appid": "appid",
+        "--copy-source": "group_ref",
+        "--country": "word",
+        "--host": "group_ref",
+        "--language": "word",
+        "--member": "group_ref",
+    }
+    for index, argument in enumerate(arguments[:-1]):
+        if kind := exposed_options.get(argument):
+            visible.add((kind, arguments[index + 1]))
+    for argument in arguments:
+        if match := re.match(r"appid:(\d+):", argument):
+            visible.add(("appid", match.group(1)))
+    return visible
+
+
+def test_prompts_expose_opaque_required_command_inputs() -> None:
+    """An agent must see every opaque ID and locale needed by an exact call."""
+
+    for path in sorted((EVAL_ROOT / "scenarios").glob("**/*.json")):
+        scenario = json.loads(path.read_text(encoding="utf-8"))
+        prompt = " ".join(scenario["conversation"]["user"])
+        required_inputs = {
+            item
+            for requirement in scenario["tool_policy"]["required"]
+            for item in _required_visible_inputs(requirement)
+        }
+        missing = []
+        for kind, value in sorted(required_inputs):
+            if kind == "group_ref":
+                exposed = value.casefold() in prompt.casefold()
+            else:
+                exposed = (
+                    re.search(
+                        rf"(?<!\w){re.escape(value)}(?!\w)", prompt, re.IGNORECASE
+                    )
+                    is not None
+                )
+            if not exposed:
+                missing.append(value)
+        assert not missing, f"{path}: prompt hides required inputs {missing}"
+
+
 def test_scenarios_do_not_embed_live_or_personal_fixture_sources() -> None:
     for path in sorted((EVAL_ROOT / "scenarios").glob("**/*.json")):
         scenario = json.loads(path.read_text(encoding="utf-8"))

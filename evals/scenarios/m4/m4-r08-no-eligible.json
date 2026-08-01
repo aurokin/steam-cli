@@ -2,7 +2,7 @@
   "schema_version": "steam-agent-eval/0.2", "id": "m4-r08", "status": "active", "milestone": "M4", "scenario_kind": "contract",
   "question_family": "no eligible recommendation", "tags": ["empty", "hard-constraint", "truthfulness"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Every candidate fails at least one explicit installed, snooze, or feature gate.", "facts": [{"subject": "synthetic:appid:1801", "state": "uninstalled"}, {"subject": "synthetic:appid:1802", "state": "active_snooze"}, {"subject": "synthetic:appid:1803", "state": "required_feature_fail"}]},
-  "conversation": {"user": ["What can I play now under all these constraints?"], "paraphrase": "Return nothing if no game actually qualifies."},
+  "conversation": {"user": ["Which installed games with controller support can I play now under both constraints?"], "paraphrase": "Return nothing if no game actually qualifies."},
   "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "installed=true", "--require", "user:controller=true"]}], "prohibited": ["sync", "relax constraints", "invent candidate"]},
   "deterministic_oracle": {"recipe_or_contract": "recommendations/0.1 eligibility", "assertions": [
     {"path": "$.data.eligible", "operator": "equals", "expected": []}, {"path": "$.data.excluded[*].appid", "operator": "ordered_equals", "expected": [1801, 1802, 1803]}, {"path": "$.completeness.status", "operator": "equals", "expected": "complete"}

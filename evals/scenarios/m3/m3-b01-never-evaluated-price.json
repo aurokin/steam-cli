@@ -4,7 +4,7 @@
   "fixture": {"kind": "synthetic_normalized", "description": "A wishlist candidate whose price has never been evaluated by any provider.", "facts": [
     {"subject": "synthetic:appid:801", "state": "unevaluated", "detail": "no price sync has ever targeted this candidate"}
   ]},
-  "conversation": {"user": ["How much does this wishlist game cost right now?"], "paraphrase": "Give me a price for a game the cache has never priced."},
+  "conversation": {"user": ["How much does this game on my US wishlist cost right now?"], "paraphrase": "Give me a price for a game the cache has never priced."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "browser", "price-invention"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 cache-only deal query", "assertions": [
     {"path": "$.data.items[0].deal.current_offer", "operator": "equals", "expected": null},

@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import signal
@@ -39,6 +40,10 @@ class _DuplicateJsonMemberError(ValueError):
     pass
 
 
+class _InvalidJsonConstantError(ValueError):
+    pass
+
+
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -46,6 +51,10 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _DuplicateJsonMemberError
         value[key] = item
     return value
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise _InvalidJsonConstantError
 
 
 _APP_SERVER_ARGS = (
@@ -73,6 +82,8 @@ _APP_SERVER_LOCALE_ENV_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM")
 _SHELL_ENV_INCLUDE_ONLY = ("PATH", *_APP_SERVER_LOCALE_ENV_KEYS)
 _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
 _VERSION_ERROR = "required codex app-server version is unavailable"
+_POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
+_PROCESS_CLEANUP_ERROR = "app-server process group did not terminate"
 _PERMISSION_PROFILE = "steam-agent-eval"
 _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
@@ -80,6 +91,7 @@ _MAX_CONVERSATION_INPUT_BYTES = 64 * 1024 * 1024
 _PROTOCOL_INPUT_LIMIT_ERROR = "app-server protocol input exceeded safety limits"
 _INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
 _INVALID_RESPONSE_ERROR = "app-server returned an invalid response"
+_INVALID_MODEL_METADATA_ERROR = "app-server returned invalid model metadata"
 _HOOK_ACTIVITY_ERROR = "app-server emitted disallowed hook activity"
 _POST_TURN_ACTIVITY_ERROR = "app-server emitted activity after turn completion"
 _POST_TURN_BOUNDARY_ERROR = "app-server did not reach an idle turn boundary"
@@ -108,7 +120,7 @@ class AgentTranscript:
         return self.agent_messages[-1] if self.agent_messages else None
 
     def rendered(self) -> str:
-        return json.dumps(self.events)
+        return json.dumps(self.events, allow_nan=False)
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,7 @@ class _TurnCollectionState:
             and started_item is not None
             and started_item.item_type == item_type
             and (status is None or status in _ITEM_TERMINAL_STATUSES)
+            and (item_type != "agentMessage" or status in {None, "completed"})
             and (
                 item_type != "commandExecution"
                 or (
@@ -199,6 +212,12 @@ def codex_version() -> str:
     return _REQUIRED_CODEX_VERSION
 
 
+def posix_runner_supported() -> bool:
+    """Whether the host provides the runner's required process primitives."""
+
+    return os.name == "posix"
+
+
 def run_agent_conversation(
     *,
     prompts: Sequence[str],
@@ -216,6 +235,8 @@ def run_agent_conversation(
 
     if not prompts:
         raise ValueError("a conversation needs at least one prompt")
+    if not posix_runner_supported():
+        raise CodexProtocolError(_POSIX_ONLY_ERROR)
     with tempfile.TemporaryDirectory(prefix="steam-agent-eval-codex-") as home_name:
         isolated_home = Path(home_name)
         isolated_home.chmod(0o700)
@@ -405,27 +426,48 @@ def _terminate_process_group(
     process-group cleanup alone is not an operating-system process jail.
     """
 
+    if not posix_runner_supported():
+        raise CodexProtocolError(_POSIX_ONLY_ERROR)
+
     process_group = process.pid
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
     deadline = time.monotonic() + timeout_seconds
-    while _process_group_exists(process_group) and time.monotonic() < deadline:
-        # Polling reaps the leader promptly so its zombie does not make the
-        # process group look alive for the entire grace period.
-        process.poll()
-        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-    if _process_group_exists(process_group):
+    group_gone = _wait_for_process_group_exit(process, process_group, deadline)
+    if not group_gone:
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        kill_deadline = time.monotonic() + timeout_seconds
+        group_gone = _wait_for_process_group_exit(
+            process, process_group, kill_deadline
+        )
     try:
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout_seconds)
+    if not group_gone:
+        raise CodexProtocolError(_PROCESS_CLEANUP_ERROR)
+
+
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[str], process_group: int, deadline: float
+) -> bool:
+    """Reap the leader and wait boundedly for every group member to disappear."""
+
+    while _process_group_exists(process_group):
+        # Polling reaps the leader promptly so its zombie does not make the
+        # process group look alive for the entire grace period.
+        process.poll()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+    return True
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -505,8 +547,9 @@ def _converse(
     )
     _validate_thread_boundary(thread, workspace)
     thread_id = thread["thread"]["id"]
-    effective_model = thread.get("model")
-    effective_effort = thread.get("reasoningEffort") if effort is None else None
+    effective_model = _validated_server_model(thread.get("model"))
+    initial_effort = _validated_server_effort(thread.get("reasoningEffort"))
+    effective_effort = initial_effort if effort is None else None
 
     transcripts: list[AgentTranscript] = []
     for prompt in prompts:
@@ -646,6 +689,32 @@ def _validate_settings_boundary(settings: dict[str, Any], workspace: str) -> Non
         raise CodexProtocolError(
             "app-server changed the requested workspace/network boundary"
         )
+
+
+_SERVER_MODEL = re.compile(
+    r"(?=[A-Za-z0-9._-]{1,128}\Z)(?=[A-Za-z0-9._-]*[A-Za-z])"
+    r"[A-Za-z0-9][A-Za-z0-9._-]*\Z",
+    re.ASCII,
+)
+_SERVER_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+
+
+def _validated_server_model(value: Any) -> str:
+    """Return one bounded model slug without retaining malformed metadata."""
+
+    if not isinstance(value, str) or _SERVER_MODEL.fullmatch(value) is None:
+        raise CodexProtocolError(_INVALID_MODEL_METADATA_ERROR)
+    return value
+
+
+def _validated_server_effort(value: Any) -> str | None:
+    """Return a pinned effort value, permitting an absent server default."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _SERVER_REASONING_EFFORTS:
+        raise CodexProtocolError(_INVALID_MODEL_METADATA_ERROR)
+    return value
 
 
 def _validate_active_permission_profile(profile: Any) -> bool:
@@ -896,7 +965,11 @@ class _ServerRequestResolutionEvidence:
 
 def _wire_fingerprint(message: Any) -> dict[str, Any]:
     rendered = json.dumps(
-        message, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        message,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
     ).encode()
     return {
         "sha256": hashlib.sha256(rendered).hexdigest(),
@@ -1142,13 +1215,15 @@ def _collect_turn(
         ):
             settings = params.get("threadSettings", {})
             _validate_settings_boundary(settings, workspace)
+            confirmed_model = _validated_server_model(settings.get("model"))
+            confirmed_effort = _validated_server_effort(settings.get("effort"))
             transcript.events.append(
                 {"method": "thread/settings/updated", "boundary_valid": True}
             )
-            transcript.effective_model = settings.get("model")
-            transcript.effective_reasoning_effort = settings.get("effort")
-            transcript.confirmed_model = settings.get("model")
-            transcript.confirmed_reasoning_effort = settings.get("effort")
+            transcript.effective_model = confirmed_model
+            transcript.effective_reasoning_effort = confirmed_effort
+            transcript.confirmed_model = confirmed_model
+            transcript.confirmed_reasoning_effort = confirmed_effort
             transcript.thread_settings_confirmed = True
         elif method == "thread/settings/updated":
             _record_invalid_notification(
@@ -1158,8 +1233,10 @@ def _collect_turn(
                 "invalid_thread_settings_scope",
             )
         elif method == "model/rerouted" and state.matches_turn(params):
+            _validated_server_model(params.get("fromModel"))
+            rerouted_model = _validated_server_model(params.get("toModel"))
             transcript.events.append({"method": "model/rerouted"})
-            transcript.effective_model = params.get("toModel")
+            transcript.effective_model = rerouted_model
         elif method == "model/rerouted":
             _record_invalid_notification(
                 transcript,
@@ -1498,7 +1575,7 @@ class _Session:
         )
 
     def _write(self, message: dict[str, Any]) -> None:
-        self._stdin.write(json.dumps(message).encode() + b"\n")
+        self._stdin.write(json.dumps(message, allow_nan=False).encode() + b"\n")
         self._stdin.flush()
 
     def _read_line(self) -> Any:
@@ -1521,12 +1598,15 @@ class _Session:
                 del self._buffer[:consumed]
                 try:
                     message = json.loads(
-                        line, object_pairs_hook=_unique_json_object
+                        line,
+                        object_pairs_hook=_unique_json_object,
+                        parse_constant=_reject_json_constant,
                     )
                 except (
                     json.JSONDecodeError,
                     UnicodeDecodeError,
                     _DuplicateJsonMemberError,
+                    _InvalidJsonConstantError,
                 ):
                     self._raise_invalid_json()
                 return True, message

@@ -77,6 +77,8 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         elif state == "travel_declared_fit":
             owned.append(appid)
             declared.append(appid)
+        elif state == "fresh_owned_not_installed":
+            owned.append(appid)
         else:
             raise UnsupportedScenarioError(f"no M7 fixture builder for {state!r}")
 

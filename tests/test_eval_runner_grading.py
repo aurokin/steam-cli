@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from evals.runner import __main__ as runner_main  # noqa: E402
-from evals.runner import grade  # noqa: E402
+from evals.runner import codex_driver, grade  # noqa: E402
 from evals.runner.materialize import materialize  # noqa: E402
 
 
@@ -44,6 +44,70 @@ POLICY = {
     ],
     "prohibited": ["sync", "network request", "filesystem mutation"],
 }
+
+
+def test_live_runner_rejects_non_posix_before_loading_or_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: object,
+) -> None:
+    def unexpected_load(*args: object) -> object:
+        del args
+        pytest.fail("non-POSIX runner loaded scenarios")
+
+    monkeypatch.setattr(codex_driver, "posix_runner_supported", lambda: False)
+    monkeypatch.setattr(runner_main, "_load_scenarios", unexpected_load)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", tmp_path / "results")
+
+    with pytest.raises(SystemExit) as captured:
+        runner_main.main(["--scenario", "m7-b01"])
+
+    assert captured.value.code == 2
+    stderr = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert runner_main._POSIX_ONLY_ERROR in stderr  # noqa: SLF001
+    assert not (tmp_path / "results").exists()
+
+
+def test_codex_driver_rejects_non_posix_before_process_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_workspace(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        pytest.fail("non-POSIX driver created an isolated process home")
+
+    monkeypatch.setattr(codex_driver, "posix_runner_supported", lambda: False)
+    monkeypatch.setattr(
+        codex_driver.tempfile, "TemporaryDirectory", unexpected_workspace
+    )
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver.run_agent_conversation(
+            prompts=["synthetic"],
+            workspace="synthetic-workspace",
+            developer_instructions="synthetic",
+        )
+
+    assert str(captured.value) == codex_driver._POSIX_ONLY_ERROR  # noqa: SLF001
+
+
+def test_frozen_launcher_rejects_non_posix_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_driver, "posix_runner_supported", lambda: False)
+    monkeypatch.setattr(
+        runner_main,
+        "_steam_agent_binary",
+        lambda: pytest.fail("non-POSIX launcher resolved the product binary"),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        runner_main._frozen_cli_launcher(  # noqa: SLF001
+            tmp_path / "workspace", "2026-01-01T00:00:00Z"
+        )
+
+    assert str(captured.value) == runner_main._POSIX_ONLY_ERROR  # noqa: SLF001
+    assert not (tmp_path / "workspace").exists()
 
 
 def _turn(*commands: str) -> dict[str, object]:
@@ -395,6 +459,34 @@ def test_private_host_path_forms_share_detection_and_redaction(
 
 
 @pytest.mark.parametrize(
+    "private_path",
+    (
+        r"\/Users\/example\/private\/secret-tail.txt",
+        r"\u002fUsers\u002fexample\u002fprivate\u002fsecret-tail.txt",
+        r"C:\\Users\\example\\private\\secret-tail.txt",
+        r"\u005c\u005cserver\u005cprivate\u005csecret-tail.txt",
+    ),
+)
+def test_json_escaped_private_paths_fail_privacy_and_redact_source_spelling(
+    private_path: str,
+) -> None:
+    text = f'{{"location":"{private_path}","next":true}}'
+
+    assert grade.find_private_host_paths(text) == [private_path]
+    assert grade.redact_private_host_paths(text) == (
+        '{"location":"<redacted-host-path>","next":true}'
+    )
+    privacy = grade.grade_privacy(text, {})
+    assert not privacy["passed"]
+    assert privacy["private_host_paths"] == [private_path]
+    sanitized = runner_main._sanitize_artifact(  # noqa: SLF001
+        text, sensitive_values=()
+    )
+    assert private_path not in sanitized
+    assert "secret-tail" not in sanitized
+
+
+@pytest.mark.parametrize(
     "text",
     (
         "https://example.com/Users/example/secret-tail.txt",
@@ -413,6 +505,8 @@ def test_private_host_path_forms_share_detection_and_redaction(
         "profile:///Users/example/secret-tail.txt",
         "file:relative/secret-tail.txt",
         "path:relative/secret-tail.txt",
+        r"https:\/\/example.com\/Users\/example\/secret-tail.txt",
+        r"relative\/Users\/example\/secret-tail.txt",
         "docs/~/secret-tail.txt",
         "docs/~alice/secret-tail.txt",
         "not~/a/home/path",
@@ -1040,7 +1134,7 @@ def test_fact_coverage_fails_closed_on_unevaluated_hard_criteria() -> None:
     assert result["limitation"] == (
         "natural_language_fact_criteria_require_model_or_human_review"
     )
-    assert not result["passed"]
+    assert result["passed"] is None
 
 
 def test_fact_coverage_keeps_non_hard_criteria_informational() -> None:

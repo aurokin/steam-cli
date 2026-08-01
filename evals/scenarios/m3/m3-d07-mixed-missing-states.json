@@ -4,7 +4,7 @@
   "fixture": {"kind": "synthetic_normalized", "description": "Wishlist candidates have running, failed, and untargeted provider states.", "facts": [
     {"subject": "synthetic:appid:701", "state": "running"}, {"subject": "synthetic:appid:702", "state": "failed_rate_limited"}, {"subject": "synthetic:appid:703", "state": "unevaluated"}
   ]},
-  "conversation": {"user": ["Why are prices missing for these games?"], "paraphrase": "Explain the different incomplete deal states."},
+  "conversation": {"user": ["Why are US prices missing for these wishlist games?"], "paraphrase": "Explain the different incomplete deal states."},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "retry", "browser"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 typed fallback states", "assertions": [
     {"path": "$.completeness.status", "operator": "equals", "expected": "partial"},

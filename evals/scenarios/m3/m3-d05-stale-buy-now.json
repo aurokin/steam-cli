@@ -2,7 +2,7 @@
   "schema_version": "steam-agent-eval/0.2", "id": "m3-d05", "status": "active", "milestone": "M3", "scenario_kind": "contract",
   "question_family": "buy now under stale evidence", "tags": ["freshness", "partial", "uncertainty"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A retained last-good official offer is outside current freshness but inside hard retention.", "facts": [{"subject": "synthetic:appid:501", "state": "stale_last_good", "detail": "amount=1500; age_hours=8"}]},
-  "conversation": {"user": ["Should I buy this game right now?"], "paraphrase": "Is the cached deal current enough to act on?"},
+  "conversation": {"user": ["Should I buy this game at its cached US price right now?"], "paraphrase": "Is the cached deal current enough to act on?"},
   "tool_policy": {"allowed": ["steam-agent deals query"], "required": [{"command": "steam-agent deals query", "arguments": ["--scope", "wishlist", "--account", "synthetic-primary", "--country", "US"]}], "prohibited": ["sync", "browser", "mutation"]},
   "deterministic_oracle": {"recipe_or_contract": "M3 cache freshness", "assertions": [
     {"path": "$.completeness.status", "operator": "equals", "expected": "partial"},

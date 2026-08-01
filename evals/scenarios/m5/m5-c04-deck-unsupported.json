@@ -2,7 +2,7 @@
   "schema_version": "steam-agent-eval/0.2", "id": "m5-c04", "status": "active", "milestone": "M5", "scenario_kind": "contract",
   "question_family": "Steam Deck incompatibility", "tags": ["incompatible", "steam-deck", "target"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Valve rates the exact Deck target Unsupported while another fact is unknown.", "facts": [{"subject": "synthetic:appid:5401", "state": "deck_unsupported"}]},
-  "conversation": {"user": ["Can I run this on my Steam Deck?"], "paraphrase": "A decisive exact-target failure wins over missing evidence."},
+  "conversation": {"user": ["Using the US store and English metadata, can I run AppID 5401 on my Steam Deck?"], "paraphrase": "A decisive exact-target failure wins over missing evidence."},
   "tool_policy": {"allowed": ["steam-agent compatibility assess"], "required": [{"command": "steam-agent compatibility assess", "arguments": ["5401", "--account", "synthetic", "--target", "valve:steam-deck", "--country", "US", "--language", "english"]}], "prohibited": ["sync", "rating widening"]},
   "deterministic_oracle": {"recipe_or_contract": "compatibility/0.1 precedence", "assertions": [{"path": "$.data.results[0].compatibility", "operator": "equals", "expected": "incompatible"}, {"path": "$.data.results[0].playable_now", "operator": "equals", "expected": "fail"}]},
   "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.results[0].compatibility", "$.data.results[0].gates[4].original"], "criteria": [{"id": "decisive-fail", "weight": 10, "requirement": "Preserve the decisive exact-target Unsupported result.", "hard_fail": true}]},

@@ -45,6 +45,7 @@ _TERMINAL_FENCED_BLOCK = re.compile(
     r"(?P<body>(?:(?!```)[\s\S])*?)```\s*\Z"
 )
 _PASS_LAYERS = ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
+_PENDING_REVIEW_EXIT_CODE = 3
 _EXPECTED_UNSUPPORTED_AGENT_SCENARIOS = {"m5-c03", "m5-c04", "m5-c11"}
 _CONFIRMED_DATA_DELETE_SCENARIO = "m2-b03"
 _CONFIRMED_DATA_DELETE_ARGUMENTS = (
@@ -56,6 +57,8 @@ _CONFIRMED_DATA_DELETE_ARGUMENTS = (
 _LIVE_EXECUTABLE = "./bin/steam-agent"
 _SCENARIO_ID = re.compile(r"m[1-9][0-9]*-[a-z][0-9]{2,}\Z", re.ASCII)
 _INVALID_SCENARIO_ERROR = "invalid eval scenario input"
+_INVALID_RESULTS_ROOT_ERROR = "eval results root is outside the repository"
+_POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
 
 DEVELOPER_INSTRUCTIONS_VERSION = "agent-instructions/0.8"
 DEVELOPER_INSTRUCTIONS = """\
@@ -107,6 +110,12 @@ def _write_private_text(path: Path, content: str, *, mode: int = 0o600) -> None:
             os.close(descriptor)
 
 
+def _artifact_json(value: Any, **kwargs: Any) -> str:
+    """Serialize persisted runner content as strict JSON."""
+
+    return json.dumps(value, allow_nan=False, **kwargs)
+
+
 def _validated_scenario_id(value: Any) -> str:
     if not isinstance(value, str) or _SCENARIO_ID.fullmatch(value) is None:
         raise ValueError(_INVALID_SCENARIO_ERROR)
@@ -128,9 +137,27 @@ def _resolved_contained_path(root: Path, candidate: Path) -> Path:
     return resolved_candidate
 
 
+def _validated_results_root() -> Path:
+    """Return the canonical repository-local results root without symlinks."""
+
+    try:
+        lexical_root = Path(os.path.abspath(ROOT))
+        lexical_results_root = Path(os.path.abspath(RESULTS_ROOT))
+        relative_results_root = lexical_results_root.relative_to(lexical_root)
+        resolved_root = ROOT.resolve()
+        resolved_results_root = _resolved_contained_path(ROOT, RESULTS_ROOT)
+        if resolved_results_root != resolved_root / relative_results_root:
+            raise ValueError(_INVALID_RESULTS_ROOT_ERROR)
+        return resolved_results_root
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(_INVALID_RESULTS_ROOT_ERROR) from None
+
+
 def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
     """Create a PATH launcher that gives cache readers the scenario clock."""
 
+    if not codex_driver.posix_runner_supported():
+        raise RuntimeError(_POSIX_ONLY_ERROR)
     _steam_agent_binary()
     bin_dir = workspace / "bin"
     _ensure_private_dir(bin_dir)
@@ -314,7 +341,7 @@ def _sanitize_artifact(
 
 
 def _omitted_content(value: Any) -> dict[str, Any]:
-    rendered = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    rendered = value if isinstance(value, str) else _artifact_json(value, sort_keys=True)
     return {
         "omitted": "unsafe-trace-content",
         "sha256": hashlib.sha256(rendered.encode()).hexdigest(),
@@ -358,6 +385,15 @@ def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
         ]
         if turn.get("turn_error") is not None:
             turn["turn_error"] = _omitted_content(turn["turn_error"])
+        for key in ("effective_model", "effective_reasoning_effort"):
+            if turn.get(key) is not None:
+                turn[key] = _omitted_content(turn[key])
+    generator = report["generator"]
+    for key in ("effective_model_by_turn", "effective_reasoning_effort_by_turn"):
+        generator[key] = [
+            None if value is None else _omitted_content(value)
+            for value in generator.get(key, ())
+        ]
     for failure in report["metrics"]["agent_turns"]["failed"]:
         if failure.get("error") is not None:
             failure["error"] = _omitted_content(failure["error"])
@@ -504,6 +540,23 @@ def _safe_to_retain_content(metrics: dict[str, dict[str, Any]]) -> bool:
     )
 
 
+def _scenario_passed(metrics: dict[str, dict[str, Any]]) -> bool | None:
+    """Return false for failures, null for pending review, and true for pass."""
+
+    outcomes = [metrics[layer]["passed"] for layer in _PASS_LAYERS]
+    if any(outcome is False for outcome in outcomes):
+        return False
+    if any(outcome is None for outcome in outcomes):
+        return None
+    return True
+
+
+def _layer_status(passed: bool | None) -> str:
+    if passed is None:
+        return "pending"
+    return "pass" if passed else "FAIL"
+
+
 def _grade_tool_policy(
     turns: list[dict[str, Any]],
     policy: dict[str, Any],
@@ -631,6 +684,19 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant {value}")
 
 
+def _approved_identifier_values(
+    requirements: list[dict[str, Any]], document: Any
+) -> frozenset[str]:
+    """Return IDs from evidence captured through an explicit identifier opt-in."""
+
+    if document is None or not any(
+        "--include-identifiers" in requirement.get("arguments", ())
+        for requirement in requirements
+    ):
+        return frozenset()
+    return grade.steam_id64_values(document)
+
+
 def run_scenario(
     scenario: dict[str, Any],
     run_dir: Path,
@@ -708,10 +774,19 @@ def run_scenario(
             turns, requirements, allow_data_delete=allow_data_delete
         )
 
-    # The privacy gate covers what the agent says and what the steam-agent
-    # CLI printed — the answer surface. Raw command lines and other tools'
-    # output (a grep over the checkout, an ls) necessarily contain harness
-    # host paths that are not part of that surface.
+    # The privacy gate covers what the agent says, what the steam-agent CLI
+    # printed, and every App Server metadata string retained in the report.
+    # Raw command lines and other tools' output (a grep over the checkout, an
+    # ls) necessarily contain harness host paths outside that retained surface.
+    server_metadata = [
+        value
+        for transcript in transcripts
+        for value in (
+            transcript.effective_model,
+            transcript.effective_reasoning_effort,
+        )
+        if value is not None
+    ]
     transcript_text = "\n".join(
         [
             *(
@@ -727,11 +802,11 @@ def run_scenario(
                 for transcript in transcripts
                 for message in transcript.agent_messages
             ),
+            *server_metadata,
         ]
     )
-    allow_identifier_patterns = any(
-        "--include-identifiers" in requirement.get("arguments", ())
-        for requirement in requirements
+    allowed_identifier_values = _approved_identifier_values(
+        requirements, oracle_document
     )
 
     claims_metric = _grade_claims_by_turn(
@@ -747,7 +822,7 @@ def run_scenario(
     privacy_metric = grade.grade_privacy(
         transcript_text,
         scenario["privacy_canaries"],
-        allow_identifier_patterns=allow_identifier_patterns,
+        allowed_identifier_values=allowed_identifier_values,
     )
     oracle_metric = grade.grade_assertions(
         scenario["deterministic_oracle"],
@@ -851,7 +926,7 @@ def run_scenario(
             ),
         }
         transcript_lines.append(
-            json.dumps(
+            _artifact_json(
                 _sanitize_artifact(
                     harness_event,
                     sensitive_values=sensitive_values,
@@ -860,7 +935,7 @@ def run_scenario(
             )
         )
         transcript_lines.extend(
-            json.dumps(
+            _artifact_json(
                 _sanitize_artifact(
                     (
                         event
@@ -878,7 +953,7 @@ def run_scenario(
         scenario_dir / "transcript.jsonl", "\n".join(transcript_lines) + "\n"
     )
     _write_private_text(
-        scenario_dir / "report.json", json.dumps(report, indent=2) + "\n"
+        scenario_dir / "report.json", _artifact_json(report, indent=2) + "\n"
     )
     return report
 
@@ -898,6 +973,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     args = parser.parse_args(argv)
+    if not codex_driver.posix_runner_supported():
+        parser.error(_POSIX_ONLY_ERROR)
     if args.family is None and args.scenario is None:
         parser.error("pass --family and/or --scenario")
 
@@ -912,7 +989,14 @@ def main(argv: list[str] | None = None) -> int:
     if not scenarios:
         parser.error("no matching scenarios")
 
-    run_dir = RESULTS_ROOT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    try:
+        results_root = _validated_results_root()
+    except ValueError:
+        parser.error(_INVALID_RESULTS_ROOT_ERROR)
+    run_dir = _resolved_contained_path(
+        results_root,
+        results_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"),
+    )
     _ensure_private_dir(run_dir)
 
     summaries = []
@@ -979,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         executed_count += 1
         metrics = report["metrics"]
-        passed = all(metrics[layer]["passed"] for layer in _PASS_LAYERS)
+        passed = _scenario_passed(metrics)
         summaries.append(
             {
                 "scenario": scenario["id"],
@@ -987,12 +1071,14 @@ def main(argv: list[str] | None = None) -> int:
                 "layers": {layer: metrics[layer]["passed"] for layer in _PASS_LAYERS},
             }
         )
-        if not passed:
+        if passed is False:
             exit_code = 1
+        elif passed is None and exit_code == 0:
+            exit_code = _PENDING_REVIEW_EXIT_CODE
         print(
             f"{scenario['id']}: "
             + ", ".join(
-                f"{layer}={'pass' if metrics[layer]['passed'] else 'FAIL'}"
+                f"{layer}={_layer_status(metrics[layer]['passed'])}"
                 for layer in _PASS_LAYERS
             ),
             file=sys.stderr,
@@ -1001,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
     if executed_count == 0:
         exit_code = 1
     _write_private_text(
-        run_dir / "summary.json", json.dumps(summaries, indent=2) + "\n"
+        run_dir / "summary.json", _artifact_json(summaries, indent=2) + "\n"
     )
     print(f"reports: {run_dir.relative_to(ROOT)}", file=sys.stderr)
     return exit_code
