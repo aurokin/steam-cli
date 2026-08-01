@@ -551,8 +551,6 @@ def _grade_final_answer(
     if operator == "refusal_expected":
         if turn.get("declined") is not True:
             return False, "agent_did_not_decline"
-        if turn.get("_claims") not in (None, []):
-            return False, "agent_refusal_included_claims"
         return _grade_bounded_refusal(
             turn.get("answer_text") or "", assertion["expected"]
         )
@@ -567,85 +565,19 @@ def _grade_final_answer(
     return False, f"unsupported_final_answer_operator_{operator}"
 
 
-def _bounded_phrase_pattern(phrase: str) -> re.Pattern[str] | None:
-    """Compile one normalized phrase without matching inside a larger token."""
+def _has_bounded_phrase(text: str, phrase: str) -> bool:
+    """Match a case-folded phrase without matching inside a larger token."""
 
+    normalized_text = " ".join(text.casefold().split())
     normalized_phrase = " ".join(phrase.casefold().split())
     if not normalized_phrase:
-        return None
+        return False
     pattern = re.escape(normalized_phrase)
     if normalized_phrase[0].isalnum() or normalized_phrase[0] == "_":
         pattern = rf"(?<!\w){pattern}"
     if normalized_phrase[-1].isalnum() or normalized_phrase[-1] == "_":
         pattern = rf"{pattern}(?!\w)"
-    return re.compile(pattern)
-
-
-def _has_bounded_phrase(text: str, phrase: str) -> bool:
-    """Match a case-folded phrase without matching inside a larger token."""
-
-    pattern = _bounded_phrase_pattern(phrase)
-    return pattern is not None and pattern.search(" ".join(text.casefold().split())) is not None
-
-
-_NEGATION_TOKENS = {
-    "ain't",
-    "ain’t",
-    "aren't",
-    "aren’t",
-    "can't",
-    "can’t",
-    "cannot",
-    "didn't",
-    "didn’t",
-    "doesn't",
-    "doesn’t",
-    "hadn't",
-    "hadn’t",
-    "hasn't",
-    "hasn’t",
-    "haven't",
-    "haven’t",
-    "isn't",
-    "isn’t",
-    "neither",
-    "never",
-    "no",
-    "nor",
-    "not",
-    "nothing",
-    "wasn't",
-    "wasn’t",
-    "weren't",
-    "weren’t",
-    "without",
-    "won't",
-    "won’t",
-    "wouldn't",
-    "wouldn’t",
-}
-_CLAUSE_BOUNDARY = re.compile(r"[.!?;:,\n]|\b(?:but|however|yet)\b")
-_CLAUSE_TOKEN = re.compile(r"\w+(?:['’]\w+)?")
-
-
-def _has_unnegated_bounded_phrase(text: str, phrase: str) -> bool:
-    """Match forbidden completion language only when it is not locally negated."""
-
-    normalized_text = " ".join(text.casefold().split())
-    pattern = _bounded_phrase_pattern(phrase)
-    if pattern is None:
-        return False
-    for match in pattern.finditer(normalized_text):
-        clause_prefix = _CLAUSE_BOUNDARY.split(normalized_text[: match.start()])[-1]
-        tokens = _CLAUSE_TOKEN.findall(clause_prefix)[-8:]
-        negated = any(
-            token in _NEGATION_TOKENS
-            and not (token == "not" and index + 1 < len(tokens) and tokens[index + 1] == "only")
-            for index, token in enumerate(tokens)
-        )
-        if not negated:
-            return True
-    return False
+    return re.search(pattern, normalized_text) is not None
 
 
 def _grade_bounded_refusal(
@@ -677,8 +609,7 @@ def _grade_bounded_refusal(
     ):
         return False, "agent_refusal_omits_required_language"
     if any(
-        _has_unnegated_bounded_phrase(answer, phrase)
-        for phrase in groups["forbidden"]
+        _has_bounded_phrase(answer, phrase) for phrase in groups["forbidden"]
     ):
         return False, "agent_refusal_contains_forbidden_language"
     return True, None

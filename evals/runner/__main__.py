@@ -116,6 +116,33 @@ def _artifact_json(value: Any, **kwargs: Any) -> str:
     return json.dumps(value, allow_nan=False, **kwargs)
 
 
+class _DuplicateJsonMemberError(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonMemberError
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("invalid JSON constant")
+
+
+def _strict_json_loads(value: str) -> Any:
+    """Parse one standards-compliant JSON value without ambiguous objects."""
+
+    return json.loads(
+        value,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
 def _validated_scenario_id(value: Any) -> str:
     if not isinstance(value, str) or _SCENARIO_ID.fullmatch(value) is None:
         raise ValueError(_INVALID_SCENARIO_ERROR)
@@ -151,6 +178,15 @@ def _validated_results_root() -> Path:
         return resolved_results_root
     except (OSError, RuntimeError, ValueError):
         raise ValueError(_INVALID_RESULTS_ROOT_ERROR) from None
+
+
+def _timeout_seconds_argument(value: str) -> float:
+    """Parse one bounded runner timeout without echoing rejected input."""
+
+    try:
+        return codex_driver.validate_timeout_seconds(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def _frozen_cli_launcher(workspace: Path, frozen_time: str) -> Path:
@@ -215,12 +251,23 @@ raise SystemExit(_main())
     return launcher
 
 
+def _cache_only_prohibited_requirement(
+    requirement: dict[str, Any], *, allow_data_delete: bool = False
+) -> tuple[str, ...] | None:
+    argv = grade.normalized_steam_agent_argv(requirement["command"])
+    if argv is None:
+        return None
+    return grade.cache_only_prohibited_head(
+        [*argv, *requirement.get("arguments", ())],
+        allow_data_delete=allow_data_delete,
+    )
+
+
 def _allows_confirmed_data_delete(scenario: dict[str, Any]) -> bool:
     if scenario.get("id") != _CONFIRMED_DATA_DELETE_SCENARIO:
         return False
     return any(
-        grade.cache_only_prohibited_command(requirement["command"])
-        == ("data", "delete")
+        _cache_only_prohibited_requirement(requirement) == ("data", "delete")
         and tuple(requirement.get("arguments", ())) == _CONFIRMED_DATA_DELETE_ARGUMENTS
         for requirement in scenario["tool_policy"].get("required", ())
     )
@@ -230,16 +277,26 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
     requirements = scenario["tool_policy"].get("required") or []
     allow_data_delete = _allows_confirmed_data_delete(scenario)
     declarations = [
-        *(("required", item["command"]) for item in requirements),
         *(
-            ("allowed", command)
+            (
+                "required",
+                _cache_only_prohibited_requirement(
+                    item, allow_data_delete=allow_data_delete
+                ),
+            )
+            for item in requirements
+        ),
+        *(
+            (
+                "allowed",
+                grade.cache_only_prohibited_command(
+                    command, allow_data_delete=allow_data_delete
+                ),
+            )
             for command in scenario["tool_policy"].get("allowed", ())
         ),
     ]
-    for declaration_kind, command in declarations:
-        head = grade.cache_only_prohibited_command(
-            command, allow_data_delete=allow_data_delete
-        )
+    for declaration_kind, head in declarations:
         if head is None:
             continue
         if declaration_kind == "required" and head == ("sync",):
@@ -463,7 +520,7 @@ def _oracle_document(
         capture_output=True,
         text=True,
     )
-    return json.loads(result.stdout)
+    return _strict_json_loads(result.stdout)
 
 
 def _extract_sidecar(
@@ -477,8 +534,8 @@ def _extract_sidecar(
     if match is None or match.group("language").casefold() != "json":
         return None, False
     try:
-        payload = json.loads(match.group("body"))
-    except json.JSONDecodeError:
+        payload = _strict_json_loads(match.group("body"))
+    except ValueError:
         return None, False
     if not isinstance(payload, dict):
         return None, False
@@ -610,9 +667,43 @@ def _grade_claims_by_turn(
     oracle_document: dict[str, Any] | None,
     fact_rubric: dict[str, Any],
 ) -> dict[str, Any]:
-    if oracle_document is None:
-        return {"provided": None, "applicable": False, "passed": True}
     merged = grade.merge_claims(turn["_claims"] for turn in turns)
+    if oracle_document is None:
+        required_paths = list(fact_rubric.get("required_claim_paths", ()))
+        criteria = list(fact_rubric.get("criteria", ()))
+        failed = list(merged or ())
+        unevaluated_hard_fail_criteria = [
+            criterion["id"]
+            for criterion in criteria
+            if criterion.get("hard_fail") is True
+        ]
+        deterministic_passed = not required_paths and not failed
+        pending_hard_fail_review = bool(
+            deterministic_passed and unevaluated_hard_fail_criteria
+        )
+        return {
+            "applicable": bool(required_paths or criteria or failed),
+            "provided": merged is not None,
+            "claims": len(merged or ()),
+            "supported": 0,
+            "failed": failed,
+            "required": len(required_paths),
+            "satisfied_required_paths": [],
+            "missing_required_paths": required_paths,
+            "criteria_evaluated": False,
+            "unevaluated_criteria": [criterion["id"] for criterion in criteria],
+            "unevaluated_hard_fail_criteria": unevaluated_hard_fail_criteria,
+            "deterministic_passed": deterministic_passed,
+            "review_status": (
+                "pending_hard_fail_review"
+                if pending_hard_fail_review
+                else "not_pending"
+            ),
+            "limitation": (
+                "natural_language_fact_criteria_require_model_or_human_review"
+            ),
+            "passed": None if pending_hard_fail_review else deterministic_passed,
+        }
     aggregate = grade.grade_fact_coverage(
         merged,
         oracle_document,
@@ -674,14 +765,10 @@ def _captured_required_document(
     if not isinstance(output, str):
         return None, "successful required command did not capture text output"
     try:
-        document = json.loads(output, parse_constant=_reject_json_constant)
-    except (json.JSONDecodeError, ValueError):
+        document = _strict_json_loads(output)
+    except ValueError:
         return None, "successful required command output is not one JSON document"
     return document, None
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant {value}")
 
 
 def _approved_identifier_values(
@@ -971,7 +1058,9 @@ def main(argv: list[str] | None = None) -> int:
         choices=("low", "medium", "high", "xhigh"),
         help="Pin the Codex reasoning effort for reproducible comparisons.",
     )
-    parser.add_argument("--timeout-seconds", type=float, default=900.0)
+    parser.add_argument(
+        "--timeout-seconds", type=_timeout_seconds_argument, default=900.0
+    )
     args = parser.parse_args(argv)
     if not codex_driver.posix_runner_supported():
         parser.error(_POSIX_ONLY_ERROR)

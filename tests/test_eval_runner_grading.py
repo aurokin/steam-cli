@@ -44,6 +44,113 @@ POLICY = {
     ],
     "prohibited": ["sync", "network request", "filesystem mutation"],
 }
+INVALID_DIRECT_TIMEOUTS = (
+    pytest.param(float("nan"), id="nan"),
+    pytest.param(float("inf"), id="positive-infinity"),
+    pytest.param(float("-inf"), id="negative-infinity"),
+    pytest.param(0.0, id="zero"),
+    pytest.param(-1.0, id="negative"),
+    pytest.param(True, id="true"),
+    pytest.param(False, id="false"),
+    pytest.param("private-timeout-value", id="nonnumeric"),
+)
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    ("nan", "inf", "+inf", "-inf", "0", "-0.1", "private-timeout-value"),
+)
+def test_live_runner_rejects_invalid_timeout_before_loading_or_writing(
+    timeout_value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: object,
+) -> None:
+    def unexpected_load(*args: object) -> object:
+        del args
+        pytest.fail("invalid timeout loaded scenarios")
+
+    results_root = tmp_path / "results"
+    monkeypatch.setattr(runner_main, "_load_scenarios", unexpected_load)
+    monkeypatch.setattr(runner_main, "RESULTS_ROOT", results_root)
+
+    with pytest.raises(SystemExit) as captured:
+        runner_main.main(
+            ["--scenario", "m7-b01", f"--timeout-seconds={timeout_value}"]
+        )
+
+    assert captured.value.code == 2
+    stderr = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert codex_driver._INVALID_TIMEOUT_ERROR in stderr  # noqa: SLF001
+    assert timeout_value not in stderr
+    assert not results_root.exists()
+
+
+@pytest.mark.parametrize("timeout_seconds", INVALID_DIRECT_TIMEOUTS)
+def test_codex_driver_rejects_invalid_timeout_before_process_setup(
+    timeout_seconds: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codex_driver,
+        "posix_runner_supported",
+        lambda: pytest.fail("invalid timeout reached the platform gate"),
+    )
+    monkeypatch.setattr(
+        codex_driver.tempfile,
+        "TemporaryDirectory",
+        lambda *args, **kwargs: pytest.fail("invalid timeout created a process home"),
+    )
+
+    with pytest.raises(ValueError) as captured:
+        codex_driver.run_agent_conversation(
+            prompts=["synthetic"],
+            workspace="synthetic-workspace",
+            developer_instructions="synthetic",
+            timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+        )
+
+    assert str(captured.value) == codex_driver._INVALID_TIMEOUT_ERROR  # noqa: SLF001
+
+
+@pytest.mark.parametrize("timeout_seconds", INVALID_DIRECT_TIMEOUTS)
+def test_process_cleanup_rejects_invalid_timeout_before_process_or_signal_access(
+    timeout_seconds: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    side_effects: list[str] = []
+
+    class UntouchedProcess:
+        @property
+        def pid(self) -> int:
+            side_effects.append("pid")
+            return 1234
+
+    monkeypatch.setattr(
+        codex_driver,
+        "posix_runner_supported",
+        lambda: side_effects.append("platform") or True,
+    )
+    monkeypatch.setattr(
+        codex_driver.os,
+        "killpg",
+        lambda *args: side_effects.append("signal"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        codex_driver.time,
+        "monotonic",
+        lambda: side_effects.append("clock") or 0.0,
+    )
+
+    with pytest.raises(ValueError) as captured:
+        codex_driver._terminate_process_group(  # noqa: SLF001
+            UntouchedProcess(),  # type: ignore[arg-type]
+            timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+        )
+
+    assert str(captured.value) == codex_driver._INVALID_TIMEOUT_ERROR  # noqa: SLF001
+    assert side_effects == []
 
 
 def test_live_runner_rejects_non_posix_before_loading_or_writing(

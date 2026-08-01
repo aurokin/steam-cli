@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -84,6 +85,7 @@ _REQUIRED_CODEX_VERSION = "codex-cli 0.146.0"
 _VERSION_ERROR = "required codex app-server version is unavailable"
 _POSIX_ONLY_ERROR = "live agent evaluations require a POSIX host"
 _PROCESS_CLEANUP_ERROR = "app-server process group did not terminate"
+_INVALID_TIMEOUT_ERROR = "timeout must be a finite positive number"
 _PERMISSION_PROFILE = "steam-agent-eval"
 _MAX_JSONL_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_TURN_INPUT_BYTES = 16 * 1024 * 1024
@@ -218,6 +220,20 @@ def posix_runner_supported() -> bool:
     return os.name == "posix"
 
 
+def validate_timeout_seconds(value: str | int | float) -> float:
+    """Return one finite positive timeout without retaining rejected input."""
+
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(_INVALID_TIMEOUT_ERROR)
+    try:
+        timeout_seconds = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(_INVALID_TIMEOUT_ERROR) from None
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(_INVALID_TIMEOUT_ERROR)
+    return timeout_seconds
+
+
 def run_agent_conversation(
     *,
     prompts: Sequence[str],
@@ -233,6 +249,7 @@ def run_agent_conversation(
     later turns must not extend the budget its earlier turns already spent.
     """
 
+    timeout_seconds = validate_timeout_seconds(timeout_seconds)
     if not prompts:
         raise ValueError("a conversation needs at least one prompt")
     if not posix_runner_supported():
@@ -426,6 +443,7 @@ def _terminate_process_group(
     process-group cleanup alone is not an operating-system process jail.
     """
 
+    timeout_seconds = validate_timeout_seconds(timeout_seconds)
     if not posix_runner_supported():
         raise CodexProtocolError(_POSIX_ONLY_ERROR)
 
@@ -1484,7 +1502,9 @@ class _Session:
                 # thread/read is the ordering barrier. Polling once at zero
                 # timeout drains only bytes that are already observable after
                 # its response, without adding an arbitrary sleep window.
-                found, raw_message = self._read_line_until(time.monotonic())
+                found, raw_message = self._read_line_until(
+                    time.monotonic(), drain_observable=True
+                )
                 if not found:
                     if self._buffer:
                         buffered = len(self._buffer)
@@ -1584,10 +1604,18 @@ class _Session:
             raise CodexProtocolError("timed out waiting for app-server")
         return message
 
-    def _read_line_until(self, deadline: float) -> tuple[bool, Any]:
+    def _read_line_until(
+        self, deadline: float, *, drain_observable: bool = False
+    ) -> tuple[bool, Any]:
         # Raw fd reads with a private buffer: select() on the fd cannot see
         # lines already sitting in a buffered stream, so buffering is ours.
         while True:
+            # Normal conversation reads honor the whole-session deadline even
+            # when a complete frame is buffered or the fd stays continuously
+            # readable. Only assert_quiescent enables the zero-time drain for
+            # bytes already observable after its ordering barrier.
+            if not drain_observable and time.monotonic() >= deadline:
+                return False, None
             newline = self._buffer.find(b"\n")
             if newline >= 0:
                 if newline > _MAX_JSONL_FRAME_BYTES:
@@ -1609,10 +1637,17 @@ class _Session:
                     _InvalidJsonConstantError,
                 ):
                     self._raise_invalid_json()
+                if not drain_observable and time.monotonic() >= deadline:
+                    return False, None
                 return True, message
             if len(self._buffer) > _MAX_JSONL_FRAME_BYTES:
                 self._raise_input_limit()
-            remaining = max(0, deadline - time.monotonic())
+            if drain_observable:
+                remaining = 0.0
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, None
             ready, _, _ = select.select([self._stdout], [], [], remaining)
             if not ready:
                 return False, None
