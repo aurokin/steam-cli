@@ -43,6 +43,9 @@ For current commands, use the [user guide](../user-guide.md) or exact
 
 ## Research and reference material
 
+- [Evaluation system verification and improvement brainstorm](evaluation-system-brainstorm.md)
+  is a proposed, evidence-backed work inventory; none of its recommendations
+  are accepted by inclusion in the document.
 - [Existing tools](existing-tools.md) is a landscape snapshot, not product
   authority.
 - [Roadmap](roadmap.md) is a noncanonical research sequence. Accepted milestone
