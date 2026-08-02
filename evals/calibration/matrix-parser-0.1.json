@@ -1,0 +1,8 @@
+{
+  "schema": "steam-agent-eval-judge-parser/0.1",
+  "required_fields": ["criterion_id", "verdict", "rationale"],
+  "verdicts": ["pass", "fail", "uncertain"],
+  "maximum_rationale_words": 12,
+  "unknown_fields": "reject",
+  "duplicate_criteria": "reject"
+}

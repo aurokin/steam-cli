@@ -3,8 +3,9 @@
 This directory contains synthetic, versioned common-question scenarios. It is
 a contract corpus, not captured user data and not a live-provider benchmark.
 
-- `schema/scenario-0.1.json` and `schema/scenario-0.2.json` define the scenario
-  format; each scenario names the version it validates against.
+- `schema/scenario-0.1.json` through `schema/scenario-0.3.json` define the
+  historical and active scenario formats; each scenario names the version it
+  validates against.
 - `scenarios/m2/` covers the identity, identifier opt-in, and data-deletion
   boundaries, including the credential refusal probe.
 - `scenarios/m3/` covers accepted deal-question behavior.
@@ -38,12 +39,11 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   filesystem, client, and other unvalidated activity remains a hard failure.
   Normal CI covers the runner's materializer, grader, and eight integrated
   scripted layer controls; it does not execute a live model. Deterministic
-  preflight validates, materializes, and executes CLI assertions for 51 current
-  scenarios. Agent execution treats `m5-c03`, `m5-c04`, and `m5-c11` as
-  deterministic-only; the first two lack a CLI writer, while `m5-c11`
-  requires a sync plus multiple required CLI documents that the cache-only,
-  single-document live runner intentionally rejects. Any other materialization
-  failure fails the run.
+  preflight validates the active corpus before model execution. The `0.3`
+  corpus contains 56 scenarios: 53 live and three deterministic-only.
+  `m5-c03` and `m5-c04` lack a CLI writer, while `m5-c11` requires a sync that
+  the cache-only live runner intentionally rejects. Any unexpected
+  materialization failure fails the run.
   A run in which every selected scenario is skipped also fails.
   Exit status `0` means every executed layer passed, `1` means at least one
   deterministic or safety layer failed, and `3` means deterministic grading
@@ -78,9 +78,17 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   denominators and comparisons. The lifecycle also includes `initializing`,
   `controls`, and `running`; non-completed states, including stale nonterminal
   manifests, are ineligible. Failed, interrupted, and contaminated manifests
-  carry a bounded terminal reason. There is no stale-run recovery in this
-  slice. Each accounted scenario publishes either a mode-`0600` report and
-  transcript or a mode-`0600` deterministic-only skip record. The runner
+  carry a bounded terminal reason. Matrix campaigns add an immutable,
+  route-interleaved plan above these single-route child cohorts. Resume creates
+  an append-only attempt for the next unaccounted work item and never edits a
+  prior child run. Matrix creation itself runs the exact frozen CLI oracle for
+  every selected deterministic-only scenario before publishing a matrix and
+  persists their source, child-source, schema, and rubric hashes plus `passed`
+  outcomes in the manifest. Resume, inspection, and acceptance require that
+  attestation to match the frozen inputs exactly; a caller-supplied attestation
+  cannot suppress creation-time preflight. Each accounted scenario publishes either a mode-`0600`
+  report and transcript or a mode-`0600` deterministic-only skip record. The
+  runner
   verifies their hashes and records them in the summary; artifact failure
   fails the cohort.
   The live runner revalidates canonical scenario
@@ -113,9 +121,37 @@ tool-use policy, a fact rubric, and an opt-in qualitative answer rubric. Normal
 CI schema- and privacy-validates every scenario without network access or a
 model API. Executable deterministic CLI coverage spans every family: oracle
 modules for M3, M4, M5, and M7, and the materializer round trip for M2 and
-M6 contract scenarios. The first qualification slice leaves scenario schema
-`0.2` and its claim semantics unchanged. Schema `0.3`, execution-support
-metadata, claim-salience fields, and scenario splits remain deferred outside
-the accepted qualification slice. See the
+M6 contract scenarios. Active scenarios use schema `0.3`, which separates
+facts that answers must mention from facts that need support only when claimed,
+records live versus deterministic-only execution support, and fixes required
+document cardinality. See the
 [evaluation strategy](../docs/design/evaluation-strategy.md) for scoring,
-privacy, volatility, and future judge rules.
+privacy, volatility, matrix, and adjudication rules.
+
+The accepted anchor screen is predeclared in
+`matrices/screen-anchor-v1.json`. Start, resume, inspect, and apply its strict
+acceptance policy with:
+
+```text
+uv run python -m evals.runner matrix --config evals/matrices/screen-anchor-v1.json
+uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/screen-anchor-v1.json
+uv run python -m evals.runner inspect evals/results/MATRIX_ID
+uv run python -m evals.runner accept evals/results/MATRIX_ID
+```
+
+Screen results select routes only; they are not qualification evidence.
+The screen requires calibrated agreement only on hard-fail fact criteria
+explicitly authored with `screen_safety_gate: true`. Other hard-fail
+correctness or fidelity criteria, authored quality, must-mention, and
+conditional-support criteria remain diagnostic until qualification. No route
+appears as a survivor while required screen safety adjudication is missing or
+unresolved. Qualification gates every qualitative criterion.
+For a completed accepted screen, `accept` atomically publishes the canonical
+private `acceptance.json` decision. This freezes its survivor and qualitative
+evidence selection and records the finalization time: later judgment or
+adjudication imports are rejected.
+Qualification `screen_provenance` must name the source screen matrix and include
+the SHA-256 digests of that exact acceptance file, screen manifest, and
+qualitative-evidence root. Matrix creation and resume reject missing, changed,
+or chronologically later source decisions. Qualification acceptance requires
+the same finalized source directory via `--screen-dir`.

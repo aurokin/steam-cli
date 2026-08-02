@@ -46,7 +46,14 @@ from .materialize import (
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_ROOT = ROOT / "evals" / "scenarios"
 RESULTS_ROOT = ROOT / "evals" / "results"
-SCENARIO_SCHEMA_PATH = ROOT / "evals" / "schema" / "scenario-0.2.json"
+SCENARIO_SCHEMA_PATHS = {
+    f"steam-agent-eval/{version}": (
+        ROOT / "evals" / "schema" / f"scenario-{version}.json"
+    )
+    for version in ("0.1", "0.2", "0.3")
+}
+CURRENT_SCENARIO_SCHEMA_VERSION = "steam-agent-eval/0.3"
+SCENARIO_SCHEMA_PATH = SCENARIO_SCHEMA_PATHS[CURRENT_SCENARIO_SCHEMA_VERSION]
 
 _TERMINAL_FENCED_BLOCK = re.compile(
     r"```(?P<language>[^\s`\r\n]+)[ \t]*(?:\r?\n|[ \t]+)"
@@ -54,7 +61,8 @@ _TERMINAL_FENCED_BLOCK = re.compile(
 )
 _PASS_LAYERS = ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
 _PENDING_REVIEW_EXIT_CODE = 3
-_EXPECTED_UNSUPPORTED_AGENT_SCENARIOS = {"m5-c03", "m5-c04", "m5-c11"}
+_LEGACY_DETERMINISTIC_ONLY_SCENARIOS = {"m5-c03", "m5-c04", "m5-c11"}
+_NO_CLI_WRITER_REASON = "no_cli_writer_for_valve_deck_exact_target_review"
 _CONFIRMED_DATA_DELETE_SCENARIO = "m2-b03"
 _CONFIRMED_DATA_DELETE_ARGUMENTS = (
     "--provider",
@@ -89,9 +97,7 @@ _MAX_COMMAND_PRIVACY_TOKENS = 16 * 1024
 _COMMAND_PRIVACY_DECODING_ERROR = "command privacy decoding failed"
 _MAX_ACCEPTED_OPTIONAL_OPTIONS = 16
 _MAX_ACCEPTED_OPTION_VALUE_CHARACTERS = 256
-_ACCEPTED_OPTION_NAME = re.compile(
-    r"--[a-z][a-z0-9-]{0,63}\Z", re.ASCII
-)
+_ACCEPTED_OPTION_NAME = re.compile(r"--[a-z][a-z0-9-]{0,63}\Z", re.ASCII)
 _INVALID_ACCEPTED_OPTIONAL_OPTIONS_ERROR = (
     "agent runner requires valid accepted optional command options"
 )
@@ -279,9 +285,12 @@ def _validated_results_root() -> Path:
 
 
 @cache
-def _scenario_validation_context() -> tuple[bytes, Draft202012Validator]:
+def _scenario_validation_context(
+    schema_version: str = CURRENT_SCENARIO_SCHEMA_VERSION,
+) -> tuple[bytes, Draft202012Validator]:
     try:
-        schema_bytes = SCENARIO_SCHEMA_PATH.read_bytes()
+        schema_path = SCENARIO_SCHEMA_PATHS[schema_version]
+        schema_bytes = schema_path.read_bytes()
         schema = _strict_json_loads(schema_bytes.decode("utf-8"))
         Draft202012Validator.check_schema(schema)
         return (
@@ -292,8 +301,8 @@ def _scenario_validation_context() -> tuple[bytes, Draft202012Validator]:
         raise ValueError(_INVALID_SCENARIO_ERROR) from None
 
 
-def _scenario_validator() -> Draft202012Validator:
-    return _scenario_validation_context()[1]
+def _scenario_validator(schema_version: str) -> Draft202012Validator:
+    return _scenario_validation_context(schema_version)[1]
 
 
 def _validate_scenario_schema(
@@ -337,11 +346,17 @@ def _validate_scenario_schema(
     else:
         schema_value = scenario
     try:
-        valid = _scenario_validator().is_valid(schema_value)
-    except (RecursionError, TypeError, ValueError):
+        schema_version = schema_value.get("schema_version")
+        valid = _scenario_validator(schema_version).is_valid(schema_value)
+    except (KeyError, RecursionError, TypeError, ValueError):
         valid = False
     if not valid:
         raise ValueError(_INVALID_SCENARIO_ERROR)
+    if schema_version == "steam-agent-eval/0.3":
+        try:
+            run_state.scenario_qualitative_criteria(schema_value)
+        except run_state.ManifestStateError as error:
+            raise ValueError(f"{_INVALID_SCENARIO_ERROR}: {error}") from None
 
 
 def _timeout_seconds_argument(value: str) -> float:
@@ -426,7 +441,9 @@ def _frozen_cli_launcher(
         "steam_agent.wishlist_library",
     )
     evaluated_source = (source_root or (ROOT / "src")).resolve()
-    import_paths = tuple(dict.fromkeys((str(evaluated_source), *site.getsitepackages())))
+    import_paths = tuple(
+        dict.fromkeys((str(evaluated_source), *site.getsitepackages()))
+    )
     source = f"""import sys as _sys
 _sys.path[:0] = {import_paths!r}
 _sys.argv[0] = {str(launcher)!r}
@@ -532,22 +549,51 @@ def _validate_accepted_optional_options(requirement: dict[str, Any]) -> None:
         accepted_names.add(name)
 
 
-def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
+def _validate_scenario_metadata(scenario: dict[str, Any]) -> None:
     fact_rubric = scenario.get("fact_rubric") or {}
-    if "required_claim_paths" in fact_rubric:
-        required_claim_paths = fact_rubric["required_claim_paths"]
-        if not isinstance(required_claim_paths, list) or any(
+    claim_path_sets = (
+        ("must_mention", "support_if_claimed")
+        if scenario.get("schema_version") == "steam-agent-eval/0.3"
+        else ("required_claim_paths",)
+    )
+    observed_claim_paths: set[str] = set()
+    for field in claim_path_sets:
+        claim_paths = fact_rubric.get(field, [])
+        if not isinstance(claim_paths, list) or any(
             not isinstance(path, str) or not grade.is_supported_path(path)
-            for path in required_claim_paths
+            for path in claim_paths
         ):
             raise UnsupportedScenarioError(_UNSUPPORTED_GRADING_PATH_ERROR)
+        if observed_claim_paths.intersection(claim_paths):
+            raise UnsupportedScenarioError(_UNSUPPORTED_GRADING_PATH_ERROR)
+        observed_claim_paths.update(claim_paths)
     requirements = scenario["tool_policy"].get("required") or []
+    if scenario.get("schema_version") == "steam-agent-eval/0.3":
+        if scenario.get("required_document_count") != len(requirements):
+            raise UnsupportedScenarioError(
+                "scenario required-document count does not match its commands"
+            )
     for requirement in requirements:
         _validate_accepted_optional_options(requirement)
     oracle = scenario.get("deterministic_oracle") or {}
     assertions = oracle.get("assertions", [])
     if not isinstance(assertions, list) or len(assertions) > _MAX_ORACLE_ASSERTIONS:
         raise UnsupportedScenarioError(_ORACLE_EVALUATION_LIMIT_ERROR)
+    deterministic_cli_paths = {
+        assertion.get("path")
+        for assertion in assertions
+        if isinstance(assertion, dict)
+        and assertion.get("source", "cli_document") == "cli_document"
+        and assertion.get("operator")
+        in {"contains", "equals", "omits", "ordered_equals", "one_of"}
+    }
+    if (
+        scenario.get("schema_version") == "steam-agent-eval/0.3"
+        and not set(fact_rubric.get("must_mention", ())) <= deterministic_cli_paths
+    ):
+        raise UnsupportedScenarioError(
+            "scenario must-mention paths need deterministic CLI assertions"
+        )
     for assertion in assertions:
         if not isinstance(assertion, dict) or (
             assertion.get("source", "cli_document") == "cli_document"
@@ -568,6 +614,13 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
             and _refusal_phrase_count(assertion) is None
         ):
             raise UnsupportedScenarioError(_ORACLE_EVALUATION_LIMIT_ERROR)
+
+
+def _validate_runner_requirements(
+    scenario: dict[str, Any], *, allow_sync: bool = False
+) -> None:
+    _validate_scenario_metadata(scenario)
+    requirements = scenario["tool_policy"].get("required") or []
     allow_data_delete = _allows_confirmed_data_delete(scenario)
     declarations = [
         *(
@@ -593,6 +646,8 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
     for declaration_kind, head in declarations:
         if head is None:
             continue
+        if allow_sync and head == ("sync",):
+            continue
         if declaration_kind == "required" and head == ("sync",):
             raise UnsupportedScenarioError(
                 "agent runner is cache-only but the scenario requires a sync command"
@@ -605,6 +660,22 @@ def _validate_runner_requirements(scenario: dict[str, Any]) -> None:
         raise UnsupportedScenarioError(
             "agent runner cannot unambiguously grade multiple required CLI documents"
         )
+
+
+def _must_mention_paths(fact_rubric: dict[str, Any]) -> Sequence[str]:
+    """Return the versioned deterministic claim-coverage requirements."""
+
+    if "must_mention" in fact_rubric:
+        return fact_rubric["must_mention"]
+    return fact_rubric.get("required_claim_paths", ())
+
+
+def _deterministic_only_scenario(scenario: dict[str, Any]) -> bool:
+    """Use schema metadata for 0.3 and a bounded historical fallback in tests."""
+
+    if scenario.get("schema_version") == "steam-agent-eval/0.3":
+        return scenario.get("execution_support") == "deterministic_only"
+    return scenario.get("id") in _LEGACY_DETERMINISTIC_ONLY_SCENARIOS
 
 
 def _grade_agent_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -801,7 +872,11 @@ def _load_scenarios(
             scenario = _strict_json_loads(source_bytes.decode("utf-8"))
         except (RecursionError, UnicodeError, ValueError):
             raise ValueError(_INVALID_SCENARIO_ERROR) from None
+        if not isinstance(scenario, dict):
+            raise ValueError(_INVALID_SCENARIO_ERROR)
         _validate_scenario_schema(scenario)
+        if scenario.get("schema_version") != CURRENT_SCENARIO_SCHEMA_VERSION:
+            raise ValueError(_INVALID_SCENARIO_ERROR)
         loaded_id = _validated_scenario_id(scenario.get("id"))
         scenario["_path"] = scenario_path
         scenario["_fixture_source_bytes"] = source_bytes
@@ -811,8 +886,7 @@ def _load_scenarios(
             continue
         if family is not None and path.parent.name != family:
             continue
-        if scenario_id is not None or family is not None:
-            scenarios.append(scenario)
+        scenarios.append(scenario)
     return scenarios
 
 
@@ -924,7 +998,10 @@ def _published_scenario_artifacts(
     for name in names:
         path = _resolved_contained_path(scenario_dir, scenario_dir / name)
         item_stat = path.lstat()
-        if not stat.S_ISREG(item_stat.st_mode) or stat.S_IMODE(item_stat.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(item_stat.st_mode)
+            or stat.S_IMODE(item_stat.st_mode) != 0o600
+        ):
             raise RuntimeError("eval artifact publication failed")
         hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     return hashes
@@ -983,9 +1060,7 @@ def _advance_manifest(
 ) -> run_state.RunManifest:
     """Persist one lifecycle step while making process cancellation explicit."""
 
-    advanced = manifest.transition(
-        state, at=datetime.now(timezone.utc), **changes
-    )
+    advanced = manifest.transition(state, at=datetime.now(timezone.utc), **changes)
     try:
         advanced.persist(manifest_path)
     except (KeyboardInterrupt, SystemExit):
@@ -1042,13 +1117,16 @@ def _oracle_document(
 def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
     """Exercise deterministic materialization and CLI assertions before a model.
 
-    Returns ``False`` only for the corpus's explicitly known deterministic-only
-    scenarios; any other unsupported or incorrect scenario aborts the cohort.
+    Deterministic-only scenarios still exercise any supported materializer and
+    deterministic CLI oracle, but return ``False`` so they never enter live
+    execution denominators. Any unsupported live scenario aborts the cohort.
     """
 
     scenario_id = _validated_scenario_id(scenario.get("id"))
+    _validate_scenario_metadata(scenario)
+    deterministic_only = _deterministic_only_scenario(scenario)
     try:
-        _validate_runner_requirements(scenario)
+        _validate_runner_requirements(scenario, allow_sync=deterministic_only)
         with tempfile.TemporaryDirectory(
             prefix=f"steam-agent-eval-preflight-{scenario_id}-"
         ) as workspace_name:
@@ -1056,19 +1134,25 @@ def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
             workspace.chmod(0o700)
             data_dir = workspace / "steam-agent-data"
             _ensure_private_dir(data_dir)
-            materialize(scenario, data_dir)
+            try:
+                materialize(scenario, data_dir)
+            except UnsupportedScenarioError:
+                if (
+                    deterministic_only
+                    and scenario.get("unsupported_reason") == _NO_CLI_WRITER_REASON
+                ):
+                    return False
+                raise
             requirements = scenario["tool_policy"].get("required") or []
             if not requirements:
-                return True
+                return not deterministic_only
             launcher = _frozen_cli_launcher(
                 workspace, scenario["frozen_time"], source_root=source_root
             )
             document = _oracle_document(data_dir, requirements[0], launcher)
             assertions = [
                 assertion
-                for assertion in scenario["deterministic_oracle"].get(
-                    "assertions", ()
-                )
+                for assertion in scenario["deterministic_oracle"].get("assertions", ())
                 if assertion.get("source", "cli_document") == "cli_document"
             ]
             result = grade.grade_assertions(
@@ -1076,10 +1160,8 @@ def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
             )
             if result.get("passed") is not True:
                 raise RuntimeError("eval deterministic preflight failed")
-            return True
+            return not deterministic_only
     except UnsupportedScenarioError:
-        if scenario_id in _EXPECTED_UNSUPPORTED_AGENT_SCENARIOS:
-            return False
         raise
 
 
@@ -1203,7 +1285,9 @@ def _tool_policy_allows_qualitative_review(metric: dict[str, Any]) -> bool:
     unlisted_calls = metric.get("unlisted_calls")
     violations = metric.get("violations")
     required = metric.get("required")
-    if not all(isinstance(value, list) for value in (unlisted_calls, violations, required)):
+    if not all(
+        isinstance(value, list) for value in (unlisted_calls, violations, required)
+    ):
         return False
     if unlisted_calls or any(
         not isinstance(violation, dict)
@@ -1393,15 +1477,12 @@ def _validate_claim_evaluation_budget(
         raise ValueError(_CLAIM_EVALUATION_LIMIT_ERROR)
     if oracle_document is None:
         return
-    required_paths = fact_rubric.get("required_claim_paths", ())
+    required_paths = _must_mention_paths(fact_rubric)
     selection_steps = sum(
         grade.path_selection_steps(claim["path"]) * _CLAIM_SELECTION_PASSES
         for turn in turns
         for claim in (turn["_claims"] or ())
-    ) + sum(
-        grade.path_selection_steps(path)
-        for path in required_paths
-    )
+    ) + sum(grade.path_selection_steps(path) for path in required_paths)
     # Coverage compares every supported claim-location set with every required
     # location set. Charging one document-weighted step per pair bounds the
     # subset and union memberships before any concrete locations are retained.
@@ -1462,9 +1543,7 @@ def _validate_oracle_evaluation_budget(
             )
             if phrase_count is None:
                 raise ValueError(_ORACLE_EVALUATION_LIMIT_ERROR)
-            work += (
-                answer_characters * phrase_count * _ORACLE_ASSERTION_PASSES
-            )
+            work += answer_characters * phrase_count * _ORACLE_ASSERTION_PASSES
         if work > _MAX_ORACLE_EVALUATION_WORK:
             raise ValueError(_ORACLE_EVALUATION_LIMIT_ERROR)
 
@@ -1480,7 +1559,7 @@ def _grade_claims_by_turn(
     _validate_claim_evaluation_budget(turns, oracle_document, fact_rubric)
     merged = grade.merge_claims(turn["_claims"] for turn in turns)
     if oracle_document is None:
-        required_paths = list(fact_rubric.get("required_claim_paths", ()))
+        required_paths = list(_must_mention_paths(fact_rubric))
         criteria = list(fact_rubric.get("criteria", ()))
         failed = list(merged or ())
         unevaluated_hard_fail_criteria = [
@@ -1518,10 +1597,10 @@ def _grade_claims_by_turn(
     aggregate = grade.grade_fact_coverage(
         merged,
         oracle_document,
-        fact_rubric.get("required_claim_paths", ()),
+        _must_mention_paths(fact_rubric),
         criteria=fact_rubric.get("criteria", ()),
     )
-    required_paths = fact_rubric.get("required_claim_paths", ())
+    required_paths = _must_mention_paths(fact_rubric)
     per_turn = []
     for turn in turns:
         evidence_available = False
@@ -1688,9 +1767,7 @@ def _capture_error(capture: EvidenceCapture) -> str | None:
             f"{capture.successful_candidates}"
         ),
         "output_absent": "successful required command did not capture text output",
-        "invalid_json": (
-            "successful required command output is not one JSON document"
-        ),
+        "invalid_json": ("successful required command output is not one JSON document"),
     }
     return errors.get(capture.state)
 
@@ -1720,9 +1797,7 @@ def _bounded_folded_shell_commands(commands: Sequence[str]) -> list[str]:
             source_characters += len(command) + 1
             if source_characters > _MAX_COMMAND_PRIVACY_CHARACTERS:
                 raise ValueError
-            folded_commands.append(
-                command.replace("\\\r\n", "").replace("\\\n", "")
-            )
+            folded_commands.append(command.replace("\\\r\n", "").replace("\\\n", ""))
     except (RecursionError, ValueError):
         raise ValueError(_COMMAND_PRIVACY_DECODING_ERROR) from None
     return folded_commands
@@ -1814,9 +1889,7 @@ def _grade_privacy_surfaces(
     """Grade retained commands without applying answer-only ID exemptions."""
 
     folded_commands = _bounded_folded_shell_commands(commands)
-    decoded_command_text = _strict_shell_decoded_folded_command_surface(
-        folded_commands
-    )
+    decoded_command_text = _strict_shell_decoded_folded_command_surface(folded_commands)
     metric = grade.grade_privacy(
         transcript_text,
         canaries,
@@ -1840,9 +1913,7 @@ def _observed_model_route(
     if transcript.observed_models:
         return tuple(transcript.observed_models)
     return (
-        (transcript.effective_model,)
-        if transcript.effective_model is not None
-        else ()
+        (transcript.effective_model,) if transcript.effective_model is not None else ()
     )
 
 
@@ -1871,8 +1942,7 @@ def _requested_route_confirmed(
                 model in transcript.pre_activity_models
                 and _observed_model_route(transcript)
                 and all(
-                    observed == model
-                    for observed in _observed_model_route(transcript)
+                    observed == model for observed in _observed_model_route(transcript)
                 )
             )
         )
@@ -1955,6 +2025,8 @@ def run_scenario(
     _validate_scenario_schema(scenario, allow_internal_path=True)
     scenario_id = _validated_scenario_id(scenario.get("id"))
     scenario_dir = _resolved_contained_path(run_dir, run_dir / scenario_id)
+    if _deterministic_only_scenario(scenario):
+        raise UnsupportedScenarioError("scenario is deterministic-only")
     _validate_runner_requirements(scenario)
     sensitive_values = tuple(scenario["privacy_canaries"].values())
     allow_data_delete = _allows_confirmed_data_delete(scenario)
@@ -1999,9 +2071,7 @@ def run_scenario(
         }
         if source_root is not None:
             conversation_arguments["source_root"] = str(source_root)
-        transcripts = codex_driver.run_agent_conversation(
-            **conversation_arguments
-        )
+        transcripts = codex_driver.run_agent_conversation(**conversation_arguments)
         finished = datetime.now(timezone.utc)
 
         turns: list[dict[str, Any]] = []
@@ -2181,12 +2251,10 @@ def run_scenario(
                 transcript.effective_reasoning_effort for transcript in transcripts
             ],
             "observed_models_by_turn": [
-                list(_observed_model_route(transcript))
-                for transcript in transcripts
+                list(_observed_model_route(transcript)) for transcript in transcripts
             ],
             "observed_reasoning_efforts_by_turn": [
-                list(_observed_effort_route(transcript))
-                for transcript in transcripts
+                list(_observed_effort_route(transcript)) for transcript in transcripts
             ],
             "requested_route_confirmed": _requested_route_confirmed(
                 transcripts, model=model, effort=effort
@@ -2277,6 +2345,32 @@ def run_scenario(
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv:
+        command = argv[0]
+        command_argv = argv[1:]
+        if command in {"matrix", "resume"}:
+            from evals.runner import matrix
+
+            return matrix.run_cli(command_argv, resume=command == "resume")
+        if command in {"inspect", "compare"}:
+            from evals.runner import inspection
+
+            handler = (
+                inspection.inspect_cli
+                if command == "inspect"
+                else inspection.compare_cli
+            )
+            return handler(command_argv)
+        if command == "adjudicate":
+            from evals.runner import judge
+
+            return judge.judge_cli(command_argv)
+        if command == "accept":
+            from evals.runner import acceptance
+
+            return acceptance.accept_cli(command_argv)
+
     parser = argparse.ArgumentParser(prog="evals.runner")
     parser.add_argument(
         "--family",
@@ -2393,9 +2487,7 @@ def main(argv: list[str] | None = None) -> int:
             track=args.track,
             control_set_version=controls.CONTROL_SCHEMA_VERSION,
             scenarios=frozen,
-            requested_routes=(
-                run_state.RequestedRoute(args.model, args.effort),
-            ),
+            requested_routes=(run_state.RequestedRoute(args.model, args.effort),),
             tool_versions={
                 "codex": codex_version,
                 "controls": controls.CONTROL_SCHEMA_VERSION.replace("/", ":"),
@@ -2429,9 +2521,7 @@ def main(argv: list[str] | None = None) -> int:
         if not controls_only:
             try:
                 for scenario in scenarios:
-                    _preflight_scenario(
-                        scenario, source_root=snapshot.root / "src"
-                    )
+                    _preflight_scenario(scenario, source_root=snapshot.root / "src")
             except (KeyboardInterrupt, SystemExit):
                 _terminalize_interruption(manifest, manifest_path)
                 raise
@@ -2459,9 +2549,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         try:
-            control_result = controls.run_scripted_controls(
-                _evaluate_scripted_control
-            )
+            control_result = controls.run_scripted_controls(_evaluate_scripted_control)
             run_state.atomic_publish_private_json(
                 run_dir / "controls.json", control_result
             )
@@ -2499,16 +2587,18 @@ def main(argv: list[str] | None = None) -> int:
             inputs_unchanged = _interruptible(
                 manifest,
                 manifest_path,
-                lambda: _selected_inputs_unchanged(
-                    scenarios,
-                    source_root=source_root,
-                    source_digest=mutable_source_digest,
-                    harness_root=harness_root,
-                    harness_digest=mutable_harness_digest,
-                    schema_path=SCENARIO_SCHEMA_PATH,
-                    schema_digest=schema_digest,
-                )
-                and _clean_revision_unchanged(revision),
+                lambda: (
+                    _selected_inputs_unchanged(
+                        scenarios,
+                        source_root=source_root,
+                        source_digest=mutable_source_digest,
+                        harness_root=harness_root,
+                        harness_digest=mutable_harness_digest,
+                        schema_path=SCENARIO_SCHEMA_PATH,
+                        schema_digest=schema_digest,
+                    )
+                    and _clean_revision_unchanged(revision)
+                ),
             )
             try:
                 _interruptible(manifest, manifest_path, snapshot.verify)
@@ -2606,7 +2696,7 @@ def main(argv: list[str] | None = None) -> int:
                         str(error),
                         tuple(scenario.get("privacy_canaries", {}).values()),
                     )
-                    if scenario["id"] in _EXPECTED_UNSUPPORTED_AGENT_SCENARIOS:
+                    if _deterministic_only_scenario(scenario):
                         print(
                             f"{scenario['id']}: skipped ({error_text})",
                             file=sys.stderr,
@@ -2629,22 +2719,16 @@ def main(argv: list[str] | None = None) -> int:
                                     "reason": "deterministic_only",
                                 },
                             )
-                            summaries[-1]["artifacts"] = (
-                                _published_scenario_artifacts(
-                                    run_dir, scenario["id"], skipped=True
-                                )
+                            summaries[-1]["artifacts"] = _published_scenario_artifacts(
+                                run_dir, scenario["id"], skipped=True
                             )
                         except Exception:
                             terminal_state = run_state.RunState.FAILED
-                            terminal_reason = (
-                                run_state.TerminalReason.ARTIFACT_FAILURE
-                            )
+                            terminal_reason = run_state.TerminalReason.ARTIFACT_FAILURE
                             exit_code = 1
                             break
                     else:
-                        print(
-                            f"{scenario['id']}: FAIL ({error_text})", file=sys.stderr
-                        )
+                        print(f"{scenario['id']}: FAIL ({error_text})", file=sys.stderr)
                         summaries.append(
                             {
                                 "scenario": scenario["id"],
@@ -2696,9 +2780,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "content": _omitted_content(error_text),
                                 "redactions": redactions,
                             },
-                            "diagnostics": {
-                                "observed_conditions": ["runner_error"]
-                            },
+                            "diagnostics": {"observed_conditions": ["runner_error"]},
                         }
                     )
                     exit_code = 1
@@ -2715,9 +2797,7 @@ def main(argv: list[str] | None = None) -> int:
                             "scenario": scenario["id"],
                             "passed": False,
                             "error": {"type": "artifact_failure"},
-                            "diagnostics": {
-                                "observed_conditions": ["runner_error"]
-                            },
+                            "diagnostics": {"observed_conditions": ["runner_error"]},
                         }
                     )
                     exit_code = 1
@@ -2734,9 +2814,7 @@ def main(argv: list[str] | None = None) -> int:
                             "passed": False,
                             "error": {"type": "requested_route_unconfirmed"},
                             "artifacts": artifact_hashes,
-                            "diagnostics": {
-                                "observed_conditions": ["runner_error"]
-                            },
+                            "diagnostics": {"observed_conditions": ["runner_error"]},
                         }
                     )
                     exit_code = 1
@@ -2792,16 +2870,18 @@ def main(argv: list[str] | None = None) -> int:
             final_inputs_unchanged = _interruptible(
                 manifest,
                 manifest_path,
-                lambda: _selected_inputs_unchanged(
-                    scenarios,
-                    source_root=source_root,
-                    source_digest=mutable_source_digest,
-                    harness_root=harness_root,
-                    harness_digest=mutable_harness_digest,
-                    schema_path=SCENARIO_SCHEMA_PATH,
-                    schema_digest=schema_digest,
-                )
-                and _clean_revision_unchanged(revision),
+                lambda: (
+                    _selected_inputs_unchanged(
+                        scenarios,
+                        source_root=source_root,
+                        source_digest=mutable_source_digest,
+                        harness_root=harness_root,
+                        harness_digest=mutable_harness_digest,
+                        schema_path=SCENARIO_SCHEMA_PATH,
+                        schema_digest=schema_digest,
+                    )
+                    and _clean_revision_unchanged(revision)
+                ),
             )
         if terminal_state is None and not final_inputs_unchanged:
             terminal_state = run_state.RunState.CONTAMINATED

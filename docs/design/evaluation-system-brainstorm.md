@@ -2,6 +2,11 @@
 
 Status: **Proposed — not accepted.**
 
+Implementation note (2026-08-02): ADRs 0019 and 0020 accepted the scenario
+`0.3`, matrix, resume, inspection, and adjudication foundations proposed here.
+This document remains the historical proposal and does not redefine those
+accepted contracts.
+
 This report records the verification evidence collected while merging the
 agent-evaluation buildout and a GPT-Sol review of possible next work. It does
 not change the accepted M1–M7 product contracts, the evaluation strategy, or

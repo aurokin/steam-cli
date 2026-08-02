@@ -1,0 +1,490 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steam-agent.invalid/evals/schema/scenario-0.3.json",
+  "title": "Steam Agent common-question scenario 0.3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "status",
+    "milestone",
+    "scenario_kind",
+    "execution_support",
+    "unsupported_reason",
+    "required_document_count",
+    "question_family",
+    "tags",
+    "frozen_time",
+    "fixture",
+    "conversation",
+    "tool_policy",
+    "deterministic_oracle",
+    "fact_rubric",
+    "judged_answer_rubric",
+    "privacy_canaries"
+  ],
+  "properties": {
+    "schema_version": {"const": "steam-agent-eval/0.3"},
+    "id": {"type": "string", "pattern": "^m[1-9][0-9]*-[a-z][0-9]{2,}$"},
+    "status": {"enum": ["active", "proposed"]},
+    "milestone": {"type": "string", "pattern": "^M[1-9][0-9]*$"},
+    "scenario_kind": {"enum": ["contract", "boundary"]},
+    "execution_support": {"enum": ["live", "deterministic_only"]},
+    "unsupported_reason": {
+      "type": ["string", "null"],
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{2,63}$"
+    },
+    "required_document_count": {"type": "integer", "minimum": 0, "maximum": 8},
+    "question_family": {"type": "string", "minLength": 3},
+    "tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}
+    },
+    "frozen_time": {"type": "string", "format": "date-time"},
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description", "facts"],
+      "properties": {
+        "kind": {"const": "synthetic_normalized"},
+        "description": {"type": "string", "minLength": 10},
+        "facts": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["subject", "state"],
+            "properties": {
+              "subject": {"type": "string", "pattern": "^synthetic:"},
+              "state": {"type": "string", "minLength": 1},
+              "detail": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user"],
+      "properties": {
+        "user": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 3}
+        },
+        "paraphrase": {"type": "string", "minLength": 3}
+      }
+    },
+    "tool_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "required", "prohibited"],
+      "properties": {
+        "allowed": {"$ref": "#/$defs/stringSet"},
+        "required": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command", "arguments"],
+            "properties": {
+              "command": {"type": "string", "pattern": "^steam-agent "},
+              "arguments": {"type": "array", "items": {"type": "string"}},
+              "accepted_optional_options": {
+                "type": "array",
+                "maxItems": 16,
+                "uniqueItems": true,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name"],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^--[a-z][a-z0-9-]{0,63}$",
+                      "not": {"const": "--format"}
+                    },
+                    "value": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^(?!--)"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "prohibited": {"$ref": "#/$defs/stringSet"}
+      }
+    },
+    "deterministic_oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recipe_or_contract", "assertions"],
+      "properties": {
+        "recipe_or_contract": {"type": "string", "minLength": 3},
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/assertion"}
+        }
+      }
+    },
+    "fact_rubric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grading", "must_mention", "support_if_claimed", "criteria"],
+      "properties": {
+        "grading": {"const": "deterministic"},
+        "must_mention": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/supportedPath"}
+        },
+        "support_if_claimed": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/supportedPath"}
+        },
+        "criteria": {"$ref": "#/$defs/criteria"}
+      }
+    },
+    "judged_answer_rubric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grading", "status", "criteria"],
+      "properties": {
+        "grading": {"const": "model_or_human"},
+        "status": {"const": "opt_in"},
+        "criteria": {"$ref": "#/$defs/criteria"}
+      }
+    },
+    "privacy_canaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steam_id64", "credential", "local_path"],
+      "properties": {
+        "steam_id64": {"type": "string", "pattern": "^EVAL_CANARY_STEAMID64_"},
+        "credential": {"type": "string", "pattern": "^EVAL_CANARY_CREDENTIAL_"},
+        "local_path": {"type": "string", "pattern": "^EVAL_CANARY_LOCAL_PATH_"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["scenario_kind"],
+        "properties": {"scenario_kind": {"const": "contract"}}
+      },
+      "then": {
+        "properties": {
+          "fixture": {"properties": {"facts": {"minItems": 1}}},
+          "tool_policy": {"properties": {"required": {"minItems": 1}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["tool_policy"],
+        "properties": {
+          "tool_policy": {
+            "required": ["required"],
+            "properties": {"required": {"minItems": 1}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "fact_rubric": {
+            "required": ["must_mention"],
+            "properties": {"must_mention": {"minItems": 1}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deterministic_oracle": {
+            "properties": {
+              "assertions": {
+                "contains": {
+                  "type": "object",
+                  "required": ["operator"],
+                  "properties": {"operator": {"const": "refusal_expected"}}
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "fact_rubric": {
+            "properties": {
+              "criteria": {
+                "contains": {
+                  "type": "object",
+                  "required": ["hard_fail"],
+                  "properties": {"hard_fail": {"const": true}}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["execution_support"],
+        "properties": {"execution_support": {"const": "live"}}
+      },
+      "then": {
+        "properties": {
+          "unsupported_reason": {"type": "null"},
+          "required_document_count": {"maximum": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["execution_support"],
+        "properties": {"execution_support": {"const": "deterministic_only"}}
+      },
+      "then": {
+        "properties": {
+          "unsupported_reason": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]{2,63}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["required_document_count"],
+        "properties": {"required_document_count": {"const": 0}}
+      },
+      "then": {
+        "properties": {
+          "fact_rubric": {
+            "properties": {
+              "must_mention": {"maxItems": 0},
+              "support_if_claimed": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "supportedPath": {
+      "type": "string",
+      "maxLength": 1024,
+      "pattern": "^\\$\\.(?:[a-z_][a-z0-9_]*(?:\\[(?:\\*|[0-9]+|\\?\\(@\\.[a-z_]+==(?:[0-9]+|'[^'\\[\\]]+')\\))\\])*)(?:\\.(?:[a-z_][a-z0-9_]*(?:\\[(?:\\*|[0-9]+|\\?\\(@\\.[a-z_]+==(?:[0-9]+|'[^'\\[\\]]+')\\))\\])*))*(?![\\s\\S])"
+    },
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "operator", "expected"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^\\$"},
+        "operator": {
+          "enum": [
+            "equals",
+            "contains",
+            "omits",
+            "ordered_equals",
+            "one_of",
+            "must_not_execute",
+            "refusal_expected"
+          ]
+        },
+        "expected": {},
+        "source": {"enum": ["cli_document", "final_answer", "trace"]},
+        "turn": {"type": "integer", "minimum": 0}
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["operator"],
+            "properties": {"operator": {"const": "must_not_execute"}}
+          },
+          "then": {
+            "required": ["source"],
+            "properties": {
+              "source": {"const": "trace"},
+              "path": {"const": "$"},
+              "expected": {"type": "string", "pattern": "\\S"}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["operator"],
+            "properties": {"operator": {"const": "refusal_expected"}}
+          },
+          "then": {
+            "required": ["source"],
+            "properties": {
+              "source": {"const": "final_answer"},
+              "expected": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["required_all", "required_any"],
+                "properties": {
+                  "required_all": {
+                    "type": "array", "minItems": 1, "maxItems": 64,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string", "maxLength": 256, "pattern": "\\S"
+                    }
+                  },
+                  "required_any": {
+                    "type": "array", "minItems": 1, "maxItems": 64,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string", "maxLength": 256, "pattern": "\\S"
+                    }
+                  }
+                }
+              },
+              "path": {"const": "$"}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["operator"],
+            "properties": {"operator": {"const": "one_of"}}
+          },
+          "then": {
+            "properties": {
+              "expected": {"type": "array", "minItems": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {"not": {"required": ["source"]}},
+              {
+                "required": ["source"],
+                "properties": {"source": {"const": "cli_document"}}
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "path": {"$ref": "#/$defs/supportedPath"},
+              "operator": {
+                "enum": [
+                  "equals",
+                  "contains",
+                  "omits",
+                  "ordered_equals",
+                  "one_of"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["source"],
+            "properties": {"source": {"const": "final_answer"}}
+          },
+          "then": {
+            "properties": {
+              "path": {"const": "$"},
+              "operator": {
+                "enum": ["contains", "omits", "refusal_expected"]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "operator": {"enum": ["contains", "omits"]}
+                  }
+                },
+                "then": {"properties": {"expected": {"type": "string"}}}
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": ["source"],
+            "properties": {"source": {"const": "trace"}}
+          },
+          "then": {
+            "properties": {
+              "path": {"const": "$"},
+              "operator": {"const": "must_not_execute"},
+              "expected": {"type": "string", "pattern": "\\S"}
+            }
+          }
+        }
+      ]
+    },
+    "stringSet": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "weight", "requirement"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
+          },
+          "weight": {"type": "integer", "minimum": 1, "maximum": 10},
+          "requirement": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 4096,
+            "pattern": "\\S"
+          },
+          "hard_fail": {"type": "boolean"},
+          "screen_safety_gate": {"type": "boolean"}
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": ["screen_safety_gate"],
+              "properties": {"screen_safety_gate": {"const": true}}
+            },
+            "then": {
+              "required": ["hard_fail"],
+              "properties": {"hard_fail": {"const": true}}
+            }
+          }
+        ]
+      }
+    }
+  }
+}

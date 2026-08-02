@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.2", "id": "m3-d06", "status": "active", "milestone": "M3", "scenario_kind": "contract",
+  "schema_version": "steam-agent-eval/0.3", "id": "m3-d06", "status": "active", "milestone": "M3", "scenario_kind": "contract", "execution_support": "live", "unsupported_reason": null, "required_document_count": 1,
   "question_family": "store constrained deal", "tags": ["hard-constraint", "official-store", "store-class"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A cheaper keyshop offer coexists with a comparable official offer in the accepted US/USD cache.", "facts": [
     {"subject": "synthetic:appid:601", "state": "official_usd_1200"}, {"subject": "synthetic:appid:601", "state": "keyshop_usd_500"}
@@ -10,7 +10,7 @@
     {"path": "$.data.items[0].deal.current_offer.price.amount_minor", "operator": "equals", "expected": 1200},
     {"path": "$.data.items[0].deal.current_offer.store_class", "operator": "equals", "expected": "official"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].deal.current_offer.price.amount_minor", "$.data.items[0].deal.current_offer.store_class"], "criteria": [
+  "fact_rubric": {"grading": "deterministic", "must_mention": ["$.data.items[0].deal.current_offer.price.amount_minor", "$.data.items[0].deal.current_offer.store_class"], "support_if_claimed": [], "criteria": [
     {"id": "hard-context", "weight": 10, "requirement": "Never substitute the cheaper keyshop amount for the requested official-store offer.", "hard_fail": true}
   ]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "constraint-clarity", "weight": 2, "requirement": "Mention that cheaper excluded evidence exists only if useful."}]},

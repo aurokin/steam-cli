@@ -25,6 +25,8 @@ from typing import Any, Self
 
 
 MANIFEST_SCHEMA = "steam-agent-eval-run/0.1"
+MATRIX_MANIFEST_SCHEMA = "steam-agent-eval-matrix-run/0.1"
+MATRIX_PREFLIGHT_SCHEMA = "steam-agent-eval-matrix-preflight/0.1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _COMMIT = re.compile(r"[0-9a-f]{40,64}\Z", re.ASCII)
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
@@ -36,8 +38,13 @@ _CONTROL_SET_VERSION = re.compile(
 _REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 _CLEANLINESS_STATES = frozenset({"clean", "dirty", "unknown"})
 _TRACKS = frozenset({"legacy", "answer", "discovery"})
+_MATRIX_HARD_LAYERS = frozenset(
+    {"agent_turns", "tool_policy", "oracle", "claims", "privacy"}
+)
 _MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_FILES = 16_384
+MATRIX_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+MAX_QUALITATIVE_CRITERIA = 1024
 _IGNORED_SOURCE_NAMES = frozenset({".DS_Store", "__pycache__"})
 
 
@@ -68,6 +75,13 @@ class TerminalReason(StrEnum):
     SOURCE_CHANGED = "source_changed"
     SNAPSHOT_INVALID = "snapshot_invalid"
     ARTIFACT_FAILURE = "artifact_failure"
+
+
+class MatrixState(StrEnum):
+    """Lifecycle of a resumable matrix plan, separate from child cohorts."""
+
+    OPEN = "open"
+    COMPLETED = "completed"
 
 
 _TERMINAL_STATES = frozenset(
@@ -121,8 +135,7 @@ def _safe_relative_name(value: str) -> str:
     if path.is_absolute() or str(path) != value:
         raise ValueError("invalid relative source name")
     if any(
-        component in {"", ".", ".."}
-        or _SAFE_COMPONENT.fullmatch(component) is None
+        component in {"", ".", ".."} or _SAFE_COMPONENT.fullmatch(component) is None
         for component in path.parts
     ):
         raise ValueError("invalid relative source name")
@@ -175,9 +188,7 @@ class FrozenScenario:
     sha256: str
 
     @classmethod
-    def create(
-        cls, *, source_name: str, original_bytes: bytes, document: Any
-    ) -> Self:
+    def create(cls, *, source_name: str, original_bytes: bytes, document: Any) -> Self:
         source_name = _safe_relative_name(source_name)
         if not isinstance(original_bytes, bytes):
             raise TypeError("scenario source must be bytes")
@@ -252,7 +263,9 @@ def _read_regular_file_at(directory_fd: int, name: str) -> tuple[bytes, os.stat_
             "st_mtime_ns",
             "st_ctime_ns",
         )
-        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        if any(
+            getattr(before, field) != getattr(after, field) for field in stable_fields
+        ):
             raise SnapshotIntegrityError("source changed while being snapshotted")
         return b"".join(chunks), after
     finally:
@@ -298,11 +311,11 @@ def _copy_source_directory(
                     opened_stat.st_dev,
                     opened_stat.st_ino,
                 ) != (source_stat.st_dev, source_stat.st_ino):
-                    raise SnapshotIntegrityError("source changed while being snapshotted")
+                    raise SnapshotIntegrityError(
+                        "source changed while being snapshotted"
+                    )
                 target.mkdir(mode=0o700)
-                _copy_source_directory(
-                    child_fd, target, file_counter=file_counter
-                )
+                _copy_source_directory(child_fd, target, file_counter=file_counter)
             finally:
                 os.close(child_fd)
             continue
@@ -329,7 +342,9 @@ def _mkdir_relative(root: Path, relative_parent: PurePosixPath) -> Path:
         except FileExistsError:
             current_stat = current.lstat()
             if not stat.S_ISDIR(current_stat.st_mode):
-                raise SnapshotIntegrityError("snapshot destination is contaminated") from None
+                raise SnapshotIntegrityError(
+                    "snapshot destination is contaminated"
+                ) from None
     return current
 
 
@@ -383,7 +398,9 @@ def _scan_inventory_unchecked(
                         opened.st_dev,
                         opened.st_ino,
                     ) != (item_stat.st_dev, item_stat.st_ino):
-                        raise SnapshotIntegrityError("snapshot changed during verification")
+                        raise SnapshotIntegrityError(
+                            "snapshot changed during verification"
+                        )
                     entries.append(
                         InventoryEntry(
                             relative_name=relative.as_posix(),
@@ -455,8 +472,7 @@ def _normalized_content_inventory(
     except OSError:
         raise SnapshotIntegrityError("source changed while being snapshotted") from None
     return tuple(
-        (entry.relative_name, entry.kind, entry.size, entry.sha256)
-        for entry in entries
+        (entry.relative_name, entry.kind, entry.size, entry.sha256) for entry in entries
     )
 
 
@@ -510,7 +526,9 @@ class SourceSnapshot:
             harness_stat = harness_root.lstat()
             parent_stat = destination.parent.lstat()
         except OSError:
-            raise SnapshotIntegrityError("source snapshot input is inaccessible") from None
+            raise SnapshotIntegrityError(
+                "source snapshot input is inaccessible"
+            ) from None
         if (
             not stat.S_ISDIR(source_stat.st_mode)
             or not stat.S_ISDIR(harness_stat.st_mode)
@@ -520,7 +538,9 @@ class SourceSnapshot:
         try:
             destination.mkdir(mode=0o700)
         except OSError:
-            raise SnapshotIntegrityError("source snapshot destination is unavailable") from None
+            raise SnapshotIntegrityError(
+                "source snapshot destination is unavailable"
+            ) from None
 
         try:
             file_counter = [0]
@@ -591,7 +611,9 @@ class SourceSnapshot:
             raise
         except OSError:
             _remove_snapshot(destination)
-            raise SnapshotIntegrityError("source changed while being snapshotted") from None
+            raise SnapshotIntegrityError(
+                "source changed while being snapshotted"
+            ) from None
         except BaseException:
             _remove_snapshot(destination)
             raise
@@ -601,11 +623,10 @@ class SourceSnapshot:
             root_stat = self.root.lstat()
         except OSError:
             raise SnapshotIntegrityError("source snapshot is inaccessible") from None
-        if (
-            not stat.S_ISDIR(root_stat.st_mode)
-            or (root_stat.st_dev, root_stat.st_ino)
-            != (self._root_device, self._root_inode)
-        ):
+        if not stat.S_ISDIR(root_stat.st_mode) or (
+            root_stat.st_dev,
+            root_stat.st_ino,
+        ) != (self._root_device, self._root_inode):
             raise SnapshotIntegrityError("source snapshot root changed")
         inventory = _scan_inventory(self.root)
         digest = _hash_inventory(inventory)
@@ -620,11 +641,10 @@ class SourceSnapshot:
             root_stat = self.root.lstat()
         except FileNotFoundError:
             return
-        if (
-            not stat.S_ISDIR(root_stat.st_mode)
-            or (root_stat.st_dev, root_stat.st_ino)
-            != (self._root_device, self._root_inode)
-        ):
+        if not stat.S_ISDIR(root_stat.st_mode) or (
+            root_stat.st_dev,
+            root_stat.st_ino,
+        ) != (self._root_device, self._root_inode):
             raise SnapshotIntegrityError("source snapshot root changed")
         _remove_snapshot(self.root)
 
@@ -675,7 +695,9 @@ def _write_all(descriptor: int, content: bytes) -> None:
         view = view[written:]
 
 
-def atomic_publish_private_bytes(path: Path, content: bytes, *, mode: int = 0o600) -> None:
+def atomic_publish_private_bytes(
+    path: Path, content: bytes, *, mode: int = 0o600
+) -> None:
     """Atomically publish a private regular file without replacing any target."""
 
     if not isinstance(content, bytes):
@@ -737,8 +759,10 @@ def atomic_publish_private_json(path: Path, value: Any) -> None:
 def _canonical_time(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ManifestStateError("manifest time must be timezone-aware")
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -826,9 +850,10 @@ class RunManifest:
             raise ManifestStateError("manifest requires unique scenarios")
         for scenario_id in self.scenario_ids:
             _safe_token(scenario_id, label="scenario ID")
-        if self.completed_scenario_ids != self.scenario_ids[
-            : len(self.completed_scenario_ids)
-        ]:
+        if (
+            self.completed_scenario_ids
+            != self.scenario_ids[: len(self.completed_scenario_ids)]
+        ):
             raise ManifestStateError("completed scenarios are not an ordered prefix")
         if self.state in {RunState.INITIALIZING, RunState.CONTROLS}:
             if self.controls_passed is not None:
@@ -1007,9 +1032,7 @@ class RunManifest:
             "control_set_version": self.control_set_version,
             "controls_passed": self.controls_passed,
             "terminal_reason": (
-                self.terminal_reason.value
-                if self.terminal_reason is not None
-                else None
+                self.terminal_reason.value if self.terminal_reason is not None else None
             ),
             "source": {
                 "commit": self.commit,
@@ -1032,6 +1055,106 @@ class RunManifest:
             "updated_at": self.updated_at,
             "finished_at": self.finished_at,
         }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        """Strictly load a manifest without accepting unknown provenance fields."""
+
+        expected = {
+            "schema",
+            "run_id",
+            "state",
+            "revision",
+            "track",
+            "control_set_version",
+            "controls_passed",
+            "terminal_reason",
+            "source",
+            "scenario_ids",
+            "completed_scenario_ids",
+            "fixture_hashes",
+            "requested_routes",
+            "tool_versions",
+            "started_at",
+            "updated_at",
+            "finished_at",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ManifestStateError("invalid manifest")
+        source = value["source"]
+        if not isinstance(source, dict) or set(source) != {
+            "commit",
+            "digest",
+            "cleanliness",
+            "snapshot",
+        }:
+            raise ManifestStateError("invalid manifest source")
+        if source["snapshot"] != "sealed":
+            raise ManifestStateError("invalid manifest snapshot")
+        scenarios = value["scenario_ids"]
+        completed = value["completed_scenario_ids"]
+        fixture_hashes = value["fixture_hashes"]
+        routes = value["requested_routes"]
+        tools = value["tool_versions"]
+        if not all(
+            isinstance(items, list)
+            for items in (scenarios, completed, fixture_hashes, routes, tools)
+        ):
+            raise ManifestStateError("invalid manifest collections")
+        if not all(isinstance(item, str) for item in (*scenarios, *completed)):
+            raise ManifestStateError("invalid manifest scenarios")
+        normalized_fixtures: list[tuple[str, str]] = []
+        for item in fixture_hashes:
+            if not isinstance(item, dict) or set(item) != {"scenario", "sha256"}:
+                raise ManifestStateError("invalid fixture hash")
+            normalized_fixtures.append((item["scenario"], item["sha256"]))
+        normalized_tools: list[tuple[str, str]] = []
+        for item in tools:
+            if not isinstance(item, dict) or set(item) != {"name", "version"}:
+                raise ManifestStateError("invalid tool version")
+            normalized_tools.append((item["name"], item["version"]))
+        normalized_routes: list[RequestedRoute] = []
+        for item in routes:
+            if not isinstance(item, dict) or set(item) != {
+                "model",
+                "reasoning_effort",
+            }:
+                raise ManifestStateError("invalid requested route")
+            normalized_routes.append(
+                RequestedRoute(item["model"], item["reasoning_effort"])
+            )
+        try:
+            state = RunState(value["state"])
+            reason = (
+                TerminalReason(value["terminal_reason"])
+                if value["terminal_reason"] is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            raise ManifestStateError("invalid manifest lifecycle") from None
+        return cls(
+            schema=value["schema"],
+            run_id=value["run_id"],
+            state=state,
+            revision=value["revision"],
+            commit=source["commit"],
+            source_digest=source["digest"],
+            cleanliness=source["cleanliness"],
+            track=value["track"],
+            control_set_version=value["control_set_version"],
+            controls_passed=value["controls_passed"],
+            terminal_reason=reason,
+            scenario_ids=tuple(scenarios),
+            completed_scenario_ids=tuple(completed),
+            fixture_hashes=tuple(
+                (scenario, digest) for scenario, digest in normalized_fixtures
+            ),
+            requested_routes=tuple(normalized_routes),
+            tool_versions=tuple(normalized_tools),
+            started_at=value["started_at"],
+            updated_at=value["updated_at"],
+            finished_at=value["finished_at"],
+        )
 
     def persist(self, path: Path) -> None:
         """Atomically create or advance the canonical private manifest file."""
@@ -1093,14 +1216,1351 @@ class RunManifest:
         if (
             existing_static != expected_static
             or existing.get("revision") != self.revision - 1
-            or self.state
-            not in _ALLOWED_TRANSITIONS.get(existing_state, frozenset())
+            or self.state not in _ALLOWED_TRANSITIONS.get(existing_state, frozenset())
             or existing.get("finished_at") is not None
             or not dynamic_valid
-            or _parse_time(existing.get("updated_at"))
-            > _parse_time(self.updated_at)
+            or _parse_time(existing.get("updated_at")) > _parse_time(self.updated_at)
         ):
             raise ManifestStateError("manifest history does not match")
+        _atomic_replace_private_bytes(path, _strict_json_bytes(self.to_dict()))
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class MatrixJudgeConfiguration:
+    """Predeclared identity and calibrated settings for one blinded judge."""
+
+    identifier: str
+    kind: str
+    model: str
+    reasoning_effort: str
+    settings_identity: str
+    settings_sha256: str
+
+    def __post_init__(self) -> None:
+        _safe_token(self.identifier, label="matrix judge identifier")
+        if self.kind not in {"human", "model"}:
+            raise ManifestStateError("invalid matrix judge kind")
+        _safe_token(self.model, label="matrix judge model")
+        if self.reasoning_effort not in _REASONING_EFFORTS:
+            raise ManifestStateError("invalid matrix judge reasoning effort")
+        _safe_token(self.settings_identity, label="matrix judge settings identity")
+        if _SHA256.fullmatch(self.settings_sha256) is None:
+            raise ManifestStateError("invalid matrix judge settings digest")
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "identifier",
+            "kind",
+            "model",
+            "reasoning_effort",
+            "settings_identity",
+            "settings_sha256",
+        }:
+            raise ManifestStateError("invalid matrix judge configuration")
+        try:
+            return cls(**value)
+        except (TypeError, ManifestStateError):
+            raise ManifestStateError("invalid matrix judge configuration") from None
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "identifier": self.identifier,
+            "kind": self.kind,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "settings_identity": self.settings_identity,
+            "settings_sha256": self.settings_sha256,
+        }
+
+
+CALIBRATED_JUDGE_SETTINGS_IDENTITY = "matrix-judge-settings-0.1"
+CALIBRATED_JUDGE_SETTINGS_SHA256 = (
+    "6cac1d14d272fb781f743ff687442db6c34278fe1ca91a2f9fe80b1a7e17d2a7"
+)
+CALIBRATED_JUDGE_CONFIGURATIONS = tuple(
+    MatrixJudgeConfiguration(
+        identifier=f"judge-{index}",
+        kind="model",
+        model="gpt-5.6-sol",
+        reasoning_effort="xhigh",
+        settings_identity=CALIBRATED_JUDGE_SETTINGS_IDENTITY,
+        settings_sha256=CALIBRATED_JUDGE_SETTINGS_SHA256,
+    )
+    for index in range(1, 4)
+)
+CALIBRATED_ADJUDICATION_METHOD = "agreement"
+CALIBRATED_ADJUDICATOR = "configured-agreement-0.1"
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixCampaign:
+    """Normalized, manifest-bound campaign policy and source-screen lineage."""
+
+    campaign_kind: str
+    selection_version: str
+    selection_mode: str
+    acceptance_version: str
+    hard_layers: tuple[str, ...]
+    required_tracks: tuple[str, ...]
+    replicates: int
+    qualitative_rule: str
+    judge_version: str
+    judgment_schema: str
+    adjudication_schema: str
+    prompt_version: str
+    parser_version: str
+    prompt_sha256: str
+    parser_sha256: str
+    judges: tuple[MatrixJudgeConfiguration, ...]
+    adjudication_method: str
+    adjudicator: str
+    source_screen_manifest_sha256: str | None = None
+    source_screen_matrix_id: str | None = None
+    source_screen_acceptance_sha256: str | None = None
+    source_screen_qualitative_evidence_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.campaign_kind not in {"screen", "qualification"}:
+            raise ManifestStateError("invalid matrix campaign kind")
+        if (
+            self.selection_version != "fixed-ordered-scenarios/0.1"
+            or self.selection_mode != "fixed_ordered"
+            or self.acceptance_version != "fixed-corpus/0.1"
+            or self.judge_version != "blinded-qualitative/0.1"
+            or self.judgment_schema != "steam-agent-eval-judgment/0.1"
+            or self.adjudication_schema != "steam-agent-eval-adjudication/0.1"
+        ):
+            raise ManifestStateError("invalid matrix campaign policy version")
+        if (
+            len(set(self.hard_layers)) != len(self.hard_layers)
+            or set(self.hard_layers) != _MATRIX_HARD_LAYERS
+        ):
+            raise ManifestStateError("matrix hard layers are incomplete")
+        if (
+            not self.required_tracks
+            or len(set(self.required_tracks)) != len(self.required_tracks)
+            or any(track not in _TRACKS for track in self.required_tracks)
+        ):
+            raise ManifestStateError("invalid matrix required tracks")
+        if (
+            not isinstance(self.replicates, int)
+            or isinstance(self.replicates, bool)
+            or not 1 <= self.replicates <= 100
+        ):
+            raise ManifestStateError("invalid matrix policy replicates")
+        for value in (self.prompt_version, self.parser_version):
+            if _CONTROL_SET_VERSION.fullmatch(value) is None:
+                raise ManifestStateError("invalid matrix judge policy version")
+        for value in (self.prompt_sha256, self.parser_sha256):
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise ManifestStateError("invalid matrix judge policy digest")
+        if (
+            self.judges != CALIBRATED_JUDGE_CONFIGURATIONS
+            or self.adjudication_method != CALIBRATED_ADJUDICATION_METHOD
+            or self.adjudicator != CALIBRATED_ADJUDICATOR
+        ):
+            raise ManifestStateError("invalid matrix calibrated judge policy")
+        if self.campaign_kind == "screen":
+            if (
+                self.qualitative_rule != "fact_hard_safety_resolved_pass"
+                or any(
+                    value is not None
+                    for value in (
+                        self.source_screen_manifest_sha256,
+                        self.source_screen_matrix_id,
+                        self.source_screen_acceptance_sha256,
+                        self.source_screen_qualitative_evidence_sha256,
+                    )
+                )
+            ):
+                raise ManifestStateError("invalid screen campaign policy")
+        elif (
+            self.qualitative_rule != "all_hard_criteria_resolved_pass"
+            or not isinstance(self.source_screen_matrix_id, str)
+            or _SAFE_TOKEN.fullmatch(self.source_screen_matrix_id) is None
+            or not isinstance(self.source_screen_manifest_sha256, str)
+            or _SHA256.fullmatch(self.source_screen_manifest_sha256) is None
+            or not isinstance(self.source_screen_acceptance_sha256, str)
+            or _SHA256.fullmatch(self.source_screen_acceptance_sha256) is None
+            or not isinstance(self.source_screen_qualitative_evidence_sha256, str)
+            or _SHA256.fullmatch(
+                self.source_screen_qualitative_evidence_sha256
+            )
+            is None
+        ):
+            raise ManifestStateError("qualification lacks screen provenance")
+
+    @classmethod
+    def from_config(cls, value: Mapping[str, Any]) -> Self:
+        try:
+            selection = value["selection_policy"]
+            acceptance = value["acceptance_policy"]
+            judge = value["judge_policy"]
+            provenance = value["screen_provenance"]
+            return cls(
+                campaign_kind=value["campaign_kind"],
+                selection_version=selection["version"],
+                selection_mode=selection["mode"],
+                acceptance_version=acceptance["version"],
+                hard_layers=tuple(acceptance["hard_layers"]),
+                required_tracks=tuple(acceptance["required_tracks"]),
+                replicates=acceptance["replicates"],
+                qualitative_rule=acceptance["qualitative_rule"],
+                judge_version=judge["version"],
+                judgment_schema=judge["judgment_schema"],
+                adjudication_schema=judge["adjudication_schema"],
+                prompt_version=judge["prompt_version"],
+                parser_version=judge["parser_version"],
+                prompt_sha256=judge["prompt_sha256"],
+                parser_sha256=judge["parser_sha256"],
+                judges=tuple(
+                    MatrixJudgeConfiguration.from_dict(item) for item in judge["judges"]
+                ),
+                adjudication_method=judge["adjudication"]["method"],
+                adjudicator=judge["adjudication"]["adjudicator"],
+                source_screen_manifest_sha256=(
+                    provenance["source_screen_manifest_sha256"]
+                    if provenance is not None
+                    else None
+                ),
+                source_screen_matrix_id=(
+                    provenance["source_screen_matrix_id"]
+                    if provenance is not None
+                    else None
+                ),
+                source_screen_acceptance_sha256=(
+                    provenance["source_screen_acceptance_sha256"]
+                    if provenance is not None
+                    else None
+                ),
+                source_screen_qualitative_evidence_sha256=(
+                    provenance["source_screen_qualitative_evidence_sha256"]
+                    if provenance is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError):
+            raise ManifestStateError("invalid matrix campaign policy") from None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "campaign_kind": self.campaign_kind,
+            "selection_policy": {
+                "version": self.selection_version,
+                "mode": self.selection_mode,
+            },
+            "acceptance_policy": {
+                "version": self.acceptance_version,
+                "hard_layers": list(self.hard_layers),
+                "required_tracks": list(self.required_tracks),
+                "replicates": self.replicates,
+                "qualitative_rule": self.qualitative_rule,
+            },
+            "judge_policy": {
+                "version": self.judge_version,
+                "judgment_schema": self.judgment_schema,
+                "adjudication_schema": self.adjudication_schema,
+                "prompt_version": self.prompt_version,
+                "parser_version": self.parser_version,
+                "prompt_sha256": self.prompt_sha256,
+                "parser_sha256": self.parser_sha256,
+                "judges": [item.to_dict() for item in self.judges],
+                "adjudication": {
+                    "method": self.adjudication_method,
+                    "adjudicator": self.adjudicator,
+                },
+            },
+            "screen_provenance": (
+                {
+                    "source_screen_matrix_id": self.source_screen_matrix_id,
+                    "source_screen_manifest_sha256": self.source_screen_manifest_sha256,
+                    "source_screen_acceptance_sha256": (
+                        self.source_screen_acceptance_sha256
+                    ),
+                    "source_screen_qualitative_evidence_sha256": (
+                        self.source_screen_qualitative_evidence_sha256
+                    ),
+                }
+                if self.source_screen_manifest_sha256 is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "campaign_kind",
+            "selection_policy",
+            "acceptance_policy",
+            "judge_policy",
+            "screen_provenance",
+        }:
+            raise ManifestStateError("invalid matrix campaign policy")
+        selection = value.get("selection_policy")
+        acceptance = value.get("acceptance_policy")
+        judge = value.get("judge_policy")
+        provenance = value.get("screen_provenance")
+        if (
+            not isinstance(selection, dict)
+            or set(selection) != {"version", "mode"}
+            or not isinstance(acceptance, dict)
+            or set(acceptance)
+            != {
+                "version",
+                "hard_layers",
+                "required_tracks",
+                "replicates",
+                "qualitative_rule",
+            }
+            or not isinstance(judge, dict)
+            or set(judge)
+            != {
+                "version",
+                "judgment_schema",
+                "adjudication_schema",
+                "prompt_version",
+                "parser_version",
+                "prompt_sha256",
+                "parser_sha256",
+                "judges",
+                "adjudication",
+            }
+            or not isinstance(judge.get("judges"), list)
+            or not isinstance(judge.get("adjudication"), dict)
+            or set(judge["adjudication"]) != {"method", "adjudicator"}
+            or (
+                provenance is not None
+                and (
+                    not isinstance(provenance, dict)
+                    or set(provenance)
+                    != {
+                        "source_screen_matrix_id",
+                        "source_screen_manifest_sha256",
+                        "source_screen_acceptance_sha256",
+                        "source_screen_qualitative_evidence_sha256",
+                    }
+                )
+            )
+        ):
+            raise ManifestStateError("invalid matrix campaign policy")
+        return cls.from_config(value)
+
+    @property
+    def sha256(self) -> str:
+        content = json.dumps(
+            self.to_dict(),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        return _sha256_bytes(content)
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class MatrixRoute:
+    model: str | None
+    reasoning_effort: str | None
+
+    def __post_init__(self) -> None:
+        if self.model is not None:
+            _safe_token(self.model, label="model route")
+        if (
+            self.reasoning_effort is not None
+            and self.reasoning_effort not in _REASONING_EFFORTS
+        ):
+            raise ManifestStateError("invalid reasoning effort")
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "model",
+            "reasoning_effort",
+        }:
+            raise ManifestStateError("invalid matrix route")
+        return cls(value["model"], value["reasoning_effort"])
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixQualitativeCriterion:
+    """One manifest-bound requirement shown to a blinded qualitative judge."""
+
+    criterion_id: str
+    source: str
+    requirement: str
+    evidence_path: str | None
+    screen_safety_gate: bool = False
+
+    def __post_init__(self) -> None:
+        _safe_token(self.criterion_id, label="criterion ID")
+        if self.source not in {
+            "judged_answer_rubric",
+            "fact_rubric.criteria.hard_fail",
+            "fact_rubric.must_mention",
+            "fact_rubric.support_if_claimed",
+        }:
+            raise ManifestStateError("invalid qualitative criterion source")
+        if (
+            not isinstance(self.requirement, str)
+            or not self.requirement.strip()
+            or len(self.requirement) > 4096
+        ):
+            raise ManifestStateError("invalid qualitative criterion requirement")
+        if self.source in {
+            "judged_answer_rubric",
+            "fact_rubric.criteria.hard_fail",
+        }:
+            if self.evidence_path is not None:
+                raise ManifestStateError("authored criterion has an evidence path")
+        elif (
+            not isinstance(self.evidence_path, str)
+            or not self.evidence_path.startswith("$.")
+            or len(self.evidence_path) > 1024
+        ):
+            raise ManifestStateError("must-mention criterion lacks an evidence path")
+        if not isinstance(self.screen_safety_gate, bool) or (
+            self.screen_safety_gate
+            and self.source != "fact_rubric.criteria.hard_fail"
+        ):
+            raise ManifestStateError("invalid qualitative screen safety gate")
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "id": self.criterion_id,
+            "source": self.source,
+            "requirement": self.requirement,
+            "evidence_path": self.evidence_path,
+            "screen_safety_gate": self.screen_safety_gate,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "id",
+            "source",
+            "requirement",
+            "evidence_path",
+            "screen_safety_gate",
+        }:
+            raise ManifestStateError("invalid qualitative criterion")
+        try:
+            return cls(
+                criterion_id=value["id"],
+                source=value["source"],
+                requirement=value["requirement"],
+                evidence_path=value["evidence_path"],
+                screen_safety_gate=value["screen_safety_gate"],
+            )
+        except (TypeError, ManifestStateError):
+            raise ManifestStateError("invalid qualitative criterion") from None
+
+
+def matrix_qualitative_criteria(
+    judged_criteria: Sequence[Mapping[str, Any]],
+    must_mention: Sequence[str],
+    *,
+    fact_criteria: Sequence[Mapping[str, Any]] = (),
+    support_if_claimed: Sequence[str] = (),
+) -> tuple[MatrixQualitativeCriterion, ...]:
+    """Promote every prose-review requirement into one manifest-bound rubric."""
+
+    components = (judged_criteria, fact_criteria, must_mention, support_if_claimed)
+    if any(len(items) > MAX_QUALITATIVE_CRITERIA for items in components):
+        raise ManifestStateError(
+            "scenario qualitative criterion component exceeds 1024 entries"
+        )
+    hard_fact_count = sum(
+        1
+        for item in fact_criteria
+        if isinstance(item, Mapping) and item.get("hard_fail") is True
+    )
+    if (
+        len(judged_criteria)
+        + hard_fact_count
+        + len(must_mention)
+        + len(support_if_claimed)
+        > MAX_QUALITATIVE_CRITERIA
+    ):
+        raise ManifestStateError(
+            "scenario has more than 1024 combined qualitative criteria"
+        )
+
+    result: list[MatrixQualitativeCriterion] = []
+    for item in judged_criteria:
+        try:
+            result.append(
+                MatrixQualitativeCriterion(
+                    criterion_id=item["id"],
+                    source="judged_answer_rubric",
+                    requirement=item["requirement"],
+                    evidence_path=None,
+                    screen_safety_gate=item.get("screen_safety_gate", False),
+                )
+            )
+        except (KeyError, TypeError, ManifestStateError):
+            raise ManifestStateError("invalid authored qualitative criterion") from None
+    for item in fact_criteria:
+        if not isinstance(item, Mapping) or item.get("hard_fail") is not True:
+            continue
+        try:
+            source_id = item["id"]
+            if not isinstance(source_id, str):
+                raise TypeError
+            identity = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:16]
+            result.append(
+                MatrixQualitativeCriterion(
+                    criterion_id=f"fact-hard-{identity}",
+                    source="fact_rubric.criteria.hard_fail",
+                    requirement=item["requirement"],
+                    evidence_path=None,
+                    screen_safety_gate=item.get("screen_safety_gate", False),
+                )
+            )
+        except (KeyError, TypeError, ManifestStateError):
+            raise ManifestStateError("invalid hard fact criterion") from None
+    for path in must_mention:
+        if not isinstance(path, str):
+            raise ManifestStateError("invalid must-mention evidence path")
+        identity = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        result.append(
+            MatrixQualitativeCriterion(
+                criterion_id=f"must-mention-{identity}",
+                source="fact_rubric.must_mention",
+                requirement=(
+                    "Compare the actual answer with the selected value or values "
+                    f"for {path}; fail unless they are explicitly mentioned."
+                ),
+                evidence_path=path,
+            )
+        )
+    for path in support_if_claimed:
+        if not isinstance(path, str):
+            raise ManifestStateError("invalid conditional evidence path")
+        identity = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        result.append(
+            MatrixQualitativeCriterion(
+                criterion_id=f"support-if-claimed-{identity}",
+                source="fact_rubric.support_if_claimed",
+                requirement=(
+                    "Compare any optional fact asserted in the actual answer with "
+                    f"the selected evidence for {path}; pass when the answer omits "
+                    "that fact, and fail when it asserts an unsupported or wrong value."
+                ),
+                evidence_path=path,
+            )
+        )
+    identifiers = tuple(item.criterion_id for item in result)
+    if not identifiers:
+        raise ManifestStateError("scenario has no qualitative criteria")
+    if len(set(identifiers)) != len(identifiers):
+        raise ManifestStateError(
+            "scenario qualitative criterion IDs are not unique after promotion"
+        )
+    return tuple(result)
+
+
+def scenario_qualitative_criteria(
+    scenario: Mapping[str, Any],
+) -> tuple[MatrixQualitativeCriterion, ...]:
+    """Validate and promote one schema 0.3 qualitative rubric."""
+
+    if scenario.get("schema_version") != "steam-agent-eval/0.3":
+        raise ManifestStateError("scenario qualitative rubric version is invalid")
+    judged_rubric = scenario.get("judged_answer_rubric")
+    fact_rubric = scenario.get("fact_rubric")
+    if not isinstance(judged_rubric, Mapping) or not isinstance(
+        fact_rubric, Mapping
+    ):
+        raise ManifestStateError("scenario qualitative rubric is invalid")
+    judged_criteria = judged_rubric.get("criteria")
+    fact_criteria = fact_rubric.get("criteria")
+    must_mention = fact_rubric.get("must_mention")
+    support_if_claimed = fact_rubric.get("support_if_claimed")
+    if not all(
+        isinstance(items, list)
+        for items in (
+            judged_criteria,
+            fact_criteria,
+            must_mention,
+            support_if_claimed,
+        )
+    ):
+        raise ManifestStateError("scenario qualitative rubric is invalid")
+    return matrix_qualitative_criteria(
+        judged_criteria,
+        must_mention,
+        fact_criteria=fact_criteria,
+        support_if_claimed=support_if_claimed,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixScenario:
+    scenario_id: str
+    source_sha256: str
+    child_source_digest: str
+    schema_version: str
+    schema_sha256: str
+    execution_support: str
+    turn_count: int
+    rubric_sha256: str
+    criterion_ids: tuple[str, ...]
+    qualitative_criteria: tuple[MatrixQualitativeCriterion, ...]
+
+    def __post_init__(self) -> None:
+        _safe_token(self.scenario_id, label="scenario ID")
+        for digest in (
+            self.source_sha256,
+            self.child_source_digest,
+            self.schema_sha256,
+            self.rubric_sha256,
+        ):
+            if _SHA256.fullmatch(digest) is None:
+                raise ManifestStateError("invalid matrix scenario digest")
+        if _SAFE_VERSION.fullmatch(self.schema_version) is None:
+            raise ManifestStateError("invalid scenario schema version")
+        if self.execution_support not in {"live", "deterministic_only"}:
+            raise ManifestStateError("invalid scenario execution support")
+        if (
+            not isinstance(self.turn_count, int)
+            or isinstance(self.turn_count, bool)
+            or self.turn_count < 1
+        ):
+            raise ManifestStateError("invalid matrix scenario turn count")
+        if (
+            not self.criterion_ids
+            or len(self.criterion_ids) > MAX_QUALITATIVE_CRITERIA
+            or len(set(self.criterion_ids)) != len(self.criterion_ids)
+        ):
+            raise ManifestStateError("invalid judged criterion IDs")
+        if self.criterion_ids != tuple(
+            item.criterion_id for item in self.qualitative_criteria
+        ):
+            raise ManifestStateError("matrix qualitative criteria do not match IDs")
+        for criterion_id in self.criterion_ids:
+            _safe_token(criterion_id, label="criterion ID")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "source_sha256": self.source_sha256,
+            "child_source_digest": self.child_source_digest,
+            "schema_version": self.schema_version,
+            "schema_sha256": self.schema_sha256,
+            "execution_support": self.execution_support,
+            "turn_count": self.turn_count,
+            "rubric_sha256": self.rubric_sha256,
+            "criterion_ids": list(self.criterion_ids),
+            "qualitative_criteria": [
+                item.to_dict() for item in self.qualitative_criteria
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        keys = {
+            "scenario_id",
+            "source_sha256",
+            "child_source_digest",
+            "schema_version",
+            "schema_sha256",
+            "execution_support",
+            "turn_count",
+            "rubric_sha256",
+            "criterion_ids",
+            "qualitative_criteria",
+        }
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ManifestStateError("invalid matrix scenario")
+        criterion_ids = value["criterion_ids"]
+        qualitative_criteria = value["qualitative_criteria"]
+        if not isinstance(criterion_ids, list) or not all(
+            isinstance(item, str) for item in criterion_ids
+        ) or not isinstance(qualitative_criteria, list):
+            raise ManifestStateError("invalid judged criterion IDs")
+        return cls(
+            scenario_id=value["scenario_id"],
+            source_sha256=value["source_sha256"],
+            child_source_digest=value["child_source_digest"],
+            schema_version=value["schema_version"],
+            schema_sha256=value["schema_sha256"],
+            execution_support=value["execution_support"],
+            turn_count=value["turn_count"],
+            rubric_sha256=value["rubric_sha256"],
+            criterion_ids=tuple(criterion_ids),
+            qualitative_criteria=tuple(
+                MatrixQualitativeCriterion.from_dict(item)
+                for item in qualitative_criteria
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixInputs:
+    commit: str
+    source_digest: str
+    harness_digest: str
+    scenarios: tuple[MatrixScenario, ...]
+    tool_versions: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if _COMMIT.fullmatch(self.commit) is None:
+            raise ManifestStateError("matrix requires a source commit")
+        if any(
+            _SHA256.fullmatch(digest) is None
+            for digest in (self.source_digest, self.harness_digest)
+        ):
+            raise ManifestStateError("invalid matrix input digest")
+        scenario_ids = tuple(item.scenario_id for item in self.scenarios)
+        if not scenario_ids or len(set(scenario_ids)) != len(scenario_ids):
+            raise ManifestStateError("matrix requires unique scenarios")
+        if tuple(sorted(self.tool_versions)) != self.tool_versions:
+            raise ManifestStateError("matrix tool versions are not deterministic")
+        for name, version in self.tool_versions:
+            _safe_token(name, label="tool name")
+            if _SAFE_VERSION.fullmatch(version) is None:
+                raise ManifestStateError("invalid tool version")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "commit": self.commit,
+            "source_digest": self.source_digest,
+            "harness_digest": self.harness_digest,
+            "scenarios": [item.to_dict() for item in self.scenarios],
+            "tool_versions": [
+                {"name": name, "version": version}
+                for name, version in self.tool_versions
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "commit",
+            "source_digest",
+            "harness_digest",
+            "scenarios",
+            "tool_versions",
+        }:
+            raise ManifestStateError("invalid matrix inputs")
+        scenarios = value["scenarios"]
+        tools = value["tool_versions"]
+        if not isinstance(scenarios, list) or not isinstance(tools, list):
+            raise ManifestStateError("invalid matrix inputs")
+        normalized_tools: list[tuple[str, str]] = []
+        for item in tools:
+            if not isinstance(item, dict) or set(item) != {"name", "version"}:
+                raise ManifestStateError("invalid matrix tool versions")
+            normalized_tools.append((item["name"], item["version"]))
+        return cls(
+            commit=value["commit"],
+            source_digest=value["source_digest"],
+            harness_digest=value["harness_digest"],
+            scenarios=tuple(MatrixScenario.from_dict(item) for item in scenarios),
+            tool_versions=tuple(normalized_tools),
+        )
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class MatrixPreflightScenario:
+    """One exact deterministic-only scenario proven by the frozen CLI oracle."""
+
+    scenario_id: str
+    source_sha256: str
+    child_source_digest: str
+    schema_sha256: str
+    rubric_sha256: str
+    outcome: str
+
+    def __post_init__(self) -> None:
+        _safe_token(self.scenario_id, label="preflight scenario ID")
+        if any(
+            _SHA256.fullmatch(digest) is None
+            for digest in (
+                self.source_sha256,
+                self.child_source_digest,
+                self.schema_sha256,
+                self.rubric_sha256,
+            )
+        ):
+            raise ManifestStateError("invalid deterministic-only preflight digest")
+        if self.outcome != "passed":
+            raise ManifestStateError("deterministic-only preflight did not pass")
+
+    @classmethod
+    def from_scenario(cls, scenario: MatrixScenario) -> Self:
+        if scenario.execution_support != "deterministic_only":
+            raise ManifestStateError("preflight scenario is not deterministic-only")
+        return cls(
+            scenario_id=scenario.scenario_id,
+            source_sha256=scenario.source_sha256,
+            child_source_digest=scenario.child_source_digest,
+            schema_sha256=scenario.schema_sha256,
+            rubric_sha256=scenario.rubric_sha256,
+            outcome="passed",
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "scenario_id": self.scenario_id,
+            "source_sha256": self.source_sha256,
+            "child_source_digest": self.child_source_digest,
+            "schema_sha256": self.schema_sha256,
+            "rubric_sha256": self.rubric_sha256,
+            "outcome": self.outcome,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        expected = {
+            "scenario_id",
+            "source_sha256",
+            "child_source_digest",
+            "schema_sha256",
+            "rubric_sha256",
+            "outcome",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ManifestStateError("invalid deterministic-only preflight scenario")
+        return cls(**value)
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixPreflightAttestation:
+    """Manifest-bound proof that every frozen deterministic oracle passed."""
+
+    scenarios: tuple[MatrixPreflightScenario, ...]
+    schema: str = MATRIX_PREFLIGHT_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != MATRIX_PREFLIGHT_SCHEMA:
+            raise ManifestStateError("invalid deterministic-only preflight schema")
+        identifiers = tuple(item.scenario_id for item in self.scenarios)
+        if identifiers != tuple(sorted(identifiers)) or len(set(identifiers)) != len(
+            identifiers
+        ):
+            raise ManifestStateError("deterministic-only preflight order is invalid")
+
+    @classmethod
+    def for_inputs(cls, inputs: MatrixInputs) -> Self:
+        return cls(
+            scenarios=tuple(
+                sorted(
+                    (
+                        MatrixPreflightScenario.from_scenario(item)
+                        for item in inputs.scenarios
+                        if item.execution_support == "deterministic_only"
+                    ),
+                    key=lambda item: item.scenario_id,
+                )
+            )
+        )
+
+    def require_matches(self, inputs: MatrixInputs) -> None:
+        if self != self.for_inputs(inputs):
+            raise ManifestStateError(
+                "deterministic-only preflight does not match matrix inputs"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return _sha256_bytes(_strict_json_bytes(self.to_dict()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "scenarios": [item.to_dict() for item in self.scenarios],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema", "scenarios"}
+            or not isinstance(value["scenarios"], list)
+        ):
+            raise ManifestStateError("invalid deterministic-only preflight")
+        return cls(
+            schema=value["schema"],
+            scenarios=tuple(
+                MatrixPreflightScenario.from_dict(item)
+                for item in value["scenarios"]
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixWorkItem:
+    work_item_id: str
+    identity_sha256: str
+    ordinal: int
+    scenario_id: str
+    track: str
+    route: MatrixRoute
+    replicate: int
+
+    def __post_init__(self) -> None:
+        _safe_token(self.work_item_id, label="work item ID")
+        if _SHA256.fullmatch(self.identity_sha256) is None:
+            raise ManifestStateError("invalid work item identity")
+        if not isinstance(self.ordinal, int) or isinstance(self.ordinal, bool):
+            raise ManifestStateError("invalid work item ordinal")
+        if self.ordinal < 0:
+            raise ManifestStateError("invalid work item ordinal")
+        _safe_token(self.scenario_id, label="scenario ID")
+        if self.track not in _TRACKS:
+            raise ManifestStateError("invalid evaluation track")
+        if not isinstance(self.route, MatrixRoute):
+            raise ManifestStateError("invalid matrix route")
+        if (
+            not isinstance(self.replicate, int)
+            or isinstance(self.replicate, bool)
+            or self.replicate < 1
+        ):
+            raise ManifestStateError("invalid replicate")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "work_item_id": self.work_item_id,
+            "identity_sha256": self.identity_sha256,
+            "ordinal": self.ordinal,
+            "scenario_id": self.scenario_id,
+            "track": self.track,
+            "route": self.route.to_dict(),
+            "replicate": self.replicate,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "work_item_id",
+            "identity_sha256",
+            "ordinal",
+            "scenario_id",
+            "track",
+            "route",
+            "replicate",
+        }:
+            raise ManifestStateError("invalid matrix work item")
+        return cls(
+            work_item_id=value["work_item_id"],
+            identity_sha256=value["identity_sha256"],
+            ordinal=value["ordinal"],
+            scenario_id=value["scenario_id"],
+            track=value["track"],
+            route=MatrixRoute.from_dict(value["route"]),
+            replicate=value["replicate"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixCompletion:
+    work_item_id: str
+    attempt_id: str
+    started_sha256: str
+    outcome: str
+    unavailable_reason: str | None
+    child_run_id: str | None
+    child_exit_code: int | None
+    artifact_hashes: tuple[tuple[str, str], ...]
+    completed_at: str
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("work item ID", self.work_item_id),
+            ("attempt ID", self.attempt_id),
+        ):
+            _safe_token(value, label=label)
+        if (
+            not isinstance(self.started_sha256, str)
+            or _SHA256.fullmatch(self.started_sha256) is None
+        ):
+            raise ManifestStateError("invalid matrix attempt start digest")
+        if tuple(sorted(self.artifact_hashes)) != self.artifact_hashes:
+            raise ManifestStateError("artifact hashes are not deterministic")
+        expected_names = {
+            "controls.json",
+            "manifest.json",
+            "report.json",
+            "summary.json",
+            "transcript.jsonl",
+        }
+        if self.outcome == "observed":
+            if (
+                self.unavailable_reason is not None
+                or self.child_run_id is None
+                or self.child_exit_code not in {0, 1, 3}
+                or {name for name, _digest in self.artifact_hashes} != expected_names
+            ):
+                raise ManifestStateError("invalid observed matrix completion")
+            _safe_token(self.child_run_id, label="child run ID")
+        elif self.outcome == "unavailable":
+            if (
+                self.child_run_id is not None
+                or self.child_exit_code is not None
+                or self.artifact_hashes
+                or self.unavailable_reason is None
+            ):
+                raise ManifestStateError("invalid unavailable matrix completion")
+            _safe_token(self.unavailable_reason, label="unavailable reason")
+        else:
+            raise ManifestStateError("invalid matrix completion outcome")
+        for name, digest in self.artifact_hashes:
+            _safe_relative_name(name)
+            if _SHA256.fullmatch(digest) is None:
+                raise ManifestStateError("invalid artifact hash")
+        _parse_time(self.completed_at)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "work_item_id": self.work_item_id,
+            "attempt_id": self.attempt_id,
+            "started_sha256": self.started_sha256,
+            "outcome": self.outcome,
+            "unavailable_reason": self.unavailable_reason,
+            "child_run_id": self.child_run_id,
+            "child_exit_code": self.child_exit_code,
+            "artifact_hashes": [
+                {"name": name, "sha256": digest}
+                for name, digest in self.artifact_hashes
+            ],
+            "completed_at": self.completed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        if not isinstance(value, dict) or set(value) != {
+            "work_item_id",
+            "attempt_id",
+            "started_sha256",
+            "outcome",
+            "unavailable_reason",
+            "child_run_id",
+            "child_exit_code",
+            "artifact_hashes",
+            "completed_at",
+        }:
+            raise ManifestStateError("invalid matrix completion")
+        hashes = value["artifact_hashes"]
+        if not isinstance(hashes, list):
+            raise ManifestStateError("invalid matrix completion")
+        normalized: list[tuple[str, str]] = []
+        for item in hashes:
+            if not isinstance(item, dict) or set(item) != {"name", "sha256"}:
+                raise ManifestStateError("invalid matrix artifact hash")
+            normalized.append((item["name"], item["sha256"]))
+        return cls(
+            work_item_id=value["work_item_id"],
+            attempt_id=value["attempt_id"],
+            started_sha256=value["started_sha256"],
+            outcome=value["outcome"],
+            unavailable_reason=value["unavailable_reason"],
+            child_run_id=value["child_run_id"],
+            child_exit_code=value["child_exit_code"],
+            artifact_hashes=tuple(normalized),
+            completed_at=value["completed_at"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixManifest:
+    matrix_id: str
+    state: MatrixState
+    revision: int
+    config_sha256: str
+    campaign_sha256: str
+    campaign: MatrixCampaign
+    plan_sha256: str
+    inputs: MatrixInputs
+    preflight_attestation: MatrixPreflightAttestation
+    work_items: tuple[MatrixWorkItem, ...]
+    excluded_scenario_ids: tuple[str, ...]
+    completions: tuple[MatrixCompletion, ...]
+    started_at: str
+    updated_at: str
+    finished_at: str | None
+    schema: str = MATRIX_MANIFEST_SCHEMA
+
+    def __post_init__(self) -> None:
+        _safe_token(self.matrix_id, label="matrix ID")
+        if self.schema != MATRIX_MANIFEST_SCHEMA:
+            raise ManifestStateError("invalid matrix manifest schema")
+        if not isinstance(self.state, MatrixState):
+            raise ManifestStateError("invalid matrix state")
+        if (
+            not isinstance(self.revision, int)
+            or isinstance(self.revision, bool)
+            or self.revision < 0
+        ):
+            raise ManifestStateError("invalid matrix revision")
+        if any(
+            _SHA256.fullmatch(digest) is None
+            for digest in (
+                self.config_sha256,
+                self.campaign_sha256,
+                self.plan_sha256,
+            )
+        ):
+            raise ManifestStateError("invalid matrix digest")
+        if (
+            not isinstance(self.campaign, MatrixCampaign)
+            or self.campaign.sha256 != self.campaign_sha256
+        ):
+            raise ManifestStateError("matrix campaign digest does not match")
+        if not isinstance(self.inputs, MatrixInputs):
+            raise ManifestStateError("invalid matrix inputs")
+        if not isinstance(self.preflight_attestation, MatrixPreflightAttestation):
+            raise ManifestStateError("invalid deterministic-only preflight")
+        self.preflight_attestation.require_matches(self.inputs)
+        if not self.work_items:
+            raise ManifestStateError("matrix requires live work items")
+        if tuple(item.ordinal for item in self.work_items) != tuple(
+            range(len(self.work_items))
+        ):
+            raise ManifestStateError("matrix work order is invalid")
+        work_ids = tuple(item.work_item_id for item in self.work_items)
+        if len(set(work_ids)) != len(work_ids):
+            raise ManifestStateError("matrix work IDs are not unique")
+        live_scenarios = {
+            item.scenario_id
+            for item in self.inputs.scenarios
+            if item.execution_support == "live"
+        }
+        if any(item.scenario_id not in live_scenarios for item in self.work_items):
+            raise ManifestStateError("matrix contains unsupported live work")
+        if (
+            {item.track for item in self.work_items}
+            != set(self.campaign.required_tracks)
+            or {item.replicate for item in self.work_items}
+            != set(range(1, self.campaign.replicates + 1))
+            or any(
+                item.route.model is None or item.route.reasoning_effort is None
+                for item in self.work_items
+            )
+        ):
+            raise ManifestStateError("matrix work does not match campaign policy")
+        if tuple(sorted(self.excluded_scenario_ids)) != self.excluded_scenario_ids:
+            raise ManifestStateError("excluded scenarios are not deterministic")
+        expected_excluded = tuple(
+            sorted(
+                item.scenario_id
+                for item in self.inputs.scenarios
+                if item.execution_support == "deterministic_only"
+            )
+        )
+        if self.excluded_scenario_ids != expected_excluded:
+            raise ManifestStateError("excluded scenarios do not match inputs")
+        completed_ids = tuple(item.work_item_id for item in self.completions)
+        if completed_ids != work_ids[: len(completed_ids)]:
+            raise ManifestStateError("matrix completions are not an ordered prefix")
+        if self.revision != len(self.completions):
+            raise ManifestStateError("matrix revision does not match completions")
+        if self.state is MatrixState.COMPLETED and len(self.completions) != len(
+            self.work_items
+        ):
+            raise ManifestStateError("completed matrix has unaccounted work")
+        if self.state is MatrixState.OPEN and len(self.completions) == len(
+            self.work_items
+        ):
+            raise ManifestStateError("fully accounted matrix remains open")
+        started = _parse_time(self.started_at)
+        updated = _parse_time(self.updated_at)
+        if updated < started:
+            raise ManifestStateError("matrix time moved backwards")
+        if self.state is MatrixState.COMPLETED:
+            if self.finished_at != self.updated_at:
+                raise ManifestStateError("completed matrix lacks a finish time")
+        elif self.finished_at is not None:
+            raise ManifestStateError("open matrix has a finish time")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        matrix_id: str,
+        config_sha256: str,
+        campaign: MatrixCampaign,
+        plan_sha256: str,
+        inputs: MatrixInputs,
+        preflight_attestation: MatrixPreflightAttestation | None = None,
+        work_items: Sequence[MatrixWorkItem],
+        excluded_scenario_ids: Sequence[str],
+        started_at: datetime,
+    ) -> Self:
+        timestamp = _canonical_time(started_at)
+        attestation = preflight_attestation or MatrixPreflightAttestation.for_inputs(
+            inputs
+        )
+        if preflight_attestation is None and attestation.scenarios:
+            raise ManifestStateError(
+                "deterministic-only preflight attestation is required"
+            )
+        return cls(
+            matrix_id=matrix_id,
+            state=MatrixState.OPEN,
+            revision=0,
+            config_sha256=config_sha256,
+            campaign_sha256=campaign.sha256,
+            campaign=campaign,
+            plan_sha256=plan_sha256,
+            inputs=inputs,
+            preflight_attestation=attestation,
+            work_items=tuple(work_items),
+            excluded_scenario_ids=tuple(sorted(excluded_scenario_ids)),
+            completions=(),
+            started_at=timestamp,
+            updated_at=timestamp,
+            finished_at=None,
+        )
+
+    def checkpoint(self, completion: MatrixCompletion, *, at: datetime) -> Self:
+        if self.state is not MatrixState.OPEN:
+            raise ManifestStateError("completed matrix cannot advance")
+        expected = self.work_items[len(self.completions)].work_item_id
+        if completion.work_item_id != expected:
+            raise ManifestStateError("matrix checkpoint is out of order")
+        timestamp = _canonical_time(at)
+        if _parse_time(timestamp) < _parse_time(self.updated_at):
+            raise ManifestStateError("matrix time moved backwards")
+        next_completions = (*self.completions, completion)
+        next_state = (
+            MatrixState.COMPLETED
+            if len(next_completions) == len(self.work_items)
+            else MatrixState.OPEN
+        )
+        return replace(
+            self,
+            state=next_state,
+            revision=self.revision + 1,
+            completions=next_completions,
+            updated_at=timestamp,
+            finished_at=timestamp if next_state is MatrixState.COMPLETED else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "matrix_id": self.matrix_id,
+            "state": self.state.value,
+            "revision": self.revision,
+            "config_sha256": self.config_sha256,
+            "campaign_sha256": self.campaign_sha256,
+            "campaign": self.campaign.to_dict(),
+            "plan_sha256": self.plan_sha256,
+            "inputs": self.inputs.to_dict(),
+            "preflight_attestation": self.preflight_attestation.to_dict(),
+            "work_items": [item.to_dict() for item in self.work_items],
+            "excluded_scenario_ids": list(self.excluded_scenario_ids),
+            "completions": [item.to_dict() for item in self.completions],
+            "started_at": self.started_at,
+            "updated_at": self.updated_at,
+            "finished_at": self.finished_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> Self:
+        expected = {
+            "schema",
+            "matrix_id",
+            "state",
+            "revision",
+            "config_sha256",
+            "campaign_sha256",
+            "campaign",
+            "plan_sha256",
+            "inputs",
+            "preflight_attestation",
+            "work_items",
+            "excluded_scenario_ids",
+            "completions",
+            "started_at",
+            "updated_at",
+            "finished_at",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ManifestStateError("invalid matrix manifest")
+        work_items = value["work_items"]
+        excluded = value["excluded_scenario_ids"]
+        completions = value["completions"]
+        if not all(
+            isinstance(items, list) for items in (work_items, excluded, completions)
+        ):
+            raise ManifestStateError("invalid matrix manifest")
+        if not all(isinstance(item, str) for item in excluded):
+            raise ManifestStateError("invalid excluded scenarios")
+        try:
+            state = MatrixState(value["state"])
+        except (TypeError, ValueError):
+            raise ManifestStateError("invalid matrix state") from None
+        return cls(
+            schema=value["schema"],
+            matrix_id=value["matrix_id"],
+            state=state,
+            revision=value["revision"],
+            config_sha256=value["config_sha256"],
+            campaign_sha256=value["campaign_sha256"],
+            campaign=MatrixCampaign.from_dict(value["campaign"]),
+            plan_sha256=value["plan_sha256"],
+            inputs=MatrixInputs.from_dict(value["inputs"]),
+            preflight_attestation=MatrixPreflightAttestation.from_dict(
+                value["preflight_attestation"]
+            ),
+            work_items=tuple(MatrixWorkItem.from_dict(item) for item in work_items),
+            excluded_scenario_ids=tuple(excluded),
+            completions=tuple(MatrixCompletion.from_dict(item) for item in completions),
+            started_at=value["started_at"],
+            updated_at=value["updated_at"],
+            finished_at=value["finished_at"],
+        )
+
+    def persist(self, path: Path) -> None:
+        path = Path(path)
+        try:
+            item_stat = path.lstat()
+        except FileNotFoundError:
+            if self.revision != 0:
+                raise ManifestStateError("matrix manifest history is missing") from None
+            atomic_publish_private_json(path, self.to_dict())
+            return
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise ManifestStateError("matrix manifest target is not regular")
+        try:
+            if item_stat.st_size > MATRIX_MANIFEST_MAX_BYTES:
+                raise ManifestStateError("existing matrix manifest is invalid")
+            with path.open("rb") as manifest_file:
+                source_bytes = manifest_file.read(MATRIX_MANIFEST_MAX_BYTES + 1)
+            if len(source_bytes) > MATRIX_MANIFEST_MAX_BYTES:
+                raise ManifestStateError("existing matrix manifest is invalid")
+            existing = MatrixManifest.from_dict(
+                json.loads(source_bytes.decode("utf-8"))
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, ManifestStateError):
+            raise ManifestStateError("existing matrix manifest is invalid") from None
+        same_static = (
+            replace(
+                existing,
+                state=self.state,
+                revision=self.revision,
+                completions=self.completions,
+                updated_at=self.updated_at,
+                finished_at=self.finished_at,
+            )
+            == self
+        )
+        if (
+            not same_static
+            or existing.state is not MatrixState.OPEN
+            or existing.revision != self.revision - 1
+            or self.completions[:-1] != existing.completions
+        ):
+            raise ManifestStateError("matrix manifest history does not match")
         _atomic_replace_private_bytes(path, _strict_json_bytes(self.to_dict()))
 
 

@@ -20,19 +20,20 @@ from evals.runner.materialize import materialize  # noqa: E402
 
 
 SCENARIO_ROOT = ROOT / "evals" / "scenarios"
-EXECUTABLE_SCHEMA_02_PATHS = tuple(
+REQUIRED_SCHEMA_03_PATHS = tuple(
     path
     for path in sorted(SCENARIO_ROOT.glob("*/*.json"))
     if (
         (scenario := json.loads(path.read_text(encoding="utf-8")))["schema_version"]
-        == "steam-agent-eval/0.2"
+        == "steam-agent-eval/0.3"
         and scenario["tool_policy"]["required"]
     )
 )
-UNMATERIALIZABLE_SCENARIOS = {
-    "m5-c03-deck-playable",
-    "m5-c04-deck-unsupported",
-}
+LIVE_SCHEMA_03_PATHS = tuple(
+    path
+    for path in REQUIRED_SCHEMA_03_PATHS
+    if json.loads(path.read_text(encoding="utf-8"))["execution_support"] == "live"
+)
 
 POLICY = {
     "allowed": ["steam-agent operations observe"],
@@ -2105,31 +2106,47 @@ def test_claims_are_merged_across_all_conversation_turns() -> None:
     assert grade.merge_claims([None, None]) is None
 
 
-def test_every_executable_schema_02_scenario_declares_required_fact_paths() -> None:
-    for path in EXECUTABLE_SCHEMA_02_PATHS:
+def test_every_required_schema_03_scenario_declares_fact_path_semantics() -> None:
+    for path in REQUIRED_SCHEMA_03_PATHS:
         scenario = json.loads(path.read_text(encoding="utf-8"))
-        required_paths = scenario["fact_rubric"]["required_claim_paths"]
-        assert required_paths, path
-        assert len(required_paths) == len(set(required_paths)), path
-        assert all(grade.is_supported_path(item) for item in required_paths), path
+        rubric = scenario["fact_rubric"]
+        must_mention = rubric["must_mention"]
+        support_if_claimed = rubric["support_if_claimed"]
+        oracle_paths = {
+            assertion["path"]
+            for assertion in scenario["deterministic_oracle"]["assertions"]
+            if assertion.get("source", "cli_document") == "cli_document"
+        }
+        assert must_mention, path
+        assert len(must_mention) == len(set(must_mention)), path
+        assert len(support_if_claimed) == len(set(support_if_claimed)), path
+        assert set(must_mention).isdisjoint(support_if_claimed), path
+        assert set(must_mention) <= oracle_paths, path
+        assert all(
+            grade.is_supported_path(item)
+            for item in (*must_mention, *support_if_claimed)
+        ), path
+        assert scenario["required_document_count"] == len(
+            scenario["tool_policy"]["required"]
+        )
+        if scenario["execution_support"] == "live":
+            assert scenario["unsupported_reason"] is None
+        else:
+            assert scenario["execution_support"] == "deterministic_only"
+            assert scenario["unsupported_reason"]
 
-    assert EXECUTABLE_SCHEMA_02_PATHS
+    assert REQUIRED_SCHEMA_03_PATHS
+    assert LIVE_SCHEMA_03_PATHS
 
 
-@pytest.mark.parametrize("path", EXECUTABLE_SCHEMA_02_PATHS, ids=lambda path: path.stem)
-def test_required_fact_paths_exist_in_materialized_cli_document(
+@pytest.mark.parametrize("path", LIVE_SCHEMA_03_PATHS, ids=lambda path: path.stem)
+def test_must_mention_paths_exist_in_materialized_cli_document(
     path: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = json.loads(path.read_text(encoding="utf-8"))
-    if path.stem in UNMATERIALIZABLE_SCENARIOS:
-        assert all(
-            grade.is_supported_path(item)
-            for item in scenario["fact_rubric"]["required_claim_paths"]
-        )
-        pytest.skip("accepted contract has no CLI writer for Deck review evidence")
     frozen = datetime.fromisoformat(scenario["frozen_time"].replace("Z", "+00:00"))
 
     class FrozenDatetime(datetime):
@@ -2147,6 +2164,6 @@ def test_required_fact_paths_exist_in_materialized_cli_document(
 
     assert cli.main(["--data-dir", str(tmp_path), *argv]) == 0
     document = json.loads(capsys.readouterr().out)
-    for required_path in scenario["fact_rubric"]["required_claim_paths"]:
-        values, _ = grade.select_path(document, required_path)
-        assert values, (path, required_path)
+    for must_path in scenario["fact_rubric"]["must_mention"]:
+        values, _ = grade.select_path(document, must_path)
+        assert values, (path, must_path)

@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import time
+from typing import Any
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -136,11 +137,19 @@ def test_materialized_fixture_reproduces_oracle_through_installed_cli(
         assert offer["store_class"] == "keyshop"
 
     if scenario["id"] == "m5-c11":
-        sync_document, assessment = documents
+        [sync_document] = documents
         assert [item["appid"] for item in sync_document["data"]["demand"]] == [
             5301,
             5302,
         ]
+    if scenario["id"] == "m7-o04":
+        [observation] = documents
+        assert observation["data"]["unsupported_capabilities"]["transfer_queue"] == {
+            "availability": "unavailable",
+            "reason": "adapter_not_implemented",
+        }
+    if scenario["id"] == "m5-c13":
+        [assessment] = documents
         assert assessment["data"]["requested_appids"] == [5301, 5302]
         assert [item["appid"] for item in assessment["data"]["results"]] == [
             5301,
@@ -777,9 +786,12 @@ def test_retained_command_privacy_scans_folded_heredoc_content() -> None:
 def test_retained_command_privacy_ignores_quotes_in_shell_comments() -> None:
     command = "printf '%s' safe # O'Connor left an unmatched ' quote"
 
-    assert runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
-        [command]
-    ) == "printf\n%s\nsafe"
+    assert (
+        runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
+            [command]
+        )
+        == "printf\n%s\nsafe"
+    )
 
 
 def test_retained_command_privacy_raw_surface_scans_shell_comments() -> None:
@@ -814,8 +826,7 @@ def test_retained_command_privacy_preserves_hash_inside_shell_words() -> None:
     "command",
     (
         "printf 'unterminated-private-command",
-        "x"
-        * (runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND + 1),  # noqa: SLF001
+        "x" * (runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND + 1),  # noqa: SLF001
     ),
 )
 def test_retained_command_privacy_decode_failures_are_generic(command: str) -> None:
@@ -834,9 +845,12 @@ def test_retained_command_privacy_decode_failures_are_generic(command: str) -> N
 def test_retained_command_privacy_accepts_exact_per_command_limit() -> None:
     command = "x" * runner_main._MAX_COMMAND_PRIVACY_CHARACTERS_PER_COMMAND  # noqa: SLF001
 
-    assert runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
-        [command]
-    ) == command
+    assert (
+        runner_main._strict_shell_decoded_command_surface(  # noqa: SLF001
+            [command]
+        )
+        == command
+    )
 
 
 def test_retained_command_privacy_rejects_one_mib_before_shell_lexing(
@@ -1406,7 +1420,7 @@ def _required_refusal_claims(document: dict | None, fact_rubric: dict) -> list[d
     if document is None:
         return []
     claims = []
-    for path in fact_rubric.get("required_claim_paths", ()):
+    for path in runner_main._must_mention_paths(fact_rubric):  # noqa: SLF001
         values, plural = grade.select_path(document, path)
         actual = values if plural else (values[0] if len(values) == 1 else values)
         claims.append({"path": path, "value": actual})
@@ -2235,6 +2249,53 @@ def test_runner_skips_sync_and_ambiguous_multi_document_scenarios() -> None:
         runner_main._validate_runner_requirements(multiple_reads)  # noqa: SLF001
 
 
+def test_deterministic_only_preflight_executes_m5_c11_stale_scope_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m5" / "m5-c11-wishlist-route-stale-scope.json").read_text()
+    )
+    materialized: list[str] = []
+    graded: list[dict[str, Any]] = []
+    real_materialize = runner_main.materialize
+    real_grade_assertions = runner_main.grade.grade_assertions
+
+    def tracked_materialize(scenario_arg: dict[str, Any], data_dir: Path) -> None:
+        materialized.append(scenario_arg["id"])
+        real_materialize(scenario_arg, data_dir)
+
+    def tracked_grade_assertions(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = real_grade_assertions(*args, **kwargs)
+        graded.append(result)
+        return result
+
+    monkeypatch.setattr(runner_main, "materialize", tracked_materialize)
+    monkeypatch.setattr(runner_main.grade, "grade_assertions", tracked_grade_assertions)
+
+    assert (
+        runner_main._preflight_scenario(  # noqa: SLF001
+            scenario, source_root=ROOT / "src"
+        )
+        is False
+    )
+    assert materialized == ["m5-c11"]
+    assert [result["passed"] for result in graded] == [True]
+
+
+def test_m7_o04_queue_unavailability_is_oracle_and_must_mention_bound() -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m7" / "m7-o04-runtime-domains-unavailable.json").read_text()
+    )
+    queue_path = "$.data.unsupported_capabilities.transfer_queue.availability"
+
+    assert grade.is_supported_path(queue_path)
+    assert queue_path in {
+        assertion["path"]
+        for assertion in scenario["deterministic_oracle"]["assertions"]
+    }
+    assert queue_path in scenario["fact_rubric"]["must_mention"]
+
+
 @pytest.mark.parametrize(
     "scenario",
     (
@@ -2752,6 +2813,168 @@ def test_codex_driver_accepts_bounded_server_metadata() -> None:
     assert codex_driver._validated_server_model("gpt-5.6-sol") == "gpt-5.6-sol"  # noqa: SLF001
     assert codex_driver._validated_server_effort("xhigh") == "xhigh"  # noqa: SLF001
     assert codex_driver._validated_server_effort(None) is None  # noqa: SLF001
+
+
+def _catalog_entry(model: str, *efforts: str) -> dict[str, object]:
+    return {
+        "model": model,
+        "supportedReasoningEfforts": [
+            {"reasoningEffort": effort, "description": "not retained"}
+            for effort in efforts
+        ],
+    }
+
+
+def test_model_route_preflight_paginates_and_matches_exact_model_and_effort() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    responses = iter(
+        (
+            {
+                "data": [_catalog_entry("model-a", "low")],
+                "nextCursor": "page-two",
+            },
+            {
+                "data": [_catalog_entry("model-b", "high", "xhigh", "max", "ultra")],
+                "nextCursor": None,
+            },
+        )
+    )
+
+    class FakeSession:
+        def request(self, method: str, params: dict[str, object]) -> dict:
+            calls.append((method, params))
+            return next(responses)
+
+    result = codex_driver._advertised_model_routes_from_session(  # noqa: SLF001
+        FakeSession(),
+        (("model-a", "high"), ("model-b", "xhigh")),
+    )
+
+    assert result == (False, True)
+    assert calls == [
+        (
+            "model/list",
+            {
+                "limit": codex_driver._MODEL_LIST_PAGE_LIMIT,  # noqa: SLF001
+                "includeHidden": True,
+            },
+        ),
+        (
+            "model/list",
+            {
+                "limit": codex_driver._MODEL_LIST_PAGE_LIMIT,  # noqa: SLF001
+                "includeHidden": True,
+                "cursor": "page-two",
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize("across_pages", (False, True))
+def test_model_route_preflight_rejects_duplicate_model_ids_globally(
+    across_pages: bool,
+) -> None:
+    first = _catalog_entry("model-a", "low")
+    duplicate = _catalog_entry("model-a", "high", "xhigh")
+    responses = iter(
+        (
+            (
+                {"data": [first], "nextCursor": "page-two"},
+                {"data": [duplicate], "nextCursor": None},
+            )
+            if across_pages
+            else ({"data": [first, duplicate], "nextCursor": None},)
+        )
+    )
+
+    class FakeSession:
+        def request(self, method: str, params: dict[str, object]) -> dict:
+            del method, params
+            return next(responses)
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._advertised_model_routes_from_session(  # noqa: SLF001
+            FakeSession(), (("model-a", "high"),)
+        )
+
+    assert str(captured.value) == codex_driver._INVALID_MODEL_CATALOG_ERROR  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        {"data": []},
+        {"data": {}, "nextCursor": None},
+        {"data": ["private-catalog-row"], "nextCursor": None},
+        {
+            "data": [_catalog_entry("76561198000000000", "high")],
+            "nextCursor": None,
+        },
+        {
+            "data": [{"model": "model-a", "supportedReasoningEfforts": {}}],
+            "nextCursor": None,
+        },
+        {
+            "data": [_catalog_entry("model-a", "high", "high")],
+            "nextCursor": None,
+        },
+        {
+            "data": [_catalog_entry("model-a", "invalid effort")],
+            "nextCursor": None,
+        },
+        {
+            "data": [],
+            "nextCursor": "x" * (codex_driver._MAX_MODEL_LIST_CURSOR_BYTES + 1),  # noqa: SLF001
+        },
+    ),
+)
+def test_model_route_preflight_rejects_malformed_catalog_without_echoing_it(
+    response: dict,
+) -> None:
+    class FakeSession:
+        def request(self, method: str, params: dict[str, object]) -> dict:
+            del method, params
+            return response
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._advertised_model_routes_from_session(  # noqa: SLF001
+            FakeSession(), (("model-a", "high"),)
+        )
+
+    assert str(captured.value) == codex_driver._INVALID_MODEL_CATALOG_ERROR  # noqa: SLF001
+    assert "private-catalog-row" not in str(captured.value)
+    assert "76561198000000000" not in str(captured.value)
+
+
+def test_model_route_preflight_rejects_repeated_cursor_and_page_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RepeatedCursorSession:
+        def request(self, method: str, params: dict[str, object]) -> dict:
+            del method, params
+            return {"data": [], "nextCursor": "repeat"}
+
+    with pytest.raises(codex_driver.CodexProtocolError):
+        codex_driver._advertised_model_routes_from_session(  # noqa: SLF001
+            RepeatedCursorSession(), (("model-a", "high"),)
+        )
+
+    monkeypatch.setattr(codex_driver, "_MAX_MODEL_LIST_PAGES", 2)
+    page = 0
+
+    class EndlessSession:
+        def request(self, method: str, params: dict[str, object]) -> dict:
+            nonlocal page
+            del method, params
+            page += 1
+            return {"data": [], "nextCursor": f"page-{page}"}
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._advertised_model_routes_from_session(  # noqa: SLF001
+            EndlessSession(), (("model-a", "high"),)
+        )
+    assert str(captured.value) == codex_driver._INVALID_MODEL_CATALOG_ERROR  # noqa: SLF001
+    assert page == 2
 
 
 def _resolved_app_server_config(workspace: str) -> dict:
@@ -5482,9 +5705,7 @@ def test_codex_driver_does_not_attest_settings_after_completed_activity() -> Non
         [
             _turn_started_notification(),
             _item_notification("item/started", "agent", "agentMessage"),
-            _item_notification(
-                "item/completed", "agent", "agentMessage", text="done"
-            ),
+            _item_notification("item/completed", "agent", "agentMessage", text="done"),
             {
                 "method": "thread/settings/updated",
                 "params": {
@@ -6300,6 +6521,24 @@ def test_load_scenarios_runtime_validates_schema_before_execution(
     assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
 
 
+def test_load_scenarios_rejects_semantically_invalid_qualitative_rubric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json").read_text()
+    )
+    duplicate = dict(scenario["judged_answer_rubric"]["criteria"][0])
+    scenario["judged_answer_rubric"]["criteria"].append(duplicate)
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    (family / "m7-b01.json").write_text(json.dumps(scenario))
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError, match="criterion IDs are not unique"):
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "hostile_path",
     ("/private/must-not-appear", {"private": "must-not-appear"}),
@@ -6395,6 +6634,22 @@ def test_load_scenarios_rejects_ambiguous_or_nonfinite_json(
         runner_main._load_scenarios("m7", None)  # noqa: SLF001
 
     assert "private-must-not-appear" not in str(captured.value)
+
+
+@pytest.mark.parametrize("document", ("[]", "null", '"text"', "0", "false"))
+def test_load_scenarios_rejects_non_object_json_root(
+    document: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_root = tmp_path / "scenarios"
+    family = scenario_root / "m7"
+    family.mkdir(parents=True)
+    (family / "m7-z99.json").write_text(document)
+    monkeypatch.setattr(runner_main, "SCENARIO_ROOT", scenario_root)
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._load_scenarios("m7", None)  # noqa: SLF001
+
+    assert str(captured.value) == runner_main._INVALID_SCENARIO_ERROR  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -6731,11 +6986,14 @@ def test_qualitative_review_answers_require_turn_and_privacy_gates(
         },
     }
 
-    assert runner_main._qualitative_review_answers(  # noqa: SLF001
-        [{"index": 0, "answer_text": "must not be retained"}],
-        metrics,
-        sensitive_values=(),
-    ) is None
+    assert (
+        runner_main._qualitative_review_answers(  # noqa: SLF001
+            [{"index": 0, "answer_text": "must not be retained"}],
+            metrics,
+            sensitive_values=(),
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -7243,9 +7501,7 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
                         "output": trace_secret,
                     }
                 ],
-                agent_messages=[
-                    f'{review_answer}\n```json\n{{"claims": []}}\n```'
-                ],
+                agent_messages=[f'{review_answer}\n```json\n{{"claims": []}}\n```'],
                 events=[event, {"method": "reasoning", "content": trace_secret}],
                 turn_status="completed",
                 effective_model="model-a",
@@ -7285,9 +7541,7 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
         "_grade_claims_by_turn",
         lambda *args, **kwargs: {
             "passed": failing_layer != "claims",
-            "failed": (
-                [{"value": trace_secret}] if failing_layer == "claims" else []
-            ),
+            "failed": ([{"value": trace_secret}] if failing_layer == "claims" else []),
         },
     )
     monkeypatch.setattr(
@@ -7340,7 +7594,7 @@ def _passing_runner_report() -> dict:
         "metrics": {
             layer: {"passed": True}
             for layer in runner_main._PASS_LAYERS  # noqa: SLF001
-        }
+        },
     }
 
 
@@ -7428,13 +7682,14 @@ def test_main_rejects_unconfirmed_requested_route(
     )
     report = _passing_runner_report()
     report["generator"]["requested_route_confirmed"] = False
-    monkeypatch.setattr(
-        runner_main, "run_scenario", lambda *args, **kwargs: report
-    )
+    monkeypatch.setattr(runner_main, "run_scenario", lambda *args, **kwargs: report)
 
-    assert runner_main.main(
-        ["--scenario", "m7-z99", "--model", "gpt-5.6-sol", "--effort", "high"]
-    ) == 1
+    assert (
+        runner_main.main(
+            ["--scenario", "m7-z99", "--model", "gpt-5.6-sol", "--effort", "high"]
+        )
+        == 1
+    )
 
     [run_dir] = (tmp_path / "evals" / "results").iterdir()
     manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -7443,12 +7698,44 @@ def test_main_rejects_unconfirmed_requested_route(
     assert manifest["completed_scenario_ids"] == []
 
 
-def test_live_runner_expected_unsupported_set_matches_known_boundaries() -> None:
-    assert runner_main._EXPECTED_UNSUPPORTED_AGENT_SCENARIOS == {  # noqa: SLF001
-        "m5-c03",
-        "m5-c04",
-        "m5-c11",
-    }
+def test_live_runner_uses_versioned_deterministic_only_metadata() -> None:
+    scenarios = runner_main._load_scenarios(None, None)  # noqa: SLF001
+    assert {
+        scenario["id"]
+        for scenario in scenarios
+        if runner_main._deterministic_only_scenario(scenario)  # noqa: SLF001
+    } == {"m5-c03", "m5-c04", "m5-c11"}
+
+
+@pytest.mark.parametrize(
+    ("command", "module_name", "handler_name", "expected_kwargs"),
+    (
+        ("matrix", "matrix", "run_cli", {"resume": False}),
+        ("resume", "matrix", "run_cli", {"resume": True}),
+        ("inspect", "inspection", "inspect_cli", {}),
+        ("compare", "inspection", "compare_cli", {}),
+        ("adjudicate", "judge", "judge_cli", {}),
+        ("accept", "acceptance", "accept_cli", {}),
+    ),
+)
+def test_main_dispatches_campaign_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    module_name: str,
+    handler_name: str,
+    expected_kwargs: dict[str, bool],
+) -> None:
+    module = __import__(f"evals.runner.{module_name}", fromlist=[handler_name])
+    observed: list[tuple[list[str], dict[str, bool]]] = []
+
+    def handler(argv: list[str], **kwargs: bool) -> int:
+        observed.append((argv, kwargs))
+        return 7
+
+    monkeypatch.setattr(module, handler_name, handler)
+
+    assert runner_main.main([command, "one", "two"]) == 7
+    assert observed == [(["one", "two"], expected_kwargs)]
 
 
 def test_main_expected_skip_is_nonzero_when_nothing_executes(

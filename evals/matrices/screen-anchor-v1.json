@@ -1,0 +1,77 @@
+{
+  "schema": "steam-agent-eval-matrix/0.1",
+  "campaign_kind": "screen",
+  "selection_policy": {
+    "version": "fixed-ordered-scenarios/0.1",
+    "mode": "fixed_ordered"
+  },
+  "acceptance_policy": {
+    "version": "fixed-corpus/0.1",
+    "hard_layers": [
+      "agent_turns",
+      "tool_policy",
+      "oracle",
+      "claims",
+      "privacy"
+    ],
+    "required_tracks": ["answer", "discovery"],
+    "replicates": 3,
+    "qualitative_rule": "fact_hard_safety_resolved_pass"
+  },
+  "judge_policy": {
+    "version": "blinded-qualitative/0.1",
+    "judgment_schema": "steam-agent-eval-judgment/0.1",
+    "adjudication_schema": "steam-agent-eval-adjudication/0.1",
+    "prompt_version": "matrix-judge/0.1",
+    "parser_version": "matrix-parser/0.1",
+    "prompt_sha256": "671449c1329475b3753ffe30a017ad60152603efe6def833872eff8c428deec7",
+    "parser_sha256": "658a8acdf97c7d681c2b78e68c853b73fe010c49631595c7f69f67575931be49",
+    "judges": [
+      {
+        "identifier": "judge-1",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "settings_identity": "matrix-judge-settings-0.1",
+        "settings_sha256": "6cac1d14d272fb781f743ff687442db6c34278fe1ca91a2f9fe80b1a7e17d2a7"
+      },
+      {
+        "identifier": "judge-2",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "settings_identity": "matrix-judge-settings-0.1",
+        "settings_sha256": "6cac1d14d272fb781f743ff687442db6c34278fe1ca91a2f9fe80b1a7e17d2a7"
+      },
+      {
+        "identifier": "judge-3",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "settings_identity": "matrix-judge-settings-0.1",
+        "settings_sha256": "6cac1d14d272fb781f743ff687442db6c34278fe1ca91a2f9fe80b1a7e17d2a7"
+      }
+    ],
+    "adjudication": {
+      "method": "agreement",
+      "adjudicator": "configured-agreement-0.1"
+    }
+  },
+  "screen_provenance": null,
+  "models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  "efforts": ["low", "medium", "high", "xhigh"],
+  "tracks": ["answer", "discovery"],
+  "scenario_ids": [
+    "m2-b01",
+    "m3-d01",
+    "m4-r07",
+    "m4-r08",
+    "m5-c13",
+    "m6-d02",
+    "m7-o01",
+    "m7-b04"
+  ],
+  "replicates": 3,
+  "timeout_seconds": 900,
+  "schedule": "route-interleaved-v1"
+}

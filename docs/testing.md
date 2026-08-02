@@ -23,9 +23,11 @@ source migration set and database reopen, and checks that secret-like
 command-line input is rejected without being echoed.
 
 The normal suite executes every deterministic assertion in the active M4, M5,
-and M7 common-question scenarios. Natural-language answer judging remains
-opt-in; deterministic evidence, gate, ordering, and truth-state oracles are
-part of CI.
+and M7 common-question scenarios. It also checks the schema `0.3` corpus
+invariants and the matrix plan, resume, inspection, comparison, judgment, and
+adjudication artifact contracts without making provider requests.
+Natural-language answer judging remains opt-in; deterministic evidence, gate,
+ordering, and truth-state oracles are part of CI.
 
 Repository documentation checks also require local Markdown links to resolve,
 every design document to declare its status near the top, and committed

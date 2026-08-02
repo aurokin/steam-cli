@@ -66,7 +66,10 @@ _DECK_STATES = {"deck_playable", "deck_unsupported"}
 # snapshot old enough to be non-authoritative while its last-good items still
 # expand the app-facts scope, and candidates absent from the visible-owned
 # projection so ``readiness:visible_owned`` stays unknown.
-_WISHLIST_STATES = {"wishlisted_comparable_minimum_stale_scope"}
+_WISHLIST_STATES = {
+    "wishlisted_comparable_minimum_stale_scope",
+    "wishlisted_compatible_uninstalled",
+}
 _STALE_WISHLIST_OFFSET = timedelta(hours=30)
 
 
@@ -143,6 +146,7 @@ class _Plan:
         self.owned = True
         self.installed = True
         self.wishlisted = False
+        self.stale_wishlist = False
         self.declared: dict[str, Any] | None = None
 
 
@@ -170,6 +174,7 @@ def _plan(appid: int, state: str) -> _Plan | None:
         plan.owned = False
         plan.installed = False
         plan.wishlisted = True
+        plan.stale_wishlist = state == "wishlisted_comparable_minimum_stale_scope"
         plan.declared = declared_app_facts_payload(
             appid, linux_supported=True, linux_minimum=COMPARABLE_MINIMUM
         )
@@ -180,14 +185,14 @@ def _plan(appid: int, state: str) -> _Plan | None:
     return plan
 
 
-def _write_stale_wishlist(
+def _write_wishlist(
     storage: Storage,
     *,
     account_id: int,
     appids: Sequence[int],
     observed_at: datetime,
 ) -> None:
-    """Write one complete wishlist snapshot old enough to be non-authoritative."""
+    """Write one complete wishlist snapshot at the scenario-selected time."""
 
     storage.record_wishlist_data_consent(
         account_id=account_id,
@@ -269,7 +274,8 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
         if (plan := _plan(subject_appid(fact_entry), fact_entry["state"])) is not None
     ]
     wishlisted = [plan.appid for plan in plans if plan.wishlisted]
-    identity_at = now - _STALE_WISHLIST_OFFSET if wishlisted else now
+    stale_wishlist = any(plan.stale_wishlist for plan in plans)
+    identity_at = now - _STALE_WISHLIST_OFFSET if stale_wishlist else now
 
     with Storage(data_dir / "steam-agent.sqlite3") as storage:
         account = seed_identity(
@@ -318,11 +324,13 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             now=now,
         )
         if wishlisted:
-            _write_stale_wishlist(
+            _write_wishlist(
                 storage,
                 account_id=account.id,
                 appids=wishlisted,
-                observed_at=now - _STALE_WISHLIST_OFFSET,
+                observed_at=(
+                    now - _STALE_WISHLIST_OFFSET if stale_wishlist else now
+                ),
             )
 
 

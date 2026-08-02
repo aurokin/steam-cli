@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steam-agent.invalid/evals/schema/matrix-0.1.json",
+  "title": "Steam Agent evaluation matrix 0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign_kind",
+    "selection_policy",
+    "acceptance_policy",
+    "judge_policy",
+    "screen_provenance",
+    "tracks",
+    "scenario_ids",
+    "replicates",
+    "timeout_seconds",
+    "schedule"
+  ],
+  "properties": {
+    "schema": {"const": "steam-agent-eval-matrix/0.1"},
+    "campaign_kind": {"enum": ["screen", "qualification"]},
+    "selection_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "mode"],
+      "properties": {
+        "version": {"const": "fixed-ordered-scenarios/0.1"},
+        "mode": {"const": "fixed_ordered"}
+      }
+    },
+    "acceptance_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "hard_layers",
+        "required_tracks",
+        "replicates",
+        "qualitative_rule"
+      ],
+      "properties": {
+        "version": {"const": "fixed-corpus/0.1"},
+        "hard_layers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["agent_turns", "tool_policy", "oracle", "claims", "privacy"]
+          }
+        },
+        "required_tracks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"enum": ["legacy", "answer", "discovery"]}
+        },
+        "replicates": {"type": "integer", "minimum": 1, "maximum": 100},
+        "qualitative_rule": {
+          "enum": [
+            "fact_hard_safety_resolved_pass",
+            "all_hard_criteria_resolved_pass"
+          ]
+        }
+      }
+    },
+    "judge_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "judgment_schema",
+        "adjudication_schema",
+        "prompt_version",
+        "parser_version",
+        "prompt_sha256",
+        "parser_sha256",
+        "judges",
+        "adjudication"
+      ],
+      "properties": {
+        "version": {"const": "blinded-qualitative/0.1"},
+        "judgment_schema": {"const": "steam-agent-eval-judgment/0.1"},
+        "adjudication_schema": {"const": "steam-agent-eval-adjudication/0.1"},
+        "prompt_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}/[0-9]+\\.[0-9]+$"
+        },
+        "parser_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}/[0-9]+\\.[0-9]+$"
+        },
+        "prompt_sha256": {"$ref": "#/$defs/sha256"},
+        "parser_sha256": {"$ref": "#/$defs/sha256"},
+        "judges": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "identifier",
+              "kind",
+              "model",
+              "reasoning_effort",
+              "settings_identity",
+              "settings_sha256"
+            ],
+            "properties": {
+              "identifier": {"enum": ["judge-1", "judge-2", "judge-3"]},
+              "kind": {"const": "model"},
+              "model": {"const": "gpt-5.6-sol"},
+              "reasoning_effort": {"const": "xhigh"},
+              "settings_identity": {"const": "matrix-judge-settings-0.1"},
+              "settings_sha256": {
+                "const": "6cac1d14d272fb781f743ff687442db6c34278fe1ca91a2f9fe80b1a7e17d2a7"
+              }
+            }
+          }
+        },
+        "adjudication": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "adjudicator"],
+          "properties": {
+            "method": {"const": "agreement"},
+            "adjudicator": {"const": "configured-agreement-0.1"}
+          }
+        }
+      }
+    },
+    "screen_provenance": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_screen_matrix_id",
+            "source_screen_manifest_sha256",
+            "source_screen_acceptance_sha256",
+            "source_screen_qualitative_evidence_sha256"
+          ],
+          "properties": {
+            "source_screen_matrix_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
+            },
+            "source_screen_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "source_screen_acceptance_sha256": {"$ref": "#/$defs/sha256"},
+            "source_screen_qualitative_evidence_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
+      }
+    },
+    "efforts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {"enum": ["low", "medium", "high", "xhigh"]}
+    },
+    "routes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "reasoning_effort"],
+        "properties": {
+          "model": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
+          },
+          "reasoning_effort": {
+            "enum": ["low", "medium", "high", "xhigh"]
+          }
+        }
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"enum": ["legacy", "answer", "discovery"]}
+    },
+    "scenario_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^m[1-9][0-9]*-[a-z][0-9]{2,}$"
+      }
+    },
+    "replicates": {"type": "integer", "minimum": 1, "maximum": 100},
+    "timeout_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 86400
+    },
+    "schedule": {"const": "route-interleaved-v1"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"campaign_kind": {"const": "screen"}}},
+      "then": {
+        "required": ["models", "efforts"],
+        "properties": {
+          "routes": false,
+          "screen_provenance": {"type": "null"},
+          "acceptance_policy": {
+            "properties": {
+              "qualitative_rule": {
+                "const": "fact_hard_safety_resolved_pass"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"campaign_kind": {"const": "qualification"}}},
+      "then": {
+        "required": ["routes"],
+        "properties": {
+          "models": false,
+          "efforts": false,
+          "screen_provenance": {"type": "object"},
+          "acceptance_policy": {
+            "properties": {
+              "qualitative_rule": {"const": "all_hard_criteria_resolved_pass"}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -104,6 +104,7 @@ _PROTOCOL_WRITE_ERROR = "failed to write app-server protocol message"
 _INVALID_JSON_ERROR = "app-server returned invalid protocol JSON"
 _INVALID_RESPONSE_ERROR = "app-server returned an invalid response"
 _INVALID_MODEL_METADATA_ERROR = "app-server returned invalid model metadata"
+_INVALID_MODEL_CATALOG_ERROR = "app-server returned an invalid model catalog"
 _HOOK_ACTIVITY_ERROR = "app-server emitted disallowed hook activity"
 _POST_TURN_ACTIVITY_ERROR = "app-server emitted activity after turn completion"
 _POST_TURN_BOUNDARY_ERROR = "app-server did not reach an idle turn boundary"
@@ -111,6 +112,10 @@ _EXTERNAL_SOURCE_ERROR = (
     "app-server retained an external source or process policy; "
     "refusing to start a thread"
 )
+_MODEL_LIST_PAGE_LIMIT = 100
+_MAX_MODEL_LIST_PAGES = 32
+_MAX_MODEL_LIST_ROUTES = 64
+_MAX_MODEL_LIST_CURSOR_BYTES = 1024
 
 
 @dataclass
@@ -289,6 +294,148 @@ def validate_timeout_seconds(value: str | int | float) -> float:
     ):
         raise ValueError(_INVALID_TIMEOUT_ERROR)
     return timeout_seconds
+
+
+def advertised_model_routes(
+    routes: Sequence[tuple[str, str]], *, timeout_seconds: float = 30.0
+) -> tuple[bool, ...]:
+    """Return only whether each exact requested model/effort route is advertised.
+
+    The App Server catalog is validated and consumed page by page. Catalog rows
+    and cursors remain process-local and are neither returned nor logged.
+    """
+
+    timeout_seconds = validate_timeout_seconds(timeout_seconds)
+    normalized = _validate_model_route_queries(routes)
+    if not posix_runner_supported():
+        raise CodexProtocolError(_POSIX_ONLY_ERROR)
+    with tempfile.TemporaryDirectory(prefix="steam-agent-eval-model-list-") as root_name:
+        isolated_home = Path(root_name)
+        isolated_home.chmod(0o700)
+        workspace = isolated_home / "workspace"
+        workspace.mkdir(mode=0o700)
+        _copy_auth_file(isolated_home)
+        environment = _app_server_environment(isolated_home, workspace)
+        app_server = shutil.which(_APP_SERVER_ARGS[0])
+        if app_server is None:
+            raise CodexProtocolError(_VERSION_ERROR)
+        launch_prefix = _app_server_launch_prefix(app_server)
+        _validate_codex_version(launch_prefix, environment=environment)
+        process = subprocess.Popen(
+            _app_server_process_args(launch_prefix, workspace),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=workspace,
+            env=environment,
+            start_new_session=True,
+        )
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            session = _Session(process.stdin, process.stdout, timeout_seconds)
+            session.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "steam-agent-evals-route-preflight",
+                        "title": "Steam Agent eval route preflight",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            session.notify("initialized", {})
+            _validate_account_boundary(session)
+            return _advertised_model_routes_from_session(session, normalized)
+        finally:
+            _terminate_process_group(process)
+
+
+def _validate_model_route_queries(
+    routes: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, str], ...]:
+    if (
+        not isinstance(routes, Sequence)
+        or isinstance(routes, str | bytes)
+        or not 1 <= len(routes) <= _MAX_MODEL_LIST_ROUTES
+    ):
+        raise ValueError("model route preflight input is invalid")
+    normalized: list[tuple[str, str]] = []
+    for route in routes:
+        if not isinstance(route, tuple) or len(route) != 2:
+            raise ValueError("model route preflight input is invalid")
+        model = _validated_server_model(route[0])
+        effort = _validated_server_effort(route[1])
+        if effort is None:
+            raise ValueError("model route preflight input is invalid")
+        normalized.append((model, effort))
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("model route preflight input is invalid")
+    return tuple(normalized)
+
+
+def _advertised_model_routes_from_session(
+    session: Any, routes: tuple[tuple[str, str], ...]
+) -> tuple[bool, ...]:
+    matched = [False] * len(routes)
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    seen_models: set[str] = set()
+    for _page in range(_MAX_MODEL_LIST_PAGES):
+        params: dict[str, Any] = {
+            "limit": _MODEL_LIST_PAGE_LIMIT,
+            "includeHidden": True,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = session.request("model/list", params)
+        if not isinstance(response, dict) or set(response) != {"data", "nextCursor"}:
+            raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+        data = response["data"]
+        if not isinstance(data, list) or len(data) > _MODEL_LIST_PAGE_LIMIT:
+            raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+            try:
+                model = _validated_server_model(entry.get("model"))
+            except CodexProtocolError:
+                raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR) from None
+            if model in seen_models:
+                raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+            seen_models.add(model)
+            efforts = entry.get("supportedReasoningEfforts")
+            if not isinstance(efforts, list) or len(efforts) > 16:
+                raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+            supported: set[str] = set()
+            for effort_entry in efforts:
+                if not isinstance(effort_entry, dict):
+                    raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+                effort = effort_entry.get("reasoningEffort")
+                if (
+                    not isinstance(effort, str)
+                    or _CATALOG_REASONING_EFFORT.fullmatch(effort) is None
+                    or effort in supported
+                ):
+                    raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+                supported.add(effort)
+            for index, route in enumerate(routes):
+                if route[0] == model and route[1] in supported:
+                    matched[index] = True
+        next_cursor = response["nextCursor"]
+        if next_cursor is None:
+            return tuple(matched)
+        if (
+            not isinstance(next_cursor, str)
+            or not next_cursor
+            or len(next_cursor.encode("utf-8")) > _MAX_MODEL_LIST_CURSOR_BYTES
+            or any(ord(character) < 0x20 for character in next_cursor)
+            or next_cursor in seen_cursors
+        ):
+            raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    raise CodexProtocolError(_INVALID_MODEL_CATALOG_ERROR)
 
 
 def run_agent_conversation(
@@ -817,6 +964,9 @@ _SERVER_MODEL = re.compile(
     re.ASCII,
 )
 _SERVER_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_CATALOG_REASONING_EFFORT = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z", re.ASCII
+)
 
 
 def _validated_server_model(value: Any) -> str:

@@ -1,11 +1,11 @@
 {
-  "schema_version": "steam-agent-eval/0.2", "id": "m5-c06", "status": "active", "milestone": "M5", "scenario_kind": "contract",
+  "schema_version": "steam-agent-eval/0.3", "id": "m5-c06", "status": "active", "milestone": "M5", "scenario_kind": "contract", "execution_support": "live", "unsupported_reason": null, "required_document_count": 1,
   "question_family": "playable now", "tags": ["installed", "operations", "unknown"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "The title is owned, installed, and compatible but M7 operational facts are unavailable.", "facts": [{"subject": "synthetic:appid:5601", "state": "installed_owned_compatible"}]},
   "conversation": {"user": ["Using the US store and English metadata, can I play AppID 5601 right now?"], "paraphrase": "Do not collapse static compatibility into current readiness."},
   "tool_policy": {"allowed": ["steam-agent compatibility assess"], "required": [{"command": "steam-agent compatibility assess", "arguments": ["5601", "--account", "synthetic", "--target", "machine:synthetic-machine", "--country", "US", "--language", "english"]}], "prohibited": ["sync", "launch", "operational inference"]},
   "deterministic_oracle": {"recipe_or_contract": "compatibility/0.1 playable-now boundary", "assertions": [{"path": "$.data.results[0].compatibility", "operator": "equals", "expected": "compatible"}, {"path": "$.data.results[0].playable_now", "operator": "equals", "expected": "unknown"}, {"path": "$.data.results[0].reasons", "operator": "contains", "expected": "playable_now_requires_m7_operational_facts"}]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.results[0].compatibility", "$.data.results[0].playable_now", "$.data.results[0].reasons[1]"], "criteria": [{"id": "static-vs-now", "weight": 10, "requirement": "Keep static compatibility separate from current readiness.", "hard_fail": true}]},
+  "fact_rubric": {"grading":"deterministic","must_mention":["$.data.results[0].playable_now"],"support_if_claimed":["$.data.results[0].compatibility","$.data.results[0].reasons[1]"],"criteria":[{"id":"static-vs-now","weight":10,"requirement":"Keep static compatibility separate from current readiness.","hard_fail":true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "next-check", "weight": 3, "requirement": "Explain that current operational state still needs checking."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_C06", "credential": "EVAL_CANARY_CREDENTIAL_C06", "local_path": "EVAL_CANARY_LOCAL_PATH_C06"}
 }

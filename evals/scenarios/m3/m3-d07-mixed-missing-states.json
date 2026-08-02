@@ -1,5 +1,5 @@
 {
-  "schema_version": "steam-agent-eval/0.2", "id": "m3-d07", "status": "active", "milestone": "M3", "scenario_kind": "contract",
+  "schema_version": "steam-agent-eval/0.3", "id": "m3-d07", "status": "active", "milestone": "M3", "scenario_kind": "contract", "execution_support": "live", "unsupported_reason": null, "required_document_count": 1,
   "question_family": "deal data quality", "tags": ["failure", "running", "unevaluated"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "Wishlist candidates have running, failed, and untargeted provider states.", "facts": [
     {"subject": "synthetic:appid:701", "state": "running"}, {"subject": "synthetic:appid:702", "state": "failed_rate_limited"}, {"subject": "synthetic:appid:703", "state": "unevaluated"}
@@ -13,7 +13,7 @@
     {"path": "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code", "operator": "ordered_equals", "expected": ["PRICE_EVIDENCE_NOT_EVALUATED", "PRICE_EVIDENCE_NOT_EVALUATED"]},
     {"path": "$.completeness.warnings[*].code", "operator": "contains", "expected": "PROVIDER_RATE_LIMITED"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[?(@.appid==701)].deal.attempted_providers[1].error_code", "$.data.items[?(@.appid==702)].deal.attempted_providers[0].error_code", "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code"], "criteria": [
+  "fact_rubric": {"grading": "deterministic", "must_mention": ["$.data.items[?(@.appid==701)].deal.attempted_providers[1].error_code", "$.data.items[?(@.appid==702)].deal.attempted_providers[0].error_code", "$.data.items[?(@.appid==703)].deal.attempted_providers[*].error_code"], "support_if_claimed": [], "criteria": [
     {"id": "state-distinction", "weight": 10, "requirement": "Keep running, failed, and unevaluated distinct.", "hard_fail": true},
     {"id": "cache-only", "weight": 5, "requirement": "Do not imply that the query refreshed or retried data.", "hard_fail": true}
   ]},

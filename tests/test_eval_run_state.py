@@ -32,6 +32,30 @@ from evals.runner.run_state import (  # noqa: E402
 NOW = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
 
 
+def _matrix_campaign() -> run_state.MatrixCampaign:
+    return run_state.MatrixCampaign(
+        campaign_kind="screen",
+        selection_version="fixed-ordered-scenarios/0.1",
+        selection_mode="fixed_ordered",
+        acceptance_version="fixed-corpus/0.1",
+        hard_layers=("agent_turns", "tool_policy", "oracle", "claims", "privacy"),
+        required_tracks=("discovery",),
+        replicates=2,
+        qualitative_rule="fact_hard_safety_resolved_pass",
+        judge_version="blinded-qualitative/0.1",
+        judgment_schema="steam-agent-eval-judgment/0.1",
+        adjudication_schema="steam-agent-eval-adjudication/0.1",
+        prompt_version="matrix-judge/0.1",
+        parser_version="matrix-parser/0.1",
+        prompt_sha256="d" * 64,
+        parser_sha256="e" * 64,
+        judges=run_state.CALIBRATED_JUDGE_CONFIGURATIONS,
+        adjudication_method=run_state.CALIBRATED_ADJUDICATION_METHOD,
+        adjudicator=run_state.CALIBRATED_ADJUDICATOR,
+        source_screen_manifest_sha256=None,
+    )
+
+
 def _scenario(
     scenario_id: str = "m7-z99", *, source_name: str | None = None
 ) -> FrozenScenario:
@@ -80,9 +104,10 @@ def _manifest(scenario: FrozenScenario | None = None) -> RunManifest:
 def test_frozen_scenario_retains_exact_bytes_hash_and_immutable_document() -> None:
     scenario = _scenario()
 
-    assert scenario.sha256 == __import__("hashlib").sha256(
-        scenario.original_bytes
-    ).hexdigest()
+    assert (
+        scenario.sha256
+        == __import__("hashlib").sha256(scenario.original_bytes).hexdigest()
+    )
     with pytest.raises(TypeError):
         scenario.document["id"] = "m7-z98"
     mutable = scenario.mutable_document()
@@ -239,7 +264,9 @@ def test_atomic_publication_is_private_and_never_overwrites(tmp_path: Path) -> N
     with pytest.raises(FileExistsError):
         atomic_publish_private_text(path, "second")
     assert json.loads(path.read_text()) == {"state": "first"}
-    assert not any(item.name.startswith(".artifact.json.tmp-") for item in tmp_path.iterdir())
+    assert not any(
+        item.name.startswith(".artifact.json.tmp-") for item in tmp_path.iterdir()
+    )
 
 
 def test_atomic_publication_rejects_existing_symlink(tmp_path: Path) -> None:
@@ -269,7 +296,12 @@ def test_manifest_transitions_are_monotonic_and_terminal() -> None:
         completed_scenario_ids=["m7-z99"],
     )
 
-    assert [manifest.revision, controls.revision, running.revision, completed.revision] == [
+    assert [
+        manifest.revision,
+        controls.revision,
+        running.revision,
+        completed.revision,
+    ] == [
         0,
         1,
         2,
@@ -304,9 +336,7 @@ def test_manifest_records_track_controls_and_ordered_running_checkpoints() -> No
         started_at=NOW,
     )
     controls = manifest.transition(RunState.CONTROLS, at=NOW)
-    running = controls.transition(
-        RunState.RUNNING, at=NOW, controls_passed=True
-    )
+    running = controls.transition(RunState.RUNNING, at=NOW, controls_passed=True)
     first = running.transition(
         RunState.RUNNING,
         at=NOW + timedelta(seconds=1),
@@ -347,9 +377,7 @@ def test_manifest_rejects_nonappend_completion_and_incomplete_success() -> None:
     controls = manifest.transition(RunState.CONTROLS, at=NOW)
     with pytest.raises(ManifestStateError):
         controls.transition(RunState.RUNNING, at=NOW, controls_passed=False)
-    running = controls.transition(
-        RunState.RUNNING, at=NOW, controls_passed=True
-    )
+    running = controls.transition(RunState.RUNNING, at=NOW, controls_passed=True)
     first = running.transition(
         RunState.RUNNING, at=NOW, completed_scenario_ids=["m7-z97"]
     )
@@ -418,9 +446,7 @@ def test_manifest_persists_dynamic_control_and_completion_checkpoints(
     path = tmp_path / "manifest.json"
     initial = _manifest()
     controls = initial.transition(RunState.CONTROLS, at=NOW)
-    running = controls.transition(
-        RunState.RUNNING, at=NOW, controls_passed=True
-    )
+    running = controls.transition(RunState.RUNNING, at=NOW, controls_passed=True)
     checkpoint = running.transition(
         RunState.RUNNING, at=NOW, completed_scenario_ids=["m7-z99"]
     )
@@ -468,7 +494,9 @@ def test_manifest_persistence_atomically_advances_one_run(tmp_path: Path) -> Non
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with pytest.raises(ManifestStateError):
         initial.persist(path)
-    assert not any(item.name.startswith(".manifest.json.tmp-") for item in tmp_path.iterdir())
+    assert not any(
+        item.name.startswith(".manifest.json.tmp-") for item in tmp_path.iterdir()
+    )
 
 
 def test_manifest_persistence_rejects_provenance_change(tmp_path: Path) -> None:
@@ -523,3 +551,263 @@ def test_snapshot_context_manager_cleans_read_only_tree(tmp_path: Path) -> None:
     with snapshot:
         assert root.exists()
     assert not root.exists()
+
+
+def _matrix_manifest() -> run_state.MatrixManifest:
+    inputs = run_state.MatrixInputs(
+        commit="a" * 40,
+        source_digest="b" * 64,
+        harness_digest="c" * 64,
+        scenarios=(
+            run_state.MatrixScenario(
+                scenario_id="m7-z99",
+                source_sha256="d" * 64,
+                child_source_digest="1" * 64,
+                schema_version="steam-agent-eval:0.3",
+                schema_sha256="e" * 64,
+                execution_support="live",
+                turn_count=2,
+                rubric_sha256="f" * 64,
+                criterion_ids=("grounded-answer",),
+                qualitative_criteria=(
+                    run_state.MatrixQualitativeCriterion(
+                        "grounded-answer",
+                        "judged_answer_rubric",
+                        "Ground the answer.",
+                        None,
+                    ),
+                ),
+            ),
+        ),
+        tool_versions=(("codex", "0.146.0"),),
+    )
+    route = run_state.MatrixRoute("gpt-5.6-sol", "xhigh")
+    work_items = tuple(
+        run_state.MatrixWorkItem(
+            work_item_id=f"w-00000{index}-{'1' * 16}",
+            identity_sha256=str(index + 1) * 64,
+            ordinal=index,
+            scenario_id="m7-z99",
+            track="discovery",
+            route=route,
+            replicate=index + 1,
+        )
+        for index in range(2)
+    )
+    return run_state.MatrixManifest.create(
+        matrix_id="matrix-20260802T120000Z",
+        config_sha256="2" * 64,
+        campaign=_matrix_campaign(),
+        plan_sha256="3" * 64,
+        inputs=inputs,
+        work_items=work_items,
+        excluded_scenario_ids=(),
+        started_at=NOW,
+    )
+
+
+def _matrix_completion(work_item_id: str, attempt: int) -> run_state.MatrixCompletion:
+    return run_state.MatrixCompletion(
+        work_item_id=work_item_id,
+        attempt_id=f"attempt-{attempt:06d}",
+        started_sha256="0" * 64,
+        outcome="observed",
+        unavailable_reason=None,
+        child_run_id=f"20260802T12000{attempt}Z",
+        child_exit_code=1,
+        artifact_hashes=tuple(
+            sorted(
+                (name, str(index) * 64)
+                for index, name in enumerate(
+                    (
+                        "controls.json",
+                        "manifest.json",
+                        "report.json",
+                        "summary.json",
+                        "transcript.jsonl",
+                    ),
+                    start=4,
+                )
+            )
+        ),
+        completed_at=(NOW + timedelta(seconds=attempt)).isoformat(),
+    )
+
+
+def test_matrix_manifest_checkpoints_exact_work_prefix_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    initial = _matrix_manifest()
+    path = tmp_path / "manifest.json"
+    initial.persist(path)
+    first = initial.checkpoint(
+        _matrix_completion(initial.work_items[0].work_item_id, 1),
+        at=NOW + timedelta(seconds=1),
+    )
+    first.persist(path)
+    completed = first.checkpoint(
+        _matrix_completion(initial.work_items[1].work_item_id, 2),
+        at=NOW + timedelta(seconds=2),
+    )
+    completed.persist(path)
+
+    loaded = run_state.MatrixManifest.from_dict(json.loads(path.read_text()))
+    assert loaded == completed
+    assert loaded.state is run_state.MatrixState.COMPLETED
+    assert loaded.inputs.scenarios[0].turn_count == 2
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    with pytest.raises(ManifestStateError):
+        loaded.checkpoint(
+            _matrix_completion(initial.work_items[0].work_item_id, 3), at=NOW
+        )
+
+
+def test_matrix_manifest_revision_exactly_counts_committed_completions() -> None:
+    initial = _matrix_manifest()
+
+    with pytest.raises(ManifestStateError, match="revision does not match"):
+        replace(initial, revision=1)
+
+    forged = initial.to_dict()
+    forged["revision"] = 1
+    with pytest.raises(ManifestStateError, match="revision does not match"):
+        run_state.MatrixManifest.from_dict(forged)
+
+
+@pytest.mark.parametrize("turn_count", (0, -1, True, 1.5))
+def test_matrix_scenario_requires_a_positive_integer_turn_count(
+    turn_count: object,
+) -> None:
+    scenario = _matrix_manifest().inputs.scenarios[0]
+
+    with pytest.raises(ManifestStateError, match="turn count"):
+        replace(scenario, turn_count=turn_count)
+
+
+@pytest.mark.parametrize("field", ("turn_count", "child_source_digest"))
+def test_matrix_scenario_strict_parse_requires_bound_fields(field: str) -> None:
+    document = _matrix_manifest().inputs.scenarios[0].to_dict()
+    document.pop(field)
+
+    with pytest.raises(ManifestStateError, match="scenario"):
+        run_state.MatrixScenario.from_dict(document)
+
+
+def test_matrix_manifest_rejects_out_of_order_or_changed_history(
+    tmp_path: Path,
+) -> None:
+    initial = _matrix_manifest()
+    with pytest.raises(ManifestStateError):
+        initial.checkpoint(
+            _matrix_completion(initial.work_items[1].work_item_id, 1), at=NOW
+        )
+
+    path = tmp_path / "manifest.json"
+    initial.persist(path)
+    changed = replace(initial, config_sha256="9" * 64).checkpoint(
+        _matrix_completion(initial.work_items[0].work_item_id, 1), at=NOW
+    )
+    with pytest.raises(ManifestStateError):
+        changed.persist(path)
+
+
+def test_matrix_manifest_hash_binds_normalized_campaign_policy() -> None:
+    manifest = _matrix_manifest()
+    document = manifest.to_dict()
+    document["campaign"]["acceptance_policy"]["replicates"] = 3
+
+    with pytest.raises(ManifestStateError, match="campaign digest"):
+        run_state.MatrixManifest.from_dict(document)
+
+
+def test_matrix_campaign_rejects_an_arbitrary_self_consistent_judge() -> None:
+    arbitrary = replace(
+        run_state.CALIBRATED_JUDGE_CONFIGURATIONS[0], model="gpt-5.6-terra"
+    )
+
+    with pytest.raises(ManifestStateError, match="calibrated judge policy"):
+        replace(
+            _matrix_campaign(),
+            judges=(arbitrary, *run_state.CALIBRATED_JUDGE_CONFIGURATIONS[1:]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "extra"),
+    (
+        ("selection_policy", "unexpected_selection_field"),
+        ("acceptance_policy", "unexpected_acceptance_field"),
+        ("judge_policy", "unexpected_judge_field"),
+    ),
+)
+def test_matrix_manifest_rejects_unknown_nested_campaign_fields(
+    section: str, extra: str
+) -> None:
+    document = _matrix_manifest().to_dict()
+    document["campaign"][section][extra] = True
+
+    with pytest.raises(ManifestStateError, match="campaign policy"):
+        run_state.MatrixManifest.from_dict(document)
+
+
+def test_unavailable_matrix_completion_is_typed_and_round_trips() -> None:
+    completion = run_state.MatrixCompletion(
+        work_item_id="w-000000-1111111111111111",
+        attempt_id="attempt-000001",
+        started_sha256="0" * 64,
+        outcome="unavailable",
+        unavailable_reason="provider_route_unavailable",
+        child_run_id=None,
+        child_exit_code=None,
+        artifact_hashes=(),
+        completed_at=NOW.isoformat(),
+    )
+
+    assert run_state.MatrixCompletion.from_dict(completion.to_dict()) == completion
+
+
+@pytest.mark.parametrize("started_sha256", ("", "0" * 63, "g" * 64, None))
+def test_matrix_completion_requires_attempt_start_digest(
+    started_sha256: object,
+) -> None:
+    completion = _matrix_completion("w-000000-1111111111111111", 1)
+
+    with pytest.raises(ManifestStateError, match="start digest"):
+        replace(completion, started_sha256=started_sha256)
+
+
+def test_matrix_completion_strict_parse_requires_attempt_start_digest() -> None:
+    completion = _matrix_completion("w-000000-1111111111111111", 1).to_dict()
+    completion.pop("started_sha256")
+
+    with pytest.raises(ManifestStateError, match="completion"):
+        run_state.MatrixCompletion.from_dict(completion)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"unavailable_reason": None},
+        {"child_run_id": "child-000001"},
+        {"child_exit_code": 1},
+        {"artifact_hashes": (("report.json", "a" * 64),)},
+    ),
+)
+def test_unavailable_matrix_completion_rejects_observation_fields(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "work_item_id": "w-000000-1111111111111111",
+        "attempt_id": "attempt-000001",
+        "started_sha256": "0" * 64,
+        "outcome": "unavailable",
+        "unavailable_reason": "provider_route_unavailable",
+        "child_run_id": None,
+        "child_exit_code": None,
+        "artifact_hashes": (),
+        "completed_at": NOW.isoformat(),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ManifestStateError, match="unavailable"):
+        run_state.MatrixCompletion(**values)  # type: ignore[arg-type]

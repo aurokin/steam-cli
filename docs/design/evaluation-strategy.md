@@ -32,8 +32,8 @@ remain opt-in follow-up work and cannot compensate for a contract failure.
    every claim from prose.
 4. **Judged answer quality (opt-in only).** Scenario-specific criteria may
    assess relevance, clarity, tradeoffs, and actionability. These scores remain
-   separate from contract and fact failures. This repository does not yet
-   implement a judge or depend on a model API.
+   separate from contract and fact failures. The repository validates imported
+   blinded judgments and adjudications; it does not automate a model judge.
 
 The scenario corpus under [`evals/`](../../evals/) represents these layers
 explicitly. Normal CI schema- and privacy-validates every M2, M3, M4, M5, M6,
@@ -152,7 +152,7 @@ state transitions. Personal titles, AppIDs, SteamID64 values, feedback, keys,
 paths, and raw provider bodies are not evaluation artifacts. Replays retain
 only normalized data allowed by the provider boundary.
 
-## Judge protocol (future)
+## Judge protocol
 
 Absolute scenario-specific criteria are the default regression rubric.
 Pairwise judging is reserved for comparing a candidate agent or prompt against
@@ -167,6 +167,8 @@ release, a human-labeled calibration set must include deliberate defects such
 as an invented price, stale evidence stated as current, unknown stated as free,
 a hidden hard-constraint violation, and a verbose but incomplete answer.
 Judge changes require recalibration and periodic blind human audits.
+The current synthetic calibration set and observed result are recorded in
+[`evals/calibration/`](../../evals/calibration/).
 
 This follows the multi-scenario, multi-metric framing of
 [HELM](https://arxiv.org/abs/2211.09110), the criterion-based approach in
@@ -179,30 +181,40 @@ blind comparison and task-specific rubrics while retaining expert review.
 ## Current implementation
 
 - Normal CI validates every scenario against the schema its own
-  `schema_version` names, including synthetic privacy canaries. `0.2` adds a
+  `schema_version` names, including synthetic privacy canaries. `0.2` added a
   required `scenario_kind` of `contract` or `boundary`, reads
   `conversation.user` as sequential turns, and lets an assertion name its
   source: the captured CLI document (the default), a turn's final answer
   (`refusal_expected`, `contains`, `omits`), or the executed-command trace
   (`must_not_execute`). A boundary scenario may therefore carry no fixture
   facts and no required command.
-  The first qualification slice leaves schema `0.2` and its existing claim
-  semantics unchanged. Schema `0.3`, `execution_support`, `must_mention`,
-  `support_if_claimed`, required-claim reclassification, and scenario splits
-  remain deferred outside the accepted qualification slice.
+  Active scenarios now use `0.3`. It records `execution_support` and required
+  document cardinality and splits answer facts into `must_mention` and
+  `support_if_claimed`. Corpus and runtime checks require those sets to be
+  disjoint and require every `must_mention` path to have deterministic CLI
+  oracle support. The semantic migration is recorded in
+  [ADR 0019](../adr/0019-eval-scenario-claim-and-execution-semantics.md).
 - Qualification cohorts require a known clean Git revision before preflight
   and recheck the revision, worktree, selected input inventories, and snapshot
   seal throughout the run. The snapshot attests the product source, loaded
   harness bytes, selected scenarios, and schema; only the product source is
-  executed from the snapshot. Deterministic preflight supports 51 current
-  scenarios and classifies M5-c03, M5-c04, and M5-c11 as deterministic-only.
+  executed from the snapshot. The active corpus contains 53 live scenarios
+  and classifies M5-c03, M5-c04, and M5-c11 as deterministic-only.
   Eight scripted controls call the integrated production-layer evaluators.
   Scenario publication verifies mode-`0600` reports and transcripts or skip
   records and puts their content hashes in the summary. Lifecycle states are
   `initializing`, `controls`, `running`, `completed`, `failed`, `interrupted`,
   and `contaminated`; every non-completed terminal state carries one bounded
-  reason. Stale nonterminal manifests are ineligible, with no recovery
-  implementation in this slice.
+  reason. Stale nonterminal child manifests are ineligible. Matrix campaigns
+  preserve those child runs and resume at an append-only scheduler attempt
+  boundary. Their plan binds the revision, input digests, ordered scenarios,
+  routes, tracks, replicate schedule, timeout, and exclusions. Inspection
+  verifies the child manifest-summary-report hash chain and reports per-layer
+  vectors without blending tracks or deterministic and qualitative outcomes.
+  Imported blinded judgments and adjudications are hash-bound to the exact
+  report and rubric; they cannot override deterministic failure. These
+  contracts are recorded in
+  [ADR 0020](../adr/0020-eval-matrix-campaigns-and-fixed-corpus-qualification.md).
 - M3, M4, M5, and M7 oracle modules execute installed command behavior
   against deterministic scenarios; M2 and M6 contract scenarios are executed
   through the materializer round trip, and boundary probes (refusal,

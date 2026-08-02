@@ -1,11 +1,11 @@
 {
-  "schema_version": "steam-agent-eval/0.2", "id": "m7-o02", "status": "active", "milestone": "M7", "scenario_kind": "contract",
+  "schema_version": "steam-agent-eval/0.3", "id": "m7-o02", "status": "active", "milestone": "M7", "scenario_kind": "contract", "execution_support": "live", "unsupported_reason": null, "required_document_count": 1,
   "question_family": "local operational freshness", "tags": ["last-good", "stale", "truth-state"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A promoted installed fact is retained after a newer failed scan.", "facts": [{"subject": "synthetic:appid:7002", "state": "retained_after_failed_scan", "detail": "promoted fact remains present but is stale"}]},
   "conversation": {"user": ["Is the retained local install observation still current?"], "paraphrase": "Preserve last-good data while exposing the failed newer attempt."},
   "tool_policy": {"allowed": ["steam-agent operations observe"], "required": [{"command": "steam-agent operations observe", "arguments": ["--machine", "synthetic-machine"]}], "prohibited": ["sync", "replace last-good", "filesystem scan"]},
-  "deterministic_oracle": {"recipe_or_contract": "local-operation-state/0.1 last-good", "assertions": [{"path": "$.data.items[0].installed.state", "operator": "equals", "expected": "present"}, {"path": "$.data.items[0].installed.freshness", "operator": "equals", "expected": "stale"}]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[0].installed.state", "$.data.items[0].installed.freshness", "$.data.snapshot.last_attempt_status"], "criteria": [{"id": "last-good", "weight": 10, "requirement": "A failed scan must not erase the promoted complete projection.", "hard_fail": true}]},
+  "deterministic_oracle": {"recipe_or_contract": "local-operation-state/0.1 last-good", "assertions": [{"path": "$.data.items[0].installed.state", "operator": "equals", "expected": "present"}, {"path": "$.data.items[0].installed.freshness", "operator": "equals", "expected": "stale"}, {"path": "$.data.snapshot.last_attempt_status", "operator": "equals", "expected": "failed"}]},
+  "fact_rubric": {"grading":"deterministic","must_mention":["$.data.items[0].installed.freshness","$.data.snapshot.last_attempt_status"],"support_if_claimed":["$.data.items[0].installed.state"],"criteria":[{"id":"last-good","weight":10,"requirement":"A failed scan must not erase the promoted complete projection.","hard_fail":true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "stale-warning", "weight": 5, "requirement": "Explain that retained evidence is stale rather than current."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_M7O02", "credential": "EVAL_CANARY_CREDENTIAL_M7O02", "local_path": "EVAL_CANARY_LOCAL_PATH_M7O02"}
 }

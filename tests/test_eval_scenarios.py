@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -14,12 +15,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from evals.runner import grade as runner_grade  # noqa: E402
+from evals.runner import __main__ as runner_main  # noqa: E402
+from evals.runner import run_state  # noqa: E402
 
 
 EVAL_ROOT = ROOT / "evals"
 SCHEMA_PATHS = {
     "steam-agent-eval/0.1": EVAL_ROOT / "schema" / "scenario-0.1.json",
     "steam-agent-eval/0.2": EVAL_ROOT / "schema" / "scenario-0.2.json",
+    "steam-agent-eval/0.3": EVAL_ROOT / "schema" / "scenario-0.3.json",
 }
 
 
@@ -35,15 +39,41 @@ def _validators() -> dict[str, Draft202012Validator]:
 
 
 def _check_version_specific(path: Path, scenario: dict[str, Any]) -> None:
-    """Rules the 0.2 vocabulary adds beyond what JSON Schema can express."""
+    """Rules the current vocabularies add beyond what JSON Schema can express."""
 
-    if scenario["schema_version"] != "steam-agent-eval/0.2":
+    version = scenario["schema_version"]
+    if version not in {"steam-agent-eval/0.2", "steam-agent-eval/0.3"}:
         return
     assert scenario["scenario_kind"] in {"contract", "boundary"}
     required = scenario["tool_policy"]["required"]
-    for claim_path in scenario["fact_rubric"].get("required_claim_paths", ()):
+    if version == "steam-agent-eval/0.3":
+        try:
+            run_state.scenario_qualitative_criteria(scenario)
+        except run_state.ManifestStateError as error:
+            raise AssertionError(f"{path}: {error}") from None
+        rubric = scenario["fact_rubric"]
+        must_mention = rubric["must_mention"]
+        support_if_claimed = rubric["support_if_claimed"]
+        assert not set(must_mention).intersection(support_if_claimed), (
+            f"{path}: must_mention and support_if_claimed overlap"
+        )
+        assert scenario["required_document_count"] == len(required), (
+            f"{path}: required document count does not match required commands"
+        )
+        oracle_paths = {
+            assertion["path"]
+            for assertion in scenario["deterministic_oracle"]["assertions"]
+            if assertion.get("source", "cli_document") == "cli_document"
+        }
+        assert set(must_mention) <= oracle_paths, (
+            f"{path}: must_mention paths need deterministic CLI assertions"
+        )
+        claim_paths = (*must_mention, *support_if_claimed)
+    else:
+        claim_paths = scenario["fact_rubric"].get("required_claim_paths", ())
+    for claim_path in claim_paths:
         assert runner_grade.is_supported_path(claim_path), (
-            f"{path}: unsupported required claim path"
+            f"{path}: unsupported fact-rubric path"
         )
     turn_count = len(scenario["conversation"]["user"])
     for assertion in scenario["deterministic_oracle"]["assertions"]:
@@ -110,6 +140,12 @@ def test_all_common_question_scenarios_validate_and_use_synthetic_canaries() -> 
         assert scenario["judged_answer_rubric"]["status"] == "opt_in"
 
     assert expected_initial_ids <= seen_ids
+    assert len(scenario_paths) == 56
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["schema_version"]
+        == "steam-agent-eval/0.3"
+        for path in scenario_paths
+    )
 
 
 def _scenario_02(**overrides: Any) -> dict[str, Any]:
@@ -178,6 +214,22 @@ def _scenario_02(**overrides: Any) -> dict[str, Any]:
     return scenario
 
 
+def _scenario_03(**overrides: Any) -> dict[str, Any]:
+    scenario = _scenario_02()
+    scenario.update(
+        {
+            "schema_version": "steam-agent-eval/0.3",
+            "execution_support": "live",
+            "unsupported_reason": None,
+            "required_document_count": 0,
+        }
+    )
+    scenario["fact_rubric"]["must_mention"] = []
+    scenario["fact_rubric"]["support_if_claimed"] = []
+    scenario.update(overrides)
+    return scenario
+
+
 def test_schema_02_separates_boundary_probes_from_contract_scenarios() -> None:
     validator = _validators()["steam-agent-eval/0.2"]
     boundary = _scenario_02()
@@ -198,6 +250,168 @@ def test_schema_02_refusal_requires_semantic_hard_fail_review() -> None:
     without_hard_fail["fact_rubric"]["criteria"][0].pop("hard_fail")
 
     assert list(validator.iter_errors(without_hard_fail))
+
+
+def _live_scenario_03() -> dict[str, Any]:
+    scenario = _scenario_03(scenario_kind="contract", required_document_count=1)
+    scenario["fixture"]["facts"] = [
+        {"subject": "synthetic:appid:7001", "state": "fresh_installed"}
+    ]
+    scenario["tool_policy"]["allowed"] = ["steam-agent operations observe"]
+    scenario["tool_policy"]["required"] = [
+        {"command": "steam-agent operations observe", "arguments": []}
+    ]
+    scenario["deterministic_oracle"]["assertions"] = [
+        {"path": "$.data.state", "operator": "equals", "expected": "ready"}
+    ]
+    scenario["fact_rubric"]["must_mention"] = ["$.data.state"]
+    scenario["fact_rubric"]["support_if_claimed"] = ["$.data.detail"]
+    return scenario
+
+
+def test_schema_03_accepts_explicit_execution_and_fact_semantics() -> None:
+    scenario = _live_scenario_03()
+
+    assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+    _check_version_specific(Path("live"), scenario)
+
+
+def test_schema_03_rejects_qualitative_fields_larger_than_manifest_bounds() -> None:
+    validator = _validators()["steam-agent-eval/0.3"]
+    long_id = _scenario_03()
+    long_id["judged_answer_rubric"]["criteria"][0]["id"] = "a" * 129
+    long_requirement = _scenario_03()
+    long_requirement["judged_answer_rubric"]["criteria"][0][
+        "requirement"
+    ] = "a" * 4097
+
+    assert list(validator.iter_errors(long_id))
+    assert list(validator.iter_errors(long_requirement))
+
+
+def test_schema_03_semantics_reject_more_than_1024_combined_criteria() -> None:
+    scenario = _scenario_03()
+    scenario["judged_answer_rubric"]["criteria"] = [
+        {
+            "id": f"criterion-{index:04d}",
+            "weight": 1,
+            "requirement": "Assess this criterion.",
+        }
+        for index in range(1023)
+    ]
+    assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+    assert len(run_state.scenario_qualitative_criteria(scenario)) == 1024
+    scenario["judged_answer_rubric"]["criteria"].append(
+        {
+            "id": "criterion-1023",
+            "weight": 1,
+            "requirement": "Assess this criterion.",
+        }
+    )
+    assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+    with pytest.raises(
+        run_state.ManifestStateError,
+        match="more than 1024 combined qualitative criteria",
+    ):
+        run_state.scenario_qualitative_criteria(scenario)
+
+
+def test_schema_03_semantics_reject_duplicate_authored_criterion_ids() -> None:
+    scenario = _scenario_03()
+    scenario["judged_answer_rubric"]["criteria"].append(
+        {"id": "tone", "weight": 1, "requirement": "Use a second tone."}
+    )
+    assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+    with pytest.raises(
+        run_state.ManifestStateError,
+        match="criterion IDs are not unique after promotion",
+    ):
+        run_state.scenario_qualitative_criteria(scenario)
+
+
+def test_schema_03_semantics_reject_authored_generated_id_collision() -> None:
+    scenario = _scenario_03()
+    source_id = scenario["fact_rubric"]["criteria"][0]["id"]
+    generated_id = (
+        f"fact-hard-{hashlib.sha256(source_id.encode()).hexdigest()[:16]}"
+    )
+    scenario["judged_answer_rubric"]["criteria"][0]["id"] = generated_id
+    assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+    with pytest.raises(
+        run_state.ManifestStateError,
+        match="criterion IDs are not unique after promotion",
+    ):
+        run_state.scenario_qualitative_criteria(scenario)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda scenario: scenario.pop("execution_support"),
+        lambda scenario: scenario.pop("unsupported_reason"),
+        lambda scenario: scenario.pop("required_document_count"),
+        lambda scenario: scenario["fact_rubric"].pop("must_mention"),
+        lambda scenario: scenario["fact_rubric"].pop("support_if_claimed"),
+        lambda scenario: scenario["fact_rubric"].__setitem__(
+            "required_claim_paths", ["$.data.state"]
+        ),
+    ),
+)
+def test_schema_03_rejects_missing_or_retired_semantics(mutation: Any) -> None:
+    scenario = _live_scenario_03()
+    mutation(scenario)
+
+    assert list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+
+@pytest.mark.parametrize(
+    ("support", "reason"),
+    (
+        ("live", "writer_missing"),
+        ("deterministic_only", None),
+        ("deterministic_only", "Writer Missing"),
+        ("deterministic_only", "a" * 65),
+    ),
+)
+def test_schema_03_rejects_invalid_unsupported_reasons(
+    support: str, reason: str | None
+) -> None:
+    scenario = _live_scenario_03()
+    scenario["execution_support"] = support
+    scenario["unsupported_reason"] = reason
+
+    assert list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+
+def test_schema_03_runtime_checks_count_overlap_and_oracle_backing() -> None:
+    count_mismatch = _live_scenario_03()
+    count_mismatch["required_document_count"] = 0
+    with pytest.raises(AssertionError, match="document count"):
+        _check_version_specific(Path("count"), count_mismatch)
+
+    overlap = _live_scenario_03()
+    overlap["fact_rubric"]["support_if_claimed"] = ["$.data.state"]
+    with pytest.raises(AssertionError, match="overlap"):
+        _check_version_specific(Path("overlap"), overlap)
+
+    unbacked = _live_scenario_03()
+    unbacked["fact_rubric"]["must_mention"] = ["$.data.other"]
+    with pytest.raises(AssertionError, match="deterministic CLI assertions"):
+        _check_version_specific(Path("unbacked"), unbacked)
+
+
+def test_runner_preflight_rejects_unbacked_schema_03_must_mention() -> None:
+    scenario = _live_scenario_03()
+    scenario["fact_rubric"]["must_mention"] = ["$.data.other"]
+
+    with pytest.raises(
+        runner_main.UnsupportedScenarioError,
+        match="must-mention paths need deterministic CLI assertions",
+    ):
+        runner_main._validate_scenario_metadata(scenario)  # noqa: SLF001
 
 
 def _scenario_with_optional_options(options: object) -> dict[str, Any]:
@@ -501,7 +715,7 @@ def test_m6_member_evidence_commands_are_requested_by_the_prompt(name: str) -> N
         for assertion in assertions
     )
     assert "$.data.members[*].member_evidence" in scenario["fact_rubric"][
-        "required_claim_paths"
+        "must_mention"
     ]
 
 

@@ -1,11 +1,11 @@
 {
-  "schema_version": "steam-agent-eval/0.2", "id": "m5-c08", "status": "active", "milestone": "M5", "scenario_kind": "contract",
+  "schema_version": "steam-agent-eval/0.3", "id": "m5-c08", "status": "active", "milestone": "M5", "scenario_kind": "contract", "execution_support": "live", "unsupported_reason": null, "required_document_count": 1,
   "question_family": "missing compatibility evidence", "tags": ["identity", "retention", "unknown"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "One explicitly requested AppID has no normalized compatibility candidate evidence.", "facts": [{"subject": "synthetic:appid:5802", "state": "only_second_candidate_available"}, {"subject": "synthetic:appid:5801", "state": "requested_without_evidence"}]},
   "conversation": {"user": ["Using the US store and English metadata, check AppIDs 5801 and 5802 on my computer."], "paraphrase": "Do not silently drop the requested game with no evidence."},
   "tool_policy": {"allowed": ["steam-agent compatibility assess"], "required": [{"command": "steam-agent compatibility assess", "arguments": ["5801", "5802", "--account", "synthetic", "--target", "machine:synthetic-machine", "--country", "US", "--language", "english"]}], "prohibited": ["sync", "drop unknown subject"]},
   "deterministic_oracle": {"recipe_or_contract": "compatibility/0.1 requested identity", "assertions": [{"path": "$.data.requested_appids", "operator": "ordered_equals", "expected": [5801, 5802]}, {"path": "$.data.results[0].appid", "operator": "equals", "expected": 5801}, {"path": "$.data.results[0].compatibility", "operator": "equals", "expected": "unknown"}]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.results[*].appid"], "criteria": [{"id": "retain-request", "weight": 10, "requirement": "Return every explicit requested AppID in stable order.", "hard_fail": true}]},
+  "fact_rubric": {"grading": "deterministic", "must_mention": ["$.data.requested_appids"], "support_if_claimed": ["$.data.results[*].appid"], "criteria": [{"id": "retain-request", "weight": 10, "requirement": "Return every explicit requested AppID in stable order.", "hard_fail": true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "missing-evidence", "weight": 3, "requirement": "Call out the missing evidence for the retained game."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_C08", "credential": "EVAL_CANARY_CREDENTIAL_C08", "local_path": "EVAL_CANARY_LOCAL_PATH_C08"}
 }

@@ -1,9 +1,12 @@
 {
-  "schema_version": "steam-agent-eval/0.2",
+  "schema_version": "steam-agent-eval/0.3",
   "id": "m3-d02",
   "status": "active",
   "milestone": "M3",
   "scenario_kind": "contract",
+  "execution_support": "live",
+  "unsupported_reason": null,
+  "required_document_count": 1,
   "question_family": "historical low summary",
   "tags": ["boundary", "historical-low", "uncertainty"],
   "frozen_time": "2030-01-15T12:00:00Z",
@@ -19,10 +22,7 @@
     {"path": "$.data.items[?(@.appid==202)].deal.bucket", "operator": "equals", "expected": "within_5_percent"},
     {"path": "$.data.items[?(@.appid==203)].deal.bucket", "operator": "equals", "expected": "current_only"}
   ]},
-  "fact_rubric": {"grading": "deterministic", "required_claim_paths": ["$.data.items[?(@.appid==201)].deal.bucket", "$.data.items[?(@.appid==202)].deal.bucket", "$.data.items[?(@.appid==203)].deal.bucket", "$.data.limitations[1]"], "criteria": [
-    {"id": "boundary-fidelity", "weight": 5, "requirement": "Classify all three low-boundary cases exactly.", "hard_fail": true},
-    {"id": "summary-scope", "weight": 5, "requirement": "Describe provider low summaries without claiming a complete price graph.", "hard_fail": true}
-  ]},
+  "fact_rubric": {"grading":"deterministic","must_mention":["$.data.items[?(@.appid==201)].deal.bucket","$.data.items[?(@.appid==202)].deal.bucket","$.data.items[?(@.appid==203)].deal.bucket"],"support_if_claimed":["$.data.limitations[1]"],"criteria":[{"id":"boundary-fidelity","weight":5,"requirement":"Classify all three low-boundary cases exactly.","hard_fail":true},{"id":"summary-scope","weight":5,"requirement":"Describe provider low summaries without claiming a complete price graph.","hard_fail":true}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [{"id": "boundary-explanation", "weight": 2, "requirement": "Make the near-low distinction understandable."}]},
   "privacy_canaries": {"steam_id64": "EVAL_CANARY_STEAMID64_D02", "credential": "EVAL_CANARY_CREDENTIAL_D02", "local_path": "EVAL_CANARY_LOCAL_PATH_D02"}
 }
