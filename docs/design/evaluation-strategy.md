@@ -374,12 +374,18 @@ blind comparison and task-specific rubrics while retaining expert review.
   either passed or failed solely because required evidence was missing or
   unusable. Unlisted commands, execution or activity violations, and every
   other tool-policy failure make the projection null. It never contains
-  prompts, commands, outputs, events, CLI documents, claims, or model metadata,
+  prompts, commands, outputs, events, CLI documents, claims, or route metadata,
   is bounded by the existing App Server turn and conversation input budgets,
   and is not oracle evidence. If any full-retention gate fails, the transcript
   and ordinary report fields still retain only structural activity plus content
   hashes and lengths; raw prompts, reasoning, commands, output, evidence, and
-  complete answer traces remain omitted. This boundary is recorded in
+  complete answer traces remain omitted. The sole provenance exception is an
+  exact pinned model-and-effort attestation: it remains readable only when the
+  requested route is valid and confirmed and every effective, observed, and
+  per-turn value equals that request. This bounded metadata lets a matrix verify
+  failed or pending observations without exposing arbitrary App Server content,
+  and it is never copied into the qualitative projection. This boundary is
+  recorded in
   [ADR 0017](../adr/0017-eval-command-equivalence-and-review-retention.md).
 - Each scenario uses a private temporary writable workspace. Its synthetic
   data directory contains a hidden canary file that the product CLI ignores,

@@ -805,7 +805,64 @@ def _structural_transcript_event(event: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _has_exact_pinned_route_attestation(report: dict[str, Any]) -> bool:
+    """Return whether bounded per-turn route provenance is safe to retain."""
+
+    generator = report.get("generator")
+    turns = report.get("turns")
+    if not isinstance(generator, dict) or not isinstance(turns, list) or not turns:
+        return False
+    model = generator.get("requested_model")
+    effort = generator.get("requested_reasoning_effort")
+    if model is None or effort is None:
+        return False
+    try:
+        run_state.RequestedRoute(model, effort)
+    except run_state.ManifestStateError:
+        return False
+    effective_models = generator.get("effective_model_by_turn")
+    effective_efforts = generator.get("effective_reasoning_effort_by_turn")
+    observed_models = generator.get("observed_models_by_turn")
+    observed_efforts = generator.get("observed_reasoning_efforts_by_turn")
+    turn_count = len(turns)
+    if (
+        generator.get("requested_route_confirmed") is not True
+        or not all(
+            isinstance(history, list) and len(history) == turn_count
+            for history in (
+                effective_models,
+                effective_efforts,
+                observed_models,
+                observed_efforts,
+            )
+        )
+        or not all(isinstance(turn, dict) for turn in turns)
+    ):
+        return False
+    return (
+        all(value == model for value in effective_models)
+        and all(value == effort for value in effective_efforts)
+        and all(
+            isinstance(history, list)
+            and bool(history)
+            and all(value == model for value in history)
+            for history in observed_models
+        )
+        and all(
+            isinstance(history, list)
+            and bool(history)
+            and all(value == effort for value in history)
+            for history in observed_efforts
+        )
+        and all(turn.get("effective_model") == model for turn in turns)
+        and all(
+            turn.get("effective_reasoning_effort") == effort for turn in turns
+        )
+    )
+
+
 def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
+    retain_route_attestation = _has_exact_pinned_route_attestation(report)
     if report.get("turn_error") is not None:
         report["turn_error"] = _omitted_content(report["turn_error"])
     if report.get("final_message") is not None:
@@ -821,20 +878,22 @@ def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
         ]
         if turn.get("turn_error") is not None:
             turn["turn_error"] = _omitted_content(turn["turn_error"])
-        for key in ("effective_model", "effective_reasoning_effort"):
-            if turn.get(key) is not None:
-                turn[key] = _omitted_content(turn[key])
+        if not retain_route_attestation:
+            for key in ("effective_model", "effective_reasoning_effort"):
+                if turn.get(key) is not None:
+                    turn[key] = _omitted_content(turn[key])
     generator = report["generator"]
-    for key in (
-        "effective_model_by_turn",
-        "effective_reasoning_effort_by_turn",
-        "observed_models_by_turn",
-        "observed_reasoning_efforts_by_turn",
-    ):
-        generator[key] = [
-            None if value is None else _omitted_content(value)
-            for value in generator.get(key, ())
-        ]
+    if not retain_route_attestation:
+        for key in (
+            "effective_model_by_turn",
+            "effective_reasoning_effort_by_turn",
+            "observed_models_by_turn",
+            "observed_reasoning_efforts_by_turn",
+        ):
+            generator[key] = [
+                None if value is None else _omitted_content(value)
+                for value in generator.get(key, ())
+            ]
     for failure in report["metrics"]["agent_turns"]["failed"]:
         if failure.get("error") is not None:
             failure["error"] = _omitted_content(failure["error"])

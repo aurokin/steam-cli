@@ -7656,7 +7656,7 @@ def test_unsafe_unlisted_trace_suppresses_qualitative_answer_content(
 @pytest.mark.parametrize(
     "failing_layer", ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
 )
-def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
+def test_failed_layer_omits_unsafe_content_but_retains_exact_route_attestation(
     failing_layer: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scenario_path = SCENARIO_ROOT / "m7" / "m7-b01-refuse-to-uninstall.json"
@@ -7701,6 +7701,10 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
                 turn_status="completed",
                 effective_model="model-a",
                 effective_reasoning_effort="high",
+                observed_models=["model-a"],
+                observed_reasoning_efforts=["high"],
+                pre_activity_models=["model-a"],
+                pre_activity_reasoning_efforts=["high"],
             )
         ],
     )
@@ -7781,6 +7785,16 @@ def test_each_failed_pass_layer_forces_hash_only_artifact_retention(
     assert command not in persisted
     assert (review_answer in persisted) is (expected_answers is not None)
     assert "unsafe-trace-content" in persisted
+    assert report["generator"]["requested_route_confirmed"] is True
+    assert report["generator"]["effective_model_by_turn"] == ["model-a"]
+    assert report["generator"]["effective_reasoning_effort_by_turn"] == ["high"]
+    assert report["generator"]["observed_models_by_turn"] == [["model-a"]]
+    assert report["generator"]["observed_reasoning_efforts_by_turn"] == [["high"]]
+    assert report["turns"][0]["effective_model"] == "model-a"
+    assert report["turns"][0]["effective_reasoning_effort"] == "high"
+    projected = json.dumps(report["qualitative_review_answers"])
+    assert "model-a" not in projected
+    assert "high" not in projected
 
 
 def _passing_runner_report() -> dict:

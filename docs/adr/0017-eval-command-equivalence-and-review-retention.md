@@ -1,6 +1,6 @@
 # ADR 0017: bounded eval command alternatives and review-answer retention
 
-Status: accepted 2026-07-31
+Status: accepted 2026-07-31; route-attestation clarification 2026-08-03
 
 ## Context
 
@@ -56,8 +56,14 @@ limits. The field is untrusted qualitative-review material, never oracle or
 claim evidence.
 
 Existing full-trace retention is unchanged. Unless every deterministic safety
-gate passes, prompts, turns, commands, outputs, documents, claims failures, and
-metadata remain structural records with hashes and lengths.
+gate passes, prompts, messages, commands, outputs, documents, claim failures,
+and arbitrary App Server metadata remain structural records with hashes and
+lengths. An exact pinned model-and-effort attestation is the only exception:
+requested, effective, observed, and per-turn route values remain readable only
+when the request is valid and confirmed and every retained value equals it.
+Otherwise those fields keep the prior hash-only representation. The exception
+is internal matrix provenance and is excluded from `qualitative_review_answers`
+and every judge projection.
 
 ## Consequences
 
@@ -72,4 +78,7 @@ The schema addition is opt-in and existing scenarios retain exact matching.
 The report addition applies across the corpus but is null at unsafe boundaries.
 Reversal is straightforward: remove declarations and the isolated report
 projection; hashes and deterministic grading remain sufficient to reproduce
-the prior retention behavior.
+the prior retention behavior. Matrix observations with failed or pending hard
+layers can still prove their exact route without retaining the failed trace;
+unconfirmed, inconsistent, or malformed route metadata remains ineligible and
+hash-only.
