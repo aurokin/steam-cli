@@ -149,6 +149,7 @@ class _SelectedCorpusSeal:
 @dataclass(frozen=True, slots=True)
 class _PreflightArtifact:
     scenario_id: str
+    input_source_bytes: bytes
     input_document: Any
     oracle_document: Any
     grading_result: dict[str, Any]
@@ -821,12 +822,16 @@ def _qualitative_rubric(
     }
 
 
-def _scenario_documents(
+def _scenario_inputs(
     scenario_ids: Sequence[str],
     *,
     root: Path,
     corpus_seal: _SelectedCorpusSeal | None = None,
-) -> tuple[tuple[run_state.MatrixScenario, ...], dict[str, Mapping[str, Any]]]:
+) -> tuple[
+    tuple[run_state.MatrixScenario, ...],
+    dict[str, Mapping[str, Any]],
+    dict[str, bytes],
+]:
     wanted = set(scenario_ids)
     if len(wanted) != len(scenario_ids) or any(
         not isinstance(item, str) or _SCENARIO_ID.fullmatch(item) is None
@@ -946,7 +951,19 @@ def _scenario_documents(
                 qualitative_criteria=qualitative_criteria,
             )
         )
-    return tuple(scenarios), documents
+    return tuple(scenarios), documents, sources
+
+
+def _scenario_documents(
+    scenario_ids: Sequence[str],
+    *,
+    root: Path,
+    corpus_seal: _SelectedCorpusSeal | None = None,
+) -> tuple[tuple[run_state.MatrixScenario, ...], dict[str, Mapping[str, Any]]]:
+    scenarios, documents, _sources = _scenario_inputs(
+        scenario_ids, root=root, corpus_seal=corpus_seal
+    )
+    return scenarios, documents
 
 
 def collect_inputs(
@@ -1267,7 +1284,7 @@ def _preflight_campaign_scenarios(
     )
     if not deterministic_ids:
         return _ExecutedPreflight(run_state.MatrixPreflightAttestation(()), ())
-    scenarios, documents = _scenario_documents(deterministic_ids, root=root)
+    scenarios, documents, sources = _scenario_inputs(deterministic_ids, root=root)
     expected_scenarios = tuple(
         item
         for item in inputs.scenarios
@@ -1303,6 +1320,7 @@ def _preflight_campaign_scenarios(
             artifacts.append(
                 _PreflightArtifact(
                     scenario_id=scenario_id,
+                    input_source_bytes=sources[scenario_id],
                     input_document=input_document,
                     oracle_document=result.document,
                     grading_result=result.grading,
@@ -1327,8 +1345,11 @@ def _publish_preflight_evidence(
     evidence_root = Path(matrix_dir) / "preflight"
     _ensure_private_dir(evidence_root)
     for artifact in executed.artifacts:
+        run_state.atomic_publish_private_bytes(
+            evidence_root / f"{artifact.scenario_id}.input.json",
+            artifact.input_source_bytes,
+        )
         for kind, value in (
-            ("input", artifact.input_document),
             ("document", artifact.oracle_document),
             ("definition", artifact.replay_definition),
             ("grading", artifact.grading_result),
@@ -1546,8 +1567,8 @@ def validate_retained_preflight_evidence(
                     evidence_root / f"{scenario_id}.{kind}.json",
                     max_bytes=_MAX_PREFLIGHT_ARTIFACT_BYTES,
                 )
-                value = _strict_json_loads(content.decode("ascii"))
-                if content != _preflight_json_bytes(value):
+                value = _strict_json_loads(content.decode("utf-8"))
+                if kind != "input" and content != _preflight_json_bytes(value):
                     raise MatrixError("matrix retained preflight evidence is invalid")
                 retained[kind] = (value, content)
             input_document = retained["input"][0]
@@ -1555,6 +1576,8 @@ def validate_retained_preflight_evidence(
             if (
                 not isinstance(input_document, dict)
                 or input_document.get("id") != scenario_id
+                or hashlib.sha256(retained["input"][1]).hexdigest()
+                != attested[scenario_id].source_sha256
                 or replay_definition
                 != _preflight_replay_definition(
                     input_document,
@@ -1573,6 +1596,7 @@ def validate_retained_preflight_evidence(
                     replay_definition,
                 )
                 != expected.document_sha256
+                or replayed_grading.get("passed") is not True
                 or retained["grading"][0] != replayed_grading
                 or hashlib.sha256(retained["grading"][1]).hexdigest()
                 != expected.grading_sha256

@@ -34,6 +34,9 @@ _MAX_SELECTED_EVIDENCE_TOTAL_BYTES = 8 * 1024 * 1024
 _MAX_PRIVATE_SCAN_STRINGS = 256 * 1024
 _MAX_PRIVATE_SCAN_CHARACTERS = 16 * 1024 * 1024
 _CANARY_MARKER = re.compile(r"eval_canary_", re.IGNORECASE | re.ASCII)
+_STEAM_ID64_TOKEN = re.compile(
+    r"(?<![0-9])7656119[0-9]{10}(?![0-9])", re.ASCII
+)
 _PRIVATE_PATH_TRIGGER_CHARACTERS = frozenset("/\\%~")
 _FORBIDDEN_PROJECTION_MARKERS = (
     '"metrics"',
@@ -585,6 +588,15 @@ def _reject_unsafe_metadata(
 ) -> None:
     if _contains_private_material(document):
         raise JudgmentError("qualitative metadata contains private material")
+    for key in ("judgment_id", "adjudication_id"):
+        artifact_id = document.get(key)
+        if (
+            isinstance(artifact_id, str)
+            and _STEAM_ID64_TOKEN.search(artifact_id) is not None
+        ):
+            raise JudgmentError(
+                "qualitative artifact ID contains a private identifier"
+            )
     candidate_model = observation.work_item.route.model
     protected_model = candidate_model.casefold() if candidate_model is not None else None
 
@@ -808,7 +820,11 @@ def _publish_artifact(
         "judgments": "judgment-",
         "adjudications": "adjudication-",
     }.get(collection)
-    if required_prefix is None or not artifact_id.startswith(required_prefix):
+    if (
+        required_prefix is None
+        or not artifact_id.startswith(required_prefix)
+        or _STEAM_ID64_TOKEN.search(artifact_id) is not None
+    ):
         raise JudgmentError("qualitative artifact ID is invalid")
     root = Path(matrix_dir) / collection
     if not root.exists():

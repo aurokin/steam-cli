@@ -210,6 +210,7 @@ def _fake_preflight(inputs: run_state.MatrixInputs) -> matrix._ExecutedPreflight
         artifacts.append(
             matrix._PreflightArtifact(  # noqa: SLF001
                 item.scenario_id,
+                matrix._preflight_json_bytes(input_document),  # noqa: SLF001
                 input_document,
                 oracle_document,
                 grading_result,
@@ -913,6 +914,97 @@ def test_retained_preflight_evidence_is_replayed_on_every_read(
     monkeypatch.setattr(inspection, "RESULTS_ROOT", results_root)
     with pytest.raises(acceptance.AcceptanceError, match="preflight evidence"):
         acceptance.evaluate_campaign(matrix_dir)
+
+
+def test_retained_preflight_input_must_match_committed_scenario_source(
+    tmp_path: Path,
+) -> None:
+    [scenario], _documents = matrix._scenario_documents(  # noqa: SLF001
+        ("m5-c03",), root=ROOT
+    )
+    inputs = replace(_inputs(), scenarios=(scenario,))
+    executed = REAL_CAMPAIGN_PREFLIGHT(inputs, root=ROOT)
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir(mode=0o700)
+    matrix._publish_preflight_evidence(matrix_dir, executed)  # noqa: SLF001
+    evidence_root = matrix_dir / "preflight"
+
+    input_path = evidence_root / "m5-c03.input.json"
+    document_path = evidence_root / "m5-c03.document.json"
+    definition_path = evidence_root / "m5-c03.definition.json"
+    grading_path = evidence_root / "m5-c03.grading.json"
+    input_document = json.loads(input_path.read_text())
+    oracle_document = json.loads(document_path.read_text())
+    input_document["deterministic_oracle"]["assertions"][0]["expected"] = "forged"
+    oracle_document["data"]["results"][0]["compatibility"] = "forged"
+    replay_definition = matrix._preflight_replay_definition(  # noqa: SLF001
+        input_document, executor="domain_oracle"
+    )
+    grading = matrix._replay_preflight(  # noqa: SLF001
+        oracle_document, replay_definition
+    )
+    assert grading["passed"] is True
+    input_path.write_bytes(matrix._preflight_json_bytes(input_document))  # noqa: SLF001
+    document_path.write_bytes(matrix._preflight_json_bytes(oracle_document))  # noqa: SLF001
+    definition_path.write_bytes(matrix._preflight_json_bytes(replay_definition))  # noqa: SLF001
+    grading_bytes = matrix._preflight_json_bytes(grading)  # noqa: SLF001
+    grading_path.write_bytes(grading_bytes)
+    [attested] = executed.attestation.scenarios
+    forged_attestation = replace(
+        executed.attestation,
+        scenarios=(
+            replace(
+                attested,
+                document_sha256=matrix._preflight_bundle_digest(  # noqa: SLF001
+                    input_document, oracle_document, replay_definition
+                ),
+                grading_sha256=hashlib.sha256(grading_bytes).hexdigest(),
+            ),
+        ),
+    )
+
+    with pytest.raises(matrix.MatrixError, match="retained preflight evidence"):
+        REAL_PREFLIGHT_VALIDATION(matrix_dir, inputs, forged_attestation)
+
+
+def test_retained_preflight_replay_must_pass(tmp_path: Path) -> None:
+    [scenario], _documents = matrix._scenario_documents(  # noqa: SLF001
+        ("m5-c03",), root=ROOT
+    )
+    inputs = replace(_inputs(), scenarios=(scenario,))
+    executed = REAL_CAMPAIGN_PREFLIGHT(inputs, root=ROOT)
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir(mode=0o700)
+    matrix._publish_preflight_evidence(matrix_dir, executed)  # noqa: SLF001
+    evidence_root = matrix_dir / "preflight"
+
+    input_document = json.loads((evidence_root / "m5-c03.input.json").read_text())
+    definition = json.loads((evidence_root / "m5-c03.definition.json").read_text())
+    document_path = evidence_root / "m5-c03.document.json"
+    grading_path = evidence_root / "m5-c03.grading.json"
+    oracle_document = json.loads(document_path.read_text())
+    oracle_document["data"]["results"][0]["compatibility"] = "forged"
+    grading = matrix._replay_preflight(oracle_document, definition)  # noqa: SLF001
+    assert grading["passed"] is False
+    document_path.write_bytes(matrix._preflight_json_bytes(oracle_document))  # noqa: SLF001
+    grading_bytes = matrix._preflight_json_bytes(grading)  # noqa: SLF001
+    grading_path.write_bytes(grading_bytes)
+    [attested] = executed.attestation.scenarios
+    forged_attestation = replace(
+        executed.attestation,
+        scenarios=(
+            replace(
+                attested,
+                document_sha256=matrix._preflight_bundle_digest(  # noqa: SLF001
+                    input_document, oracle_document, definition
+                ),
+                grading_sha256=hashlib.sha256(grading_bytes).hexdigest(),
+            ),
+        ),
+    )
+
+    with pytest.raises(matrix.MatrixError, match="retained preflight evidence"):
+        REAL_PREFLIGHT_VALIDATION(matrix_dir, inputs, forged_attestation)
 
 
 def test_direct_creation_cannot_use_a_forged_attestation_to_skip_preflight(

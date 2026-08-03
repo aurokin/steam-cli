@@ -2138,6 +2138,32 @@ def test_judgment_id_requires_opaque_prefix_before_artifact_output(
     assert not (matrix_dir / "judgments").exists()
 
 
+def test_judgment_id_rejects_a_steam_id64_token_before_artifact_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result = _inspection(matrix_dir)
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: result)
+    source = tmp_path / "judgment.json"
+    for judgment_id in (
+        "judgment-import-76561198000000001",
+        "judgment-import76561198000000001",
+    ):
+        document = _judgment(
+            result,
+            judgment_id=judgment_id,
+            clear="pass",
+            actionable="pass",
+        )
+        source.write_text(json.dumps(document))
+
+        with pytest.raises(judge.JudgmentError, match="private identifier"):
+            judge.import_judgment(matrix_dir, source)
+
+    assert not (matrix_dir / "judgments").exists()
+
+
 def test_agreement_adjudication_retains_disagreement_as_unresolved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2210,6 +2236,13 @@ def test_agreement_adjudication_retains_disagreement_as_unresolved(
         source.write_text(json.dumps(adjudication))
         with pytest.raises(judge.JudgmentError, match="schema"):
             judge.import_adjudication(matrix_dir, source)
+    adjudication["adjudication_id"] = (
+        "adjudication-import-76561198000000001"
+    )
+    adjudication["outcomes"][1]["outcome"] = "unresolved"
+    source.write_text(json.dumps(adjudication))
+    with pytest.raises(judge.JudgmentError, match="private identifier"):
+        judge.import_adjudication(matrix_dir, source)
     assert sorted(path.name for path in (matrix_dir / "adjudications").iterdir()) == [
         "adjudication-1.json"
     ]
