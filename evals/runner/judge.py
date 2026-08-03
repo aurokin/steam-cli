@@ -136,7 +136,10 @@ def _contains_token_sequence(
 
 
 def _contains_candidate_route_material(
-    value: str, *, candidate_model: str | None
+    value: str,
+    *,
+    candidate_model: str | None,
+    association_boundary: bool = False,
 ) -> bool:
     """Detect route disclosures as tokens without rejecting ordinary prose."""
 
@@ -157,16 +160,24 @@ def _contains_candidate_route_material(
         or "xhigh" in tokens
     ):
         return True
-    for sentence in _SENTENCE_BOUNDARY.split(value):
-        sentence_tokens = _identity_tokens(sentence)
+    segments = (value,) if association_boundary else _SENTENCE_BOUNDARY.split(value)
+    for segment in segments:
+        sentence_tokens = _identity_tokens(segment)
+        sentence_identities = frozenset(sentence_tokens)
         for index, token in enumerate(sentence_tokens):
             if token not in _REASONING_EFFORT_IDENTITIES or token == "xhigh":
                 continue
+            if "effort" in sentence_identities:
+                return True
             if (
                 index + 1 < len(sentence_tokens)
                 and sentence_tokens[index + 1] in _NON_EFFORT_QUALIFIED_NOUNS
             ):
                 continue
+            if association_boundary and (
+                sentence_identities & _ROUTE_CONTEXT_IDENTITIES
+            ):
+                return True
             start = max(0, index - _EFFORT_CONTEXT_TOKEN_DISTANCE)
             stop = min(len(sentence_tokens), index + _EFFORT_CONTEXT_TOKEN_DISTANCE + 1)
             if any(
@@ -512,6 +523,7 @@ def _qualitative_projection(
         _contains_candidate_route_material(
             matrix._canonical_json_bytes(claim).decode("ascii"),  # noqa: SLF001
             candidate_model=candidate_model,
+            association_boundary=True,
         )
         for sidecar in sidecars
         if isinstance(sidecar["claims"], list)

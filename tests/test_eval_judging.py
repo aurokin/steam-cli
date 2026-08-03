@@ -1616,6 +1616,113 @@ def test_candidate_sidecar_route_context_and_effort_in_separate_claims_pass(
     assert len(projection["claims_sidecars"][0]["claims"]) == 3
 
 
+@pytest.mark.parametrize(
+    "disclosure",
+    (
+        "model.high",
+        "reasoning;high",
+    ),
+)
+def test_candidate_sidecar_keeps_delimited_value_as_one_route_association(
+    tmp_path: Path, disclosure: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": disclosure}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+def test_candidate_sidecar_keeps_route_path_and_effort_value_associated(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.candidate.reasoning_effort.level", "value": "high"}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+def test_candidate_sidecar_keeps_model_path_and_effort_value_associated(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.model.score", "value": "high"}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+def test_explicit_reasoning_effort_beats_ordinary_noun_exemption(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": "Reasoning effort: high setting"}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+def test_natural_reasoning_effort_level_disclosure_is_rejected(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {
+            "turn": 0,
+            "text": "The candidate uses a reasoning effort level of high.",
+        }
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+@pytest.mark.parametrize(
+    "disclosure",
+    (
+        "The reasoning effort was configured by the evaluator to high.",
+        "High was the selected value for this candidate's reasoning effort.",
+    ),
+)
+def test_long_distance_reasoning_effort_disclosures_are_rejected(
+    tmp_path: Path, disclosure: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": disclosure}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
 def test_candidate_route_context_and_effort_in_separate_answer_turns_pass(
     tmp_path: Path,
 ) -> None:
