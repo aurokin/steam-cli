@@ -98,6 +98,23 @@ _BOUND_RATIONALE_IDENTITIES = (
     ("tool", "policy"),
 )
 _IDENTITY_TOKEN = re.compile(r"[A-Za-z0-9]+", re.ASCII)
+_SENTENCE_BOUNDARY = re.compile(r"[.!?;\r\n]+", re.ASCII)
+_EFFORT_CONTEXT_TOKEN_DISTANCE = 2
+_NON_EFFORT_QUALIFIED_NOUNS = frozenset(
+    {
+        "discount",
+        "discounts",
+        "frame",
+        "frames",
+        "hardware",
+        "price",
+        "prices",
+        "rate",
+        "rates",
+        "setting",
+        "settings",
+    }
+)
 
 
 class JudgmentError(RuntimeError):
@@ -124,8 +141,7 @@ def _contains_candidate_route_material(
     """Detect route disclosures as tokens without rejecting ordinary prose."""
 
     folded = value.casefold()
-    token_sequence = _identity_tokens(value)
-    tokens = frozenset(token_sequence)
+    tokens = frozenset(_identity_tokens(value))
     model_is_present = (
         candidate_model is not None
         and re.search(
@@ -135,15 +151,31 @@ def _contains_candidate_route_material(
         )
         is not None
     )
-    return bool(
+    if (
         model_is_present
         or tokens & _FIXED_ROUTE_IDENTITIES
         or "xhigh" in tokens
-        or (
-            tokens & _REASONING_EFFORT_IDENTITIES
-            and tokens & _ROUTE_CONTEXT_IDENTITIES
-        )
-    )
+    ):
+        return True
+    for sentence in _SENTENCE_BOUNDARY.split(value):
+        sentence_tokens = _identity_tokens(sentence)
+        for index, token in enumerate(sentence_tokens):
+            if token not in _REASONING_EFFORT_IDENTITIES or token == "xhigh":
+                continue
+            if (
+                index + 1 < len(sentence_tokens)
+                and sentence_tokens[index + 1] in _NON_EFFORT_QUALIFIED_NOUNS
+            ):
+                continue
+            start = max(0, index - _EFFORT_CONTEXT_TOKEN_DISTANCE)
+            stop = min(len(sentence_tokens), index + _EFFORT_CONTEXT_TOKEN_DISTANCE + 1)
+            if any(
+                sentence_tokens[context_index] in _ROUTE_CONTEXT_IDENTITIES
+                for context_index in range(start, stop)
+                if context_index != index
+            ):
+                return True
+    return False
 
 
 def _validate_schema(document: Any, schema_name: str) -> dict[str, Any]:
@@ -472,16 +504,25 @@ def _qualitative_projection(
     sidecar_text = matrix._canonical_json_bytes(sidecars).decode("ascii")  # noqa: SLF001
     sidecar_folded = sidecar_text.casefold()
     candidate_model = observation.work_item.route.model
+    answer_contains_route_material = any(
+        _contains_candidate_route_material(text, candidate_model=candidate_model)
+        for text in texts
+    )
+    sidecar_contains_route_material = any(
+        _contains_candidate_route_material(
+            matrix._canonical_json_bytes(claim).decode("ascii"),  # noqa: SLF001
+            candidate_model=candidate_model,
+        )
+        for sidecar in sidecars
+        if isinstance(sidecar["claims"], list)
+        for claim in sidecar["claims"]
+    )
     if (
         _contains_private_material(projection)
         or any(marker in folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
         or any(marker in sidecar_folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
-        or _contains_candidate_route_material(
-            combined, candidate_model=candidate_model
-        )
-        or _contains_candidate_route_material(
-            sidecar_text, candidate_model=candidate_model
-        )
+        or answer_contains_route_material
+        or sidecar_contains_route_material
     ):
         raise JudgmentError("qualitative projection contains prohibited material")
     return projection

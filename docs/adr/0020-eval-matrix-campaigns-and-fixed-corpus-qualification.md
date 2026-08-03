@@ -74,8 +74,11 @@ commands, raw protocol errors, or suppressed unsafe content.
 Candidate answer and sidecar strings are rejected when token-aware scanning
 finds the exact candidate model ID, a fixed route alias (`sol`, `terra`, or
 `luna`), `xhigh`, or `low`, `medium`, or `high` bound to model, route, effort,
-generator, candidate, or reasoning context. Token boundaries keep ordinary
-words and uses such as low settings or high frame rates judgeable.
+generator, candidate, or reasoning context in the same sentence or sidecar
+claim and within a bounded token window. Answer turns and sidecar claims are
+scanned independently so unrelated context cannot combine across them. Token
+boundaries keep ordinary words and uses such as low settings, high discounts,
+or high frame rates judgeable.
 
 The matrix qualitative rubric preserves authored judged-answer criteria and
 promotes every hard-fail fact criterion, `fact_rubric.must_mention` path, and

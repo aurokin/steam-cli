@@ -1569,6 +1569,11 @@ def test_candidate_sidecar_projection_rejects_route_and_effort_disclosures(
 @pytest.mark.parametrize(
     "content",
     (
+        "This candidate has a high discount.",
+        "This candidate has a low price.",
+        "Candidate high discounts remain attractive.",
+        "The candidate offers high frame rates.",
+        "Model low settings preserve battery life.",
         "Use low settings for high frame rates on medium hardware.",
         "Solar terrain looks lunar in highlights.",
         "A model-aware answer is solid.",
@@ -1591,6 +1596,44 @@ def test_candidate_projection_route_tokens_avoid_ordinary_word_false_positives(
     )
 
     assert projection["answers"][0]["text"] == content
+
+
+def test_candidate_sidecar_route_context_and_effort_in_separate_claims_pass(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.category", "value": "model"},
+        {"path": "$.data.discount", "value": "high"},
+        {"path": "$.data.price", "value": "low"},
+    ]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, result.manifest.inputs.scenarios[0]
+    )
+
+    assert len(projection["claims_sidecars"][0]["claims"]) == 3
+
+
+def test_candidate_route_context_and_effort_in_separate_answer_turns_pass(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    scenario = replace(result.manifest.inputs.scenarios[0], turn_count=2)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": "This candidate is promising."},
+        {"turn": 1, "text": "It has a high discount."},
+    ]
+    observation.report["qualitative_review_claims_sidecars"] = [
+        {"turn": 0, "claims": [], "declined": False},
+        {"turn": 1, "claims": [], "declined": False},
+    ]
+
+    projection = judge._qualitative_projection(observation, scenario)  # noqa: SLF001
+
+    assert len(projection["answers"]) == 2
 
 
 @pytest.mark.parametrize("judge_model", ("candidate-XHIGH", "SOL", "gpt-5.6-terra"))
