@@ -666,6 +666,48 @@ def test_clean_revision_preserves_narrow_generated_file_ignores(tmp_path: Path) 
     assert commit == _git(root, "rev-parse", "HEAD")
 
 
+def test_clean_revision_accepts_committed_python_package_files(tmp_path: Path) -> None:
+    root = _execution_repo(tmp_path)
+    (root / "evals" / "runner" / "__init__.py").write_text("")
+    package = root / "src" / "package"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "_helpers.py").write_text("VALUE = 3\n")
+    _git(root, "add", ".")
+    _git(
+        root,
+        "-c",
+        "user.name=Eval Test",
+        "-c",
+        "user.email=eval@example.invalid",
+        "commit",
+        "-qm",
+        "add package files",
+    )
+
+    commit = matrix._git_commit_and_clean(root)  # noqa: SLF001
+
+    assert commit == _git(root, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ("src/../escape.py", "src/.hidden.py", "src/unsafe name.py"),
+)
+def test_committed_execution_inventory_rejects_unsafe_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    listing = f"100644 blob {'a' * 40}\t{relative}\0".encode()
+    monkeypatch.setattr(
+        matrix.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=listing),
+    )
+
+    with pytest.raises(matrix.MatrixError, match="source inventory is invalid"):
+        matrix._committed_execution_files(tmp_path, "1" * 40)  # noqa: SLF001
+
+
 @pytest.mark.parametrize("index_flag", ("--assume-unchanged", "--skip-worktree"))
 @pytest.mark.parametrize(
     "relative",

@@ -61,6 +61,9 @@ _CHILD_BOOTSTRAP = (
 _MAX_CHILD_SCENARIO_TURNS = run_state.MAX_SCENARIO_TURNS
 _SCENARIO_ID = re.compile(r"m[1-9][0-9]*-[a-z][0-9]{2,}\Z", re.ASCII)
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
+_SAFE_SOURCE_COMPONENT = re.compile(
+    r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,127}\Z", re.ASCII
+)
 _QUALITATIVE_ARTIFACT = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\.json\Z", re.ASCII
 )
@@ -449,7 +452,8 @@ def _committed_execution_files(
             if _generated_source_name(local_name):
                 continue
             if any(
-                _SAFE_COMPONENT.fullmatch(part) is None for part in relative.parts
+                _SAFE_SOURCE_COMPONENT.fullmatch(part) is None
+                for part in relative.parts
             ):
                 raise ValueError
             if name in committed:
