@@ -211,6 +211,12 @@ blind comparison and task-specific rubrics while retaining expert review.
   routes, tracks, replicate schedule, timeout, and exclusions. Inspection
   verifies the child manifest-summary-report hash chain and reports per-layer
   vectors without blending tracks or deterministic and qualitative outcomes.
+  Strictly earlier failed or abandoned attempts remain hash-bound audit history
+  but do not disqualify a later official successful retry; later, overlapping,
+  conflicting, or child-evidence-duplicating attempt history remains
+  ineligible. Compatibility vectors bind the complete ordered selected corpus,
+  including deterministic-only scenarios, and the exact deterministic
+  preflight attestation, so differing preflight cohorts cannot be pooled.
   Imported blinded judgments and adjudications are hash-bound to the exact
   report and rubric; they cannot override deterministic failure. These
   contracts are recorded in

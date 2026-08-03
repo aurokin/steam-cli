@@ -81,10 +81,13 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   carry a bounded terminal reason. Matrix campaigns add an immutable,
   route-interleaved plan above these single-route child cohorts. Resume creates
   an append-only attempt for the next unaccounted work item and never edits a
-  prior child run. Matrix creation itself runs the exact frozen CLI oracle for
-  every selected deterministic-only scenario before publishing a matrix and
-  persists their source, child-source, schema, and rubric hashes plus `passed`
-  outcomes in the manifest. Resume, inspection, and acceptance require that
+  prior child run. Matrix creation itself executes and grades the exact frozen
+  deterministic oracle for every selected deterministic-only scenario before
+  publishing a matrix. Deck cases run the compatibility domain oracle because
+  no CLI writer reconstructs exact-target review; wishlist scope runs the
+  frozen CLI. The manifest binds the executor and source, child-source, schema,
+  rubric, oracle-document, and grading-result hashes plus `passed` outcomes.
+  Resume, inspection, and acceptance require that
   attestation to match the frozen inputs exactly; a caller-supplied attestation
   cannot suppress creation-time preflight. Each accounted scenario publishes either a mode-`0600`
   report and transcript or a mode-`0600` deterministic-only skip record. The
@@ -150,6 +153,8 @@ For a completed accepted screen, `accept` atomically publishes the canonical
 private `acceptance.json` decision. This freezes its survivor and qualitative
 evidence selection and records the finalization time: later judgment or
 adjudication imports are rejected.
+Even a complete screen with zero survivors publishes this immutable evidence;
+its empty survivor set simply cannot seed qualification.
 Qualification `screen_provenance` must name the source screen matrix and include
 the SHA-256 digests of that exact acceptance file, screen manifest, and
 qualitative-evidence root. Matrix creation and resume reject missing, changed,

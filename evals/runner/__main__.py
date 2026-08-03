@@ -42,6 +42,7 @@ from .materialize import (
     scenario_account_alias,
     scenario_machine_key,
 )
+from .materialize_m5 import valve_deck_oracle_document
 
 ROOT = Path(__file__).resolve().parents[2]
 SCENARIO_ROOT = ROOT / "evals" / "scenarios"
@@ -579,20 +580,20 @@ def _validate_scenario_metadata(scenario: dict[str, Any]) -> None:
     assertions = oracle.get("assertions", [])
     if not isinstance(assertions, list) or len(assertions) > _MAX_ORACLE_ASSERTIONS:
         raise UnsupportedScenarioError(_ORACLE_EVALUATION_LIMIT_ERROR)
-    deterministic_cli_paths = {
+    exact_deterministic_cli_paths = {
         assertion.get("path")
         for assertion in assertions
         if isinstance(assertion, dict)
         and assertion.get("source", "cli_document") == "cli_document"
-        and assertion.get("operator")
-        in {"contains", "equals", "omits", "ordered_equals", "one_of"}
+        and assertion.get("operator") in {"equals", "ordered_equals"}
     }
     if (
         scenario.get("schema_version") == "steam-agent-eval/0.3"
-        and not set(fact_rubric.get("must_mention", ())) <= deterministic_cli_paths
+        and not set(fact_rubric.get("must_mention", ()))
+        <= exact_deterministic_cli_paths
     ):
         raise UnsupportedScenarioError(
-            "scenario must-mention paths need deterministic CLI assertions"
+            "scenario must-mention paths need exact deterministic CLI assertions"
         )
     for assertion in assertions:
         if not isinstance(assertion, dict) or (
@@ -1114,6 +1115,76 @@ def _oracle_document(
     return _strict_json_loads(result.stdout)
 
 
+@dataclass(frozen=True, slots=True)
+class DeterministicPreflightEvidence:
+    executor: str
+    document_sha256: str
+    grading_sha256: str
+
+
+def _evidence_digest(value: Any) -> str:
+    content = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _preflight_deterministic_scenario(
+    scenario: dict[str, Any], *, source_root: Path
+) -> DeterministicPreflightEvidence:
+    """Execute and grade one exact deterministic-only oracle."""
+
+    scenario_id = _validated_scenario_id(scenario.get("id"))
+    _validate_scenario_metadata(scenario)
+    if not _deterministic_only_scenario(scenario):
+        raise RuntimeError("eval deterministic preflight requires deterministic input")
+    _validate_runner_requirements(scenario, allow_sync=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f"steam-agent-eval-preflight-{scenario_id}-"
+    ) as workspace_name:
+        workspace = Path(workspace_name)
+        workspace.chmod(0o700)
+        data_dir = workspace / "steam-agent-data"
+        _ensure_private_dir(data_dir)
+        executor = "frozen_cli"
+        try:
+            materialize(scenario, data_dir)
+        except UnsupportedScenarioError:
+            if scenario.get("unsupported_reason") != _NO_CLI_WRITER_REASON:
+                raise
+            document = valve_deck_oracle_document(scenario)
+            executor = "domain_oracle"
+        else:
+            requirements = scenario["tool_policy"].get("required") or []
+            if len(requirements) != 1:
+                raise RuntimeError("eval deterministic preflight lacks one CLI oracle")
+            launcher = _frozen_cli_launcher(
+                workspace, scenario["frozen_time"], source_root=source_root
+            )
+            document = _oracle_document(data_dir, requirements[0], launcher)
+        assertions = [
+            assertion
+            for assertion in scenario["deterministic_oracle"].get("assertions", ())
+            if assertion.get("source", "cli_document") == "cli_document"
+        ]
+        if not assertions:
+            raise RuntimeError("eval deterministic preflight lacks CLI assertions")
+        result = grade.grade_assertions(
+            {"assertions": assertions}, document=document, turns=[]
+        )
+        if result.get("passed") is not True:
+            raise RuntimeError("eval deterministic preflight failed")
+        return DeterministicPreflightEvidence(
+            executor=executor,
+            document_sha256=_evidence_digest(document),
+            grading_sha256=_evidence_digest(result),
+        )
+
+
 def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
     """Exercise deterministic materialization and CLI assertions before a model.
 
@@ -1125,8 +1196,11 @@ def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
     scenario_id = _validated_scenario_id(scenario.get("id"))
     _validate_scenario_metadata(scenario)
     deterministic_only = _deterministic_only_scenario(scenario)
+    if deterministic_only:
+        _preflight_deterministic_scenario(scenario, source_root=source_root)
+        return False
     try:
-        _validate_runner_requirements(scenario, allow_sync=deterministic_only)
+        _validate_runner_requirements(scenario, allow_sync=False)
         with tempfile.TemporaryDirectory(
             prefix=f"steam-agent-eval-preflight-{scenario_id}-"
         ) as workspace_name:
@@ -1137,15 +1211,10 @@ def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
             try:
                 materialize(scenario, data_dir)
             except UnsupportedScenarioError:
-                if (
-                    deterministic_only
-                    and scenario.get("unsupported_reason") == _NO_CLI_WRITER_REASON
-                ):
-                    return False
                 raise
             requirements = scenario["tool_policy"].get("required") or []
             if not requirements:
-                return not deterministic_only
+                return True
             launcher = _frozen_cli_launcher(
                 workspace, scenario["frozen_time"], source_root=source_root
             )
@@ -1160,7 +1229,7 @@ def _preflight_scenario(scenario: dict[str, Any], *, source_root: Path) -> bool:
             )
             if result.get("passed") is not True:
                 raise RuntimeError("eval deterministic preflight failed")
-            return not deterministic_only
+            return True
     except UnsupportedScenarioError:
         raise
 

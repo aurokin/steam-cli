@@ -15,9 +15,12 @@ the case bytes by SHA-256. The current case-set digest is
 The expanded case set was reviewed independently by three fresh,
 context-isolated GPT-Sol xhigh judges. All 69 decisions matched the frozen
 labels, all three judges agreed on every case, and no decision was `uncertain`.
-`judge-v1-results.json` records the exact verdicts and short rationales; its
-SHA-256 digest is
-`0e1ceef76cce638758029f64f374beec6806d5a934307b8c78fe8ee7a09013e2`.
+`judge-v1-results.json` records the exact verdicts and short rationales and
+binds the reviewed prompt and parser bytes. Their SHA-256 digests are
+`671449c1329475b3753ffe30a017ad60152603efe6def833872eff8c428deec7` and
+`658a8acdf97c7d681c2b78e68c853b73fe010c49631595c7f69f67575931be49`.
+The results artifact SHA-256 digest is
+`c23be4a56f0852141070c798dcb4aea1dda5aec0ed28a12cfe81c05591dcfa92`.
 The previously verified 16-case result does not calibrate the newly enforced
 criterion sources or selected-evidence semantics and is not represented as
 current evidence.

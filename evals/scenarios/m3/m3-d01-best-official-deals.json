@@ -31,7 +31,7 @@
       {"path": "$.completeness.status", "operator": "equals", "expected": "complete"},
       {"path": "$.data.items[*].appid", "operator": "ordered_equals", "expected": [101, 102, 103]},
       {"path": "$.data.items[*].deal.current_offer.fresh", "operator": "ordered_equals", "expected": [true, true, true]},
-      {"path": "$.data.items[*].deal.current_offer.provider", "operator": "contains", "expected": "gg-deals"}
+      {"path": "$.data.items[*].deal.current_offer.provider", "operator": "ordered_equals", "expected": ["gg-deals", "gg-deals", "gg-deals"]}
     ]
   },
   "fact_rubric": {"grading":"deterministic","must_mention":["$.data.items[*].appid","$.data.items[*].deal.current_offer.fresh","$.data.items[*].deal.current_offer.provider"],"support_if_claimed":["$.context.country","$.context.currency","$.context.store_class"],"criteria":[{"id":"correct-order","weight":5,"requirement":"Preserve the deterministic deal order.","hard_fail":true},{"id":"price-context","weight":5,"requirement":"State US, USD, official-store, freshness, and attribution."}]},

@@ -249,3 +249,32 @@ def test_m3_reranking_rejects_reversed_document_order(
 
     with pytest.raises(AssertionError, match="exact rank_deals order"):
         _assert_document_ranking(document)
+
+
+def test_m3_d01_oracle_rejects_one_wrong_offer_provider(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = json.loads(
+        (
+            ROOT / "evals" / "scenarios" / "m3" / "m3-d01-best-official-deals.json"
+        ).read_text(encoding="utf-8")
+    )
+    _freeze_cli_clock(monkeypatch, scenario)
+    materialize(scenario, tmp_path)
+    document = _run(scenario, tmp_path, capsys)
+    document["data"]["items"][1]["deal"]["current_offer"]["provider"] = (
+        "cheapshark"
+    )
+
+    result = grade.grade_oracle(document, scenario["deterministic_oracle"])
+
+    assert not result["passed"]
+    assert result["failed"] == [
+        {
+            "path": "$.data.items[*].deal.current_offer.provider",
+            "operator": "ordered_equals",
+            "expected": ["gg-deals", "gg-deals", "gg-deals"],
+        }
+    ]

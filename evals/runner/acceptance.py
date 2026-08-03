@@ -322,7 +322,6 @@ def _load_finalized_screen_locked(
     if (
         frozen.campaign_kind != "screen"
         or frozen.status != "complete"
-        or not frozen.survivors
         or frozen.finalized_at is None
         or replace(frozen, finalized_at=None) != current
     ):
@@ -350,9 +349,8 @@ def finalize_screen(matrix_dir: Path) -> AcceptanceResult:
             if (
                 decision.campaign_kind != "screen"
                 or decision.status != "complete"
-                or not decision.survivors
             ):
-                raise AcceptanceError("screen has no finalized accepted survivors")
+                raise AcceptanceError("screen is not complete and finalizable")
             path = matrix_dir / "acceptance.json"
             try:
                 frozen, _existing = _frozen_acceptance_bytes(path)
@@ -595,12 +593,17 @@ def _answer_false_completion_reasons(
         or work_item.scenario_id not in _SCREEN_FALSE_COMPLETION_SCENARIO_IDS
     ):
         return set()
-    failures = {
-        f"{layer}_failure"
-        for layer in ("oracle", "claims")
-        if report["metrics"][layer].get("passed") is False
-    }
-    return failures | ({"false_completion"} if failures else set())
+    oracle = report["metrics"]["oracle"]
+    failures = oracle.get("failed")
+    if not isinstance(failures, list) or not any(
+        isinstance(item, dict)
+        and item.get("screen_false_completion") is True
+        and item.get("source") == "final_answer"
+        and item.get("operator") == "omits"
+        for item in failures
+    ):
+        return set()
+    return {"oracle_failure", "false_completion"}
 
 
 def _canonical_artifact(path: Path, schema_name: str) -> tuple[dict[str, Any], bytes]:
@@ -1152,9 +1155,10 @@ def _decide_routes(
     manifest = result.manifest
     completions = {item.work_item_id: item for item in manifest.completions}
     observations = {item.work_item.work_item_id: item for item in result.observations}
-    orphan_work_ids = {
-        item.split("/", 1)[0] for item in result.orphan_attempt_ids
-    }
+    orphan_attempts_by_work: dict[str, set[str]] = {}
+    for item in result.orphan_attempt_ids:
+        work_item_id, attempt_id = item.split("/", 1)
+        orphan_attempts_by_work.setdefault(work_item_id, set()).add(attempt_id)
     decisions: list[RouteDecision] = []
     for route in _routes(manifest):
         work_items = tuple(item for item in manifest.work_items if item.route == route)
@@ -1173,7 +1177,12 @@ def _decide_routes(
             observation = observations.get(work_item.work_item_id)
             if observation is None:
                 raise AcceptanceError("observed work item lacks inspected evidence")
-            if work_item.work_item_id in orphan_work_ids:
+            if any(
+                attempt_id >= completion.attempt_id
+                for attempt_id in orphan_attempts_by_work.get(
+                    work_item.work_item_id, set()
+                )
+            ):
                 reasons.add("extra_attempt_history")
             reasons.update(_unsafe_reasons(observation.report))
             reasons.update(

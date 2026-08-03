@@ -60,13 +60,14 @@ def _check_version_specific(path: Path, scenario: dict[str, Any]) -> None:
         assert scenario["required_document_count"] == len(required), (
             f"{path}: required document count does not match required commands"
         )
-        oracle_paths = {
+        exact_oracle_paths = {
             assertion["path"]
             for assertion in scenario["deterministic_oracle"]["assertions"]
             if assertion.get("source", "cli_document") == "cli_document"
+            and assertion["operator"] in {"equals", "ordered_equals"}
         }
-        assert set(must_mention) <= oracle_paths, (
-            f"{path}: must_mention paths need deterministic CLI assertions"
+        assert set(must_mention) <= exact_oracle_paths, (
+            f"{path}: must_mention paths need exact deterministic CLI assertions"
         )
         claim_paths = (*must_mention, *support_if_claimed)
     else:
@@ -399,7 +400,7 @@ def test_schema_03_runtime_checks_count_overlap_and_oracle_backing() -> None:
 
     unbacked = _live_scenario_03()
     unbacked["fact_rubric"]["must_mention"] = ["$.data.other"]
-    with pytest.raises(AssertionError, match="deterministic CLI assertions"):
+    with pytest.raises(AssertionError, match="exact deterministic CLI assertions"):
         _check_version_specific(Path("unbacked"), unbacked)
 
 
@@ -409,7 +410,39 @@ def test_runner_preflight_rejects_unbacked_schema_03_must_mention() -> None:
 
     with pytest.raises(
         runner_main.UnsupportedScenarioError,
-        match="must-mention paths need deterministic CLI assertions",
+        match="must-mention paths need exact deterministic CLI assertions",
+    ):
+        runner_main._validate_scenario_metadata(scenario)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("operator", ("contains", "omits", "one_of"))
+def test_runner_rejects_non_exhaustive_must_mention_backing(operator: str) -> None:
+    scenario = _live_scenario_03()
+    assertion = scenario["deterministic_oracle"]["assertions"][0]
+    assertion["operator"] = operator
+    assertion["expected"] = (
+        ["ready", "unknown"] if operator == "one_of" else "ready"
+    )
+
+    with pytest.raises(
+        runner_main.UnsupportedScenarioError,
+        match="must-mention paths need exact deterministic CLI assertions",
+    ):
+        runner_main._validate_scenario_metadata(scenario)  # noqa: SLF001
+
+
+def test_runner_rejects_partial_index_backing_for_wildcard_must_mention() -> None:
+    scenario = _live_scenario_03()
+    scenario["fact_rubric"]["must_mention"] = ["$.data.items[*].provider"]
+    scenario["deterministic_oracle"]["assertions"][0] = {
+        "path": "$.data.items[0].provider",
+        "operator": "equals",
+        "expected": "gg-deals",
+    }
+
+    with pytest.raises(
+        runner_main.UnsupportedScenarioError,
+        match="must-mention paths need exact deterministic CLI assertions",
     ):
         runner_main._validate_scenario_metadata(scenario)  # noqa: SLF001
 

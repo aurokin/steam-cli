@@ -495,6 +495,91 @@ def test_compare_rejects_same_live_scenario_set_in_different_order(
         inspection.compare_matrices([first_dir, second_dir])
 
 
+@pytest.mark.parametrize("difference", ("selected_corpus", "preflight_evidence"))
+def test_compare_rejects_different_deterministic_preflight_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, difference: str
+) -> None:
+    first_dir = _completed_matrix(tmp_path, name="first", model="model-a")
+    second_dir = _completed_matrix(tmp_path, name="second", model="model-b")
+    first = inspection.inspect_matrix(first_dir)
+    second = inspection.inspect_matrix(second_dir)
+    live = first.manifest.inputs.scenarios[0]
+    deterministic = replace(
+        live,
+        scenario_id="m5-c03",
+        source_sha256="4" * 64,
+        child_source_digest="5" * 64,
+        execution_support="deterministic_only",
+        rubric_sha256="6" * 64,
+    )
+
+    def with_deterministic_corpus(
+        result: inspection.MatrixInspection,
+        scenario: run_state.MatrixScenario,
+        *,
+        evidence_digest: str,
+    ) -> inspection.MatrixInspection:
+        inputs = replace(result.manifest.inputs, scenarios=(live, scenario))
+        manifest = replace(
+            result.manifest,
+            inputs=inputs,
+            preflight_attestation=run_state.MatrixPreflightAttestation.for_inputs(
+                inputs,
+                evidence={
+                    scenario.scenario_id: (
+                        "domain_oracle",
+                        "8" * 64,
+                        evidence_digest,
+                    )
+                },
+            ),
+            excluded_scenario_ids=(scenario.scenario_id,),
+        )
+        observation = result.observations[0]
+        compatibility, digest = inspection._compatibility(  # noqa: SLF001
+            manifest,
+            observation.work_item,
+            observation.child_manifest,
+            observation.report,
+            timeout_seconds=30,
+        )
+        return replace(
+            result,
+            manifest=manifest,
+            observations=(
+                replace(
+                    observation,
+                    compatibility=compatibility,
+                    compatibility_sha256=digest,
+                ),
+            ),
+        )
+
+    first = with_deterministic_corpus(
+        first, deterministic, evidence_digest="9" * 64
+    )
+    second_scenario = (
+        replace(deterministic, source_sha256="7" * 64)
+        if difference == "selected_corpus"
+        else deterministic
+    )
+    second = with_deterministic_corpus(
+        second,
+        second_scenario,
+        evidence_digest=("a" * 64 if difference == "preflight_evidence" else "9" * 64),
+    )
+    first_fields = dict(first.observations[0].compatibility)
+    assert len(first_fields["ordered_selected_scenario_inventory"]) == 2
+    assert first_fields["deterministic_preflight_attestation"] == (
+        first.manifest.preflight_attestation.to_dict()
+    )
+    results = iter((first, second))
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: next(results))
+
+    with pytest.raises(inspection.InspectionError, match="incompatible"):
+        inspection.compare_matrices((first_dir, second_dir))
+
+
 def test_inspection_rejects_tampered_committed_attempt_start(
     tmp_path: Path,
 ) -> None:
@@ -946,6 +1031,85 @@ def test_unavailable_completion_is_accounted_without_becoming_observation(
             "reason": "provider_route_unavailable",
         }
     ]
+
+
+def test_successful_retry_history_is_audited_without_disqualifying_matrix(
+    tmp_path: Path,
+) -> None:
+    results_root = tmp_path / "results"
+    config = _write_config(
+        tmp_path / "retry.json", model="model-a", timeout=30
+    )
+
+    def fail_first_attempt(
+        _item: run_state.MatrixWorkItem, _timeout: float
+    ) -> matrix.ChildResult:
+        raise RuntimeError("simulated first-attempt failure")
+
+    with pytest.raises(matrix.MatrixError, match="failed structurally"):
+        matrix.execute_matrix(
+            config,
+            results_root=results_root,
+            input_collector=lambda _config: _inputs(),
+            child_executor=fail_first_attempt,
+        )
+
+    [matrix_dir] = results_root.glob("matrix-*")
+    completed = matrix.execute_matrix(
+        config,
+        matrix_id=matrix_dir.name,
+        results_root=results_root,
+        input_collector=lambda _config: _inputs(),
+        child_executor=_child(results_root, _inputs(), duration=1.0),
+    )
+    result = inspection.inspect_matrix(matrix_dir)
+
+    assert completed.completions[0].attempt_id == "attempt-000002"
+    assert result.orphan_attempt_ids == (
+        f"{completed.work_items[0].work_item_id}/attempt-000001",
+    )
+    assert result.eligible is True
+    compared = inspection.compare_matrices((matrix_dir,))
+    assert compared["eligible"] is True
+    assert compared["vector"] is not None
+
+
+def test_orphan_completion_cannot_duplicate_official_child_evidence(
+    tmp_path: Path,
+) -> None:
+    matrix_dir = _completed_matrix(tmp_path, name="one", model="model-a")
+    inspected = inspection.inspect_matrix(matrix_dir)
+    [official] = inspected.manifest.completions
+    orphan_dir = (
+        matrix_dir / "work" / official.work_item_id / "attempt-000002"
+    )
+    orphan_dir.mkdir(mode=0o700)
+    started_path = orphan_dir / "started.json"
+    run_state.atomic_publish_private_json(
+        started_path,
+        {
+            "schema": "steam-agent-eval-matrix-attempt/0.1",
+            "attempt_id": "attempt-000002",
+            "work_item_id": official.work_item_id,
+            "started_at": inspected.manifest.finished_at,
+        },
+    )
+    duplicate = replace(
+        official,
+        attempt_id="attempt-000002",
+        started_sha256=hashlib.sha256(started_path.read_bytes()).hexdigest(),
+        completed_at=inspected.manifest.finished_at,
+    )
+    run_state.atomic_publish_private_json(
+        orphan_dir / "result.json",
+        {
+            "schema": "steam-agent-eval-matrix-attempt-result/0.1",
+            "completion": duplicate.to_dict(),
+        },
+    )
+
+    with pytest.raises(inspection.InspectionError, match="duplicates child evidence"):
+        inspection.inspect_matrix(matrix_dir)
 
 
 def test_unavailable_attempt_result_remains_private_and_hash_bound(

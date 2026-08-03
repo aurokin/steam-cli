@@ -1970,13 +1970,16 @@ class MatrixInputs:
 
 @dataclass(frozen=True, slots=True, order=True)
 class MatrixPreflightScenario:
-    """One exact deterministic-only scenario proven by the frozen CLI oracle."""
+    """One exact deterministic-only scenario proven by an executed oracle."""
 
     scenario_id: str
     source_sha256: str
     child_source_digest: str
     schema_sha256: str
     rubric_sha256: str
+    executor: str
+    document_sha256: str
+    grading_sha256: str
     outcome: str
 
     def __post_init__(self) -> None:
@@ -1988,14 +1991,25 @@ class MatrixPreflightScenario:
                 self.child_source_digest,
                 self.schema_sha256,
                 self.rubric_sha256,
+                self.document_sha256,
+                self.grading_sha256,
             )
         ):
             raise ManifestStateError("invalid deterministic-only preflight digest")
+        if self.executor not in {"frozen_cli", "domain_oracle"}:
+            raise ManifestStateError("invalid deterministic-only preflight executor")
         if self.outcome != "passed":
             raise ManifestStateError("deterministic-only preflight did not pass")
 
     @classmethod
-    def from_scenario(cls, scenario: MatrixScenario) -> Self:
+    def from_scenario(
+        cls,
+        scenario: MatrixScenario,
+        *,
+        executor: str,
+        document_sha256: str,
+        grading_sha256: str,
+    ) -> Self:
         if scenario.execution_support != "deterministic_only":
             raise ManifestStateError("preflight scenario is not deterministic-only")
         return cls(
@@ -2004,6 +2018,9 @@ class MatrixPreflightScenario:
             child_source_digest=scenario.child_source_digest,
             schema_sha256=scenario.schema_sha256,
             rubric_sha256=scenario.rubric_sha256,
+            executor=executor,
+            document_sha256=document_sha256,
+            grading_sha256=grading_sha256,
             outcome="passed",
         )
 
@@ -2014,6 +2031,9 @@ class MatrixPreflightScenario:
             "child_source_digest": self.child_source_digest,
             "schema_sha256": self.schema_sha256,
             "rubric_sha256": self.rubric_sha256,
+            "executor": self.executor,
+            "document_sha256": self.document_sha256,
+            "grading_sha256": self.grading_sha256,
             "outcome": self.outcome,
         }
 
@@ -2025,6 +2045,9 @@ class MatrixPreflightScenario:
             "child_source_digest",
             "schema_sha256",
             "rubric_sha256",
+            "executor",
+            "document_sha256",
+            "grading_sha256",
             "outcome",
         }
         if not isinstance(value, dict) or set(value) != expected:
@@ -2049,14 +2072,33 @@ class MatrixPreflightAttestation:
             raise ManifestStateError("deterministic-only preflight order is invalid")
 
     @classmethod
-    def for_inputs(cls, inputs: MatrixInputs) -> Self:
+    def for_inputs(
+        cls,
+        inputs: MatrixInputs,
+        *,
+        evidence: Mapping[str, tuple[str, str, str]] | None = None,
+    ) -> Self:
+        deterministic = tuple(
+            item
+            for item in inputs.scenarios
+            if item.execution_support == "deterministic_only"
+        )
+        provided = evidence or {}
+        if set(provided) != {item.scenario_id for item in deterministic}:
+            raise ManifestStateError(
+                "deterministic-only preflight evidence is incomplete"
+            )
         return cls(
             scenarios=tuple(
                 sorted(
                     (
-                        MatrixPreflightScenario.from_scenario(item)
-                        for item in inputs.scenarios
-                        if item.execution_support == "deterministic_only"
+                        MatrixPreflightScenario.from_scenario(
+                            item,
+                            executor=provided[item.scenario_id][0],
+                            document_sha256=provided[item.scenario_id][1],
+                            grading_sha256=provided[item.scenario_id][2],
+                        )
+                        for item in deterministic
                     ),
                     key=lambda item: item.scenario_id,
                 )
@@ -2064,7 +2106,26 @@ class MatrixPreflightAttestation:
         )
 
     def require_matches(self, inputs: MatrixInputs) -> None:
-        if self != self.for_inputs(inputs):
+        expected = {
+            item.scenario_id: item
+            for item in inputs.scenarios
+            if item.execution_support == "deterministic_only"
+        }
+        if set(expected) != {item.scenario_id for item in self.scenarios} or any(
+            (
+                item.source_sha256,
+                item.child_source_digest,
+                item.schema_sha256,
+                item.rubric_sha256,
+            )
+            != (
+                expected[item.scenario_id].source_sha256,
+                expected[item.scenario_id].child_source_digest,
+                expected[item.scenario_id].schema_sha256,
+                expected[item.scenario_id].rubric_sha256,
+            )
+            for item in self.scenarios
+        ):
             raise ManifestStateError(
                 "deterministic-only preflight does not match matrix inputs"
             )
@@ -2395,13 +2456,17 @@ class MatrixManifest:
         started_at: datetime,
     ) -> Self:
         timestamp = _canonical_time(started_at)
-        attestation = preflight_attestation or MatrixPreflightAttestation.for_inputs(
-            inputs
-        )
-        if preflight_attestation is None and attestation.scenarios:
-            raise ManifestStateError(
-                "deterministic-only preflight attestation is required"
-            )
+        if preflight_attestation is None:
+            if any(
+                item.execution_support == "deterministic_only"
+                for item in inputs.scenarios
+            ):
+                raise ManifestStateError(
+                    "deterministic-only preflight attestation is required"
+                )
+            attestation = MatrixPreflightAttestation(())
+        else:
+            attestation = preflight_attestation
         return cls(
             matrix_id=matrix_id,
             state=MatrixState.OPEN,

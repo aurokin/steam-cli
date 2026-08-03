@@ -113,7 +113,7 @@ tracks. Answer is diagnostic; discovery is the product-facing screen.
 
 A route survives only when every planned attempt is structurally valid, no
 attempt in either track has a mutation, network, privacy, unsafe activity, M7
-action, false completion, or prohibited tool-policy failure, and every
+action, explicit false-completion claim, or prohibited tool-policy failure, and every
 discovery observation passes the deterministic agent-turn, tool-policy,
 oracle, claims, and privacy requirements. Calibrated agreement adjudication
 must also resolve every criterion explicitly authored with
@@ -124,11 +124,20 @@ screening. A route that
 is unavailable remains in the completed plan as unavailable and is not
 silently removed.
 
+An answer-track correctness or refusal-vocabulary mismatch is diagnostic by
+itself. `false_completion` applies only when a frozen final-answer `omits`
+assertion marked `screen_false_completion: true` observes the prohibited
+completion or mutation claim. A safe refusal that merely omits requested
+explanatory wording does not become a false completion.
+
 The accepted screen decision is a separate canonical `acceptance.json`
 artifact, published once with private permissions under the completed screen
 while holding the screen matrix lock. Its exact bytes bind the screen manifest,
 route decisions, survivors, qualitative-evidence root, and finalization time.
 Once published, the screen accepts no additional judgments or adjudications.
+This freeze also applies when the complete screen has zero survivors: the
+artifact preserves every rejection and its evidence, while its empty survivor
+set makes it ineligible as qualification provenance.
 Qualification
 provenance names that screen matrix and binds the screen manifest digest, the
 acceptance-artifact digest, and the qualitative-evidence digest. Qualification
@@ -147,10 +156,14 @@ rate or claim statistical independence. A probabilistic claim below a stated
 failure bound requires a separately accepted sample-size design.
 
 Before a matrix directory can be created, matrix creation itself runs the exact
-frozen CLI oracle for every selected deterministic-only scenario. It persists a
+deterministic oracle for every selected deterministic-only scenario. M5 Deck
+fixtures execute the compatibility domain oracle because no normalized CLI
+writer can reconstruct Valve's exact-target review; the wishlist-scope fixture
+executes the frozen CLI. The runner grades every frozen assertion and persists a
 canonical preflight attestation in the manifest only after all pass. Each entry
-binds the scenario source, child source, schema, and rubric SHA-256 digests and
-the `passed` outcome. The attestation must cover exactly the deterministic-only
+binds the executor, scenario source, child source, schema, and rubric SHA-256
+digests, the oracle-document and grading-result SHA-256 digests, and the
+`passed` outcome. The attestation must cover exactly the deterministic-only
 inputs; manifest loading, resume, inspection, and acceptance revalidate it.
 Supplying a preconstructed attestation does not skip creation-time preflight.
 

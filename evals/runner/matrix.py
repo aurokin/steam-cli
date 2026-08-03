@@ -1229,7 +1229,7 @@ def _preflight_campaign_scenarios(
         if item.execution_support == "deterministic_only"
     )
     if not deterministic_ids:
-        return run_state.MatrixPreflightAttestation.for_inputs(inputs)
+        return run_state.MatrixPreflightAttestation(())
     scenarios, documents = _scenario_documents(deterministic_ids, root=root)
     expected_scenarios = tuple(
         item
@@ -1244,15 +1244,19 @@ def _preflight_campaign_scenarios(
     from evals.runner import __main__ as runner_main
 
     try:
+        evidence: dict[str, tuple[str, str, str]] = {}
         for scenario_id in deterministic_ids:
-            if (
-                runner_main._preflight_scenario(  # noqa: SLF001
-                    dict(documents[scenario_id]), source_root=root / "src"
-                )
-                is not False
-            ):
-                raise MatrixError("matrix deterministic-only preflight is invalid")
-        return run_state.MatrixPreflightAttestation.for_inputs(inputs)
+            result = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
+                dict(documents[scenario_id]), source_root=root / "src"
+            )
+            evidence[scenario_id] = (
+                result.executor,
+                result.document_sha256,
+                result.grading_sha256,
+            )
+        return run_state.MatrixPreflightAttestation.for_inputs(
+            inputs, evidence=evidence
+        )
     except MatrixError:
         raise
     except Exception:

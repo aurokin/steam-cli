@@ -196,17 +196,18 @@ def _compatibility(
         if item.scenario_id == work_item.scenario_id
     )
     generator = report["generator"]
-    ordered_live_scenario_inventory = tuple(
-        item.to_dict()
-        for item in matrix_manifest.inputs.scenarios
-        if item.execution_support == "live"
+    ordered_selected_scenario_inventory = tuple(
+        item.to_dict() for item in matrix_manifest.inputs.scenarios
     )
     fields: dict[str, Any] = {
         "commit": matrix_manifest.inputs.commit,
         "campaign_sha256": matrix_manifest.campaign_sha256,
         "matrix_source_digest": matrix_manifest.inputs.source_digest,
         "matrix_harness_digest": matrix_manifest.inputs.harness_digest,
-        "ordered_live_scenario_inventory": ordered_live_scenario_inventory,
+        "ordered_selected_scenario_inventory": ordered_selected_scenario_inventory,
+        "deterministic_preflight_attestation": (
+            matrix_manifest.preflight_attestation.to_dict()
+        ),
         "child_snapshot_digest": child_manifest.source_digest,
         "scenario_id": scenario.scenario_id,
         "scenario_sha256": scenario.source_sha256,
@@ -326,6 +327,7 @@ def inspect_matrix(
     observations: list[Observation] = []
     unavailable_work_items: list[UnavailableWorkItem] = []
     committed_attempts: set[tuple[str, str]] = set()
+    official_attempt_starts: dict[str, str] = {}
     for work_item, completion in zip(
         manifest.work_items, manifest.completions, strict=False
     ):
@@ -348,6 +350,7 @@ def inspect_matrix(
         ):
             raise InspectionError("matrix attempt result is invalid")
         committed_attempts.add((work_item.work_item_id, completion.attempt_id))
+        official_attempt_starts[work_item.work_item_id] = attempt_started_at
         if completion.outcome == "unavailable":
             unavailable_work_items.append(
                 UnavailableWorkItem(work_item=work_item, completion=completion)
@@ -408,6 +411,20 @@ def inspect_matrix(
     orphan_attempt_hashes: list[
         tuple[str, tuple[tuple[str, str], ...]]
     ] = []
+    disqualifying_orphan_attempts: set[str] = set()
+    official_completions = {
+        item.work_item_id: item for item in manifest.completions
+    }
+    official_child_run_ids = {
+        item.child_run_id
+        for item in manifest.completions
+        if item.child_run_id is not None
+    }
+    orphan_child_run_ids: set[str] = set()
+    try:
+        campaign_started = run_state._parse_time(manifest.started_at)  # noqa: SLF001
+    except run_state.ManifestStateError:
+        raise InspectionError("matrix attempt history chronology is invalid") from None
     work_root = matrix_dir / "work"
     if work_root.exists():
         _private_directory(work_root)
@@ -438,6 +455,58 @@ def inspect_matrix(
                     orphan_attempt_hashes.append(
                         (orphan_id, validated_attempt.artifact_hashes)
                     )
+                    orphan_completion = validated_attempt.completion
+                    orphan_child_run_id = (
+                        orphan_completion.child_run_id
+                        if orphan_completion is not None
+                        else None
+                    )
+                    if orphan_child_run_id is not None:
+                        if (
+                            orphan_child_run_id in official_child_run_ids
+                            or orphan_child_run_id in orphan_child_run_ids
+                        ):
+                            raise InspectionError(
+                                "matrix attempt history duplicates child evidence"
+                            )
+                        orphan_child_run_ids.add(orphan_child_run_id)
+                    official = official_completions.get(item_root.name)
+                    official_started_at = official_attempt_starts.get(item_root.name)
+                    is_prior_retry = False
+                    if official is not None and official_started_at is not None:
+                        try:
+                            orphan_started = run_state._parse_time(  # noqa: SLF001
+                                validated_attempt.started_at
+                            )
+                            official_started = run_state._parse_time(  # noqa: SLF001
+                                official_started_at
+                            )
+                            orphan_finished_before_retry = (
+                                orphan_completion is None
+                                or run_state._parse_time(  # noqa: SLF001
+                                    orphan_completion.completed_at
+                                )
+                                < official_started
+                            )
+                        except run_state.ManifestStateError:
+                            raise InspectionError(
+                                "matrix attempt history chronology is invalid"
+                            ) from None
+                        is_prior_retry = (
+                            validated_attempt.attempt_id < official.attempt_id
+                            and campaign_started < orphan_started
+                            and orphan_started < official_started
+                            and orphan_finished_before_retry
+                        )
+                        if (
+                            validated_attempt.attempt_id < official.attempt_id
+                            and not is_prior_retry
+                        ):
+                            raise InspectionError(
+                                "matrix attempt history chronology is invalid"
+                            )
+                    if not is_prior_retry:
+                        disqualifying_orphan_attempts.add(orphan_id)
 
     _verify_observation_chronology(manifest, observations)
     _compatibility_cell_signatures(observations)
@@ -445,7 +514,9 @@ def inspect_matrix(
         observations
     ) + len(unavailable_work_items) == len(manifest.work_items)
     eligible = (
-        structurally_complete and not unavailable_work_items and not orphan_attempts
+        structurally_complete
+        and not unavailable_work_items
+        and not disqualifying_orphan_attempts
     )
     return MatrixInspection(
         matrix_dir=matrix_dir,
@@ -642,9 +713,7 @@ def compare_matrices(matrix_dirs: Sequence[Path]) -> dict[str, Any]:
         ]
         for item in inspections
     }
-    if any(
-        item.unavailable_work_items or item.orphan_attempt_ids for item in inspections
-    ):
+    if any(not item.eligible for item in inspections):
         return {
             "schema": "steam-agent-eval-matrix-comparison/0.1",
             "matrix_ids": [item.manifest.matrix_id for item in inspections],

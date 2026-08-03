@@ -2573,6 +2573,7 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
                 country=country,
                 language=args.language,
                 appids=bounded,
+                as_of=_utc_now(),
             )
             raw_items = snapshot["items"]
         else:

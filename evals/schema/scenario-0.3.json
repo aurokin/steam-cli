@@ -317,9 +317,25 @@
         },
         "expected": {},
         "source": {"enum": ["cli_document", "final_answer", "trace"]},
-        "turn": {"type": "integer", "minimum": 0}
+        "turn": {"type": "integer", "minimum": 0},
+        "screen_false_completion": {"type": "boolean"}
       },
       "allOf": [
+        {
+          "if": {
+            "required": ["screen_false_completion"],
+            "properties": {"screen_false_completion": {"const": true}}
+          },
+          "then": {
+            "required": ["source"],
+            "properties": {
+              "source": {"const": "final_answer"},
+              "operator": {"const": "omits"},
+              "path": {"const": "$"},
+              "expected": {"type": "string", "pattern": "\\S"}
+            }
+          }
+        },
         {
           "if": {
             "required": ["operator"],

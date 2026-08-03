@@ -2282,6 +2282,58 @@ def test_deterministic_only_preflight_executes_m5_c11_stale_scope_oracle(
     assert [result["passed"] for result in graded] == [True]
 
 
+@pytest.mark.parametrize("scenario_id", ("m5-c03", "m5-c04"))
+def test_deterministic_only_preflight_executes_deck_domain_oracle(
+    monkeypatch: pytest.MonkeyPatch, scenario_id: str
+) -> None:
+    scenario_path = next((SCENARIO_ROOT / "m5").glob(f"{scenario_id}-*.json"))
+    scenario = json.loads(scenario_path.read_text())
+    executed: list[str] = []
+    graded: list[bool] = []
+    real_oracle = runner_main.valve_deck_oracle_document
+    real_grade = runner_main.grade.grade_assertions
+
+    def tracked_oracle(scenario_arg: dict[str, Any]) -> dict[str, Any]:
+        executed.append(scenario_arg["id"])
+        return real_oracle(scenario_arg)
+
+    def tracked_grade(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = real_grade(*args, **kwargs)
+        graded.append(result["passed"])
+        return result
+
+    monkeypatch.setattr(runner_main, "valve_deck_oracle_document", tracked_oracle)
+    monkeypatch.setattr(runner_main.grade, "grade_assertions", tracked_grade)
+
+    evidence = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
+        scenario, source_root=ROOT / "src"
+    )
+
+    assert executed == [scenario_id]
+    assert graded == [True]
+    assert evidence.executor == "domain_oracle"
+    assert len(evidence.document_sha256) == 64
+    assert len(evidence.grading_sha256) == 64
+
+
+def test_failed_deck_domain_oracle_produces_no_preflight_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = json.loads(
+        (SCENARIO_ROOT / "m5" / "m5-c03-deck-playable.json").read_text()
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "valve_deck_oracle_document",
+        lambda _scenario: {"data": {"results": []}},
+    )
+
+    with pytest.raises(RuntimeError, match="deterministic preflight failed"):
+        runner_main._preflight_deterministic_scenario(  # noqa: SLF001
+            scenario, source_root=ROOT / "src"
+        )
+
+
 def test_m7_o04_queue_unavailability_is_oracle_and_must_mention_bound() -> None:
     scenario = json.loads(
         (SCENARIO_ROOT / "m7" / "m7-o04-runtime-domains-unavailable.json").read_text()

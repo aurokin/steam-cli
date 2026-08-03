@@ -13,17 +13,27 @@ installed observation is written one minute before the scenario clock so the
 storage-free minimum path stays selected for installed candidates.
 
 Valve Deck targets have no CLI writer: ``compatibility_query`` never
-reconstructs ``exact_target_review``, so those scenarios are unsupported here
-and remain covered by the pure oracle only.
+reconstructs ``exact_target_review``. Their deterministic preflight therefore
+executes the same compatibility domain oracle directly and grades the frozen
+scenario assertions against its serialized assessment.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from steam_agent.steam_declared_facts import DECLARED_FACTS_DISCLOSURE_VERSION
+from steam_agent.compatibility import (
+    CompatibilityCandidate,
+    CompatibilityTarget,
+    PrimitiveEvidence,
+    assess_compatibility,
+    unknown as compatibility_unknown,
+    valve_deck_review,
+)
 from steam_agent.storage import Storage, WishlistObservation
 from steam_agent.system_profile import SYSTEM_PROFILE_DISCLOSURE_VERSION, fact, unknown
 from steam_agent.wishlist_library import WISHLIST_DISCLOSURE_VERSION
@@ -71,6 +81,88 @@ _WISHLIST_STATES = {
     "wishlisted_compatible_uninstalled",
 }
 _STALE_WISHLIST_OFFSET = timedelta(hours=30)
+
+
+def _compatibility_fact(
+    now: datetime, *, state: str = "pass", suffix: str
+) -> PrimitiveEvidence:
+    return PrimitiveEvidence(
+        state,  # type: ignore[arg-type]
+        "synthetic",
+        "local",
+        now,
+        "fresh",
+        (f"eval:{suffix}",),
+    )
+
+
+def valve_deck_oracle_document(scenario: Mapping[str, Any]) -> dict[str, Any]:
+    """Execute the exact pure domain oracle for a frozen Deck fixture."""
+
+    scenario_id = scenario.get("id")
+    required = scenario.get("tool_policy", {}).get("required", ())
+    facts = scenario.get("fixture", {}).get("facts", ())
+    if (
+        scenario_id not in {"m5-c03", "m5-c04"}
+        or len(required) != 1
+        or required[0].get("command") != "steam-agent compatibility assess"
+        or len(facts) != 1
+    ):
+        raise UnsupportedScenarioError("invalid Valve Deck oracle fixture")
+    arguments = required[0].get("arguments")
+    if not isinstance(arguments, list) or not arguments:
+        raise UnsupportedScenarioError("invalid Valve Deck oracle invocation")
+    try:
+        appid = int(arguments[0])
+        target_index = arguments.index("--target")
+        target_value = arguments[target_index + 1]
+        fact_appid = int(facts[0]["subject"].rsplit(":", 1)[1])
+        state = facts[0]["state"]
+        now = materialization_now(scenario)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        raise UnsupportedScenarioError("invalid Valve Deck oracle fixture") from None
+    if (
+        target_value != "valve:steam-deck"
+        or appid != fact_appid
+        or state not in _DECK_STATES
+    ):
+        raise UnsupportedScenarioError("invalid Valve Deck oracle fixture")
+    target = CompatibilityTarget("valve_deck", "steam-deck", "steamos")
+    candidate = CompatibilityCandidate(
+        appid=appid,
+        target=target,
+        declared_native_build=_compatibility_fact(now, suffix="native-build"),
+        effective_execution_support=_compatibility_fact(now, suffix="os"),
+        architecture=_compatibility_fact(now, suffix="arch"),
+        meets_minimum=(
+            compatibility_unknown("minimum_not_observed")
+            if state == "deck_unsupported"
+            else _compatibility_fact(now, suffix="minimum")
+        ),
+        exact_target_review=valve_deck_review(
+            "playable" if state == "deck_playable" else "unsupported",
+            target=target,
+            source="valve",
+            observed_at=now,
+            freshness="fresh",
+            evidence_ids=("eval:deck",),
+        ),
+        likely_good_experience=compatibility_unknown("performance_not_benchmarked"),
+        installed=_compatibility_fact(now, suffix="installed"),
+        owned=_compatibility_fact(now, suffix="owned"),
+    )
+    assessment = assess_compatibility((appid,), (candidate,), target=target)
+    return {"data": _json_ready(asdict(assessment))}
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, Mapping):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def _system_profile() -> dict[str, Any]:
@@ -334,4 +426,4 @@ def build(scenario: Mapping[str, Any], data_dir: Path) -> None:
             )
 
 
-__all__ = ["build"]
+__all__ = ["build", "valve_deck_oracle_document"]

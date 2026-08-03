@@ -38,9 +38,7 @@ def _isolate_campaign_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         matrix,
         "_preflight_campaign_scenarios",
-        lambda inputs, *, root: run_state.MatrixPreflightAttestation.for_inputs(
-            inputs
-        ),
+        lambda inputs, *, root: _attestation(inputs),
     )
 
 
@@ -169,7 +167,15 @@ def _inputs() -> run_state.MatrixInputs:
 def _attestation(
     inputs: run_state.MatrixInputs | None = None,
 ) -> run_state.MatrixPreflightAttestation:
-    return run_state.MatrixPreflightAttestation.for_inputs(inputs or _inputs())
+    selected = inputs or _inputs()
+    return run_state.MatrixPreflightAttestation.for_inputs(
+        selected,
+        evidence={
+            item.scenario_id: ("frozen_cli", "4" * 64, "5" * 64)
+            for item in selected.scenarios
+            if item.execution_support == "deterministic_only"
+        },
+    )
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -675,9 +681,11 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
     config = _config(tmp_path, replicates=1)
     _rewrite_json(config, lambda value: value.__setitem__("scenario_ids", scenario_ids))
     events: list[str] = []
-    real_preflight = runner_main._preflight_scenario  # noqa: SLF001
+    real_preflight = runner_main._preflight_deterministic_scenario  # noqa: SLF001
 
-    def tracked_preflight(scenario: dict[str, Any], *, source_root: Path) -> bool:
+    def tracked_preflight(
+        scenario: dict[str, Any], *, source_root: Path
+    ) -> runner_main.DeterministicPreflightEvidence:
         events.append(f"preflight:{scenario['id']}")
         return real_preflight(scenario, source_root=source_root)
 
@@ -685,7 +693,9 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
     monkeypatch.setattr(
         matrix, "_preflight_campaign_scenarios", REAL_CAMPAIGN_PREFLIGHT
     )
-    monkeypatch.setattr(runner_main, "_preflight_scenario", tracked_preflight)
+    monkeypatch.setattr(
+        runner_main, "_preflight_deterministic_scenario", tracked_preflight
+    )
 
     def unavailable(
         item: run_state.MatrixWorkItem, _timeout: float
@@ -725,6 +735,15 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
             child_source_digest=deterministic[scenario_id].child_source_digest,
             schema_sha256=deterministic[scenario_id].schema_sha256,
             rubric_sha256=deterministic[scenario_id].rubric_sha256,
+            executor=(
+                "domain_oracle" if scenario_id in {"m5-c03", "m5-c04"} else "frozen_cli"
+            ),
+            document_sha256=completed.preflight_attestation.scenarios[
+                ("m5-c03", "m5-c04", "m5-c11").index(scenario_id)
+            ].document_sha256,
+            grading_sha256=completed.preflight_attestation.scenarios[
+                ("m5-c03", "m5-c04", "m5-c11").index(scenario_id)
+            ].grading_sha256,
             outcome="passed",
         )
         for scenario_id in ("m5-c03", "m5-c04", "m5-c11")

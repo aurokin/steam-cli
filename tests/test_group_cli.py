@@ -120,7 +120,7 @@ def declared_payload(appid: int) -> dict[str, object]:
     }
 
 
-def seed_declared(tmp_path: Path, appid: int) -> None:
+def seed_declared(tmp_path: Path, appid: int, *, at: datetime = NOW) -> None:
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
         account = storage.get_account("primary")
         assert account is not None
@@ -132,7 +132,7 @@ def seed_declared(tmp_path: Path, appid: int) -> None:
             language="english",
             max_items=10,
             skip_fresh_terminal=True,
-            started_at=NOW,
+            started_at=at,
             disclosure_version="m5-v1",
         )
         storage.record_declared_app_result(
@@ -140,10 +140,10 @@ def seed_declared(tmp_path: Path, appid: int) -> None:
             account_id=account.id,
             appid=appid,
             state="ready",
-            observed_at=NOW,
+            observed_at=at,
             facts=declared_payload(appid),
         )
-        storage.finish_declared_app_sync(run.id, completed_at=NOW)
+        storage.finish_declared_app_sync(run.id, completed_at=at)
 
 
 def test_profile_mutations_require_disclosure_and_destructive_confirmation(
@@ -480,15 +480,18 @@ def test_group_eligibility_reports_missing_declared_evidence_in_completeness(
 
 
 def test_group_eligibility_propagates_stale_declared_facts(
-    tmp_path: Path, capsys: object
+    tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr(cli, "_utc_now", lambda: test_now)
     configure(tmp_path)
     create_profile(tmp_path, capsys, "synthetic:Alpha")
     create_profile(tmp_path, capsys, "synthetic:Beta")
-    seed_declared(tmp_path, 400)
+    seed_declared(tmp_path, 400, at=test_now)
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
         storage._connection.execute(  # noqa: SLF001
-            "UPDATE declared_app_current SET observed_at='2026-07-04T00:00:00Z'"
+            "UPDATE declared_app_current SET observed_at=?",
+            ((test_now - timedelta(days=8)).isoformat().replace("+00:00", "Z"),),
         )
         storage._connection.commit()  # noqa: SLF001
 

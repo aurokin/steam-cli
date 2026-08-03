@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from evals.runner import inspection, judge, matrix, run_state  # noqa: E402
+from evals.runner import grade, inspection, judge, matrix, run_state  # noqa: E402
 
 
 NOW = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
@@ -27,6 +27,8 @@ def test_verified_judge_calibration_labels_bind_the_complete_case_set() -> None:
     settings_path = (
         ROOT / "evals" / "calibration" / "matrix-judge-settings-0.1.json"
     )
+    prompt_path = ROOT / "evals" / "calibration" / "matrix-judge-prompt-0.1.md"
+    parser_path = ROOT / "evals" / "calibration" / "matrix-parser-0.1.json"
     cases_bytes = cases_path.read_bytes()
     cases = json.loads(cases_bytes)
     labels = json.loads(labels_path.read_text())
@@ -69,6 +71,14 @@ def test_verified_judge_calibration_labels_bind_the_complete_case_set() -> None:
         ).append(labels["labels"][case["id"]])
     assert all(set(values) == {"fail", "pass"} for values in pair_labels.values())
     assert results["case_set_sha256"] == labels["cases_sha256"]
+    assert results["prompt_version"] == "matrix-judge/0.1"
+    assert results["prompt_sha256"] == hashlib.sha256(
+        prompt_path.read_bytes()
+    ).hexdigest()
+    assert results["parser_version"] == "matrix-parser/0.1"
+    assert results["parser_sha256"] == hashlib.sha256(
+        parser_path.read_bytes()
+    ).hexdigest()
     assert results["judge_settings_sha256"] == hashlib.sha256(
         settings_path.read_bytes()
     ).hexdigest()
@@ -886,6 +896,55 @@ def test_judgment_rejects_private_route_or_outcome_metadata(
 
 
 @pytest.mark.parametrize(
+    "rationale",
+    (
+        "Read /Users/private/Steam/config.vdf",
+        r"Read \u002fUsers\u002fprivate\u002fSteam\u002fconfig.vdf",
+        r"Read C:\\Users\\private\\Steam\\config.vdf",
+        "Read file:%2FUsers%2Fprivate%2FSteam%2Fconfig.vdf",
+    ),
+)
+def test_judgment_structural_privacy_scan_rejects_escaped_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rationale: str,
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result = _inspection(matrix_dir)
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: result)
+    document = _judgment(
+        result,
+        judgment_id="judgment-private-rationale",
+        clear="pass",
+        actionable="pass",
+    )
+    document["verdicts"][0]["rationale"] = rationale
+    source = tmp_path / "judgment.json"
+    source.write_text(json.dumps(document))
+
+    with pytest.raises(judge.JudgmentError, match="private material"):
+        judge.import_judgment(matrix_dir, source)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("_MAX_PRIVATE_SCAN_STRINGS", 1),
+        ("_MAX_PRIVATE_SCAN_CHARACTERS", 3),
+    ),
+)
+def test_structural_privacy_scan_fails_closed_at_aggregate_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    monkeypatch.setattr(judge, limit_name, limit)
+
+    assert judge._contains_private_material({"safe": "value"})  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
     ("section", "field", "value"),
     [
         ("presentation", "blinded_label", "candidate-XHIGH"),
@@ -1239,6 +1298,96 @@ def test_judgment_and_adjudication_support_more_than_64_criteria(
 
     assert retained.name == "adjudication-large.json"
     assert len(digest) == 64
+
+
+def test_imports_near_maximum_1024_verdict_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result = _inspection(matrix_dir)
+    scenario = result.manifest.inputs.scenarios[0]
+    criterion_ids = tuple(
+        f"criterion-{index:04d}-".ljust(128, "a")
+        for index in range(1024)
+    )
+    criteria = tuple(
+        run_state.MatrixQualitativeCriterion(
+            criterion_id,
+            "judged_answer_rubric",
+            "Assess this criterion.",
+            None,
+        )
+        for criterion_id in criterion_ids
+    )
+    scenario = replace(
+        scenario,
+        rubric_sha256="f" * 64,
+        criterion_ids=criterion_ids,
+        qualitative_criteria=criteria,
+    )
+    result = replace(
+        result,
+        manifest=replace(
+            result.manifest,
+            inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
+        ),
+    )
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: result)
+    scanned_lengths: list[int] = []
+    find_private_host_paths = grade.find_private_host_paths
+
+    def tracked_private_host_paths(value: str) -> list[str]:
+        scanned_lengths.append(len(value))
+        return find_private_host_paths(value)
+
+    monkeypatch.setattr(grade, "find_private_host_paths", tracked_private_host_paths)
+
+    rationale = "\U0010ffff" * 1024
+    document = _judgment(
+        result,
+        judgment_id="judgment-near-maximum",
+        clear="pass",
+        actionable="pass",
+    )
+    document["verdicts"] = [
+        {
+            "criterion_id": criterion_id,
+            "verdict": "pass",
+            "rationale": rationale,
+        }
+        for criterion_id in criterion_ids
+    ]
+    source = tmp_path / "judgment-near-maximum.json"
+    source.write_text(json.dumps(document, ensure_ascii=False))
+    assert source.stat().st_size > 1024 * 1024
+
+    retained, judgment_digest = judge.import_judgment(matrix_dir, source)
+
+    assert retained.stat().st_size > source.stat().st_size
+    assert retained.stat().st_size < judge._MAX_ARTIFACT_BYTES  # noqa: SLF001
+    adjudication = {
+        "schema": "steam-agent-eval-adjudication/0.1",
+        "adjudication_id": "adjudication-near-maximum",
+        "target": document["target"],
+        "method": "human_adjudication",
+        "adjudicator": "human-reviewer",
+        "judgment_sha256s": [judgment_digest],
+        "outcomes": [
+            {"criterion_id": criterion_id, "outcome": "pass"}
+            for criterion_id in criterion_ids
+        ],
+        "created_at": "2026-08-02T12:01:00Z",
+    }
+    source = tmp_path / "adjudication-near-maximum.json"
+    source.write_text(json.dumps(adjudication))
+
+    retained, digest = judge.import_adjudication(matrix_dir, source)
+
+    assert retained.name == "adjudication-near-maximum.json"
+    assert len(digest) == 64
+    assert scanned_lengths
+    assert max(scanned_lengths) <= 1024
 
 
 def test_qualification_rejects_an_unconfigured_judge(

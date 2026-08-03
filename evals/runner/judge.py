@@ -23,9 +23,16 @@ from evals.runner import grade, inspection, matrix, run_state
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_ROOT = ROOT / "evals" / "schema"
-_MAX_ARTIFACT_BYTES = 1024 * 1024
+# A 1024-character Unicode rationale can canonicalize to 12 ASCII bytes per
+# character as escaped surrogate pairs. Across 1024 verdicts, maximum IDs and
+# the JSON envelope remain below this bounded ceiling.
+_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_PROJECTION_BYTES = 16 * 1024 * 1024
 _MAX_SELECTED_EVIDENCE_BYTES = 1024 * 1024
+_MAX_PRIVATE_SCAN_STRINGS = 256 * 1024
+_MAX_PRIVATE_SCAN_CHARACTERS = 16 * 1024 * 1024
+_CANARY_MARKER = re.compile(r"eval_canary_", re.IGNORECASE | re.ASCII)
+_PRIVATE_PATH_TRIGGER_CHARACTERS = frozenset("/\\%~")
 _FORBIDDEN_PROJECTION_MARKERS = (
     '"metrics"',
     '"passed"',
@@ -223,6 +230,37 @@ def _conditional_selected_evidence(
     return evidence
 
 
+def _contains_private_material(value: Any) -> bool:
+    """Scan parsed strings for canaries and private paths within fixed bounds."""
+
+    stack = [value]
+    string_count = 0
+    character_count = 0
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            string_count += 1
+            character_count += len(current)
+            if (
+                string_count > _MAX_PRIVATE_SCAN_STRINGS
+                or character_count > _MAX_PRIVATE_SCAN_CHARACTERS
+            ):
+                return True
+            if _CANARY_MARKER.search(current) is not None:
+                return True
+            if any(
+                character in current
+                for character in _PRIVATE_PATH_TRIGGER_CHARACTERS
+            ) and grade.find_private_host_paths(current):
+                return True
+        elif isinstance(current, dict):
+            for key, item in current.items():
+                stack.extend((key, item))
+        elif isinstance(current, list):
+            stack.extend(current)
+    return False
+
+
 def _qualitative_projection(
     observation: inspection.Observation,
     scenario: run_state.MatrixScenario,
@@ -276,16 +314,13 @@ def _qualitative_projection(
         "answers": answers,
     }
     content = matrix._canonical_json_bytes(projection)  # noqa: SLF001
-    rendered = content.decode("ascii")
     if len(content) > _MAX_PROJECTION_BYTES:
         raise JudgmentError("qualitative projection exceeds safety limits")
     combined = "\n".join(texts)
     folded = combined.casefold()
     candidate_model = observation.work_item.route.model
     if (
-        "eval_canary_" in rendered.casefold()
-        or grade.find_private_host_paths(rendered)
-        or grade.find_private_host_paths(combined)
+        _contains_private_material(projection)
         or any(marker in folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
         or (
             candidate_model is not None
@@ -310,8 +345,7 @@ def _projection_digest(
 def _reject_unsafe_metadata(
     document: dict[str, Any], observation: inspection.Observation
 ) -> None:
-    rendered = matrix._canonical_json_bytes(document).decode("ascii")  # noqa: SLF001
-    if "eval_canary_" in rendered.casefold() or grade.find_private_host_paths(rendered):
+    if _contains_private_material(document):
         raise JudgmentError("qualitative metadata contains private material")
     candidate_model = observation.work_item.route.model
     protected_model = candidate_model.casefold() if candidate_model is not None else None

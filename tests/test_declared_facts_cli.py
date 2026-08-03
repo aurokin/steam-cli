@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -505,13 +505,14 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
 def test_discovery_reports_retained_declared_facts_as_stale(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    test_now = datetime.now(timezone.utc).replace(microsecond=0)
     configure(tmp_path)
     monkeypatch.setattr(
         cli,
         "_declared_facts_client",
         lambda: SteamDeclaredFactsClient(transport=FixtureTransport()),
     )
-    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(cli, "_utc_now", lambda: test_now)
     assert (
         invoke(
             tmp_path,
@@ -536,7 +537,8 @@ def test_discovery_reports_retained_declared_facts_as_stale(
     )
     with Storage(tmp_path / "steam-agent.sqlite3") as storage:
         storage._connection.execute(  # noqa: SLF001
-            "UPDATE declared_app_current SET observed_at='2026-07-04T00:00:00Z'"
+            "UPDATE declared_app_current SET observed_at=?",
+            ((test_now - timedelta(days=8)).isoformat().replace("+00:00", "Z"),),
         )
         storage._connection.commit()  # noqa: SLF001
 
