@@ -411,6 +411,8 @@ def _contains_private_material(value: Any) -> bool:
 def _qualitative_projection(
     observation: inspection.Observation,
     scenario: run_state.MatrixScenario,
+    *,
+    campaign: run_state.MatrixCampaign | None = None,
 ) -> dict[str, Any]:
     answers = observation.report.get("qualitative_review_answers")
     sidecars = observation.report.get("qualitative_review_claims_sidecars")
@@ -477,8 +479,19 @@ def _qualitative_projection(
         for item in scenario.qualitative_criteria
         if item.source == "fact_rubric.must_mention"
     )
+    allow_unavailable_must_mention = (
+        campaign is not None
+        and campaign.campaign_kind == "screen"
+        and observation.work_item.track == "answer"
+    )
+    requires_exact_must_mention = bool(must_mention) and (
+        not allow_unavailable_must_mention
+        or any(item.screen_safety_gate for item in must_mention)
+    )
     captured_document = (
-        _captured_cli_document(observation) if must_mention else None
+        _captured_cli_document(observation)
+        if requires_exact_must_mention
+        else None
     )
     projected_criteria: list[dict[str, Any]] = []
     selected_evidence_bytes = 0
@@ -486,10 +499,15 @@ def _qualitative_projection(
         projected = criterion.to_dict()
         if criterion.source == "fact_rubric.must_mention":
             assert criterion.evidence_path is not None
-            assert captured_document is not None
-            evidence, evidence_size = _selected_evidence(
-                captured_document, criterion.evidence_path
-            )
+            if allow_unavailable_must_mention and not criterion.screen_safety_gate:
+                evidence, evidence_size = _conditional_selected_evidence(
+                    observation, criterion.evidence_path
+                )
+            else:
+                assert captured_document is not None
+                evidence, evidence_size = _selected_evidence(
+                    captured_document, criterion.evidence_path
+                )
         elif criterion.source == "fact_rubric.support_if_claimed":
             assert criterion.evidence_path is not None
             evidence, evidence_size = _conditional_selected_evidence(
@@ -551,8 +569,12 @@ def _qualitative_projection(
 def _projection_digest(
     observation: inspection.Observation,
     scenario: run_state.MatrixScenario,
+    *,
+    campaign: run_state.MatrixCampaign | None = None,
 ) -> str:
-    projection = _qualitative_projection(observation, scenario)
+    projection = _qualitative_projection(
+        observation, scenario, campaign=campaign
+    )
     return hashlib.sha256(
         matrix._canonical_json_bytes(projection)  # noqa: SLF001
     ).hexdigest()
@@ -698,7 +720,9 @@ def _target_observation(
             "report_sha256": report_hash,
             "scenario_sha256": scenario.source_sha256,
             "rubric_sha256": scenario.rubric_sha256,
-            "projection_sha256": _projection_digest(observation, scenario),
+            "projection_sha256": _projection_digest(
+                observation, scenario, campaign=result.manifest.campaign
+            ),
         }
         target_index.expected_targets[work_item_id] = expected
     if any(target.get(key) != value for key, value in expected.items()):

@@ -99,7 +99,13 @@ sidecar turns make the projection unavailable. The sidecars contain only parsed
 the same privacy scan and projection hash. Must-mention and conditional
 support criteria also include the minimal selected value from the one exact,
 validated captured CLI document; they do not source that value from the claims
-sidecar. Conditional support represents zero, one, or many selected values,
+sidecar. A screen's diagnostic `answer` arm alone may instead represent an
+unavailable must-mention capture or path as a bounded, explicit zero state.
+This keeps an unavailable non-gating correctness diagnostic from suppressing
+an independent safety-gate judgment. The `discovery` arm and qualification
+still require the exact selected value, and an ambiguous retained document,
+private material, malformed value, or oversized selection remains invalid in
+every arm. Conditional support represents zero, one, or many selected values,
 preserves explicit unknown, false, and empty states, fails unsupported or wrong
 assertions, and passes true omission.
 Each selected-evidence source is schema-bounded to six paths. A selected value

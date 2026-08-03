@@ -683,6 +683,7 @@ def _target_observation(
     target: dict[str, Any],
     observations: dict[str, inspection.Observation],
     scenarios: dict[str, run_state.MatrixScenario],
+    campaign: run_state.MatrixCampaign,
 ) -> tuple[inspection.Observation, run_state.MatrixScenario]:
     observation = observations.get(target.get("work_item_id"))
     if observation is None or target.get("matrix_id") != observation.matrix_id:
@@ -693,7 +694,7 @@ def _target_observation(
     scenario = scenarios[observation.work_item.scenario_id]
     try:
         projection_sha256 = judge._projection_digest(  # noqa: SLF001
-            observation, scenario
+            observation, scenario, campaign=campaign
         )
     except judge.JudgmentError as error:
         raise AcceptanceError(str(error)) from None
@@ -752,7 +753,7 @@ def _qualitative_outcomes(
     for path in _artifact_files(result.matrix_dir / "judgments"):
         document, content = _canonical_artifact(path, "judgment-0.1.json")
         observation, scenario = _target_observation(
-            document["target"], observations, scenarios
+            document["target"], observations, scenarios, manifest.campaign
         )
         try:
             judge._reject_unsafe_metadata(document, observation)  # noqa: SLF001
@@ -784,7 +785,7 @@ def _qualitative_outcomes(
     for path in _artifact_files(result.matrix_dir / "adjudications"):
         document, content = _canonical_artifact(path, "adjudication-0.1.json")
         observation, scenario = _target_observation(
-            document["target"], observations, scenarios
+            document["target"], observations, scenarios, manifest.campaign
         )
         try:
             judge._reject_unsafe_metadata(document, observation)  # noqa: SLF001

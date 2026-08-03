@@ -365,8 +365,10 @@ def _judgment(
 ) -> dict[str, Any]:
     observation = result.observations[0]
     scenario = result.manifest.inputs.scenarios[0]
-    projection = judge._qualitative_projection(observation, scenario)  # noqa: SLF001
     campaign = result.manifest.campaign
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, scenario, campaign=campaign
+    )
     return {
         "schema": "steam-agent-eval-judgment/0.1",
         "judgment_id": judgment_id,
@@ -465,6 +467,21 @@ def _with_must_mention(
             "completion_sequence": 0,
         }
     return replace(result, manifest=manifest), criterion
+
+
+def _with_observation_track(
+    result: inspection.MatrixInspection, track: str
+) -> inspection.MatrixInspection:
+    observation = result.observations[0]
+    return replace(
+        result,
+        observations=(
+            replace(
+                observation,
+                work_item=replace(observation.work_item, track=track),
+            ),
+        ),
+    )
 
 
 def _with_prose_claims_alignment(
@@ -1024,6 +1041,205 @@ def test_conditional_selected_evidence_allows_an_unavailable_capture(
         "cardinality": "zero",
         "state": "capture_unavailable",
     }
+
+
+@pytest.mark.parametrize(
+    ("documents", "capture", "expected"),
+    (
+        (
+            [
+                {
+                    "omitted": "unsafe-trace-content",
+                    "sha256": "a" * 64,
+                    "length": 128,
+                }
+            ],
+            {
+                "state": "captured",
+                "successful_candidates": 1,
+            },
+            {"cardinality": "zero", "state": "path_unavailable"},
+        ),
+        (
+            [],
+            {
+                "state": "multiple_candidates",
+                "successful_candidates": 2,
+            },
+            {"cardinality": "zero", "state": "capture_unavailable"},
+        ),
+    ),
+)
+def test_screen_answer_projects_unavailable_must_mention_as_zero_evidence(
+    tmp_path: Path,
+    documents: list[dict[str, Any]],
+    capture: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    result, criterion = _with_must_mention(_inspection(tmp_path))
+    result = _with_observation_track(result, "answer")
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = documents
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = capture
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation,
+        result.manifest.inputs.scenarios[0],
+        campaign=result.manifest.campaign,
+    )
+
+    projected = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
+    assert projected["selected_evidence"] == expected
+
+
+@pytest.mark.parametrize(
+    ("campaign_kind", "track", "documents", "capture"),
+    (
+        (
+            "screen",
+            "discovery",
+            [],
+            {"state": "multiple_candidates", "successful_candidates": 2},
+        ),
+        (
+            "screen",
+            "discovery",
+            [
+                {
+                    "omitted": "unsafe-trace-content",
+                    "sha256": "a" * 64,
+                    "length": 128,
+                }
+            ],
+            {"state": "captured", "successful_candidates": 1},
+        ),
+        (
+            "qualification",
+            "discovery",
+            [],
+            {"state": "multiple_candidates", "successful_candidates": 2},
+        ),
+        (
+            "qualification",
+            "discovery",
+            [
+                {
+                    "omitted": "unsafe-trace-content",
+                    "sha256": "a" * 64,
+                    "length": 128,
+                }
+            ],
+            {"state": "captured", "successful_candidates": 1},
+        ),
+    ),
+)
+def test_discovery_and_qualification_require_exact_must_mention_evidence(
+    tmp_path: Path,
+    campaign_kind: str,
+    track: str,
+    documents: list[dict[str, Any]],
+    capture: dict[str, Any],
+) -> None:
+    result, _criterion = _with_must_mention(
+        _inspection(tmp_path, campaign_kind=campaign_kind)
+    )
+    result = _with_observation_track(result, track)
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = documents
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = capture
+
+    with pytest.raises(judge.JudgmentError, match="selected evidence is unavailable"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation,
+            result.manifest.inputs.scenarios[0],
+            campaign=result.manifest.campaign,
+        )
+
+
+def test_screen_answer_keeps_exact_must_mention_evidence(tmp_path: Path) -> None:
+    result, criterion = _with_must_mention(_inspection(tmp_path))
+    result = _with_observation_track(result, "answer")
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        result.observations[0],
+        result.manifest.inputs.scenarios[0],
+        campaign=result.manifest.campaign,
+    )
+
+    projected = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
+    assert projected["selected_evidence"] == {
+        "cardinality": "one",
+        "value": "76561198000000001",
+    }
+
+
+@pytest.mark.parametrize(
+    ("documents", "expected"),
+    (
+        (
+            [
+                {"data": {"steam_id64": "76561198000000001"}},
+                {"data": {"steam_id64": "76561198000000001"}},
+            ],
+            "ambiguous",
+        ),
+        ([{"data": {"steam_id64": "/Users/private/Steam"}}], "prohibited"),
+        ([{"data": {"steam_id64": float("nan")}}], "invalid"),
+        ([{"data": {"steam_id64": "x" * (1024 * 1024)}}], "exceeds safety limits"),
+    ),
+)
+def test_screen_answer_unavailable_exception_still_rejects_unsafe_evidence(
+    tmp_path: Path,
+    documents: list[dict[str, Any]],
+    expected: str,
+) -> None:
+    result, _criterion = _with_must_mention(_inspection(tmp_path))
+    result = _with_observation_track(result, "answer")
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = documents
+
+    with pytest.raises(judge.JudgmentError, match=expected):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation,
+            result.manifest.inputs.scenarios[0],
+            campaign=result.manifest.campaign,
+        )
+
+
+def test_screen_answer_judgment_binds_unavailable_must_mention_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result, criterion = _with_must_mention(_inspection(matrix_dir))
+    result = _with_observation_track(result, "answer")
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = []
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = {
+        "state": "multiple_candidates",
+        "successful_candidates": 2,
+    }
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: result)
+    document = _configured_judgment(
+        result, judgment_id="judgment-screen-answer-unavailable", judge_index=0
+    )
+    document["verdicts"].append(
+        {
+            "criterion_id": criterion.criterion_id,
+            "verdict": "uncertain",
+            "rationale": "Required evidence is unavailable.",
+        }
+    )
+    source = tmp_path / "judgment.json"
+    source.write_text(json.dumps(document))
+
+    retained, _digest = judge.import_judgment(matrix_dir, source)
+
+    assert retained.name == "judgment-screen-answer-unavailable.json"
 
 
 @pytest.mark.parametrize(
@@ -2057,10 +2273,12 @@ def test_adjudication_inspects_once_for_hundreds_of_retained_judgments(
     def tracked_projection_digest(
         observation: inspection.Observation,
         scenario: run_state.MatrixScenario,
+        *,
+        campaign: run_state.MatrixCampaign | None = None,
     ) -> str:
         nonlocal projection_calls
         projection_calls += 1
-        return projection_digest(observation, scenario)
+        return projection_digest(observation, scenario, campaign=campaign)
 
     monkeypatch.setattr(judge, "_projection_digest", tracked_projection_digest)
     adjudication = {

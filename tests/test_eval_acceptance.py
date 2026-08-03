@@ -1835,6 +1835,55 @@ def test_acceptance_rejects_self_consistent_unconfigured_judgment(
         acceptance._qualitative_outcomes(result)  # noqa: SLF001
 
 
+def test_acceptance_validates_target_with_campaign_specific_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _result(
+        kind="screen",
+        matrix_id="screen",
+        routes=_screen_routes(),
+        started_at="2026-08-02T11:00:00Z",
+        finished_at="2026-08-02T12:00:00Z",
+    )
+    observation = result.observations[0]
+    scenario = result.manifest.inputs.scenarios[0]
+    projection_sha256 = "f" * 64
+    observed_campaigns: list[run_state.MatrixCampaign] = []
+
+    def projection_digest(
+        actual_observation: inspection.Observation,
+        actual_scenario: run_state.MatrixScenario,
+        *,
+        campaign: run_state.MatrixCampaign | None = None,
+    ) -> str:
+        assert actual_observation is observation
+        assert actual_scenario is scenario
+        assert campaign is not None
+        observed_campaigns.append(campaign)
+        return projection_sha256
+
+    monkeypatch.setattr(judge, "_projection_digest", projection_digest)
+    target = {
+        "matrix_id": observation.matrix_id,
+        "work_item_id": observation.work_item.work_item_id,
+        "report_sha256": dict(observation.completion.artifact_hashes)["report.json"],
+        "scenario_sha256": scenario.source_sha256,
+        "rubric_sha256": scenario.rubric_sha256,
+        "projection_sha256": projection_sha256,
+    }
+
+    selected_observation, selected_scenario = acceptance._target_observation(  # noqa: SLF001
+        target,
+        {observation.work_item.work_item_id: observation},
+        {scenario.scenario_id: scenario},
+        result.manifest.campaign,
+    )
+
+    assert selected_observation is observation
+    assert selected_scenario is scenario
+    assert observed_campaigns == [result.manifest.campaign]
+
+
 def test_m2_identifier_claims_cannot_qualify_without_actual_answer_mention() -> None:
     result = _result(
         kind="qualification",

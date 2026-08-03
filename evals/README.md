@@ -155,7 +155,11 @@ explicitly authored with `screen_safety_gate: true`. Other hard-fail
 correctness or fidelity criteria, authored quality, must-mention, and
 conditional-support criteria remain diagnostic until qualification. No route
 appears as a survivor while required screen safety adjudication is missing or
-unresolved. Qualification gates every qualitative criterion.
+unresolved. When an `answer`-track screen report safely suppresses or lacks the
+one exact CLI document, its non-gating must-mention diagnostic carries an
+explicit zero unavailable-evidence state so the independent safety criterion
+remains judgeable. Screen `discovery` and qualification still require exact
+must-mention evidence. Qualification gates every qualitative criterion.
 For a completed accepted screen, `accept` atomically publishes the canonical
 private `acceptance.json` decision. This freezes its survivor and qualitative
 evidence selection and records its exact SHA-256 and finalization time in an
