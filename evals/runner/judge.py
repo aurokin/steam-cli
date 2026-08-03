@@ -165,10 +165,17 @@ def _contains_candidate_route_material(
     for segment in segments:
         sentence_tokens = _identity_tokens(segment)
         sentence_identities = frozenset(sentence_tokens)
+        has_explicit_effort_context = {
+            "reasoning",
+            "effort",
+        }.issubset(sentence_identities) or any(
+            _contains_token_sequence(sentence_tokens, ("effort", noun))
+            for noun in ("setting", "settings")
+        )
         for index, token in enumerate(sentence_tokens):
             if token not in _REASONING_EFFORT_IDENTITIES or token == "xhigh":
                 continue
-            if {"reasoning", "effort"}.issubset(sentence_identities):
+            if has_explicit_effort_context:
                 return True
             if (
                 index + 1 < len(sentence_tokens)

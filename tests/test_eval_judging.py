@@ -1723,6 +1723,30 @@ def test_long_distance_reasoning_effort_disclosures_are_rejected(
         )
 
 
+@pytest.mark.parametrize(
+    "disclosure",
+    (
+        "The effort setting chosen after reviewing all available evidence in "
+        "detail was high.",
+        "The effort settings selected after a lengthy review were medium.",
+        "The effort-setting selected after a lengthy review was low.",
+    ),
+)
+def test_effort_setting_compound_disclosures_are_rejected(
+    tmp_path: Path, disclosure: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": disclosure}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
 def test_distant_generic_effort_and_level_are_allowed_in_ordinary_prose(
     tmp_path: Path,
 ) -> None:
@@ -1761,6 +1785,45 @@ def test_atomic_sidecar_allows_distant_generic_effort_and_level(
     )
 
     assert projection["claims_sidecars"][0]["claims"][0]["value"] == content
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "Low settings reduced rendering cost; the migration effort took hours.",
+        "The effort setting was documented. Performance was high.",
+    ),
+)
+def test_effort_setting_context_does_not_cross_prose_boundaries(
+    tmp_path: Path, content: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": content}
+    ]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, result.manifest.inputs.scenarios[0]
+    )
+
+    assert projection["answers"][0]["text"] == content
+
+
+def test_atomic_sidecar_preserves_effort_setting_and_level_association(
+    tmp_path: Path,
+) -> None:
+    content = "The effort setting was documented. Performance was high."
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": content}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
 
 
 def test_candidate_route_context_and_effort_in_separate_answer_turns_pass(
