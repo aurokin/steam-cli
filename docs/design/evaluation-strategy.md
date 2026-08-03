@@ -380,11 +380,12 @@ blind comparison and task-specific rubrics while retaining expert review.
   and ordinary report fields still retain only structural activity plus content
   hashes and lengths; raw prompts, reasoning, commands, output, evidence, and
   complete answer traces remain omitted. The sole provenance exception is an
-  exact pinned model-and-effort attestation: it remains readable only when the
-  requested route is valid and confirmed and every effective, observed, and
-  per-turn value equals that request. This bounded metadata lets a matrix verify
-  failed or pending observations without exposing arbitrary App Server content,
-  and it is never copied into the qualitative projection. This boundary is
+  exact pinned model-and-effort attestation. The requested route remains
+  readable as declared run configuration; effective, observed, and per-turn
+  values remain readable only when that request is valid and confirmed and
+  every such value equals it. This bounded metadata lets a matrix verify failed
+  or pending observations without exposing arbitrary App Server content, and
+  it is never copied into the qualitative projection. This boundary is
   recorded in
   [ADR 0017](../adr/0017-eval-command-equivalence-and-review-retention.md).
 - Each scenario uses a private temporary writable workspace. Its synthetic
