@@ -1,6 +1,6 @@
 {
   "schema": "steam-agent-eval-judge-calibration-labels/0.1",
-  "cases_sha256": "b4894562f9994ceb340502b3b14a6239202479828436bf10e13c92a716ab2748",
+  "cases_sha256": "30343e2a2a4ae56799b7374dd8cace155c5daaa0448ca47e1a90133ad3bb2ac7",
   "labels": {
     "c01": "pass",
     "c02": "fail",
@@ -32,6 +32,10 @@
     "c28": "pass",
     "c29": "fail",
     "c30": "pass",
-    "c31": "fail"
+    "c31": "fail",
+    "c32": "pass",
+    "c33": "fail",
+    "c34": "pass",
+    "c35": "fail"
   }
 }

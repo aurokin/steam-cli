@@ -1096,6 +1096,70 @@ def test_successful_retry_history_is_audited_without_disqualifying_matrix(
     assert compared["vector"] is not None
 
 
+@pytest.mark.parametrize("tamper", ("delete", "replace", "mutate"))
+def test_observed_orphan_revalidates_its_distinct_child_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    results_root = tmp_path / "results"
+    config = _write_config(tmp_path / "retry.json", model="model-a", timeout=30)
+    original_persist = run_state.MatrixManifest.persist
+
+    def fail_first_checkpoint(
+        manifest: run_state.MatrixManifest, path: Path
+    ) -> None:
+        if manifest.revision == 1:
+            raise OSError("simulated checkpoint failure")
+        original_persist(manifest, path)
+
+    monkeypatch.setattr(
+        run_state.MatrixManifest, "persist", fail_first_checkpoint
+    )
+    with pytest.raises(matrix.MatrixError, match="failed structurally"):
+        matrix.execute_matrix(
+            config,
+            results_root=results_root,
+            input_collector=lambda _config: _inputs(),
+            child_executor=_child(results_root, _inputs(), duration=1.0),
+        )
+
+    [matrix_dir] = results_root.glob("matrix-*")
+    monkeypatch.setattr(run_state.MatrixManifest, "persist", original_persist)
+    completed = matrix.execute_matrix(
+        config,
+        matrix_id=matrix_dir.name,
+        results_root=results_root,
+        input_collector=lambda _config: _inputs(),
+        child_executor=_child(results_root, _inputs(), duration=1.0),
+    )
+    inspected = inspection.inspect_matrix(matrix_dir)
+    assert inspected.eligible is True
+    [orphan_id] = inspected.orphan_attempt_ids
+    orphan_result = json.loads(
+        (matrix_dir / "work" / orphan_id / "result.json").read_text()
+    )
+    orphan_child_id = orphan_result["completion"]["child_run_id"]
+    assert orphan_child_id != completed.completions[0].child_run_id
+    orphan_child = results_root / orphan_child_id
+    report_path = orphan_child / "m7-z99" / "report.json"
+    if tamper == "delete":
+        report_path.unlink()
+    elif tamper == "replace":
+        official_child_id = completed.completions[0].child_run_id
+        assert official_child_id is not None
+        report_path.write_bytes(
+            (results_root / official_child_id / "manifest.json").read_bytes()
+        )
+    else:
+        report = json.loads(report_path.read_text())
+        report["scenario"] = "m7-tampered"
+        report_path.write_bytes(run_state._strict_json_bytes(report))  # noqa: SLF001
+
+    with pytest.raises(inspection.InspectionError, match="child|artifact|report"):
+        inspection.inspect_matrix(matrix_dir)
+
+
 def test_orphan_completion_cannot_duplicate_official_child_evidence(
     tmp_path: Path,
 ) -> None:

@@ -8,6 +8,7 @@ layer vector.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -28,7 +29,8 @@ SCHEMA_ROOT = ROOT / "evals" / "schema"
 # the JSON envelope remain below this bounded ceiling.
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_PROJECTION_BYTES = 16 * 1024 * 1024
-_MAX_SELECTED_EVIDENCE_BYTES = 1024 * 1024
+_MAX_SELECTED_EVIDENCE_BYTES = 512 * 1024
+_MAX_SELECTED_EVIDENCE_TOTAL_BYTES = 8 * 1024 * 1024
 _MAX_PRIVATE_SCAN_STRINGS = 256 * 1024
 _MAX_PRIVATE_SCAN_CHARACTERS = 16 * 1024 * 1024
 _CANARY_MARKER = re.compile(r"eval_canary_", re.IGNORECASE | re.ASCII)
@@ -116,6 +118,34 @@ def _contains_token_sequence(
     )
 
 
+def _contains_candidate_route_material(
+    value: str, *, candidate_model: str | None
+) -> bool:
+    """Detect route disclosures as tokens without rejecting ordinary prose."""
+
+    folded = value.casefold()
+    token_sequence = _identity_tokens(value)
+    tokens = frozenset(token_sequence)
+    model_is_present = (
+        candidate_model is not None
+        and re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(candidate_model.casefold())}"
+            r"(?![A-Za-z0-9])",
+            folded,
+        )
+        is not None
+    )
+    return bool(
+        model_is_present
+        or tokens & _FIXED_ROUTE_IDENTITIES
+        or "xhigh" in tokens
+        or (
+            tokens & _REASONING_EFFORT_IDENTITIES
+            and tokens & _ROUTE_CONTEXT_IDENTITIES
+        )
+    )
+
+
 def _validate_schema(document: Any, schema_name: str) -> dict[str, Any]:
     schema = matrix._read_strict_json(  # noqa: SLF001
         SCHEMA_ROOT / schema_name, max_bytes=_MAX_ARTIFACT_BYTES
@@ -173,7 +203,81 @@ def _captured_cli_document(observation: inspection.Observation) -> dict[str, Any
     return documents[0]
 
 
-def _selected_evidence(document: dict[str, Any], path: str) -> dict[str, Any]:
+def _bounded_canonical_json_size(value: Any, limit: int) -> int | None:
+    """Count canonical ASCII JSON bytes without allocating serialized copies."""
+
+    def mapping_children(value: dict[str, Any]):
+        for key, child in value.items():
+            yield key
+            yield child
+
+    size = 0
+    pending = [iter((value,))]
+    while pending:
+        try:
+            item = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if isinstance(item, str):
+            size += 2
+            for character in item:
+                codepoint = ord(character)
+                if character in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
+                    size += 2
+                elif codepoint < 0x20:
+                    size += 6
+                elif codepoint < 0x80:
+                    size += 1
+                elif codepoint <= 0xFFFF:
+                    size += 6
+                else:
+                    size += 12
+                if size > limit:
+                    return None
+        elif item is None:
+            size += 4
+        elif item is True:
+            size += 4
+        elif item is False:
+            size += 5
+        elif isinstance(item, int):
+            try:
+                size += len(str(item))
+            except ValueError:
+                raise JudgmentError("qualitative selected evidence is invalid") from None
+        elif isinstance(item, float):
+            try:
+                size += len(json.dumps(item, allow_nan=False))
+            except (TypeError, ValueError):
+                raise JudgmentError("qualitative selected evidence is invalid") from None
+        elif isinstance(item, list):
+            size += 2 + max(0, len(item) - 1)
+            pending.append(iter(item))
+        elif isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise JudgmentError("qualitative selected evidence is invalid")
+            size += 2 + max(0, len(item) - 1) + len(item)
+            pending.append(mapping_children(item))
+        else:
+            raise JudgmentError("qualitative selected evidence is invalid")
+        if size > limit:
+            return None
+    return size
+
+
+def _bounded_selected_evidence(
+    evidence: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    size = _bounded_canonical_json_size(evidence, _MAX_SELECTED_EVIDENCE_BYTES)
+    if size is None:
+        raise JudgmentError("qualitative selected evidence exceeds safety limits")
+    return evidence, size
+
+
+def _selected_evidence(
+    document: dict[str, Any], path: str
+) -> tuple[dict[str, Any], int]:
     try:
         values, plural = grade.select_path(document, path)
     except (IndexError, KeyError, TypeError, ValueError):
@@ -185,28 +289,26 @@ def _selected_evidence(document: dict[str, Any], path: str) -> dict[str, Any]:
         if plural
         else {"cardinality": "one", "value": values[0]}
     )
-    try:
-        content = matrix._canonical_json_bytes(evidence)  # noqa: SLF001
-    except matrix.MatrixError:
-        raise JudgmentError("qualitative selected evidence is invalid") from None
-    if len(content) > _MAX_SELECTED_EVIDENCE_BYTES:
-        raise JudgmentError("qualitative selected evidence exceeds safety limits")
-    return evidence
+    return _bounded_selected_evidence(evidence)
 
 
 def _conditional_selected_evidence(
     observation: inspection.Observation, path: str
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int]:
     try:
         document = _captured_cli_document(observation)
     except JudgmentError as error:
         if str(error) != "qualitative selected evidence is unavailable":
             raise
-        return {"cardinality": "zero", "state": "capture_unavailable"}
+        return _bounded_selected_evidence(
+            {"cardinality": "zero", "state": "capture_unavailable"}
+        )
     try:
         values, plural = grade.select_path(document, path)
     except (IndexError, KeyError, TypeError):
-        return {"cardinality": "zero", "state": "path_unavailable"}
+        return _bounded_selected_evidence(
+            {"cardinality": "zero", "state": "path_unavailable"}
+        )
     except ValueError:
         raise JudgmentError("qualitative selected evidence is invalid") from None
     if not plural and len(values) != 1:
@@ -221,13 +323,7 @@ def _conditional_selected_evidence(
         evidence = {"cardinality": "one", "value": values[0]}
     else:
         evidence = {"cardinality": "many", "values": values}
-    try:
-        content = matrix._canonical_json_bytes(evidence)  # noqa: SLF001
-    except matrix.MatrixError:
-        raise JudgmentError("qualitative selected evidence is invalid") from None
-    if len(content) > _MAX_SELECTED_EVIDENCE_BYTES:
-        raise JudgmentError("qualitative selected evidence exceeds safety limits")
-    return evidence
+    return _bounded_selected_evidence(evidence)
 
 
 def _contains_private_material(value: Any) -> bool:
@@ -334,19 +430,33 @@ def _qualitative_projection(
         _captured_cli_document(observation) if must_mention else None
     )
     projected_criteria: list[dict[str, Any]] = []
+    selected_evidence_bytes = 0
     for criterion in scenario.qualitative_criteria:
         projected = criterion.to_dict()
         if criterion.source == "fact_rubric.must_mention":
             assert criterion.evidence_path is not None
             assert captured_document is not None
-            projected["selected_evidence"] = _selected_evidence(
+            evidence, evidence_size = _selected_evidence(
                 captured_document, criterion.evidence_path
             )
         elif criterion.source == "fact_rubric.support_if_claimed":
             assert criterion.evidence_path is not None
-            projected["selected_evidence"] = _conditional_selected_evidence(
+            evidence, evidence_size = _conditional_selected_evidence(
                 observation, criterion.evidence_path
             )
+        else:
+            evidence = None
+            evidence_size = 0
+        if evidence is not None:
+            if (
+                evidence_size
+                > _MAX_SELECTED_EVIDENCE_TOTAL_BYTES - selected_evidence_bytes
+            ):
+                raise JudgmentError(
+                    "qualitative selected evidence exceeds aggregate safety limits"
+                )
+            selected_evidence_bytes += evidence_size
+            projected["selected_evidence"] = evidence
         projected_criteria.append(projected)
     projection = {
         "schema": "steam-agent-eval-qualitative-projection/0.2",
@@ -359,16 +469,18 @@ def _qualitative_projection(
         raise JudgmentError("qualitative projection exceeds safety limits")
     combined = "\n".join(texts)
     folded = combined.casefold()
-    sidecar_folded = matrix._canonical_json_bytes(sidecars).decode("ascii").casefold()  # noqa: SLF001
+    sidecar_text = matrix._canonical_json_bytes(sidecars).decode("ascii")  # noqa: SLF001
+    sidecar_folded = sidecar_text.casefold()
     candidate_model = observation.work_item.route.model
     if (
         _contains_private_material(projection)
         or any(marker in folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
         or any(marker in sidecar_folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
-        or (
-            candidate_model is not None
-            and len(candidate_model) >= 3
-            and candidate_model.casefold() in (folded + sidecar_folded)
+        or _contains_candidate_route_material(
+            combined, candidate_model=candidate_model
+        )
+        or _contains_candidate_route_material(
+            sidecar_text, candidate_model=candidate_model
         )
     ):
         raise JudgmentError("qualitative projection contains prohibited material")
@@ -394,27 +506,10 @@ def _reject_unsafe_metadata(
     protected_model = candidate_model.casefold() if candidate_model is not None else None
 
     def reject_rationale(value: str) -> None:
-        folded = value.casefold()
         token_sequence = _identity_tokens(value)
         tokens = frozenset(token_sequence)
-        model_is_present = (
-            protected_model is not None
-            and re.search(
-                rf"(?<![A-Za-z0-9]){re.escape(protected_model)}(?![A-Za-z0-9])",
-                folded,
-            )
-            is not None
-        )
-        route_alias_is_present = bool(tokens & _FIXED_ROUTE_IDENTITIES)
-        effort_is_bound = bool(
-            tokens & _REASONING_EFFORT_IDENTITIES
-            and tokens & _ROUTE_CONTEXT_IDENTITIES
-        )
-        if (
-            model_is_present
-            or route_alias_is_present
-            or "xhigh" in tokens
-            or effort_is_bound
+        if _contains_candidate_route_material(
+            value, candidate_model=candidate_model
         ):
             raise JudgmentError(
                 "qualitative rationale contains candidate route material"
@@ -487,42 +582,65 @@ def _reject_unsafe_metadata(
                 )
 
 
-def _target_observation(
-    matrix_dir: Path, target: dict[str, Any]
-) -> tuple[inspection.MatrixInspection, inspection.Observation, run_state.MatrixScenario]:
+@dataclass(slots=True)
+class _TargetIndex:
+    inspection_result: inspection.MatrixInspection
+    observations: dict[str, inspection.Observation]
+    scenarios: dict[str, run_state.MatrixScenario]
+    expected_targets: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def _target_index(matrix_dir: Path) -> _TargetIndex:
     try:
         result = inspection.inspect_matrix(matrix_dir)
     except inspection.InspectionError as error:
         raise JudgmentError(str(error)) from None
+    observations = {
+        item.work_item.work_item_id: item for item in result.observations
+    }
+    scenarios = {
+        item.scenario_id: item for item in result.manifest.inputs.scenarios
+    }
+    if len(observations) != len(result.observations) or len(scenarios) != len(
+        result.manifest.inputs.scenarios
+    ):
+        raise JudgmentError("qualitative target index is invalid")
+    return _TargetIndex(result, observations, scenarios)
+
+
+def _target_observation(
+    target_index: _TargetIndex, target: dict[str, Any]
+) -> tuple[inspection.MatrixInspection, inspection.Observation, run_state.MatrixScenario]:
+    result = target_index.inspection_result
     if target.get("matrix_id") != result.manifest.matrix_id:
         raise JudgmentError("qualitative target matrix does not match")
-    observation = next(
-        (
-            item
-            for item in result.observations
-            if item.work_item.work_item_id == target.get("work_item_id")
-        ),
-        None,
-    )
+    work_item_id = target.get("work_item_id")
+    observation = target_index.observations.get(work_item_id)
     if observation is None:
         raise JudgmentError("qualitative target work item is unavailable")
     metrics = observation.report.get("metrics")
     privacy = metrics.get("privacy") if isinstance(metrics, dict) else None
     if not isinstance(privacy, dict) or privacy.get("passed") is not True:
         raise JudgmentError("qualitative target is not privacy-cleared")
-    scenario = next(
-        item
-        for item in result.manifest.inputs.scenarios
-        if item.scenario_id == observation.work_item.scenario_id
-    )
-    report_hash = dict(observation.completion.artifact_hashes)["report.json"]
-    projection_hash = _projection_digest(observation, scenario)
-    if (
-        target.get("report_sha256") != report_hash
-        or target.get("scenario_sha256") != scenario.source_sha256
-        or target.get("rubric_sha256") != scenario.rubric_sha256
-        or target.get("projection_sha256") != projection_hash
-    ):
+    scenario = target_index.scenarios.get(observation.work_item.scenario_id)
+    if scenario is None:
+        raise JudgmentError("qualitative target scenario is unavailable")
+    expected = target_index.expected_targets.get(work_item_id)
+    if expected is None:
+        try:
+            report_hash = dict(observation.completion.artifact_hashes)["report.json"]
+        except KeyError:
+            raise JudgmentError("qualitative target report is unavailable") from None
+        expected = {
+            "matrix_id": result.manifest.matrix_id,
+            "work_item_id": work_item_id,
+            "report_sha256": report_hash,
+            "scenario_sha256": scenario.source_sha256,
+            "rubric_sha256": scenario.rubric_sha256,
+            "projection_sha256": _projection_digest(observation, scenario),
+        }
+        target_index.expected_targets[work_item_id] = expected
+    if any(target.get(key) != value for key, value in expected.items()):
         raise JudgmentError("qualitative target digest does not match")
     return result, observation, scenario
 
@@ -601,6 +719,12 @@ def _publish_artifact(
     artifact_id: str,
     content: bytes,
 ) -> tuple[Path, str]:
+    required_prefix = {
+        "judgments": "judgment-",
+        "adjudications": "adjudication-",
+    }.get(collection)
+    if required_prefix is None or not artifact_id.startswith(required_prefix):
+        raise JudgmentError("qualitative artifact ID is invalid")
     root = Path(matrix_dir) / collection
     if not root.exists():
         try:
@@ -617,8 +741,22 @@ def _publish_artifact(
 
 
 def _reject_finalized_screen(matrix_dir: Path) -> None:
+    matrix_dir = Path(matrix_dir)
     try:
-        (Path(matrix_dir) / "acceptance.json").lstat()
+        (matrix_dir / "manifest.json").lstat()
+    except FileNotFoundError:
+        manifest = None
+    except OSError:
+        raise JudgmentError("finalized screen state is invalid") from None
+    else:
+        try:
+            manifest = matrix.load_manifest(matrix_dir)
+        except matrix.MatrixError:
+            raise JudgmentError("finalized screen state is invalid") from None
+    if manifest is not None and manifest.acceptance_sha256 is not None:
+        raise JudgmentError("finalized screen cannot accept qualitative artifacts")
+    try:
+        (matrix_dir / "acceptance.json").lstat()
     except FileNotFoundError:
         return
     except OSError:
@@ -628,8 +766,9 @@ def _reject_finalized_screen(matrix_dir: Path) -> None:
 
 def _import_judgment_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
     document, content = _read_import(source, "judgment-0.1.json")
+    target_index = _target_index(matrix_dir)
     result, observation, scenario = _target_observation(
-        matrix_dir, document["target"]
+        target_index, document["target"]
     )
     _reject_unsafe_metadata(document, observation)
     verdicts = _criterion_map(document["verdicts"], field="verdict")
@@ -654,7 +793,9 @@ def import_judgment(matrix_dir: Path, source: Path) -> tuple[Path, str]:
         raise JudgmentError(str(error)) from None
 
 
-def _retained_judgments(matrix_dir: Path) -> dict[str, dict[str, Any]]:
+def _retained_judgments(
+    matrix_dir: Path, target_index: _TargetIndex
+) -> dict[str, dict[str, Any]]:
     root = Path(matrix_dir) / "judgments"
     if not root.is_dir():
         return {}
@@ -677,7 +818,7 @@ def _retained_judgments(matrix_dir: Path) -> dict[str, dict[str, Any]]:
         if path.read_bytes() != content:
             raise JudgmentError("retained judgment is not canonical")
         inspection_result, observation, scenario = _target_observation(
-            matrix_dir, validated["target"]
+            target_index, validated["target"]
         )
         _reject_unsafe_metadata(validated, observation)
         verdicts = _criterion_map(validated["verdicts"], field="verdict")
@@ -691,14 +832,15 @@ def _retained_judgments(matrix_dir: Path) -> dict[str, dict[str, Any]]:
 
 def _import_adjudication_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
     document, content = _read_import(source, "adjudication-0.1.json")
+    target_index = _target_index(matrix_dir)
     inspection_result, observation, scenario = _target_observation(
-        matrix_dir, document["target"]
+        target_index, document["target"]
     )
     _reject_unsafe_metadata(document, observation)
     outcomes = _criterion_map(document["outcomes"], field="outcome")
     if set(outcomes) != set(scenario.criterion_ids):
         raise JudgmentError("adjudication does not cover the exact rubric")
-    retained = _retained_judgments(matrix_dir)
+    retained = _retained_judgments(matrix_dir, target_index)
     hashes = document["judgment_sha256s"]
     if any(digest not in retained for digest in hashes):
         raise JudgmentError("adjudication references an unavailable judgment")

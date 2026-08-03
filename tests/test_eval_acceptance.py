@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -399,6 +400,30 @@ def _install_results(
             "load_finalized_screen",
             lambda _path: (finalized, b"screen-acceptance\n", screen),
         )
+
+
+def _install_finalization_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    matrix_dir: Path,
+    result: Callable[[], inspection.MatrixInspection],
+) -> None:
+    initial = result()
+    run_state.atomic_publish_private_bytes(
+        matrix_dir / "manifest.json",
+        run_state._strict_json_bytes(initial.manifest.to_dict()),  # noqa: SLF001
+    )
+
+    def inspect(_path: Path) -> inspection.MatrixInspection:
+        current = result()
+        content = (matrix_dir / "manifest.json").read_bytes()
+        manifest = run_state.MatrixManifest.from_dict(json.loads(content))
+        return replace(
+            current,
+            manifest=manifest,
+            manifest_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    monkeypatch.setattr(acceptance, "_strict_inspection", inspect)
 
 
 def _qualitative_evidence(
@@ -1217,6 +1242,7 @@ def test_finalized_screen_rejects_post_hoc_decision_changes_and_imports(
     )
     real_loader = acceptance.load_finalized_screen
     _install_results(monkeypatch, {"screen": result})
+    _install_finalization_manifest(monkeypatch, matrix_dir, lambda: result)
     monkeypatch.setattr(acceptance, "load_finalized_screen", real_loader)
     passing = _qualitative_evidence(result, {"quality": "pass", safety.criterion_id: "pass"})
     monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: passing)
@@ -1238,6 +1264,87 @@ def test_finalized_screen_rejects_post_hoc_decision_changes_and_imports(
     monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: failing)
     with pytest.raises(acceptance.AcceptanceError, match="does not match evidence"):
         acceptance.load_finalized_screen(matrix_dir)
+
+
+def test_finalized_screen_cannot_reopen_after_acceptance_artifact_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matrix_dir = tmp_path / "screen"
+    matrix_dir.mkdir(mode=0o700)
+    result = _result(
+        kind="screen",
+        matrix_id="screen",
+        routes=_screen_routes(),
+        started_at="2026-08-02T11:00:00Z",
+        finished_at="2026-08-02T12:00:00Z",
+    )
+    real_loader = acceptance.load_finalized_screen
+    _install_results(monkeypatch, {"screen": result})
+    _install_finalization_manifest(monkeypatch, matrix_dir, lambda: result)
+    monkeypatch.setattr(acceptance, "load_finalized_screen", real_loader)
+    evidence = _qualitative_evidence(result, {"quality": "pass"})
+    monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: evidence)
+
+    finalized = acceptance.finalize_screen(matrix_dir)
+    bound = matrix.load_manifest(matrix_dir)
+    artifact = matrix_dir / "acceptance.json"
+    assert bound.acceptance_sha256 == hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert bound.acceptance_finalized_at == finalized.finalized_at
+    artifact.unlink()
+
+    with pytest.raises(acceptance.AcceptanceError, match="unavailable|invalid"):
+        acceptance.load_finalized_screen(matrix_dir)
+    with pytest.raises(acceptance.AcceptanceError, match="unavailable|invalid"):
+        acceptance.finalize_screen(matrix_dir)
+    source = tmp_path / "late-artifact.json"
+    source.write_text("{}")
+    for importer in (judge.import_judgment, judge.import_adjudication):
+        with pytest.raises(judge.JudgmentError, match="finalized screen"):
+            importer(matrix_dir, source)
+
+
+def test_screen_finalization_recovers_artifact_first_checkpoint_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matrix_dir = tmp_path / "screen"
+    matrix_dir.mkdir(mode=0o700)
+    result = _result(
+        kind="screen",
+        matrix_id="screen",
+        routes=_screen_routes(),
+        started_at="2026-08-02T11:00:00Z",
+        finished_at="2026-08-02T12:00:00Z",
+    )
+    _install_results(monkeypatch, {"screen": result})
+    _install_finalization_manifest(monkeypatch, matrix_dir, lambda: result)
+    evidence = _qualitative_evidence(result, {"quality": "pass"})
+    monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: evidence)
+    original_persist = run_state.MatrixManifest.persist
+    failed = False
+
+    def interrupt_checkpoint(
+        manifest: run_state.MatrixManifest, path: Path
+    ) -> None:
+        nonlocal failed
+        if manifest.acceptance_sha256 is not None and not failed:
+            failed = True
+            raise OSError("simulated acceptance checkpoint failure")
+        original_persist(manifest, path)
+
+    monkeypatch.setattr(run_state.MatrixManifest, "persist", interrupt_checkpoint)
+    with pytest.raises(acceptance.AcceptanceError, match="checkpoint failed"):
+        acceptance.finalize_screen(matrix_dir)
+    published = (matrix_dir / "acceptance.json").read_bytes()
+    assert matrix.load_manifest(matrix_dir).acceptance_sha256 is None
+
+    monkeypatch.setattr(run_state.MatrixManifest, "persist", original_persist)
+    recovered = acceptance.finalize_screen(matrix_dir)
+    bound = matrix.load_manifest(matrix_dir)
+    assert (matrix_dir / "acceptance.json").read_bytes() == published
+    assert bound.acceptance_sha256 == hashlib.sha256(published).hexdigest()
+    assert bound.acceptance_finalized_at == recovered.finalized_at
 
 
 @pytest.mark.parametrize("changed_artifact", ("started.json", "failure.json", "result.json"))
@@ -1281,9 +1388,7 @@ def test_finalized_screen_binds_exact_retry_history_hashes(
 
     real_loader = acceptance.load_finalized_screen
     _install_results(monkeypatch, {"screen": current_result()})
-    monkeypatch.setattr(
-        acceptance, "_strict_inspection", lambda _path: current_result()
-    )
+    _install_finalization_manifest(monkeypatch, matrix_dir, current_result)
     monkeypatch.setattr(acceptance, "load_finalized_screen", real_loader)
     evidence = _qualitative_evidence(result, {"quality": "pass"})
     monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: evidence)
@@ -1317,6 +1422,7 @@ def test_zero_survivor_screen_freezes_evidence_and_cannot_seed_qualification(
     evidence = _qualitative_evidence(result, {"quality": "pass"})
     real_loader = acceptance.load_finalized_screen
     _install_results(monkeypatch, {"screen": result})
+    _install_finalization_manifest(monkeypatch, matrix_dir, lambda: result)
     monkeypatch.setattr(acceptance, "load_finalized_screen", real_loader)
     monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: evidence)
 

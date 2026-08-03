@@ -16,7 +16,7 @@
   ],
   "properties": {
     "schema": {"const": "steam-agent-eval-adjudication/0.1"},
-    "adjudication_id": {"$ref": "#/$defs/token"},
+    "adjudication_id": {"$ref": "#/$defs/adjudicationId"},
     "target": {
       "type": "object",
       "additionalProperties": false,
@@ -66,6 +66,10 @@
     "created_at": {"type": "string", "format": "date-time"}
   },
   "$defs": {
+    "adjudicationId": {
+      "type": "string",
+      "pattern": "^adjudication-[A-Za-z0-9][A-Za-z0-9._+-]{0,114}$"
+    },
     "token": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"

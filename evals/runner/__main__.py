@@ -574,6 +574,12 @@ def _validate_scenario_metadata(scenario: dict[str, Any]) -> None:
             raise UnsupportedScenarioError(
                 "scenario required-document count does not match its commands"
             )
+        if scenario.get("execution_support") == "deterministic_only" and (
+            scenario.get("required_document_count") != 1 or len(requirements) != 1
+        ):
+            raise UnsupportedScenarioError(
+                "deterministic-only scenario requires exactly one CLI document"
+            )
     for requirement in requirements:
         _validate_accepted_optional_options(requirement)
     oracle = scenario.get("deterministic_oracle") or {}
@@ -1579,11 +1585,13 @@ def _validate_claim_evaluation_budget(
     if oracle_document is None:
         return
     required_paths = _must_mention_paths(fact_rubric)
+    optional_paths = tuple(fact_rubric.get("support_if_claimed", ()))
+    evidence_paths = (*required_paths, *optional_paths)
     selection_steps = sum(
         grade.path_selection_steps(claim["path"]) * _CLAIM_SELECTION_PASSES
         for turn in turns
         for claim in (turn["_claims"] or ())
-    ) + sum(grade.path_selection_steps(path) for path in required_paths)
+    ) + sum(grade.path_selection_steps(path) for path in evidence_paths)
     # Coverage compares every supported claim-location set with every required
     # location set. Charging one document-weighted step per pair bounds the
     # subset and union memberships before any concrete locations are retained.

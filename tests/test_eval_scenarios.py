@@ -322,6 +322,20 @@ def test_schema_03_rejects_qualitative_fields_larger_than_manifest_bounds() -> N
     assert list(validator.iter_errors(long_requirement))
 
 
+@pytest.mark.parametrize("field", ("must_mention", "support_if_claimed"))
+def test_schema_03_bounds_each_selected_evidence_path_set(field: str) -> None:
+    validator = _validators()["steam-agent-eval/0.3"]
+    valid = _live_scenario_03()
+    valid["fact_rubric"][field] = [f"$.data.field_{index}" for index in range(6)]
+    invalid = _live_scenario_03()
+    invalid["fact_rubric"][field] = [
+        f"$.data.field_{index}" for index in range(7)
+    ]
+
+    assert not list(validator.iter_errors(valid))
+    assert list(validator.iter_errors(invalid))
+
+
 def test_schema_03_semantics_reject_more_than_1024_combined_criteria() -> None:
     scenario = _scenario_03()
     scenario["judged_answer_rubric"]["criteria"] = [
@@ -417,6 +431,46 @@ def test_schema_03_rejects_invalid_unsupported_reasons(
     scenario["unsupported_reason"] = reason
 
     assert list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+
+@pytest.mark.parametrize("document_count", (0, 2))
+def test_schema_03_deterministic_only_requires_exactly_one_cli_document(
+    document_count: int,
+) -> None:
+    validator = _validators()["steam-agent-eval/0.3"]
+    valid = _live_scenario_03()
+    valid["execution_support"] = "deterministic_only"
+    valid["unsupported_reason"] = "writer_missing"
+    invalid = _live_scenario_03()
+    invalid["execution_support"] = "deterministic_only"
+    invalid["unsupported_reason"] = "writer_missing"
+    invalid["required_document_count"] = document_count
+    invalid["tool_policy"]["required"] = [
+        dict(invalid["tool_policy"]["required"][0]) for _ in range(document_count)
+    ]
+
+    assert not list(validator.iter_errors(valid))
+    assert list(validator.iter_errors(invalid))
+
+
+@pytest.mark.parametrize("document_count", (0, 2))
+def test_schema_03_semantics_enforce_deterministic_only_document_cardinality(
+    document_count: int,
+) -> None:
+    scenario = _live_scenario_03()
+    scenario["execution_support"] = "deterministic_only"
+    scenario["unsupported_reason"] = "writer_missing"
+    scenario["required_document_count"] = document_count
+    scenario["tool_policy"]["required"] = [
+        dict(scenario["tool_policy"]["required"][0])
+        for _ in range(document_count)
+    ]
+
+    with pytest.raises(
+        runner_main.UnsupportedScenarioError,
+        match="deterministic-only scenario requires exactly one CLI document",
+    ):
+        runner_main._validate_scenario_metadata(scenario)  # noqa: SLF001
 
 
 def test_schema_03_runtime_checks_count_overlap_and_oracle_backing() -> None:

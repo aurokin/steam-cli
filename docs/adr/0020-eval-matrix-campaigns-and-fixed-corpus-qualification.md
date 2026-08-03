@@ -71,6 +71,11 @@ It binds the subject report digest, scenario and rubric digests, judge model and
 settings, prompt/parser versions, blinded candidate label, presentation order,
 and per-criterion verdicts. It never receives route identity, reasoning,
 commands, raw protocol errors, or suppressed unsafe content.
+Candidate answer and sidecar strings are rejected when token-aware scanning
+finds the exact candidate model ID, a fixed route alias (`sol`, `terra`, or
+`luna`), `xhigh`, or `low`, `medium`, or `high` bound to model, route, effort,
+generator, candidate, or reasoning context. Token boundaries keep ordinary
+words and uses such as low settings or high frame rates judgeable.
 
 The matrix qualitative rubric preserves authored judged-answer criteria and
 promotes every hard-fail fact criterion, `fact_rubric.must_mention` path, and
@@ -94,6 +99,12 @@ validated captured CLI document; they do not source that value from the claims
 sidecar. Conditional support represents zero, one, or many selected values,
 preserves explicit unknown, false, and empty states, fails unsupported or wrong
 assertions, and passes true omission.
+Each selected-evidence source is schema-bounded to six paths. A selected value
+is bounded to 512 KiB of canonical JSON and all selected values are charged
+incrementally against an 8 MiB aggregate before they are attached to the
+projection. Thus the twelve-path schema maximum contributes at most 6 MiB of
+evidence, while the runner's document-weighted selection budget rejects
+expensive required and optional path traversal before judging.
 Passing claim-sidecar grading does not satisfy a must-mention criterion: the
 three configured judges and agreement adjudication must resolve that the value
 was explicitly present in the user-visible answer. Deterministic sidecar
@@ -105,6 +116,15 @@ An adjudication binds immutable judgment hashes and yields `pass`, `fail`, or
 never override a deterministic `false`. Missing qualitative projection,
 malformed output, critical disagreement, or privacy failure remains unresolved
 and cannot qualify.
+Imported artifact IDs are opaque namespace tokens: judgments require the
+`judgment-` prefix and adjudications require `adjudication-`. Bare account,
+SteamID64-shaped, or private identifiers are rejected before a retained
+filename is constructed.
+Adjudication inspects the matrix once and builds a shared work-item/scenario
+index, including a lazily cached expected target per referenced work item. Every
+retained judgment is still freshly read and independently checked for private
+mode, schema, canonical bytes, target digests, projection binding, privacy,
+rubric coverage, and campaign policy before it can participate.
 
 Qualification uses the calibrated three-judge GPT-Sol xhigh configuration.
 The campaign manifest predeclares three opaque judge identities and binds each
@@ -144,7 +164,12 @@ The accepted screen decision is a separate canonical `acceptance.json`
 artifact, published once with private permissions under the completed screen
 while holding the screen matrix lock. Its exact bytes bind the screen manifest,
 route decisions, survivors, qualitative-evidence root, and finalization time.
-Once published, the screen accepts no additional judgments or adjudications.
+Publication is followed by an append-only manifest checkpoint that binds the
+exact acceptance SHA-256 and finalization time. The artifact-first ordering is
+recoverable after an interrupted checkpoint, but once the manifest is bound the
+decision cannot be removed or replaced: a missing, changed, or malformed bound
+artifact is invalid rather than an unfinalized screen. Once bound, the screen
+accepts no additional judgments or adjudications.
 This freeze also applies when the complete screen has zero survivors: the
 artifact preserves every rejection and its evidence, while its empty survivor
 set makes it ineligible as qualification provenance.
@@ -174,9 +199,14 @@ writer can reconstruct Valve's exact-target review; the wishlist-scope fixture
 executes the frozen CLI. The runner grades every frozen assertion and persists a
 canonical preflight attestation in the manifest only after all pass. Each entry
 binds the executor, scenario source, child source, schema, and rubric SHA-256
-digests, the oracle-document and grading-result SHA-256 digests, and the
-`passed` outcome. The attestation must cover exactly the deterministic-only
-inputs; manifest loading, resume, inspection, and acceptance revalidate it.
+digests, a digest over the retained input, oracle document, and versioned replay
+definition, the grading-result SHA-256 digest, and the `passed` outcome. The
+private archive retains those four canonical artifacts. Historical replay uses
+only that frozen definition and the retained oracle document; it does not read
+the current checkout or invoke the current runner, while deletion, replacement,
+or rewriting of retained evidence still fails closed. The attestation must
+cover exactly the deterministic-only inputs; manifest loading, resume,
+inspection, and acceptance revalidate it.
 Supplying a preconstructed attestation does not skip creation-time preflight.
 
 ### Observed gaps create a new corpus and fresh claims
@@ -193,7 +223,10 @@ fresh qualification for every route being compared.
 Campaigns cost more process startup, controls, preflight, storage, and model
 work, but each observation retains the already-reviewed child-cohort boundary.
 Resume can recover scheduling progress without converting an abandoned child
-run into eligible evidence. Exact compatibility keys prevent accidental
+run into eligible evidence. An abandoned attempt that already published an
+observed completion remains distinct audit history and its complete child
+bundle and artifact hashes are revalidated exactly like an official completion.
+Exact compatibility keys prevent accidental
 cross-schema, cross-track, cross-commit, or post-selection pooling.
 
 Five qualification replicates are a strict fixed-corpus acceptance rule, not a

@@ -335,13 +335,21 @@ def _frozen_acceptance_bytes(path: Path) -> tuple[AcceptanceResult, bytes]:
 def _load_finalized_screen_locked(
     matrix_dir: Path,
 ) -> tuple[AcceptanceResult, bytes, inspection.MatrixInspection]:
-    frozen, content = _frozen_acceptance_bytes(matrix_dir / "acceptance.json")
     result = _strict_inspection(matrix_dir)
+    manifest = result.manifest
+    if (
+        manifest.acceptance_sha256 is None
+        or manifest.acceptance_finalized_at is None
+    ):
+        raise AcceptanceError("screen acceptance is not finalized")
+    frozen, content = _frozen_acceptance_bytes(matrix_dir / "acceptance.json")
     current = _evaluate_inspected(result, screen_dir=None)
     if (
         frozen.campaign_kind != "screen"
         or frozen.status != "complete"
         or frozen.finalized_at is None
+        or frozen.finalized_at != manifest.acceptance_finalized_at
+        or hashlib.sha256(content).hexdigest() != manifest.acceptance_sha256
         or replace(frozen, finalized_at=None) != current
     ):
         raise AcceptanceError("finalized screen acceptance does not match evidence")
@@ -371,8 +379,14 @@ def finalize_screen(matrix_dir: Path) -> AcceptanceResult:
             ):
                 raise AcceptanceError("screen is not complete and finalizable")
             path = matrix_dir / "acceptance.json"
+            manifest = result.manifest
+            if manifest.acceptance_sha256 is not None:
+                frozen, _content, _inspected = _load_finalized_screen_locked(
+                    matrix_dir
+                )
+                return frozen
             try:
-                frozen, _existing = _frozen_acceptance_bytes(path)
+                frozen, content = _frozen_acceptance_bytes(path)
             except AcceptanceError as error:
                 if str(error) != "finalized screen acceptance is unavailable":
                     raise
@@ -384,21 +398,33 @@ def finalize_screen(matrix_dir: Path) -> AcceptanceResult:
                     raise AcceptanceError(
                         "finalized screen acceptance does not match evidence"
                     )
-                return frozen
-            finalized = datetime.now(timezone.utc)
-            if finalized <= _parse_time(result.manifest.finished_at):
-                raise AcceptanceError("screen finalization chronology is invalid")
-            decision = replace(
-                decision,
-                finalized_at=finalized.isoformat(timespec="microseconds").replace(
-                    "+00:00", "Z"
-                ),
-            )
-            content = matrix._canonical_json_bytes(decision.to_dict())  # noqa: SLF001
+                decision = frozen
+            if decision.finalized_at is None:
+                finalized = datetime.now(timezone.utc)
+                if finalized <= _parse_time(result.manifest.finished_at):
+                    raise AcceptanceError("screen finalization chronology is invalid")
+                decision = replace(
+                    decision,
+                    finalized_at=finalized.isoformat(timespec="microseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                )
+                content = matrix._canonical_json_bytes(decision.to_dict())  # noqa: SLF001
+                try:
+                    run_state.atomic_publish_private_bytes(path, content)
+                except FileExistsError:
+                    raise AcceptanceError("finalized screen acceptance raced") from None
+            digest = hashlib.sha256(content).hexdigest()
             try:
-                run_state.atomic_publish_private_bytes(path, content)
-            except FileExistsError:
-                raise AcceptanceError("finalized screen acceptance raced") from None
+                finalized_manifest = manifest.bind_acceptance(
+                    digest,
+                    finalized_at=decision.finalized_at,
+                )
+                finalized_manifest.persist(matrix_dir / "manifest.json")
+            except (OSError, run_state.ManifestStateError):
+                raise AcceptanceError(
+                    "screen acceptance finalization checkpoint failed"
+                ) from None
             return decision
     except matrix.MatrixError as error:
         raise AcceptanceError(str(error)) from None
@@ -1271,7 +1297,11 @@ def _evaluate_inspected(
     if manifest.campaign.campaign_kind == "screen":
         _verify_screen_config(result)
         _verify_screen_corpus(manifest)
-    manifest_sha256 = result.manifest_sha256
+    manifest_sha256 = (
+        manifest.acceptance_source_sha256
+        if manifest.acceptance_sha256 is not None
+        else result.manifest_sha256
+    )
     is_complete = manifest.state is run_state.MatrixState.COMPLETED
     if not is_complete:
         decisions = _pending_decisions(manifest)
@@ -1313,7 +1343,11 @@ def _evaluate_inspected(
         screen_acceptance, screen_acceptance_bytes, screen_result = (
             load_finalized_screen(Path(screen_dir))
         )
-        source_screen_hash = screen_result.manifest_sha256
+        source_screen_hash = (
+            screen_result.manifest.acceptance_source_sha256
+            if screen_result.manifest.acceptance_sha256 is not None
+            else screen_result.manifest_sha256
+        )
         source_screen_acceptance_sha256 = hashlib.sha256(
             screen_acceptance_bytes
         ).hexdigest()

@@ -44,6 +44,8 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = run_state.MATRIX_MANIFEST_MAX_BYTES
 _MAX_CALIBRATED_ASSET_BYTES = 1024 * 1024
 _MAX_PREFLIGHT_ARTIFACT_BYTES = 4 * 1024 * 1024
+_MAX_ACCEPTANCE_ARTIFACT_BYTES = 16 * 1024 * 1024
+_PREFLIGHT_REPLAY_SCHEMA = "steam-agent-eval-preflight-replay/0.1"
 _MAX_CORPUS_OBJECT_BYTES = 1024 * 1024
 _MAX_CORPUS_TREE_BYTES = 256 * 1024
 _MAX_WORK_ITEMS = 10_000
@@ -147,6 +149,7 @@ class _PreflightArtifact:
     input_document: Any
     oracle_document: Any
     grading_result: dict[str, Any]
+    replay_definition: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1277,20 +1280,29 @@ def _preflight_campaign_scenarios(
         evidence: dict[str, tuple[str, str, str]] = {}
         artifacts: list[_PreflightArtifact] = []
         for scenario_id in deterministic_ids:
+            input_document = documents[scenario_id]
             result = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
-                dict(documents[scenario_id]), source_root=root / "src"
+                dict(input_document), source_root=root / "src"
+            )
+            replay_definition = _preflight_replay_definition(
+                input_document, executor=result.executor
             )
             evidence[scenario_id] = (
                 result.executor,
-                result.document_sha256,
+                _preflight_bundle_digest(
+                    input_document,
+                    result.document,
+                    replay_definition,
+                ),
                 result.grading_sha256,
             )
             artifacts.append(
                 _PreflightArtifact(
                     scenario_id=scenario_id,
-                    input_document=documents[scenario_id],
+                    input_document=input_document,
                     oracle_document=result.document,
                     grading_result=result.grading,
+                    replay_definition=replay_definition,
                 )
             )
         return _ExecutedPreflight(
@@ -1314,12 +1326,187 @@ def _publish_preflight_evidence(
         for kind, value in (
             ("input", artifact.input_document),
             ("document", artifact.oracle_document),
+            ("definition", artifact.replay_definition),
             ("grading", artifact.grading_result),
         ):
             run_state.atomic_publish_private_bytes(
                 evidence_root / f"{artifact.scenario_id}.{kind}.json",
                 _preflight_json_bytes(value),
             )
+
+
+def _preflight_replay_definition(
+    input_document: Any, *, executor: str
+) -> dict[str, Any]:
+    if not isinstance(input_document, dict):
+        raise MatrixError("matrix deterministic-only preflight failed")
+    oracle = input_document.get("deterministic_oracle")
+    assertions = oracle.get("assertions") if isinstance(oracle, dict) else None
+    if not isinstance(assertions, list):
+        raise MatrixError("matrix deterministic-only preflight failed")
+    retained = [
+        assertion
+        for assertion in assertions
+        if isinstance(assertion, dict)
+        and assertion.get("source", "cli_document") == "cli_document"
+    ]
+    if not retained or len(retained) != sum(
+        isinstance(assertion, dict)
+        and assertion.get("source", "cli_document") == "cli_document"
+        for assertion in assertions
+    ):
+        raise MatrixError("matrix deterministic-only preflight failed")
+    return {
+        "schema": _PREFLIGHT_REPLAY_SCHEMA,
+        "executor": executor,
+        "assertions": retained,
+    }
+
+
+def _preflight_bundle_digest(
+    input_document: Any,
+    oracle_document: Any,
+    replay_definition: Any,
+) -> str:
+    content = _preflight_json_bytes(
+        {
+            "input": input_document,
+            "document": oracle_document,
+            "definition": replay_definition,
+        }
+    )
+    return hashlib.sha256(content).hexdigest()
+
+
+def _replay_json_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, int | float) and isinstance(right, int | float):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(
+            _replay_json_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _replay_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _replay_select(document: Any, path: Any) -> tuple[list[Any], bool]:
+    if path == "$":
+        return [document], False
+    if not isinstance(path, str) or not path.startswith("$.") or len(path) > 1024:
+        raise ValueError("unsupported replay path")
+    nodes = [document]
+    plural = False
+    segments: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(path[2:]):
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+        elif character == "." and depth == 0:
+            segments.append(path[2:][start:index])
+            start = index + 1
+        if depth < 0:
+            raise ValueError("unsupported replay path")
+    if depth != 0:
+        raise ValueError("unsupported replay path")
+    segments.append(path[2:][start:])
+    for segment in segments:
+        match = re.fullmatch(r"([a-z_][a-z0-9_]*)((?:\[[^]]+\])*)", segment)
+        if match is None:
+            raise ValueError("unsupported replay path")
+        nodes = [node[match.group(1)] for node in nodes]
+        for bracket in re.findall(r"\[([^]]+)\]", match.group(2)):
+            if bracket == "*":
+                nodes = [item for node in nodes for item in node]
+                plural = True
+            elif bracket.isascii() and bracket.isdecimal():
+                nodes = [node[int(bracket)] for node in nodes]
+            else:
+                condition = re.fullmatch(
+                    r"\?\(@\.([a-z_]+)==(?:([0-9]+)|'([^']+)')\)", bracket
+                )
+                if condition is None:
+                    raise ValueError("unsupported replay path")
+                field, number, text = condition.groups()
+                expected = int(number) if number is not None else text
+                nodes = [
+                    item
+                    for node in nodes
+                    for item in node
+                    if isinstance(item, dict)
+                    and field in item
+                    and _replay_json_equal(item[field], expected)
+                ]
+                plural = True
+            if len(nodes) > 16 * 1024:
+                raise ValueError("replay selection exceeded safety limit")
+    return nodes, plural
+
+
+def _replay_assertion(document: Any, assertion: Any) -> bool:
+    if not isinstance(assertion, dict) or set(assertion) - {
+        "path",
+        "operator",
+        "expected",
+        "source",
+    }:
+        raise ValueError("invalid replay assertion")
+    if assertion.get("source", "cli_document") != "cli_document":
+        raise ValueError("invalid replay assertion source")
+    values, plural = _replay_select(document, assertion.get("path"))
+    operator = assertion.get("operator")
+    expected = assertion.get("expected")
+    if operator == "ordered_equals":
+        actual = values if plural else values[0]
+        return _replay_json_equal(actual, expected)
+    actual = values[0] if len(values) == 1 else values
+    if operator == "equals":
+        return _replay_json_equal(actual, expected)
+    if operator == "contains":
+        if isinstance(actual, list):
+            return any(_replay_json_equal(item, expected) for item in actual)
+        return expected in actual
+    if operator == "omits":
+        if isinstance(actual, list):
+            return not any(_replay_json_equal(item, expected) for item in actual)
+        return expected not in actual
+    if operator == "one_of" and isinstance(expected, list) and expected:
+        return any(_replay_json_equal(actual, item) for item in expected)
+    raise ValueError("unsupported replay operator")
+
+
+def _replay_preflight(
+    oracle_document: Any, replay_definition: Any
+) -> dict[str, Any]:
+    if (
+        not isinstance(replay_definition, dict)
+        or set(replay_definition) != {"schema", "executor", "assertions"}
+        or replay_definition.get("schema") != _PREFLIGHT_REPLAY_SCHEMA
+        or replay_definition.get("executor") not in {"frozen_cli", "domain_oracle"}
+        or not isinstance(replay_definition.get("assertions"), list)
+        or not replay_definition["assertions"]
+    ):
+        raise ValueError("invalid preflight replay definition")
+    failures = [
+        dict(assertion)
+        for assertion in replay_definition["assertions"]
+        if not _replay_assertion(oracle_document, assertion)
+    ]
+    return {
+        "assertions": len(replay_definition["assertions"]),
+        "failed": failures,
+        "passed": not failures,
+    }
 
 
 def validate_retained_preflight_evidence(
@@ -1329,6 +1516,7 @@ def validate_retained_preflight_evidence(
     *,
     root: Path = ROOT,
 ) -> None:
+    del root
     deterministic = tuple(
         item for item in inputs.scenarios if item.execution_support == "deterministic_only"
     )
@@ -1339,22 +1527,17 @@ def validate_retained_preflight_evidence(
         expected_names = {
             f"{scenario_id}.{kind}.json"
             for scenario_id in scenario_ids
-            for kind in ("input", "document", "grading")
+            for kind in ("input", "document", "definition", "grading")
         }
         items = tuple(evidence_root.iterdir())
         if {item.name for item in items} != expected_names:
             raise MatrixError("matrix retained preflight evidence is invalid")
-        scenarios, current_documents = _scenario_documents(scenario_ids, root=Path(root))
-        if scenarios != deterministic:
-            raise MatrixError("matrix retained preflight evidence is invalid")
         attested = {item.scenario_id: item for item in attestation.scenarios}
         if set(attested) != set(scenario_ids):
             raise MatrixError("matrix retained preflight evidence is invalid")
-        from evals.runner import __main__ as runner_main
-
         for scenario_id in scenario_ids:
             retained: dict[str, tuple[Any, bytes]] = {}
-            for kind in ("input", "document", "grading"):
+            for kind in ("input", "document", "definition", "grading"):
                 content = _private_regular_bytes(
                     evidence_root / f"{scenario_id}.{kind}.json",
                     max_bytes=_MAX_PREFLIGHT_ARTIFACT_BYTES,
@@ -1363,29 +1546,37 @@ def validate_retained_preflight_evidence(
                 if content != _preflight_json_bytes(value):
                     raise MatrixError("matrix retained preflight evidence is invalid")
                 retained[kind] = (value, content)
-            if retained["input"][0] != current_documents[scenario_id]:
+            input_document = retained["input"][0]
+            replay_definition = retained["definition"][0]
+            if (
+                not isinstance(input_document, dict)
+                or input_document.get("id") != scenario_id
+                or replay_definition
+                != _preflight_replay_definition(
+                    input_document,
+                    executor=attested[scenario_id].executor,
+                )
+            ):
                 raise MatrixError("matrix retained preflight evidence is invalid")
-            replayed = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
-                dict(retained["input"][0]), source_root=Path(root) / "src"
+            replayed_grading = _replay_preflight(
+                retained["document"][0], replay_definition
             )
             expected = attested[scenario_id]
             if (
-                replayed.executor != expected.executor
-                or replayed.document_sha256 != expected.document_sha256
-                or replayed.grading_sha256 != expected.grading_sha256
-                or retained["document"][1]
-                != _preflight_json_bytes(replayed.document)
-                or retained["grading"][1]
-                != _preflight_json_bytes(replayed.grading)
-                or hashlib.sha256(retained["document"][1]).hexdigest()
+                _preflight_bundle_digest(
+                    input_document,
+                    retained["document"][0],
+                    replay_definition,
+                )
                 != expected.document_sha256
+                or retained["grading"][0] != replayed_grading
                 or hashlib.sha256(retained["grading"][1]).hexdigest()
                 != expected.grading_sha256
             ):
                 raise MatrixError("matrix retained preflight evidence is invalid")
     except MatrixError:
         raise MatrixError("matrix retained preflight evidence is invalid") from None
-    except (OSError, UnicodeError, ValueError):
+    except (IndexError, KeyError, OSError, TypeError, UnicodeError, ValueError):
         raise MatrixError("matrix retained preflight evidence is invalid") from None
 
 
@@ -2426,11 +2617,37 @@ def _verify_preflight_artifact_directory(path: Path) -> None:
         if (
             len(parts) != 3
             or _SAFE_COMPONENT.fullmatch(parts[0]) is None
-            or parts[1] not in {"input", "document", "grading"}
+            or parts[1] not in {"input", "document", "definition", "grading"}
             or parts[2] != "json"
         ):
             raise MatrixError("matrix preflight directory contains unexpected nodes")
         _private_attempt_file(item)
+
+
+def _validate_bound_acceptance_artifact(
+    matrix_dir: Path, manifest: run_state.MatrixManifest
+) -> None:
+    if manifest.acceptance_sha256 is None:
+        return
+    try:
+        content = _private_regular_bytes(
+            Path(matrix_dir) / "acceptance.json",
+            max_bytes=_MAX_ACCEPTANCE_ARTIFACT_BYTES,
+        )
+        document = _strict_json_loads(content.decode("ascii"))
+        if (
+            content != _canonical_json_bytes(document)
+            or hashlib.sha256(content).hexdigest() != manifest.acceptance_sha256
+            or not isinstance(document, dict)
+            or document.get("campaign_kind") != "screen"
+            or document.get("status") != "complete"
+            or document.get("finalized_at") != manifest.acceptance_finalized_at
+        ):
+            raise MatrixError("matrix acceptance finalization is invalid")
+    except MatrixError:
+        raise MatrixError("matrix acceptance finalization is invalid") from None
+    except (OSError, UnicodeError, ValueError):
+        raise MatrixError("matrix acceptance finalization is invalid") from None
 
 
 def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) -> None:
@@ -2450,6 +2667,10 @@ def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) 
     top_names = {item.name for item in matrix_dir.iterdir()}
     if (
         not {"calibration", "preflight", "config.json", "manifest.json"} <= top_names
+        or (
+            manifest.acceptance_sha256 is not None
+            and "acceptance.json" not in top_names
+        )
         or not top_names <= allowed_top
     ):
         raise MatrixError("matrix directory contains unexpected nodes")
@@ -2462,6 +2683,7 @@ def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) 
         _private_attempt_file(matrix_dir / name)
     _verify_calibration_artifact_directory(matrix_dir / "calibration")
     _verify_preflight_artifact_directory(matrix_dir / "preflight")
+    _validate_bound_acceptance_artifact(matrix_dir, manifest)
     for name in top_names & artifact_directories:
         _verify_qualitative_artifact_directory(matrix_dir / name)
     work_root = matrix_dir / "work"
@@ -2640,7 +2862,11 @@ def _verify_qualification_source(
         }
         if (
             inspected.manifest.matrix_id != campaign.source_screen_matrix_id
-            or inspected.manifest_sha256
+            or (
+                inspected.manifest.acceptance_source_sha256
+                if inspected.manifest.acceptance_sha256 is not None
+                else inspected.manifest_sha256
+            )
             != campaign.source_screen_manifest_sha256
             or hashlib.sha256(content).hexdigest()
             != campaign.source_screen_acceptance_sha256

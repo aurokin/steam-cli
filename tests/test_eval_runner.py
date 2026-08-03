@@ -2061,6 +2061,29 @@ def test_claim_grading_rejects_multiplicative_selection_work() -> None:
     assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
 
 
+def test_claim_budget_charges_schema_maximum_optional_evidence_paths() -> None:
+    document = {
+        "data": {
+            f"items_{index}": [0] * 100_000
+            for index in range(6)
+        }
+    }
+    fact_rubric = {
+        "must_mention": [],
+        "support_if_claimed": [
+            f"$.data.items_{index}[*]" for index in range(6)
+        ],
+        "criteria": [],
+    }
+
+    with pytest.raises(ValueError) as captured:
+        runner_main._validate_claim_evaluation_budget(  # noqa: SLF001
+            [{"index": 0, "_claims": []}], document, fact_rubric
+        )
+
+    assert str(captured.value) == runner_main._CLAIM_EVALUATION_LIMIT_ERROR  # noqa: SLF001
+
+
 def test_claim_grading_charges_concrete_location_depth() -> None:
     value: object = list(range(35_000))
     for _ in range(64):

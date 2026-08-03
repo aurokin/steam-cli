@@ -38,11 +38,12 @@ Schema `0.3` adds these required top-level fields:
 - `required_document_count` equals the number of entries in
   `tool_policy.required`.
 
-A live scenario must remain compatible with the runner's exact-one required
-document evidence contract. A deterministic-only scenario remains in
-deterministic preflight and outside live denominators. The runner derives this
-behavior from scenario metadata rather than a private identifier list. A
-scenario whose metadata and executable shape disagree fails preflight.
+A live scenario may require at most one captured CLI document. A
+deterministic-only scenario requires exactly one CLI document, matching the
+smallest contract the current deterministic preflight executor can evaluate.
+It remains outside live denominators. The runner derives this behavior from
+scenario metadata rather than a private identifier list. A scenario whose
+metadata and executable shape disagree fails preflight.
 
 ### Separate required mentions from optional grounded claims
 

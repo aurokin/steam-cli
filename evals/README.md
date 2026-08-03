@@ -158,8 +158,10 @@ appears as a survivor while required screen safety adjudication is missing or
 unresolved. Qualification gates every qualitative criterion.
 For a completed accepted screen, `accept` atomically publishes the canonical
 private `acceptance.json` decision. This freezes its survivor and qualitative
-evidence selection and records the finalization time: later judgment or
-adjudication imports are rejected.
+evidence selection and records its exact SHA-256 and finalization time in an
+append-only manifest checkpoint: later judgment or adjudication imports are
+rejected, and deleting or replacing the bound artifact fails closed rather than
+reopening the screen.
 Even a complete screen with zero survivors publishes this immutable evidence;
 its empty survivor set simply cannot seed qualification.
 Qualification `screen_provenance` must name the source screen matrix and include

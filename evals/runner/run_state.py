@@ -2369,6 +2369,8 @@ class MatrixManifest:
     started_at: str
     updated_at: str
     finished_at: str | None
+    acceptance_sha256: str | None = None
+    acceptance_finalized_at: str | None = None
     schema: str = MATRIX_MANIFEST_SCHEMA
 
     def __post_init__(self) -> None:
@@ -2462,6 +2464,19 @@ class MatrixManifest:
                 raise ManifestStateError("completed matrix lacks a finish time")
         elif self.finished_at is not None:
             raise ManifestStateError("open matrix has a finish time")
+        if (self.acceptance_sha256 is None) != (
+            self.acceptance_finalized_at is None
+        ):
+            raise ManifestStateError("matrix acceptance finalization is incomplete")
+        if self.acceptance_sha256 is not None:
+            if (
+                self.state is not MatrixState.COMPLETED
+                or self.campaign.campaign_kind != "screen"
+                or _SHA256.fullmatch(self.acceptance_sha256) is None
+                or _parse_time(self.acceptance_finalized_at)
+                <= _parse_time(self.finished_at)
+            ):
+                raise ManifestStateError("matrix acceptance finalization is invalid")
 
     @classmethod
     def create(
@@ -2531,8 +2546,32 @@ class MatrixManifest:
             finished_at=timestamp if next_state is MatrixState.COMPLETED else None,
         )
 
+    def bind_acceptance(self, digest: str, *, finalized_at: str) -> Self:
+        if (
+            self.state is not MatrixState.COMPLETED
+            or self.campaign.campaign_kind != "screen"
+            or self.acceptance_sha256 is not None
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise ManifestStateError("matrix acceptance cannot be finalized")
+        _parse_time(finalized_at)
+        return replace(
+            self,
+            acceptance_sha256=digest,
+            acceptance_finalized_at=finalized_at,
+        )
+
+    @property
+    def acceptance_source_sha256(self) -> str:
+        source = replace(
+            self,
+            acceptance_sha256=None,
+            acceptance_finalized_at=None,
+        )
+        return _sha256_bytes(_strict_json_bytes(source.to_dict()))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "schema": self.schema,
             "matrix_id": self.matrix_id,
             "state": self.state.value,
@@ -2550,6 +2589,10 @@ class MatrixManifest:
             "updated_at": self.updated_at,
             "finished_at": self.finished_at,
         }
+        if self.acceptance_sha256 is not None:
+            value["acceptance_sha256"] = self.acceptance_sha256
+            value["acceptance_finalized_at"] = self.acceptance_finalized_at
+        return value
 
     @classmethod
     def from_dict(cls, value: Any) -> Self:
@@ -2571,7 +2614,12 @@ class MatrixManifest:
             "updated_at",
             "finished_at",
         }
-        if not isinstance(value, dict) or set(value) != expected:
+        optional = {"acceptance_sha256", "acceptance_finalized_at"}
+        if (
+            not isinstance(value, dict)
+            or frozenset(value)
+            not in {frozenset(expected), frozenset(expected | optional)}
+        ):
             raise ManifestStateError("invalid matrix manifest")
         work_items = value["work_items"]
         excluded = value["excluded_scenario_ids"]
@@ -2605,6 +2653,8 @@ class MatrixManifest:
             started_at=value["started_at"],
             updated_at=value["updated_at"],
             finished_at=value["finished_at"],
+            acceptance_sha256=value.get("acceptance_sha256"),
+            acceptance_finalized_at=value.get("acceptance_finalized_at"),
         )
 
     def persist(self, path: Path) -> None:
@@ -2641,6 +2691,20 @@ class MatrixManifest:
             )
             == self
         )
+        acceptance_transition = (
+            existing.acceptance_sha256 is None
+            and existing.acceptance_finalized_at is None
+            and self.acceptance_sha256 is not None
+            and replace(
+                existing,
+                acceptance_sha256=self.acceptance_sha256,
+                acceptance_finalized_at=self.acceptance_finalized_at,
+            )
+            == self
+        )
+        if acceptance_transition:
+            _atomic_replace_private_bytes(path, _strict_json_bytes(self.to_dict()))
+            return
         if (
             not same_static
             or existing.state is not MatrixState.OPEN

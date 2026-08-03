@@ -17,7 +17,7 @@
   ],
   "properties": {
     "schema": {"const": "steam-agent-eval-judgment/0.1"},
-    "judgment_id": {"$ref": "#/$defs/token"},
+    "judgment_id": {"$ref": "#/$defs/judgmentId"},
     "target": {
       "type": "object",
       "additionalProperties": false,
@@ -98,6 +98,10 @@
     "created_at": {"type": "string", "format": "date-time"}
   },
   "$defs": {
+    "judgmentId": {
+      "type": "string",
+      "pattern": "^judgment-[A-Za-z0-9][A-Za-z0-9._+-]{0,118}$"
+    },
     "token": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"

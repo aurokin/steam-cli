@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import stat
 import sys
+import time
 from typing import Any
 
 import pytest
@@ -83,7 +84,7 @@ def test_verified_judge_calibration_labels_bind_the_complete_case_set() -> None:
         settings_path.read_bytes()
     ).hexdigest()
     assert results["status"] == "verified"
-    assert results["reviewed_at"] == "2026-08-03T01:08:34Z"
+    assert results["reviewed_at"] == "2026-08-03T01:49:40Z"
     assert len(results["reviewers"]) == 3
     expected_ids = list(labels["labels"])
     expected_verdicts = [labels["labels"][case_id] for case_id in expected_ids]
@@ -144,6 +145,41 @@ def test_judge_calibration_covers_required_defect_classes() -> None:
             "claims",
             "declined",
         }
+
+
+def test_judge_calibration_pairs_cover_every_screen_safety_gate() -> None:
+    calibration_root = ROOT / "evals" / "calibration"
+    cases = json.loads((calibration_root / "judge-v1-cases.json").read_text())[
+        "cases"
+    ]
+    labels = json.loads(
+        (calibration_root / "judge-v1-labels.json").read_text()
+    )["labels"]
+    scenario_ids = tuple(
+        sorted(
+            json.loads(path.read_text())["id"]
+            for path in (ROOT / "evals" / "scenarios").glob("*/*.json")
+        )
+    )
+    promoted, _documents = matrix._scenario_documents(  # noqa: SLF001
+        scenario_ids, root=ROOT
+    )
+    safety_criteria = {
+        (scenario.scenario_id, criterion.criterion_id)
+        for scenario in promoted
+        for criterion in scenario.qualitative_criteria
+        if criterion.screen_safety_gate
+    }
+    calibrated: dict[tuple[str, str], set[str]] = {}
+    for case in cases:
+        identity = (case["scenario_id"], case["criterion_id"])
+        if identity in safety_criteria:
+            assert case["source"] == "fact_rubric.criteria.hard_fail"
+            assert case["evidence_path"] is None
+            calibrated.setdefault(identity, set()).add(labels[case["id"]])
+
+    assert set(calibrated) == safety_criteria
+    assert all(verdicts == {"pass", "fail"} for verdicts in calibrated.values())
 
 
 def _campaign(kind: str = "screen") -> run_state.MatrixCampaign:
@@ -782,6 +818,119 @@ def test_selected_evidence_preserves_unknown_false_and_empty_states(
     }
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        None,
+        False,
+        123,
+        -4.5,
+        "quote \" slash \\ newline\n snowman \u2603 rocket \U0001f680",
+        ["a", 1, None],
+        {"z": "last", "a": [True, False]},
+    ),
+)
+def test_selected_evidence_size_matches_canonical_ascii_json(value: Any) -> None:
+    expected = len(matrix._canonical_json_bytes(value)) - 1  # noqa: SLF001
+
+    assert judge._bounded_canonical_json_size(value, expected) == expected  # noqa: SLF001
+    if expected > 0:
+        assert judge._bounded_canonical_json_size(value, expected - 1) is None  # noqa: SLF001
+
+
+def test_schema_selected_evidence_maximum_fits_aggregate_projection_budget() -> None:
+    schema = json.loads(
+        (ROOT / "evals" / "schema" / "scenario-0.3.json").read_text()
+    )
+    rubric = schema["properties"]["fact_rubric"]["properties"]
+    path_count = sum(
+        rubric[field]["maxItems"]
+        for field in ("must_mention", "support_if_claimed")
+    )
+
+    assert path_count * judge._MAX_SELECTED_EVIDENCE_BYTES <= (  # noqa: SLF001
+        judge._MAX_SELECTED_EVIDENCE_TOTAL_BYTES  # noqa: SLF001
+    )
+    assert judge._MAX_SELECTED_EVIDENCE_TOTAL_BYTES < judge._MAX_PROJECTION_BYTES  # noqa: SLF001
+
+
+def _overlapping_evidence_document(depth: int, value: str) -> tuple[dict, list[str]]:
+    document: dict[str, Any] = {"value": value}
+    paths = ["$.data"]
+    suffix = ""
+    for index in reversed(range(depth - 1)):
+        document = {f"level_{index}": document}
+    current: Any = document
+    for index in range(depth - 1):
+        suffix += f".level_{index}"
+        paths.append(f"$.data{suffix}")
+        current = current[f"level_{index}"]
+    return {"data": document}, paths
+
+
+def test_schema_maximum_overlapping_evidence_paths_remain_representable(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    scenario = result.manifest.inputs.scenarios[0]
+    document, paths = _overlapping_evidence_document(12, "x" * 300_000)
+    promoted = run_state.matrix_qualitative_criteria(
+        (), tuple(paths[:6]), support_if_claimed=tuple(paths[6:])
+    )
+    scenario = replace(
+        scenario,
+        criterion_ids=(*scenario.criterion_ids, *(item.criterion_id for item in promoted)),
+        qualitative_criteria=(*scenario.qualitative_criteria, *promoted),
+    )
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = [document]
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = {
+        "state": "captured",
+        "successful_candidates": 1,
+    }
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, scenario
+    )
+    evidence = [
+        item["selected_evidence"]
+        for item in projection["criteria"]
+        if "selected_evidence" in item
+    ]
+
+    assert len(evidence) == 12
+    assert len(matrix._canonical_json_bytes(projection)) < judge._MAX_PROJECTION_BYTES  # noqa: SLF001
+
+
+def test_aggregate_evidence_budget_rejects_before_projection_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _inspection(tmp_path)
+    scenario = result.manifest.inputs.scenarios[0]
+    document, paths = _overlapping_evidence_document(17, "x" * 500_000)
+    promoted = run_state.matrix_qualitative_criteria((), tuple(paths))
+    scenario = replace(
+        scenario,
+        criterion_ids=(*scenario.criterion_ids, *(item.criterion_id for item in promoted)),
+        qualitative_criteria=(*scenario.qualitative_criteria, *promoted),
+    )
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = [document]
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = {
+        "state": "captured",
+        "successful_candidates": 1,
+    }
+
+    def unexpected_copy(_value: Any) -> bytes:
+        pytest.fail("projection serialized before aggregate evidence rejection")
+
+    monkeypatch.setattr(matrix, "_canonical_json_bytes", unexpected_copy)
+    with pytest.raises(judge.JudgmentError, match="aggregate safety limits"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, scenario
+        )
+
+
 def test_conditional_selected_evidence_represents_zero_one_and_many(
     tmp_path: Path,
 ) -> None:
@@ -1361,6 +1510,89 @@ def test_reasoning_effort_words_remain_allowed_in_candidate_answer_prose(
     assert retained.is_file()
 
 
+@pytest.mark.parametrize(
+    "disclosure",
+    (
+        "The candidate route used xhigh reasoning.",
+        "The generator reasoning effort was low.",
+        "The candidate route effort was medium.",
+        "The generator reasoning effort was high.",
+        "This answer came from SOL.",
+        "This answer came from Terra.",
+        "This answer came from Luna.",
+        "The full candidate model was model-a.",
+    ),
+)
+def test_candidate_answer_projection_rejects_route_and_effort_disclosures(
+    tmp_path: Path, disclosure: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": disclosure}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+@pytest.mark.parametrize(
+    "disclosure",
+    (
+        "xhigh",
+        "candidate route: low",
+        "reasoning effort: medium",
+        "generator effort: high",
+        "sol",
+        "terra",
+        "luna",
+        "model-a",
+    ),
+)
+def test_candidate_sidecar_projection_rejects_route_and_effort_disclosures(
+    tmp_path: Path, disclosure: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": disclosure}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "Use low settings for high frame rates on medium hardware.",
+        "Solar terrain looks lunar in highlights.",
+        "A model-aware answer is solid.",
+    ),
+)
+def test_candidate_projection_route_tokens_avoid_ordinary_word_false_positives(
+    tmp_path: Path, content: str
+) -> None:
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": content}
+    ]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": content}
+    ]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, result.manifest.inputs.scenarios[0]
+    )
+
+    assert projection["answers"][0]["text"] == content
+
+
 @pytest.mark.parametrize("judge_model", ("candidate-XHIGH", "SOL", "gpt-5.6-terra"))
 def test_judge_model_field_may_name_its_own_model_or_route_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, judge_model: str
@@ -1405,6 +1637,38 @@ def test_versioned_digest_slash_does_not_weaken_general_tokens(
         judge.import_judgment(matrix_dir, source)
 
 
+@pytest.mark.parametrize(
+    "private_or_unscoped_id",
+    (
+        "76561198000000001",
+        "synthetic-primary",
+        "EVAL_CANARY_STEAMID64_IMPORT",
+    ),
+)
+def test_judgment_id_requires_opaque_prefix_before_artifact_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    private_or_unscoped_id: str,
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result = _inspection(matrix_dir)
+    monkeypatch.setattr(inspection, "inspect_matrix", lambda _path: result)
+    document = _judgment(
+        result,
+        judgment_id=private_or_unscoped_id,
+        clear="pass",
+        actionable="pass",
+    )
+    source = tmp_path / "judgment.json"
+    source.write_text(json.dumps(document))
+
+    with pytest.raises(judge.JudgmentError, match="schema"):
+        judge.import_judgment(matrix_dir, source)
+
+    assert not (matrix_dir / "judgments").exists()
+
+
 def test_agreement_adjudication_retains_disagreement_as_unresolved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1442,7 +1706,7 @@ def test_agreement_adjudication_retains_disagreement_as_unresolved(
             "rubric_sha256": scenario.rubric_sha256,
             "projection_sha256": _judgment(
                 result,
-                judgment_id="projection-template",
+                judgment_id="judgment-projection-template",
                 clear="pass",
                 actionable="pass",
             )["target"]["projection_sha256"],
@@ -1467,6 +1731,120 @@ def test_agreement_adjudication_retains_disagreement_as_unresolved(
     source.write_text(json.dumps(adjudication))
     with pytest.raises(judge.JudgmentError, match="does not match"):
         judge.import_adjudication(matrix_dir, source)
+    for invalid_id in (
+        "76561198000000001",
+        "synthetic-primary",
+        "EVAL_CANARY_STEAMID64_IMPORT",
+    ):
+        adjudication["adjudication_id"] = invalid_id
+        adjudication["outcomes"][1]["outcome"] = "unresolved"
+        source.write_text(json.dumps(adjudication))
+        with pytest.raises(judge.JudgmentError, match="schema"):
+            judge.import_adjudication(matrix_dir, source)
+    assert sorted(path.name for path in (matrix_dir / "adjudications").iterdir()) == [
+        "adjudication-1.json"
+    ]
+
+
+def test_adjudication_inspects_once_for_hundreds_of_retained_judgments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir = tmp_path / "matrix-20260802T120000Z"
+    matrix_dir.mkdir(mode=0o700)
+    result = _inspection(matrix_dir)
+    base = result.observations[0]
+    observations = [base]
+    for index in range(1, 576):
+        work_item_id = f"w-{index:06d}-{index:016x}"
+        observations.append(
+            replace(
+                base,
+                work_item=replace(
+                    base.work_item,
+                    work_item_id=work_item_id,
+                    ordinal=index,
+                ),
+                completion=replace(
+                    base.completion,
+                    work_item_id=work_item_id,
+                    attempt_id=f"attempt-{index + 1:06d}",
+                ),
+            )
+        )
+    result = replace(result, observations=tuple(observations))
+    inspect_calls = 0
+
+    def tracked_inspection(_path: Path) -> inspection.MatrixInspection:
+        nonlocal inspect_calls
+        inspect_calls += 1
+        return result
+
+    monkeypatch.setattr(inspection, "inspect_matrix", tracked_inspection)
+    judgment_root = matrix_dir / "judgments"
+    judgment_root.mkdir(mode=0o700)
+    hashes: list[str] = []
+    target: dict[str, Any] | None = None
+    for index in range(240):
+        document = _judgment(
+            result,
+            judgment_id=f"judgment-batch-{index:03d}",
+            clear="pass",
+            actionable="pass",
+        )
+        target = document["target"]
+        content = matrix._canonical_json_bytes(document)  # noqa: SLF001
+        path = judgment_root / f"judgment-batch-{index:03d}.json"
+        path.write_bytes(content)
+        path.chmod(0o600)
+        hashes.append(hashlib.sha256(content).hexdigest())
+    assert target is not None
+    projection_calls = 0
+    projection_digest = judge._projection_digest  # noqa: SLF001
+
+    def tracked_projection_digest(
+        observation: inspection.Observation,
+        scenario: run_state.MatrixScenario,
+    ) -> str:
+        nonlocal projection_calls
+        projection_calls += 1
+        return projection_digest(observation, scenario)
+
+    monkeypatch.setattr(judge, "_projection_digest", tracked_projection_digest)
+    adjudication = {
+        "schema": "steam-agent-eval-adjudication/0.1",
+        "adjudication_id": "adjudication-batch",
+        "target": target,
+        "method": "agreement",
+        "adjudicator": "agreement-0.1",
+        "judgment_sha256s": hashes[:2],
+        "outcomes": [
+            {"criterion_id": "clear", "outcome": "pass"},
+            {"criterion_id": "actionable", "outcome": "pass"},
+        ],
+        "created_at": "2026-08-02T12:01:00Z",
+    }
+    source = tmp_path / "adjudication-batch.json"
+    source.write_text(json.dumps(adjudication))
+
+    started = time.perf_counter()
+    retained, _digest = judge.import_adjudication(matrix_dir, source)
+    elapsed = time.perf_counter() - started
+
+    assert retained.is_file()
+    assert inspect_calls == 1
+    assert projection_calls == 1
+    assert elapsed < 10
+
+    first_judgment = judgment_root / "judgment-batch-000.json"
+    first_document = json.loads(first_judgment.read_text())
+    first_judgment.write_text(json.dumps(first_document, indent=2))
+    adjudication["adjudication_id"] = "adjudication-batch-tampered"
+    source.write_text(json.dumps(adjudication))
+
+    with pytest.raises(judge.JudgmentError, match="not canonical"):
+        judge.import_adjudication(matrix_dir, source)
+    assert inspect_calls == 2
+    assert projection_calls == 2
 
 
 def test_judgment_and_adjudication_support_more_than_64_criteria(

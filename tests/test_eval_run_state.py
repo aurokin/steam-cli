@@ -662,6 +662,51 @@ def test_matrix_manifest_checkpoints_exact_work_prefix_and_round_trips(
         )
 
 
+def test_matrix_acceptance_checkpoint_is_exact_and_irreversible(
+    tmp_path: Path,
+) -> None:
+    initial = _matrix_manifest()
+    path = tmp_path / "manifest.json"
+    initial.persist(path)
+    first = initial.checkpoint(
+        _matrix_completion(initial.work_items[0].work_item_id, 1),
+        at=NOW + timedelta(seconds=1),
+    )
+    first.persist(path)
+    completed = first.checkpoint(
+        _matrix_completion(initial.work_items[1].work_item_id, 2),
+        at=NOW + timedelta(seconds=2),
+    )
+    completed.persist(path)
+    source_digest = completed.acceptance_source_sha256
+    assert "acceptance_sha256" not in completed.to_dict()
+    assert "acceptance_finalized_at" not in completed.to_dict()
+    bound = completed.bind_acceptance(
+        "7" * 64,
+        finalized_at=(NOW + timedelta(seconds=3)).isoformat(),
+    )
+    bound.persist(path)
+
+    assert bound.to_dict()["acceptance_sha256"] == "7" * 64
+    assert bound.to_dict()["acceptance_finalized_at"] == (
+        NOW + timedelta(seconds=3)
+    ).isoformat()
+    assert run_state.MatrixManifest.from_dict(json.loads(path.read_text())) == bound
+    assert bound.acceptance_source_sha256 == source_digest
+    frozen_bytes = path.read_bytes()
+    for changed in (
+        completed,
+        replace(bound, acceptance_sha256="8" * 64),
+        replace(
+            bound,
+            acceptance_finalized_at=(NOW + timedelta(seconds=4)).isoformat(),
+        ),
+    ):
+        with pytest.raises(ManifestStateError, match="history"):
+            changed.persist(path)
+        assert path.read_bytes() == frozen_bytes
+
+
 def test_matrix_manifest_revision_exactly_counts_committed_completions() -> None:
     initial = _matrix_manifest()
 

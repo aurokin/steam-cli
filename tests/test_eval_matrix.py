@@ -180,14 +180,29 @@ def _fake_preflight(inputs: run_state.MatrixInputs) -> matrix._ExecutedPreflight
     for item in inputs.scenarios:
         if item.execution_support != "deterministic_only":
             continue
-        input_document = {"id": item.scenario_id, "execution_support": "deterministic_only"}
+        input_document = {
+            "id": item.scenario_id,
+            "execution_support": "deterministic_only",
+            "deterministic_oracle": {
+                "assertions": [
+                    {
+                        "path": "$.value",
+                        "operator": "equals",
+                        "expected": "fixture",
+                    }
+                ]
+            },
+        }
         oracle_document = {"scenario_id": item.scenario_id, "value": "fixture"}
-        grading_result = {"passed": True, "scenario_id": item.scenario_id}
+        grading_result = {"assertions": 1, "failed": [], "passed": True}
+        replay_definition = matrix._preflight_replay_definition(  # noqa: SLF001
+            input_document, executor="frozen_cli"
+        )
         evidence[item.scenario_id] = (
             "frozen_cli",
-            hashlib.sha256(
-                matrix._preflight_json_bytes(oracle_document)  # noqa: SLF001
-            ).hexdigest(),
+            matrix._preflight_bundle_digest(  # noqa: SLF001
+                input_document, oracle_document, replay_definition
+            ),
             hashlib.sha256(
                 matrix._preflight_json_bytes(grading_result)  # noqa: SLF001
             ).hexdigest(),
@@ -198,6 +213,7 @@ def _fake_preflight(inputs: run_state.MatrixInputs) -> matrix._ExecutedPreflight
                 input_document,
                 oracle_document,
                 grading_result,
+                replay_definition,
             )
         )
     return matrix._ExecutedPreflight(  # noqa: SLF001
@@ -741,6 +757,20 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
         results_root=tmp_path / "results",
         child_executor=unavailable,
     )
+    monkeypatch.setattr(
+        matrix,
+        "_scenario_documents",
+        lambda *_args, **_kwargs: pytest.fail(
+            "retained preflight must not read the current checkout"
+        ),
+    )
+    monkeypatch.setattr(
+        runner_main,
+        "_preflight_deterministic_scenario",
+        lambda *_args, **_kwargs: pytest.fail(
+            "retained preflight must not invoke the current harness"
+        ),
+    )
     resumed = matrix.execute_matrix(
         config,
         matrix_id=completed.matrix_id,
@@ -755,9 +785,6 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
         "preflight:m5-c04",
         "preflight:m5-c11",
         "child:m7-o01",
-        "preflight:m5-c03",
-        "preflight:m5-c04",
-        "preflight:m5-c11",
     ]
     deterministic = {
         item.scenario_id: item
@@ -1442,10 +1469,11 @@ def test_qualification_source_verification_rejects_post_hoc_screen_changes(
     )
     inspected = SimpleNamespace(
         manifest_sha256="9" * 64,
-        manifest=SimpleNamespace(
-            matrix_id="matrix-screen",
-            finished_at="2026-08-02T11:00:00Z",
-        ),
+            manifest=SimpleNamespace(
+                matrix_id="matrix-screen",
+                finished_at="2026-08-02T11:00:00Z",
+                acceptance_sha256=None,
+            ),
     )
     current = [decision, content, inspected]
     monkeypatch.setattr(

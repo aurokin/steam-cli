@@ -439,6 +439,7 @@ def inspect_matrix(
     official_completions = {
         item.work_item_id: item for item in manifest.completions
     }
+    work_items_by_id = {item.work_item_id: item for item in manifest.work_items}
     official_child_run_ids = {
         item.child_run_id
         for item in manifest.completions
@@ -485,6 +486,33 @@ def inspect_matrix(
                         if orphan_completion is not None
                         else None
                     )
+                    if (
+                        orphan_completion is not None
+                        and orphan_completion.outcome == "observed"
+                    ):
+                        assert orphan_completion.child_exit_code is not None
+                        assert orphan_child_run_id is not None
+                        orphan_child = matrix.ChildResult(
+                            orphan_completion.child_exit_code,
+                            results_root / orphan_child_run_id,
+                        )
+                        try:
+                            validated_child = matrix.validate_child_result(
+                                orphan_child,
+                                work_items_by_id[item_root.name],
+                                manifest,
+                                results_root=results_root,
+                            )
+                        except matrix.MatrixError as error:
+                            raise InspectionError(str(error)) from None
+                        if (
+                            validated_child.child_run_id != orphan_child_run_id
+                            or validated_child.artifact_hashes
+                            != orphan_completion.artifact_hashes
+                        ):
+                            raise InspectionError(
+                                "orphan child artifact hash changed"
+                            )
                     if orphan_child_run_id is not None:
                         if (
                             orphan_child_run_id in official_child_run_ids

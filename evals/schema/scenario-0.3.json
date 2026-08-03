@@ -150,13 +150,13 @@
         "grading": {"const": "deterministic"},
         "must_mention": {
           "type": "array",
-          "maxItems": 256,
+          "maxItems": 6,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/supportedPath"}
         },
         "support_if_claimed": {
           "type": "array",
-          "maxItems": 256,
+          "maxItems": 6,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/supportedPath"}
         },
@@ -279,6 +279,12 @@
             "minLength": 3,
             "maxLength": 64,
             "pattern": "^[a-z][a-z0-9_]{2,63}$"
+          },
+          "required_document_count": {"const": 1},
+          "tool_policy": {
+            "properties": {
+              "required": {"minItems": 1, "maxItems": 1}
+            }
           }
         }
       }
