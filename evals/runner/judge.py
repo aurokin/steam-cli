@@ -65,6 +65,7 @@ _FIXED_ROUTE_IDENTITIES = frozenset({"sol", "terra", "luna"})
 _ROUTE_CONTEXT_IDENTITIES = frozenset(
     {"candidate", "effort", "generator", "model", "reasoning", "route"}
 )
+_ATOMIC_ROUTE_CONTEXT_IDENTITIES = _ROUTE_CONTEXT_IDENTITIES - {"effort"}
 _DETERMINISTIC_LAYER_IDENTITIES = frozenset(
     {"claims", "metrics", "oracle", "privacy", "tool"}
 )
@@ -167,7 +168,7 @@ def _contains_candidate_route_material(
         for index, token in enumerate(sentence_tokens):
             if token not in _REASONING_EFFORT_IDENTITIES or token == "xhigh":
                 continue
-            if "effort" in sentence_identities:
+            if {"reasoning", "effort"}.issubset(sentence_identities):
                 return True
             if (
                 index + 1 < len(sentence_tokens)
@@ -175,7 +176,7 @@ def _contains_candidate_route_material(
             ):
                 continue
             if association_boundary and (
-                sentence_identities & _ROUTE_CONTEXT_IDENTITIES
+                sentence_identities & _ATOMIC_ROUTE_CONTEXT_IDENTITIES
             ):
                 return True
             start = max(0, index - _EFFORT_CONTEXT_TOKEN_DISTANCE)

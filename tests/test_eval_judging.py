@@ -1723,6 +1723,46 @@ def test_long_distance_reasoning_effort_disclosures_are_rejected(
         )
 
 
+def test_distant_generic_effort_and_level_are_allowed_in_ordinary_prose(
+    tmp_path: Path,
+) -> None:
+    content = (
+        "Performance was high after reviewing all available evidence in detail, "
+        "an effort that took hours."
+    )
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": content}
+    ]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, result.manifest.inputs.scenarios[0]
+    )
+
+    assert projection["answers"][0]["text"] == content
+
+
+def test_atomic_sidecar_allows_distant_generic_effort_and_level(
+    tmp_path: Path,
+) -> None:
+    content = (
+        "Performance was high after reviewing all available evidence in detail, "
+        "an effort that took hours."
+    )
+    result = _inspection(tmp_path)
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": content}
+    ]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, result.manifest.inputs.scenarios[0]
+    )
+
+    assert projection["claims_sidecars"][0]["claims"][0]["value"] == content
+
+
 def test_candidate_route_context_and_effort_in_separate_answer_turns_pass(
     tmp_path: Path,
 ) -> None:
