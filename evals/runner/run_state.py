@@ -45,6 +45,15 @@ _MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_FILES = 16_384
 MATRIX_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
 MAX_QUALITATIVE_CRITERIA = 1024
+MAX_SCENARIO_TURNS = 64
+PROSE_CLAIMS_ALIGNMENT_CRITERION_ID = "prose-claims-sidecar-alignment"
+PROSE_CLAIMS_ALIGNMENT_SOURCE = "generated.prose_claims_sidecar_alignment"
+PROSE_CLAIMS_ALIGNMENT_REQUIREMENT = (
+    "Review every answer turn against its same-turn captured claims sidecar. "
+    "Pass only when every factual assertion in the prose is represented by a "
+    "matching sidecar claim; fail if any factual prose assertion is missing, "
+    "materially broader, unsupported, or contradictory."
+)
 _IGNORED_SOURCE_NAMES = frozenset({".DS_Store", "__pycache__"})
 
 
@@ -1605,6 +1614,7 @@ class MatrixQualitativeCriterion:
             "fact_rubric.criteria.hard_fail",
             "fact_rubric.must_mention",
             "fact_rubric.support_if_claimed",
+            PROSE_CLAIMS_ALIGNMENT_SOURCE,
         }:
             raise ManifestStateError("invalid qualitative criterion source")
         if (
@@ -1616,6 +1626,7 @@ class MatrixQualitativeCriterion:
         if self.source in {
             "judged_answer_rubric",
             "fact_rubric.criteria.hard_fail",
+            PROSE_CLAIMS_ALIGNMENT_SOURCE,
         }:
             if self.evidence_path is not None:
                 raise ManifestStateError("authored criterion has an evidence path")
@@ -1686,6 +1697,7 @@ def matrix_qualitative_criteria(
         + hard_fact_count
         + len(must_mention)
         + len(support_if_claimed)
+        + 1
         > MAX_QUALITATIVE_CRITERIA
     ):
         raise ManifestStateError(
@@ -1756,6 +1768,14 @@ def matrix_qualitative_criteria(
                 evidence_path=path,
             )
         )
+    result.append(
+        MatrixQualitativeCriterion(
+            criterion_id=PROSE_CLAIMS_ALIGNMENT_CRITERION_ID,
+            source=PROSE_CLAIMS_ALIGNMENT_SOURCE,
+            requirement=PROSE_CLAIMS_ALIGNMENT_REQUIREMENT,
+            evidence_path=None,
+        )
+    )
     identifiers = tuple(item.criterion_id for item in result)
     if not identifiers:
         raise ManifestStateError("scenario has no qualitative criteria")
@@ -1831,9 +1851,11 @@ class MatrixScenario:
         if (
             not isinstance(self.turn_count, int)
             or isinstance(self.turn_count, bool)
-            or self.turn_count < 1
+            or not 1 <= self.turn_count <= MAX_SCENARIO_TURNS
         ):
-            raise ManifestStateError("invalid matrix scenario turn count")
+            raise ManifestStateError(
+                f"invalid matrix scenario turn count (expected 1..{MAX_SCENARIO_TURNS})"
+            )
         if (
             not self.criterion_ids
             or len(self.criterion_ids) > MAX_QUALITATIVE_CRITERIA

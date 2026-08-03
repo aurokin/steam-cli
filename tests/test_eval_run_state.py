@@ -674,7 +674,7 @@ def test_matrix_manifest_revision_exactly_counts_committed_completions() -> None
         run_state.MatrixManifest.from_dict(forged)
 
 
-@pytest.mark.parametrize("turn_count", (0, -1, True, 1.5))
+@pytest.mark.parametrize("turn_count", (0, -1, True, 1.5, 65))
 def test_matrix_scenario_requires_a_positive_integer_turn_count(
     turn_count: object,
 ) -> None:
@@ -682,6 +682,12 @@ def test_matrix_scenario_requires_a_positive_integer_turn_count(
 
     with pytest.raises(ManifestStateError, match="turn count"):
         replace(scenario, turn_count=turn_count)
+
+
+def test_matrix_scenario_accepts_executor_maximum_turn_count() -> None:
+    scenario = _matrix_manifest().inputs.scenarios[0]
+
+    assert replace(scenario, turn_count=64).turn_count == 64
 
 
 @pytest.mark.parametrize("field", ("turn_count", "child_source_digest"))

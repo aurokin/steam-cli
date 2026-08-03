@@ -58,6 +58,7 @@ _UNSAFE_CONDITIONS = frozenset(
     {"unsafe_activity", "privacy_failure"}
 )
 _BENIGN_TOOL_FAILURE = "invalid_required_command_evidence"
+_EMPTY_ATTEMPT_HISTORY_SHA256 = hashlib.sha256(b"[]\n").hexdigest()
 
 
 class AcceptanceError(RuntimeError):
@@ -134,6 +135,7 @@ class AcceptanceResult:
     source_screen_manifest_sha256: str | None
     qualitative_evidence_sha256: str | None
     source_screen_acceptance_sha256: str | None = None
+    attempt_history_sha256: str = _EMPTY_ATTEMPT_HISTORY_SHA256
     finalized_at: str | None = None
     schema: str = "steam-agent-eval-acceptance/0.1"
 
@@ -143,6 +145,7 @@ class AcceptanceResult:
             self.config_sha256,
             self.campaign_sha256,
             self.plan_sha256,
+            self.attempt_history_sha256,
         )
         if self.schema != "steam-agent-eval-acceptance/0.1" or any(
             not isinstance(value, str)
@@ -211,6 +214,7 @@ class AcceptanceResult:
             "source_screen_acceptance_sha256": (
                 self.source_screen_acceptance_sha256
             ),
+            "attempt_history_sha256": self.attempt_history_sha256,
             "finalized_at": self.finalized_at,
         }
 
@@ -231,6 +235,7 @@ class AcceptanceResult:
             "source_screen_manifest_sha256",
             "qualitative_evidence_sha256",
             "source_screen_acceptance_sha256",
+            "attempt_history_sha256",
             "finalized_at",
         }
         if not isinstance(value, dict) or set(value) != expected:
@@ -262,6 +267,7 @@ class AcceptanceResult:
                 source_screen_acceptance_sha256=value[
                     "source_screen_acceptance_sha256"
                 ],
+                attempt_history_sha256=value["attempt_history_sha256"],
                 finalized_at=value["finalized_at"],
             )
         except (
@@ -286,6 +292,19 @@ def _strict_inspection(matrix_dir: Path) -> inspection.MatrixInspection:
         return inspection.inspect_matrix(matrix_dir)
     except (inspection.InspectionError, matrix.MatrixError) as error:
         raise AcceptanceError(str(error)) from None
+
+
+def _attempt_history_sha256(result: inspection.MatrixInspection) -> str:
+    value = [
+        {
+            "attempt_id": attempt_id,
+            "artifact_hashes": [
+                {"name": name, "sha256": digest} for name, digest in hashes
+            ],
+        }
+        for attempt_id, hashes in result.orphan_attempt_hashes
+    ]
+    return hashlib.sha256(matrix._canonical_json_bytes(value)).hexdigest()  # noqa: SLF001
 
 
 def _frozen_acceptance_bytes(path: Path) -> tuple[AcceptanceResult, bytes]:
@@ -1274,6 +1293,7 @@ def _evaluate_inspected(
             source_screen_acceptance_sha256=(
                 manifest.campaign.source_screen_acceptance_sha256
             ),
+            attempt_history_sha256=_attempt_history_sha256(result),
         )
     if not result.structurally_complete:
         raise AcceptanceError("completed campaign is not structurally complete")
@@ -1339,6 +1359,7 @@ def _evaluate_inspected(
         source_screen_acceptance_sha256=(
             manifest.campaign.source_screen_acceptance_sha256
         ),
+        attempt_history_sha256=_attempt_history_sha256(result),
     )
 
 

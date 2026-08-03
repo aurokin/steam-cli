@@ -102,8 +102,15 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   persist under `results/`. Runs that fail a full-retention gate persist only
   structural activity plus content hashes and lengths in the transcript and
   ordinary report fields. A separate, untrusted qualitative-answer projection
-  may remain available after a required-evidence-only failure, but never after
-  an incomplete turn, privacy failure, unlisted command, or unsafe activity.
+  requires exactly one retained answer and one parsed claims-sidecar entry for
+  every scenario turn. Its route-blind, privacy-scanned bytes bind all answer
+  prose and same-turn `{path, value}` claims. Every scenario receives a stable
+  generated prose/sidecar-alignment criterion so qualification can reject
+  factual prose that is missing from, broader than, unsupported by, or
+  contradictory to its sidecar even when deterministic sidecar grading passes.
+  That projection may remain available after a required-evidence-only failure,
+  but never after an incomplete turn, privacy failure, unlisted command, or
+  unsafe activity.
   The canonical retention and sanitization rules are in the
   [evaluation strategy](../docs/design/evaluation-strategy.md#current-implementation).
   Evaluated commands run under the named `steam-agent-eval` permission

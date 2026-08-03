@@ -27,6 +27,7 @@ LAYERS = ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
 PROMPT_SHA256 = "671449c1329475b3753ffe30a017ad60152603efe6def833872eff8c428deec7"
 PARSER_SHA256 = "658a8acdf97c7d681c2b78e68c853b73fe010c49631595c7f69f67575931be49"
 REAL_CAMPAIGN_PREFLIGHT = matrix._preflight_campaign_scenarios  # noqa: SLF001
+REAL_PREFLIGHT_VALIDATION = matrix.validate_retained_preflight_evidence
 
 
 class LifecycleAbort(BaseException):
@@ -38,7 +39,10 @@ def _isolate_campaign_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         matrix,
         "_preflight_campaign_scenarios",
-        lambda inputs, *, root: _attestation(inputs),
+        lambda inputs, *, root: _fake_preflight(inputs),
+    )
+    monkeypatch.setattr(
+        matrix, "validate_retained_preflight_evidence", lambda *_args, **_kwargs: None
     )
 
 
@@ -167,14 +171,38 @@ def _inputs() -> run_state.MatrixInputs:
 def _attestation(
     inputs: run_state.MatrixInputs | None = None,
 ) -> run_state.MatrixPreflightAttestation:
-    selected = inputs or _inputs()
-    return run_state.MatrixPreflightAttestation.for_inputs(
-        selected,
-        evidence={
-            item.scenario_id: ("frozen_cli", "4" * 64, "5" * 64)
-            for item in selected.scenarios
-            if item.execution_support == "deterministic_only"
-        },
+    return _fake_preflight(inputs or _inputs()).attestation  # noqa: SLF001
+
+
+def _fake_preflight(inputs: run_state.MatrixInputs) -> matrix._ExecutedPreflight:  # noqa: SLF001
+    artifacts: list[matrix._PreflightArtifact] = []  # noqa: SLF001
+    evidence: dict[str, tuple[str, str, str]] = {}
+    for item in inputs.scenarios:
+        if item.execution_support != "deterministic_only":
+            continue
+        input_document = {"id": item.scenario_id, "execution_support": "deterministic_only"}
+        oracle_document = {"scenario_id": item.scenario_id, "value": "fixture"}
+        grading_result = {"passed": True, "scenario_id": item.scenario_id}
+        evidence[item.scenario_id] = (
+            "frozen_cli",
+            hashlib.sha256(
+                matrix._preflight_json_bytes(oracle_document)  # noqa: SLF001
+            ).hexdigest(),
+            hashlib.sha256(
+                matrix._preflight_json_bytes(grading_result)  # noqa: SLF001
+            ).hexdigest(),
+        )
+        artifacts.append(
+            matrix._PreflightArtifact(  # noqa: SLF001
+                item.scenario_id,
+                input_document,
+                oracle_document,
+                grading_result,
+            )
+        )
+    return matrix._ExecutedPreflight(  # noqa: SLF001
+        run_state.MatrixPreflightAttestation.for_inputs(inputs, evidence=evidence),
+        tuple(artifacts),
     )
 
 
@@ -694,6 +722,11 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
         matrix, "_preflight_campaign_scenarios", REAL_CAMPAIGN_PREFLIGHT
     )
     monkeypatch.setattr(
+        matrix,
+        "validate_retained_preflight_evidence",
+        REAL_PREFLIGHT_VALIDATION,
+    )
+    monkeypatch.setattr(
         runner_main, "_preflight_deterministic_scenario", tracked_preflight
     )
 
@@ -722,6 +755,9 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
         "preflight:m5-c04",
         "preflight:m5-c11",
         "child:m7-o01",
+        "preflight:m5-c03",
+        "preflight:m5-c04",
+        "preflight:m5-c11",
     ]
     deterministic = {
         item.scenario_id: item
@@ -748,6 +784,66 @@ def test_new_campaign_preflights_deterministic_only_scenarios_once_before_childr
         )
         for scenario_id in ("m5-c03", "m5-c04", "m5-c11")
     )
+
+
+@pytest.mark.parametrize("tamper", ("delete", "mutate", "swap"))
+def test_retained_preflight_evidence_is_replayed_on_every_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    scenario_ids = ["m7-o01", "m5-c03"]
+    scenarios, _documents = matrix._scenario_documents(  # noqa: SLF001
+        scenario_ids, root=ROOT
+    )
+    inputs = replace(_inputs(), scenarios=scenarios)
+    config = _config(tmp_path, replicates=1)
+    _rewrite_json(config, lambda value: value.__setitem__("scenario_ids", scenario_ids))
+    results_root = tmp_path / "results"
+    monkeypatch.setattr(
+        matrix, "_preflight_campaign_scenarios", REAL_CAMPAIGN_PREFLIGHT
+    )
+    monkeypatch.setattr(
+        matrix,
+        "validate_retained_preflight_evidence",
+        REAL_PREFLIGHT_VALIDATION,
+    )
+    completed = matrix.execute_matrix(
+        config,
+        results_root=results_root,
+        input_collector=lambda _config: inputs,
+        child_executor=lambda _item, _timeout: matrix.ChildResult.unavailable(
+            "provider_route_unavailable"
+        ),
+    )
+    matrix_dir = results_root / completed.matrix_id
+    evidence_root = matrix_dir / "preflight"
+    input_path = evidence_root / "m5-c03.input.json"
+    document_path = evidence_root / "m5-c03.document.json"
+    grading_path = evidence_root / "m5-c03.grading.json"
+    if tamper == "delete":
+        grading_path.unlink()
+    elif tamper == "mutate":
+        document = json.loads(document_path.read_text())
+        document["tampered"] = True
+        document_path.write_bytes(matrix._preflight_json_bytes(document))  # noqa: SLF001
+    else:
+        input_bytes = input_path.read_bytes()
+        document_bytes = document_path.read_bytes()
+        input_path.write_bytes(document_bytes)
+        document_path.write_bytes(input_bytes)
+
+    with pytest.raises(matrix.MatrixError, match="preflight evidence"):
+        matrix.execute_matrix(
+            config,
+            matrix_id=completed.matrix_id,
+            results_root=results_root,
+            input_collector=lambda _config: inputs,
+            child_executor=lambda _item, _timeout: pytest.fail("must not execute"),
+        )
+    with pytest.raises(inspection.InspectionError, match="preflight evidence"):
+        inspection.inspect_matrix(matrix_dir, results_root=results_root)
+    monkeypatch.setattr(inspection, "RESULTS_ROOT", results_root)
+    with pytest.raises(acceptance.AcceptanceError, match="preflight evidence"):
+        acceptance.evaluate_campaign(matrix_dir)
 
 
 def test_direct_creation_cannot_use_a_forged_attestation_to_skip_preflight(
@@ -952,11 +1048,13 @@ def test_matrix_promotes_must_mention_paths_into_the_blinded_rubric() -> None:
     scenario = scenarios[0]
     fact_hard = scenario.qualitative_criteria[1]
     must_mention = scenario.qualitative_criteria[2]
+    alignment = scenario.qualitative_criteria[3]
 
     assert scenario.criterion_ids == (
         "name-the-opt-in",
         "fact-hard-5f9ee77592a7cf83",
         "must-mention-43b9b6bc22b904eb",
+        run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID,
     )
     assert fact_hard.to_dict() == {
         "id": "fact-hard-5f9ee77592a7cf83",
@@ -976,6 +1074,13 @@ def test_matrix_promotes_must_mention_paths_into_the_blinded_rubric() -> None:
             "$.data.steam_id64; fail unless they are explicitly mentioned."
         ),
         "evidence_path": "$.data.steam_id64",
+        "screen_safety_gate": False,
+    }
+    assert alignment.to_dict() == {
+        "id": run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID,
+        "source": run_state.PROSE_CLAIMS_ALIGNMENT_SOURCE,
+        "requirement": run_state.PROSE_CLAIMS_ALIGNMENT_REQUIREMENT,
+        "evidence_path": None,
         "screen_safety_gate": False,
     }
     _criteria, rubric = matrix._qualitative_rubric(  # noqa: SLF001

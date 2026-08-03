@@ -43,6 +43,7 @@ CALIBRATION_ROOT = ROOT / "evals" / "calibration"
 _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = run_state.MATRIX_MANIFEST_MAX_BYTES
 _MAX_CALIBRATED_ASSET_BYTES = 1024 * 1024
+_MAX_PREFLIGHT_ARTIFACT_BYTES = 4 * 1024 * 1024
 _MAX_CORPUS_OBJECT_BYTES = 1024 * 1024
 _MAX_CORPUS_TREE_BYTES = 256 * 1024
 _MAX_WORK_ITEMS = 10_000
@@ -55,7 +56,7 @@ _CHILD_BOOTSTRAP = (
     "os.kill(os.getpid(), signal.SIGSTOP)\n"
     "os.execv(sys.argv[1], sys.argv[1:])\n"
 )
-_MAX_CHILD_SCENARIO_TURNS = 64
+_MAX_CHILD_SCENARIO_TURNS = run_state.MAX_SCENARIO_TURNS
 _SCENARIO_ID = re.compile(r"m[1-9][0-9]*-[a-z][0-9]{2,}\Z", re.ASCII)
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
 _QUALITATIVE_ARTIFACT = re.compile(
@@ -141,6 +142,20 @@ class _SelectedCorpusSeal:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreflightArtifact:
+    scenario_id: str
+    input_document: Any
+    oracle_document: Any
+    grading_result: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutedPreflight:
+    attestation: run_state.MatrixPreflightAttestation
+    artifacts: tuple[_PreflightArtifact, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedAttemptArtifacts:
     attempt_id: str
     work_item_id: str
@@ -186,6 +201,19 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ).encode("ascii")
     except (TypeError, ValueError):
         raise MatrixError("matrix value is not strict JSON") from None
+
+
+def _preflight_json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (TypeError, ValueError):
+        raise MatrixError("matrix preflight evidence is invalid") from None
 
 
 def _read_strict_json(path: Path, *, max_bytes: int = _MAX_CONFIG_BYTES) -> Any:
@@ -1171,7 +1199,8 @@ def create_matrix(
     results_root: Path = RESULTS_ROOT,
     now: datetime | None = None,
 ) -> tuple[Path, run_state.MatrixManifest]:
-    exact_attestation = _preflight_campaign_scenarios(inputs, root=Path(root))
+    executed_preflight = _preflight_campaign_scenarios(inputs, root=Path(root))
+    exact_attestation = executed_preflight.attestation
     if preflight_attestation is None:
         preflight_attestation = exact_attestation
     elif preflight_attestation != exact_attestation:
@@ -1193,6 +1222,7 @@ def create_matrix(
     matrix_dir = results_root / matrix_id
     _ensure_private_dir(matrix_dir)
     _publish_calibrated_assets(matrix_dir, config)
+    _publish_preflight_evidence(matrix_dir, executed_preflight)
     manifest = run_state.MatrixManifest.create(
         matrix_id=matrix_id,
         config_sha256=config.sha256,
@@ -1222,14 +1252,14 @@ def create_matrix(
 
 def _preflight_campaign_scenarios(
     inputs: run_state.MatrixInputs, *, root: Path
-) -> run_state.MatrixPreflightAttestation:
+) -> _ExecutedPreflight:
     deterministic_ids = tuple(
         item.scenario_id
         for item in inputs.scenarios
         if item.execution_support == "deterministic_only"
     )
     if not deterministic_ids:
-        return run_state.MatrixPreflightAttestation(())
+        return _ExecutedPreflight(run_state.MatrixPreflightAttestation(()), ())
     scenarios, documents = _scenario_documents(deterministic_ids, root=root)
     expected_scenarios = tuple(
         item
@@ -1245,6 +1275,7 @@ def _preflight_campaign_scenarios(
 
     try:
         evidence: dict[str, tuple[str, str, str]] = {}
+        artifacts: list[_PreflightArtifact] = []
         for scenario_id in deterministic_ids:
             result = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
                 dict(documents[scenario_id]), source_root=root / "src"
@@ -1254,13 +1285,108 @@ def _preflight_campaign_scenarios(
                 result.document_sha256,
                 result.grading_sha256,
             )
-        return run_state.MatrixPreflightAttestation.for_inputs(
-            inputs, evidence=evidence
+            artifacts.append(
+                _PreflightArtifact(
+                    scenario_id=scenario_id,
+                    input_document=documents[scenario_id],
+                    oracle_document=result.document,
+                    grading_result=result.grading,
+                )
+            )
+        return _ExecutedPreflight(
+            run_state.MatrixPreflightAttestation.for_inputs(
+                inputs, evidence=evidence
+            ),
+            tuple(artifacts),
         )
     except MatrixError:
         raise
     except Exception:
         raise MatrixError("matrix deterministic-only preflight failed") from None
+
+
+def _publish_preflight_evidence(
+    matrix_dir: Path, executed: _ExecutedPreflight
+) -> None:
+    evidence_root = Path(matrix_dir) / "preflight"
+    _ensure_private_dir(evidence_root)
+    for artifact in executed.artifacts:
+        for kind, value in (
+            ("input", artifact.input_document),
+            ("document", artifact.oracle_document),
+            ("grading", artifact.grading_result),
+        ):
+            run_state.atomic_publish_private_bytes(
+                evidence_root / f"{artifact.scenario_id}.{kind}.json",
+                _preflight_json_bytes(value),
+            )
+
+
+def validate_retained_preflight_evidence(
+    matrix_dir: Path,
+    inputs: run_state.MatrixInputs,
+    attestation: run_state.MatrixPreflightAttestation,
+    *,
+    root: Path = ROOT,
+) -> None:
+    deterministic = tuple(
+        item for item in inputs.scenarios if item.execution_support == "deterministic_only"
+    )
+    scenario_ids = tuple(item.scenario_id for item in deterministic)
+    evidence_root = Path(matrix_dir) / "preflight"
+    try:
+        _require_private_dir(evidence_root)
+        expected_names = {
+            f"{scenario_id}.{kind}.json"
+            for scenario_id in scenario_ids
+            for kind in ("input", "document", "grading")
+        }
+        items = tuple(evidence_root.iterdir())
+        if {item.name for item in items} != expected_names:
+            raise MatrixError("matrix retained preflight evidence is invalid")
+        scenarios, current_documents = _scenario_documents(scenario_ids, root=Path(root))
+        if scenarios != deterministic:
+            raise MatrixError("matrix retained preflight evidence is invalid")
+        attested = {item.scenario_id: item for item in attestation.scenarios}
+        if set(attested) != set(scenario_ids):
+            raise MatrixError("matrix retained preflight evidence is invalid")
+        from evals.runner import __main__ as runner_main
+
+        for scenario_id in scenario_ids:
+            retained: dict[str, tuple[Any, bytes]] = {}
+            for kind in ("input", "document", "grading"):
+                content = _private_regular_bytes(
+                    evidence_root / f"{scenario_id}.{kind}.json",
+                    max_bytes=_MAX_PREFLIGHT_ARTIFACT_BYTES,
+                )
+                value = _strict_json_loads(content.decode("ascii"))
+                if content != _preflight_json_bytes(value):
+                    raise MatrixError("matrix retained preflight evidence is invalid")
+                retained[kind] = (value, content)
+            if retained["input"][0] != current_documents[scenario_id]:
+                raise MatrixError("matrix retained preflight evidence is invalid")
+            replayed = runner_main._preflight_deterministic_scenario(  # noqa: SLF001
+                dict(retained["input"][0]), source_root=Path(root) / "src"
+            )
+            expected = attested[scenario_id]
+            if (
+                replayed.executor != expected.executor
+                or replayed.document_sha256 != expected.document_sha256
+                or replayed.grading_sha256 != expected.grading_sha256
+                or retained["document"][1]
+                != _preflight_json_bytes(replayed.document)
+                or retained["grading"][1]
+                != _preflight_json_bytes(replayed.grading)
+                or hashlib.sha256(retained["document"][1]).hexdigest()
+                != expected.document_sha256
+                or hashlib.sha256(retained["grading"][1]).hexdigest()
+                != expected.grading_sha256
+            ):
+                raise MatrixError("matrix retained preflight evidence is invalid")
+    except MatrixError:
+        raise MatrixError("matrix retained preflight evidence is invalid") from None
+    except (OSError, UnicodeError, ValueError):
+        raise MatrixError("matrix retained preflight evidence is invalid") from None
 
 
 def load_manifest(matrix_dir: Path) -> run_state.MatrixManifest:
@@ -2293,6 +2419,20 @@ def _verify_calibration_artifact_directory(path: Path) -> None:
         _private_attempt_file(item)
 
 
+def _verify_preflight_artifact_directory(path: Path) -> None:
+    _require_private_dir(path)
+    for item in path.iterdir():
+        parts = item.name.rsplit(".", 2)
+        if (
+            len(parts) != 3
+            or _SAFE_COMPONENT.fullmatch(parts[0]) is None
+            or parts[1] not in {"input", "document", "grading"}
+            or parts[2] != "json"
+        ):
+            raise MatrixError("matrix preflight directory contains unexpected nodes")
+        _private_attempt_file(item)
+
+
 def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) -> None:
     _require_private_dir(matrix_dir)
     artifact_directories = {"judgments", "adjudications"}
@@ -2302,19 +2442,26 @@ def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) 
         "matrix.lock",
         "work",
         "calibration",
+        "preflight",
         *artifact_directories,
     }
     if manifest.campaign.campaign_kind == "screen":
         allowed_top.add("acceptance.json")
     top_names = {item.name for item in matrix_dir.iterdir()}
     if (
-        not {"calibration", "config.json", "manifest.json"} <= top_names
+        not {"calibration", "preflight", "config.json", "manifest.json"} <= top_names
         or not top_names <= allowed_top
     ):
         raise MatrixError("matrix directory contains unexpected nodes")
-    for name in top_names - {"calibration", "work", *artifact_directories}:
+    for name in top_names - {
+        "calibration",
+        "preflight",
+        "work",
+        *artifact_directories,
+    }:
         _private_attempt_file(matrix_dir / name)
     _verify_calibration_artifact_directory(matrix_dir / "calibration")
+    _verify_preflight_artifact_directory(matrix_dir / "preflight")
     for name in top_names & artifact_directories:
         _verify_qualitative_artifact_directory(matrix_dir / name)
     work_root = matrix_dir / "work"
@@ -2377,6 +2524,8 @@ def _verify_resume(
     manifest: run_state.MatrixManifest,
     *,
     results_root: Path,
+    root: Path,
+    revalidate_preflight: bool,
 ) -> None:
     try:
         manifest.preflight_attestation.require_matches(current_inputs)
@@ -2406,6 +2555,13 @@ def _verify_resume(
     ):
         raise MatrixError("matrix resume provenance does not match")
     validate_retained_calibrated_assets(matrix_dir, config)
+    if revalidate_preflight:
+        validate_retained_preflight_evidence(
+            matrix_dir,
+            current_inputs,
+            manifest.preflight_attestation,
+            root=root,
+        )
     _verify_observation_freshness(manifest.completions)
     for work_item, completion in zip(
         manifest.work_items, manifest.completions, strict=False
@@ -2536,7 +2692,8 @@ def execute_matrix(
     root = Path(root)
     results_root = Path(results_root)
     collect = input_collector or (lambda loaded: collect_inputs(loaded, root=root))
-    if matrix_id is None:
+    newly_created = matrix_id is None
+    if newly_created:
         current_inputs = collect(config)
         matrix_dir, manifest = create_matrix(
             config,
@@ -2564,6 +2721,8 @@ def execute_matrix(
             current_inputs,
             manifest,
             results_root=results_root,
+            root=root,
+            revalidate_preflight=not newly_created,
         )
         if manifest.state is run_state.MatrixState.COMPLETED:
             return manifest

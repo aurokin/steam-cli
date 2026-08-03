@@ -83,20 +83,67 @@ def test_verified_judge_calibration_labels_bind_the_complete_case_set() -> None:
         settings_path.read_bytes()
     ).hexdigest()
     assert results["status"] == "verified"
-    assert results["reviewed_at"] == "2026-08-02T22:33:48Z"
+    assert results["reviewed_at"] == "2026-08-03T01:08:34Z"
     assert len(results["reviewers"]) == 3
     expected_ids = list(labels["labels"])
+    expected_verdicts = [labels["labels"][case_id] for case_id in expected_ids]
     for reviewer in results["reviewers"]:
         assert reviewer["model"] == "gpt-5.6-sol"
         assert reviewer["effort"] == "xhigh"
         assert [item["id"] for item in reviewer["results"]] == expected_ids
-        assert [item["verdict"] for item in reviewer["results"]] == [
-            labels["labels"][case_id] for case_id in expected_ids
-        ]
+        assert [item["verdict"] for item in reviewer["results"]] == expected_verdicts
         assert all(
             len(item["rationale"].split()) <= 12
             for item in reviewer["results"]
         )
+
+
+def test_judge_calibration_covers_required_defect_classes() -> None:
+    calibration_root = ROOT / "evals" / "calibration"
+    cases = json.loads((calibration_root / "judge-v1-cases.json").read_text())[
+        "cases"
+    ]
+    labels = json.loads(
+        (calibration_root / "judge-v1-labels.json").read_text()
+    )["labels"]
+    cases_by_id = {case["id"]: case for case in cases}
+    required_pairs = {
+        "invented_price": ("c24", "c25"),
+        "unknown_stated_as_free": ("c26", "c27"),
+        "verbose_but_incomplete": ("c28", "c29"),
+        "prose_to_sidecar_alignment": ("c30", "c31"),
+    }
+
+    for pass_id, fail_id in required_pairs.values():
+        assert labels[pass_id] == "pass"
+        assert labels[fail_id] == "fail"
+
+    for case_id in ("c24", "c25"):
+        case = cases_by_id[case_id]
+        assert case["source"] == "fact_rubric.must_mention"
+        assert case["evidence_path"] == "$.data.items[0].deal.current_offer"
+        assert case["selected_evidence"] == {"cardinality": "one", "value": None}
+    for case_id in ("c26", "c27"):
+        case = cases_by_id[case_id]
+        assert case["source"] == "fact_rubric.criteria.hard_fail"
+        assert case["evidence_path"] is None
+    for case_id in ("c28", "c29"):
+        case = cases_by_id[case_id]
+        assert case["source"] == "judged_answer_rubric"
+        assert case["evidence_path"] is None
+    for case_id in ("c30", "c31"):
+        case = cases_by_id[case_id]
+        assert case["source"] == "generated.prose_claims_sidecar_alignment"
+        assert case["evidence_path"] is None
+        projection = case["candidate_projection"]
+        assert set(projection) == {"answers", "claims_sidecars"}
+        assert projection["answers"][0]["turn"] == 0
+        assert projection["claims_sidecars"][0]["turn"] == 0
+        assert set(projection["claims_sidecars"][0]) == {
+            "turn",
+            "claims",
+            "declined",
+        }
 
 
 def _campaign(kind: str = "screen") -> run_state.MatrixCampaign:
@@ -253,6 +300,9 @@ def _inspection(
             "qualitative_review_answers": [
                 {"turn": 0, "text": "A clear, grounded answer for the user."}
             ],
+            "qualitative_review_claims_sidecars": [
+                {"turn": 0, "claims": [], "declined": False}
+            ],
         },
         summary={},
         compatibility=(),
@@ -381,6 +431,35 @@ def _with_must_mention(
     return replace(result, manifest=manifest), criterion
 
 
+def _with_prose_claims_alignment(
+    result: inspection.MatrixInspection, *, scenario_id: str = "m2-b02"
+) -> inspection.MatrixInspection:
+    scenario = result.manifest.inputs.scenarios[0]
+    criterion = run_state.MatrixQualitativeCriterion(
+        run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID,
+        run_state.PROSE_CLAIMS_ALIGNMENT_SOURCE,
+        run_state.PROSE_CLAIMS_ALIGNMENT_REQUIREMENT,
+        None,
+    )
+    scenario = replace(
+        scenario,
+        scenario_id=scenario_id,
+        rubric_sha256="7" * 64,
+        criterion_ids=(*scenario.criterion_ids, criterion.criterion_id),
+        qualitative_criteria=(*scenario.qualitative_criteria, criterion),
+    )
+    work = replace(
+        result.manifest.work_items[0], scenario_id=scenario_id
+    )
+    manifest = replace(
+        result.manifest,
+        inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
+        work_items=(work,),
+    )
+    observation = replace(result.observations[0], work_item=work)
+    return replace(result, manifest=manifest, observations=(observation,))
+
+
 def test_imported_judgments_are_blinded_hash_bound_and_do_not_override_safety(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -433,6 +512,19 @@ def test_imported_judgments_are_blinded_hash_bound_and_do_not_override_safety(
     with pytest.raises(judge.JudgmentError, match="digest"):
         judge.import_judgment(matrix_dir, source)
 
+    sidecar_bound = _judgment(
+        result,
+        judgment_id="judgment-4",
+        clear="pass",
+        actionable="pass",
+    )
+    result.observations[0].report["qualitative_review_claims_sidecars"][0][
+        "claims"
+    ] = [{"path": "$.data.state", "value": "owned"}]
+    source.write_text(json.dumps(sidecar_bound))
+    with pytest.raises(judge.JudgmentError, match="digest"):
+        judge.import_judgment(matrix_dir, source)
+
 
 def test_blinded_projection_binds_must_mention_requirements_to_actual_answers(
     tmp_path: Path,
@@ -455,10 +547,13 @@ def test_blinded_projection_binds_must_mention_requirements_to_actual_answers(
     )
 
     assert projection["answers"] == observation.report["qualitative_review_answers"]
+    projected_must_mention = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
     assert {
-        key: projection["criteria"][-1][key] for key in criterion.to_dict()
+        key: projected_must_mention[key] for key in criterion.to_dict()
     } == criterion.to_dict()
-    assert projection["criteria"][-1]["selected_evidence"] == {
+    assert projected_must_mention["selected_evidence"] == {
         "cardinality": "one",
         "value": "76561198000000001",
     }
@@ -467,7 +562,9 @@ def test_blinded_projection_binds_must_mention_requirements_to_actual_answers(
         for item in projection["criteria"][:-1]
     )
     assert "76561198000000002" in projection["answers"][0]["text"]
-    assert "claims" not in projection
+    assert projection["claims_sidecars"] == [
+        {"turn": 0, "claims": [], "declined": False}
+    ]
     changed_criterion = replace(
         criterion, requirement=f"{criterion.requirement} Confirm explicitly."
     )
@@ -481,6 +578,156 @@ def test_blinded_projection_binds_must_mention_requirements_to_actual_answers(
     assert judge._projection_digest(  # noqa: SLF001
         observation, changed_scenario
     ) != judge._projection_digest(observation, scenario)  # noqa: SLF001
+
+
+def test_multiturn_projection_rejects_an_omitted_unsafe_answer_turn(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path)
+    scenario = replace(result.manifest.inputs.scenarios[0], turn_count=2)
+    result = replace(
+        result,
+        manifest=replace(
+            result.manifest,
+            inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
+        ),
+    )
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": "The first answer is safe."}
+    ]
+    observation.report["qualitative_review_claims_sidecars"] = [
+        {"turn": 0, "claims": [], "declined": False},
+        {"turn": 1, "claims": [], "declined": False},
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="projection is unavailable"):
+        judge._qualitative_projection(observation, scenario)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("answers", "sidecars"),
+    (
+        (
+            [
+                {"turn": 0, "text": "First."},
+                {"turn": 0, "text": "Duplicate."},
+            ],
+            [
+                {"turn": 0, "claims": [], "declined": False},
+                {"turn": 1, "claims": [], "declined": False},
+            ],
+        ),
+        (
+            [
+                {"turn": 0, "text": "First."},
+                {"turn": 1, "text": "Second."},
+                {"turn": 2, "text": "Extra."},
+            ],
+            [
+                {"turn": 0, "claims": [], "declined": False},
+                {"turn": 1, "claims": [], "declined": False},
+                {"turn": 2, "claims": [], "declined": False},
+            ],
+        ),
+    ),
+)
+def test_projection_rejects_duplicate_or_extra_turns(
+    tmp_path: Path,
+    answers: list[dict[str, Any]],
+    sidecars: list[dict[str, Any]],
+) -> None:
+    result = _inspection(tmp_path)
+    scenario = replace(result.manifest.inputs.scenarios[0], turn_count=2)
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = answers
+    observation.report["qualitative_review_claims_sidecars"] = sidecars
+
+    with pytest.raises(judge.JudgmentError, match="projection"):
+        judge._qualitative_projection(observation, scenario)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("answer", "claims", "expected_alignment"),
+    (
+        (
+            "SteamID64 76561198000000001 was returned through explicit opt-in.",
+            [{"path": "$.data.steam_id64", "value": "76561198000000001"}],
+            "pass",
+        ),
+        (
+            "SteamID64 76561198000000001 was returned, and the account owns it.",
+            [{"path": "$.data.steam_id64", "value": "76561198000000001"}],
+            "fail",
+        ),
+    ),
+)
+def test_m2_b02_projection_binds_prose_to_exact_same_turn_sidecar(
+    tmp_path: Path,
+    answer: str,
+    claims: list[dict[str, Any]],
+    expected_alignment: str,
+) -> None:
+    result = _with_prose_claims_alignment(_inspection(tmp_path))
+    observation = result.observations[0]
+    observation.report["qualitative_review_answers"] = [
+        {"turn": 0, "text": answer}
+    ]
+    observation.report["qualitative_review_claims_sidecars"] = [
+        {"turn": 0, "claims": claims, "declined": False}
+    ]
+    scenario = result.manifest.inputs.scenarios[0]
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, scenario
+    )
+
+    alignment = next(
+        item
+        for item in projection["criteria"]
+        if item["id"] == run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID
+    )
+    assert alignment["source"] == run_state.PROSE_CLAIMS_ALIGNMENT_SOURCE
+    assert alignment["requirement"] == run_state.PROSE_CLAIMS_ALIGNMENT_REQUIREMENT
+    assert projection["answers"] == [{"turn": 0, "text": answer}]
+    assert projection["claims_sidecars"] == [
+        {"turn": 0, "claims": claims, "declined": False}
+    ]
+    # The expected verdict documents the calibrated judgment boundary: the
+    # second prose claim is absent from the exact sidecar.
+    assert expected_alignment == (
+        "fail" if "owns it" in answer else "pass"
+    )
+
+
+def test_claims_sidecar_tamper_changes_projection_provenance(tmp_path: Path) -> None:
+    result = _with_prose_claims_alignment(_inspection(tmp_path))
+    observation = result.observations[0]
+    scenario = result.manifest.inputs.scenarios[0]
+    original = judge._projection_digest(observation, scenario)  # noqa: SLF001
+
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.steam_id64", "value": "76561198000000001"}
+    ]
+
+    assert judge._projection_digest(  # noqa: SLF001
+        observation, scenario
+    ) != original
+
+
+def test_claims_sidecar_projection_rejects_candidate_route_material(
+    tmp_path: Path,
+) -> None:
+    result = _with_prose_claims_alignment(_inspection(tmp_path))
+    observation = result.observations[0]
+    observation.report["qualitative_review_claims_sidecars"][0]["claims"] = [
+        {"path": "$.data.note", "value": "model-a"}
+    ]
+
+    with pytest.raises(judge.JudgmentError, match="prohibited material"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation, result.manifest.inputs.scenarios[0]
+        )
 
 
 def test_selected_evidence_preserves_unknown_false_and_empty_states(

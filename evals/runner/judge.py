@@ -266,11 +266,18 @@ def _qualitative_projection(
     scenario: run_state.MatrixScenario,
 ) -> dict[str, Any]:
     answers = observation.report.get("qualitative_review_answers")
-    if not isinstance(answers, list) or not answers or len(answers) > 128:
+    sidecars = observation.report.get("qualitative_review_claims_sidecars")
+    if (
+        not isinstance(answers, list)
+        or not isinstance(sidecars, list)
+        or len(answers) != scenario.turn_count
+        or len(sidecars) != scenario.turn_count
+        or scenario.turn_count > 128
+    ):
         raise JudgmentError("qualitative projection is unavailable")
-    expected_turn = -1
     texts: list[str] = []
-    for item in answers:
+    expected_turns = tuple(range(scenario.turn_count))
+    for expected_turn, item in enumerate(answers):
         if not isinstance(item, dict) or set(item) != {"turn", "text"}:
             raise JudgmentError("qualitative projection contains grading metadata")
         turn = item["turn"]
@@ -278,13 +285,46 @@ def _qualitative_projection(
         if (
             not isinstance(turn, int)
             or isinstance(turn, bool)
-            or turn <= expected_turn
+            or turn != expected_turn
             or not isinstance(text, str)
             or not text.strip()
         ):
             raise JudgmentError("qualitative projection is invalid")
-        expected_turn = turn
         texts.append(text)
+    sidecar_turns: list[int] = []
+    for expected_turn, item in enumerate(sidecars):
+        if not isinstance(item, dict) or set(item) != {
+            "turn",
+            "claims",
+            "declined",
+        }:
+            raise JudgmentError("qualitative sidecar projection is invalid")
+        turn = item["turn"]
+        claims = item["claims"]
+        if (
+            not isinstance(turn, int)
+            or isinstance(turn, bool)
+            or turn != expected_turn
+            or not isinstance(item["declined"], bool)
+            or (
+                claims is not None
+                and (
+                    not isinstance(claims, list)
+                    or any(
+                        not isinstance(claim, dict)
+                        or set(claim) != {"path", "value"}
+                        or not isinstance(claim["path"], str)
+                        for claim in claims
+                    )
+                )
+            )
+        ):
+            raise JudgmentError("qualitative sidecar projection is invalid")
+        sidecar_turns.append(turn)
+    if tuple(item["turn"] for item in answers) != expected_turns or tuple(
+        sidecar_turns
+    ) != expected_turns:
+        raise JudgmentError("qualitative projection turn coverage is invalid")
     must_mention = tuple(
         item
         for item in scenario.qualitative_criteria
@@ -309,23 +349,26 @@ def _qualitative_projection(
             )
         projected_criteria.append(projected)
     projection = {
-        "schema": "steam-agent-eval-qualitative-projection/0.1",
+        "schema": "steam-agent-eval-qualitative-projection/0.2",
         "criteria": projected_criteria,
         "answers": answers,
+        "claims_sidecars": sidecars,
     }
     content = matrix._canonical_json_bytes(projection)  # noqa: SLF001
     if len(content) > _MAX_PROJECTION_BYTES:
         raise JudgmentError("qualitative projection exceeds safety limits")
     combined = "\n".join(texts)
     folded = combined.casefold()
+    sidecar_folded = matrix._canonical_json_bytes(sidecars).decode("ascii").casefold()  # noqa: SLF001
     candidate_model = observation.work_item.route.model
     if (
         _contains_private_material(projection)
         or any(marker in folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
+        or any(marker in sidecar_folded for marker in _FORBIDDEN_PROJECTION_MARKERS)
         or (
             candidate_model is not None
             and len(candidate_model) >= 3
-            and candidate_model.casefold() in folded
+            and candidate_model.casefold() in (folded + sidecar_folded)
         )
     ):
         raise JudgmentError("qualitative projection contains prohibited material")

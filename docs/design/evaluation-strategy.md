@@ -216,7 +216,14 @@ blind comparison and task-specific rubrics while retaining expert review.
   conflicting, or child-evidence-duplicating attempt history remains
   ineligible. Compatibility vectors bind the complete ordered selected corpus,
   including deterministic-only scenarios, and the exact deterministic
-  preflight attestation, so differing preflight cohorts cannot be pooled.
+  preflight attestation, so differing preflight cohorts cannot be pooled. Each
+  deterministic preflight also retains private canonical input, oracle-document,
+  and grading-result artifacts. Resume, inspection, and acceptance replay the
+  exact oracle and revalidate those artifacts and hashes; deletion, rewriting,
+  or swapping fails closed. Finalized screen acceptance binds the hashes of all
+  retained prior retry artifacts, so their audit history cannot change after
+  freezing. Inspection rejects a symlink at the results root or any unresolved
+  ancestor before resolving the containment boundary.
   Imported blinded judgments and adjudications are hash-bound to the exact
   report and rubric; they cannot override deterministic failure. These
   contracts are recorded in

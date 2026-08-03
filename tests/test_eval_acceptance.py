@@ -131,6 +131,9 @@ def _report(
         "metrics": _metrics(failure=failure, unresolved_claims=unresolved_claims),
         "diagnostics": {"observed_conditions": []},
         "qualitative_review_answers": [{"turn": 0, "text": "A useful answer."}],
+        "qualitative_review_claims_sidecars": [
+            {"turn": 0, "claims": [], "declined": False}
+        ],
     }
 
 
@@ -996,9 +999,18 @@ def test_m2_contradictory_stored_key_answer_is_rejected_by_screen_safety_judgmen
     assert accepted.qualitative_evidence_sha256 == evidence.sha256
 
 
-@pytest.mark.parametrize("scenario_id", ("m3-d01", "m4-r07"))
-def test_screen_keeps_correctness_and_fidelity_hard_failures_diagnostic(
-    monkeypatch: pytest.MonkeyPatch, scenario_id: str
+@pytest.mark.parametrize(
+    ("scenario_id", "criterion_source"),
+    (
+        ("m3-d01", "fact_rubric.criteria.hard_fail"),
+        ("m4-r07", "fact_rubric.criteria.hard_fail"),
+        ("m2-b02", run_state.PROSE_CLAIMS_ALIGNMENT_SOURCE),
+    ),
+)
+def test_screen_keeps_non_safety_qualitative_failures_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario_id: str,
+    criterion_source: str,
 ) -> None:
     routes = _screen_routes()
     result = _result(
@@ -1020,14 +1032,14 @@ def test_screen_keeps_correctness_and_fidelity_hard_failures_diagnostic(
             inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
         ),
     )
-    hard_fact_id = next(
+    diagnostic_id = next(
         item.criterion_id
         for item in scenario.qualitative_criteria
-        if item.source == "fact_rubric.criteria.hard_fail"
+        if item.source == criterion_source
     )
     outcomes = {
         item.criterion_id: (
-            "fail" if item.criterion_id == hard_fact_id else "pass"
+            "fail" if item.criterion_id == diagnostic_id else "pass"
         )
         for item in scenario.qualitative_criteria
     }
@@ -1041,8 +1053,62 @@ def test_screen_keeps_correctness_and_fidelity_hard_failures_diagnostic(
     assert decision.outcome == "survivor"
     assert "qualitative_criterion_failed" not in decision.reasons
     assert (
-        dict(dict(evidence.outcomes)[decision.work_item_ids[0]])[hard_fact_id]
+        dict(dict(evidence.outcomes)[decision.work_item_ids[0]])[diagnostic_id]
         == "fail"
+    )
+
+
+@pytest.mark.parametrize(
+    ("alignment_outcome", "expected_route"),
+    (("pass", "qualified"), ("fail", "rejected")),
+)
+def test_qualification_gates_generated_prose_claims_sidecar_alignment(
+    alignment_outcome: str, expected_route: str
+) -> None:
+    route = run_state.MatrixRoute("model-a", "high")
+    result = _result(
+        kind="qualification",
+        matrix_id="qualification",
+        routes=(route,),
+        started_at="2026-08-02T13:00:00Z",
+        finished_at="2026-08-02T14:00:00Z",
+        source_screen_manifest_sha256="a" * 64,
+        scenario_id="m2-b02",
+    )
+    original = result.manifest.inputs.scenarios[0]
+    alignment = run_state.MatrixQualitativeCriterion(
+        run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID,
+        run_state.PROSE_CLAIMS_ALIGNMENT_SOURCE,
+        run_state.PROSE_CLAIMS_ALIGNMENT_REQUIREMENT,
+        None,
+    )
+    scenario = replace(
+        original,
+        criterion_ids=(*original.criterion_ids, alignment.criterion_id),
+        qualitative_criteria=(*original.qualitative_criteria, alignment),
+    )
+    result = replace(
+        result,
+        manifest=replace(
+            result.manifest,
+            inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
+        ),
+    )
+    qualitative = {
+        item.work_item.work_item_id: {
+            "quality": "pass",
+            alignment.criterion_id: alignment_outcome,
+        }
+        for item in result.observations
+    }
+
+    [decision] = acceptance._decide_routes(  # noqa: SLF001
+        result, qualitative=qualitative
+    )
+
+    assert decision.outcome == expected_route
+    assert ("qualitative_criterion_failed" in decision.reasons) is (
+        alignment_outcome == "fail"
     )
 
 
@@ -1170,6 +1236,63 @@ def test_finalized_screen_rejects_post_hoc_decision_changes_and_imports(
 
     failing = _qualitative_evidence(result, {"quality": "pass", safety.criterion_id: "fail"})
     monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: failing)
+    with pytest.raises(acceptance.AcceptanceError, match="does not match evidence"):
+        acceptance.load_finalized_screen(matrix_dir)
+
+
+@pytest.mark.parametrize("changed_artifact", ("started.json", "failure.json", "result.json"))
+def test_finalized_screen_binds_exact_retry_history_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_artifact: str,
+) -> None:
+    matrix_dir = tmp_path / "screen"
+    matrix_dir.mkdir(mode=0o700)
+    result = _result(
+        kind="screen",
+        matrix_id="screen",
+        routes=_screen_routes(),
+        started_at="2026-08-02T11:00:00Z",
+        finished_at="2026-08-02T12:00:00Z",
+        orphan_work_ids={"w-000000"},
+    )
+    orphan_id = result.orphan_attempt_ids[0]
+    history_root = matrix_dir / "history"
+    history_root.mkdir(mode=0o700)
+    artifact_names = (
+        ("started.json", "failure.json")
+        if changed_artifact != "result.json"
+        else ("started.json", "result.json")
+    )
+    for name in artifact_names:
+        run_state.atomic_publish_private_bytes(
+            history_root / name, f'{{"artifact":"{name}"}}'.encode()
+        )
+
+    def current_result() -> inspection.MatrixInspection:
+        hashes = tuple(
+            (name, hashlib.sha256((history_root / name).read_bytes()).hexdigest())
+            for name in artifact_names
+        )
+        return replace(
+            result,
+            orphan_attempt_hashes=((orphan_id, hashes),),
+        )
+
+    real_loader = acceptance.load_finalized_screen
+    _install_results(monkeypatch, {"screen": current_result()})
+    monkeypatch.setattr(
+        acceptance, "_strict_inspection", lambda _path: current_result()
+    )
+    monkeypatch.setattr(acceptance, "load_finalized_screen", real_loader)
+    evidence = _qualitative_evidence(result, {"quality": "pass"})
+    monkeypatch.setattr(acceptance, "_qualitative_outcomes", lambda _result: evidence)
+
+    finalized = acceptance.finalize_screen(matrix_dir)
+    assert finalized.attempt_history_sha256 != acceptance._EMPTY_ATTEMPT_HISTORY_SHA256  # noqa: SLF001
+
+    changed_path = history_root / changed_artifact
+    changed_path.write_bytes(changed_path.read_bytes() + b" ")
     with pytest.raises(acceptance.AcceptanceError, match="does not match evidence"):
         acceptance.load_finalized_screen(matrix_dir)
 
@@ -1641,7 +1764,11 @@ def test_m2_identifier_claims_cannot_qualify_without_actual_answer_mention() -> 
             inputs=replace(result.manifest.inputs, scenarios=(scenario,)),
         ),
     )
-    mention_id = qualitative_criteria[-1].criterion_id
+    mention_id = next(
+        item.criterion_id
+        for item in qualitative_criteria
+        if item.source == "fact_rubric.must_mention"
+    )
     outcomes: dict[str, dict[str, str]] = {}
     for observation in result.observations:
         observation.report["qualitative_review_answers"] = [
@@ -1666,6 +1793,7 @@ def test_m2_identifier_claims_cannot_qualify_without_actual_answer_mention() -> 
         outcomes[observation.work_item.work_item_id] = {
             "name-the-opt-in": "pass",
             mention_id: "fail",
+            run_state.PROSE_CLAIMS_ALIGNMENT_CRITERION_ID: "pass",
         }
         assert "76561198000000001" not in observation.report[
             "qualitative_review_answers"

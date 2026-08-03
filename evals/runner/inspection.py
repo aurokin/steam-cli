@@ -163,6 +163,24 @@ def _private_directory(path: Path) -> None:
         raise InspectionError("matrix directory is not private")
 
 
+def _private_results_boundary(path: Path) -> Path:
+    if ".." in Path(path).parts:
+        raise InspectionError("matrix results root boundary is invalid")
+    absolute = Path(os.path.abspath(path))
+    chain = (*reversed(absolute.parents), absolute)
+    try:
+        for item in chain:
+            item_stat = item.lstat()
+            if stat.S_ISLNK(item_stat.st_mode) or not stat.S_ISDIR(item_stat.st_mode):
+                raise InspectionError("matrix results root boundary is invalid")
+        _private_directory(absolute)
+        return absolute
+    except InspectionError:
+        raise
+    except OSError:
+        raise InspectionError("matrix results root boundary is unavailable") from None
+
+
 def _strict_object(path: Path, *, max_bytes: int = 64 * 1024 * 1024) -> dict[str, Any]:
     value = matrix._read_strict_json(path, max_bytes=max_bytes)  # noqa: SLF001
     if not isinstance(value, dict):
@@ -275,6 +293,7 @@ def inspect_matrix(
     requested_matrix_dir = Path(matrix_dir)
     _private_directory(requested_matrix_dir)
     boundary = Path(results_root) if results_root is not None else RESULTS_ROOT
+    boundary = _private_results_boundary(boundary)
     try:
         matrix_dir = requested_matrix_dir.resolve(strict=True)
         results_root = boundary.resolve(strict=True)
@@ -311,6 +330,11 @@ def inspect_matrix(
             matrix_dir / "config.json", validate_calibrated_assets=False
         )
         matrix.validate_retained_calibrated_assets(matrix_dir, config)
+        matrix.validate_retained_preflight_evidence(
+            matrix_dir,
+            manifest.inputs,
+            manifest.preflight_attestation,
+        )
         matrix._verify_matrix_layout(matrix_dir, manifest)  # noqa: SLF001
     except matrix.MatrixError as error:
         raise InspectionError(str(error)) from None

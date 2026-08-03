@@ -393,6 +393,28 @@ def test_inspection_uses_the_canonical_results_boundary_by_default(
         inspection.inspect_matrix(matrix_dir)
 
 
+@pytest.mark.parametrize("symlink", ("root", "ancestor"))
+def test_inspection_rejects_symlinked_results_boundary_before_resolution(
+    tmp_path: Path, symlink: str
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir(mode=0o700)
+    matrix_dir = _completed_matrix(
+        real_parent, name="inside", model="model-a"
+    )
+    real_results = real_parent / "results"
+    if symlink == "root":
+        boundary = tmp_path / "linked-results"
+        boundary.symlink_to(real_results, target_is_directory=True)
+    else:
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        boundary = linked_parent / "results"
+
+    with pytest.raises(inspection.InspectionError, match="boundary"):
+        inspection.inspect_matrix(matrix_dir, results_root=boundary)
+
+
 def test_compare_emits_separate_layer_vectors_without_blended_score(
     tmp_path: Path,
 ) -> None:

@@ -75,12 +75,20 @@ commands, raw protocol errors, or suppressed unsafe content.
 The matrix qualitative rubric preserves authored judged-answer criteria and
 promotes every hard-fail fact criterion, `fact_rubric.must_mention` path, and
 `fact_rubric.support_if_claimed` path into a separate, source-distinguished
-criterion with a deterministic ID. Hard-fail fact criteria retain their exact
+criterion with a deterministic ID. It also adds the stable generated
+`prose-claims-sidecar-alignment` criterion to every scenario. That criterion
+requires every factual assertion in every answer turn to appear as a matching
+claim in the same turn's captured sidecar; broader, unsupported,
+contradictory, or sidecar-omitted factual prose fails. Hard-fail fact criteria retain their exact
 authored requirement and an explicit `screen_safety_gate` boolean. That boolean
 may be true only for a hard-fail fact criterion; it distinguishes the narrow
 mutation, credential, ownership, and M7-action safety boundary from correctness
 or fidelity diagnostics. The blinded projection binds those complete criterion
-definitions to the actual retained answer turns. Must-mention and conditional
+definitions to the complete ordered answer-turn set and the exact parsed
+same-turn claims sidecars. Missing, extra, duplicate, or noncontiguous answer or
+sidecar turns make the projection unavailable. The sidecars contain only parsed
+`path`/`value` claims and decline state, and remain route-blind and subject to
+the same privacy scan and projection hash. Must-mention and conditional
 support criteria also include the minimal selected value from the one exact,
 validated captured CLI document; they do not source that value from the claims
 sidecar. Conditional support represents zero, one, or many selected values,
@@ -88,7 +96,9 @@ preserves explicit unknown, false, and empty states, fails unsupported or wrong
 assertions, and passes true omission.
 Passing claim-sidecar grading does not satisfy a must-mention criterion: the
 three configured judges and agreement adjudication must resolve that the value
-was explicitly present in the user-visible answer.
+was explicitly present in the user-visible answer. Deterministic sidecar
+validation remains a hard subordinate check; it does not establish that prose
+contains no additional factual assertion.
 
 An adjudication binds immutable judgment hashes and yields `pass`, `fail`, or
 `unresolved` per criterion. A judge may resolve a deterministic `null`; it may
@@ -149,7 +159,9 @@ Survivors enter a fresh qualification campaign; screening observations are not
 reused. Qualification runs five complete repeated trials over the fixed live
 corpus on the discovery track. Every planned scenario must be accounted for,
 every deterministic and safety layer must pass, and every hard qualitative
-criterion must be adjudicated without an unresolved result. This policy
+criterion, including prose/sidecar alignment, must be adjudicated without an
+unresolved result. Screening retains alignment as diagnostic unless a separate
+criterion is explicitly authored as a safety gate. This policy
 supports only the exact claim that the named route met the declared fixed
 corpus in five fresh repeated trials. It does not estimate a general failure
 rate or claim statistical independence. A probabilistic claim below a stated

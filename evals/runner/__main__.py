@@ -1120,6 +1120,8 @@ class DeterministicPreflightEvidence:
     executor: str
     document_sha256: str
     grading_sha256: str
+    document: Any
+    grading: dict[str, Any]
 
 
 def _evidence_digest(value: Any) -> str:
@@ -1182,6 +1184,8 @@ def _preflight_deterministic_scenario(
             executor=executor,
             document_sha256=_evidence_digest(document),
             grading_sha256=_evidence_digest(result),
+            document=document,
+            grading=result,
         )
 
 
@@ -1331,12 +1335,16 @@ def _qualitative_review_answers(
     ):
         return None
 
+    if not turns or tuple(turn.get("index") for turn in turns) != tuple(
+        range(len(turns))
+    ):
+        raise ValueError(_QUALITATIVE_REVIEW_LIMIT_ERROR)
     answers: list[dict[str, Any]] = []
     total_bytes = 0
     for turn in turns:
         text = _sanitize_text(turn.get("answer_text", ""), sensitive_values).strip()
         if not text:
-            continue
+            return None
         encoded_bytes = len(text.encode())
         total_bytes += encoded_bytes
         if (
@@ -1346,6 +1354,30 @@ def _qualitative_review_answers(
             raise ValueError(_QUALITATIVE_REVIEW_LIMIT_ERROR)
         answers.append({"turn": turn["index"], "text": text})
     return answers
+
+
+def _qualitative_review_claims_sidecars(
+    turns: list[dict[str, Any]],
+    answers: list[dict[str, Any]] | None,
+    *,
+    sensitive_values: tuple[str, ...],
+) -> list[dict[str, Any]] | None:
+    """Project the exact parsed same-turn sidecars beside retained prose."""
+
+    if answers is None:
+        return None
+    if tuple(item["turn"] for item in answers) != tuple(range(len(turns))):
+        raise ValueError(_QUALITATIVE_REVIEW_LIMIT_ERROR)
+    return [
+        {
+            "turn": turn["index"],
+            "claims": _sanitize_artifact(
+                turn.get("_claims"), sensitive_values=sensitive_values
+            ),
+            "declined": turn.get("declined") is True,
+        }
+        for turn in turns
+    ]
 
 
 def _tool_policy_allows_qualitative_review(metric: dict[str, Any]) -> bool:
@@ -2275,6 +2307,11 @@ def run_scenario(
         metrics,
         sensitive_values=sensitive_values,
     )
+    qualitative_review_claims_sidecars = _qualitative_review_claims_sidecars(
+        turns,
+        qualitative_review_answers,
+        sensitive_values=sensitive_values,
+    )
 
     rendered_turns = [
         _sanitize_artifact(
@@ -2338,6 +2375,9 @@ def run_scenario(
             allow_data_delete=allow_data_delete,
         ),
         "qualitative_review_answers": qualitative_review_answers,
+        "qualitative_review_claims_sidecars": (
+            qualitative_review_claims_sidecars
+        ),
         "turns": rendered_turns,
         "required_cli_documents": (
             [oracle_document] if oracle_document is not None else []

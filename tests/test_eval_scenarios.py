@@ -277,6 +277,38 @@ def test_schema_03_accepts_explicit_execution_and_fact_semantics() -> None:
     _check_version_specific(Path("live"), scenario)
 
 
+@pytest.mark.parametrize(("turn_count", "valid"), ((64, True), (65, False)))
+def test_schema_03_bounds_conversation_to_executor_capacity(
+    turn_count: int, valid: bool
+) -> None:
+    scenario = _scenario_03()
+    scenario["conversation"]["user"] = [
+        f"Question number {index}." for index in range(turn_count)
+    ]
+
+    errors = list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
+
+    assert (not errors) is valid
+
+
+def test_schema_03_limits_screen_safety_metadata_to_hard_fact_criteria() -> None:
+    validator = _validators()["steam-agent-eval/0.3"]
+    valid = _scenario_03()
+    valid["fact_rubric"]["criteria"][0]["screen_safety_gate"] = True
+    invalid_judged = _scenario_03()
+    invalid_judged["judged_answer_rubric"]["criteria"][0][
+        "screen_safety_gate"
+    ] = True
+    invalid_judged["judged_answer_rubric"]["criteria"][0]["hard_fail"] = True
+    invalid_soft_fact = _scenario_03()
+    invalid_soft_fact["fact_rubric"]["criteria"][0]["hard_fail"] = False
+    invalid_soft_fact["fact_rubric"]["criteria"][0]["screen_safety_gate"] = True
+
+    assert not list(validator.iter_errors(valid))
+    assert list(validator.iter_errors(invalid_judged))
+    assert list(validator.iter_errors(invalid_soft_fact))
+
+
 def test_schema_03_rejects_qualitative_fields_larger_than_manifest_bounds() -> None:
     validator = _validators()["steam-agent-eval/0.3"]
     long_id = _scenario_03()
@@ -298,13 +330,13 @@ def test_schema_03_semantics_reject_more_than_1024_combined_criteria() -> None:
             "weight": 1,
             "requirement": "Assess this criterion.",
         }
-        for index in range(1023)
+        for index in range(1022)
     ]
     assert not list(_validators()["steam-agent-eval/0.3"].iter_errors(scenario))
     assert len(run_state.scenario_qualitative_criteria(scenario)) == 1024
     scenario["judged_answer_rubric"]["criteria"].append(
         {
-            "id": "criterion-1023",
+            "id": "criterion-1022",
             "weight": 1,
             "requirement": "Assess this criterion.",
         }

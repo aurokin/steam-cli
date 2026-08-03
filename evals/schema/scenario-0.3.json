@@ -77,6 +77,7 @@
         "user": {
           "type": "array",
           "minItems": 1,
+          "maxItems": 64,
           "items": {"type": "string", "minLength": 3}
         },
         "paraphrase": {"type": "string", "minLength": 3}
@@ -169,7 +170,14 @@
       "properties": {
         "grading": {"const": "model_or_human"},
         "status": {"const": "opt_in"},
-        "criteria": {"$ref": "#/$defs/criteria"}
+        "criteria": {
+          "$ref": "#/$defs/criteria",
+          "items": {
+            "properties": {
+              "screen_safety_gate": {"const": false}
+            }
+          }
+        }
       }
     },
     "privacy_canaries": {
