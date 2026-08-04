@@ -223,14 +223,19 @@ One setup pattern is:
 
 ```text
 umask 077
-PRIVATE_JUDGE_PARENT=/operator-owned/private-parent
-test -d "$PRIVATE_JUDGE_PARENT" && test ! -L "$PRIVATE_JUDGE_PARENT"
-test "$(stat -f '%Lp' "$PRIVATE_JUDGE_PARENT")" = 700
-JUDGE_ROOT="$(mktemp -d "$PRIVATE_JUDGE_PARENT/steam-agent-judge.XXXXXX")"
+JUDGE_ROOT="$(mktemp -d /tmp/steam-agent-judge.XXXXXX)"
+test -d "$JUDGE_ROOT" && test ! -L "$JUDGE_ROOT"
+test "$(stat -f '%Lp' "$JUDGE_ROOT")" = 700
 trap 'rm -rf "$JUDGE_ROOT"' EXIT
 mkdir -m 700 "$JUDGE_ROOT/codex-home" "$JUDGE_ROOT/workspace"
 install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
   "$JUDGE_ROOT/codex-home/auth.json"
+SOURCE_REVIEW_ROOT=/operator-owned/private-review-root
+CASE_PATH="$JUDGE_ROOT/case-judge-1.json"
+SCHEMA_PATH="$JUDGE_ROOT/response-schema.json"
+install -m 600 \
+  "$SOURCE_REVIEW_ROOT/cases/WORK_ITEM_ID-judge-1.json" "$CASE_PATH"
+install -m 600 "$SOURCE_REVIEW_ROOT/response-schema.json" "$SCHEMA_PATH"
 VERDICT_PATH="$JUDGE_ROOT/verdict-judge-1.json"
 STDOUT_LOG="$JUDGE_ROOT/codex.stdout"
 STDERR_LOG="$JUDGE_ROOT/codex.stderr"
@@ -240,9 +245,14 @@ test -f "$VERDICT_PATH" && test ! -L "$VERDICT_PATH"
 test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600
 ```
 
-`JUDGE_ROOT` is outside the model workspace. The case, response schema, verdict,
-and private stdout/stderr logs also remain outside that empty workspace. Then
-invoke the judge with the isolated environment:
+On macOS, `/tmp` canonicalizes to `/private/tmp`; both are neutral system paths
+without an account identifier. `mktemp -d` creates the unpredictable root
+atomically, and the mode check rejects anything other than `0700`. Do not move
+the root under a home directory or other account-named path. `SOURCE_REVIEW_ROOT`
+is used only by the host-side copy above and is never passed to the model
+process. `JUDGE_ROOT` is outside the model workspace. The private case, response
+schema, verdict, and stdout/stderr logs are neutral-path siblings of that empty
+workspace. Then invoke the judge with the isolated environment:
 
 ```text
 CODEX_BIN="$(command -v codex)"
@@ -266,9 +276,9 @@ env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
   --config 'default_permissions="steam-agent-eval"' \
   --config 'permissions.steam-agent-eval={extends=":workspace",filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny"},network={enabled=false}}' \
   --model gpt-5.6-sol --config model_reasoning_effort=xhigh \
-  --output-schema /private/path/MATRIX_ID-review/response-schema.json \
+  --output-schema "$SCHEMA_PATH" \
   --output-last-message "$VERDICT_PATH" \
-  - < /private/path/MATRIX_ID-review/cases/WORK_ITEM_ID-judge-1.json \
+  - < "$CASE_PATH" \
   >"$STDOUT_LOG" 2>"$STDERR_LOG"
 test -f "$VERDICT_PATH" && test ! -L "$VERDICT_PATH"
 test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600

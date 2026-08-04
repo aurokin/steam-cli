@@ -514,13 +514,22 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     assert profile in documentation
     assert 'approval_policy="never"' in documentation
     assert "umask 077" in documentation
-    assert 'JUDGE_ROOT="$(mktemp -d ' in documentation
+    assert 'JUDGE_ROOT="$(mktemp -d /tmp/steam-agent-judge.XXXXXX)"' in documentation
+    assert 'test "$(stat -f \'%Lp\' "$JUDGE_ROOT")" = 700' in documentation
     assert "Never reuse that root or" in documentation
-    assert "WORK_ITEM_ID-judge-1.json" in documentation
+    assert '"$SOURCE_REVIEW_ROOT/cases/WORK_ITEM_ID-judge-1.json"' in documentation
+    assert '--output-schema "$SCHEMA_PATH"' in documentation
+    assert '- < "$CASE_PATH"' in documentation
     assert 'install -m 600 /dev/null "$VERDICT_PATH"' in documentation
     assert 'test "$(stat -f \'%Lp\' "$VERDICT_PATH")" = 600' in documentation
     assert '>"$STDOUT_LOG" 2>"$STDERR_LOG"' in documentation
     assert 'HOME="$JUDGE_ROOT/workspace"' in documentation
+    invocation = documentation.split(
+        "Then invoke the judge with the isolated environment:", maxsplit=1
+    )[1].split("Import the result", maxsplit=1)[0]
+    assert "SOURCE_REVIEW_ROOT" not in invocation
+    assert "/operator-owned" not in invocation
+    assert "/Users/" not in invocation
     assert "--sandbox read-only" not in documentation
     assert review._ISOLATION_ATTESTATION in documentation  # noqa: SLF001
 
