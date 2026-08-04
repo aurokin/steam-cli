@@ -407,6 +407,112 @@ raise SystemExit(1)
     assert not (matrix_dir / "matrix.lock").exists()
 
 
+@pytest.mark.parametrize("command", ["prepare", "assemble", "resolve"])
+def test_review_commands_reject_case_alias_without_hanging(
+    tmp_path: Path, command: str
+) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("macOS case-alias regression")
+    matrix_dir = tmp_path / "CaseMatrix"
+    matrix_dir.mkdir(mode=0o700)
+    alias_dir = tmp_path / "casematrix"
+    if not alias_dir.exists() or not os.path.samefile(matrix_dir, alias_dir):
+        pytest.skip("filesystem is case-sensitive")
+    review_dir = alias_dir / "prepared"
+    script = """
+from pathlib import Path
+import sys
+from evals.runner import review
+
+matrix_dir = Path(sys.argv[2])
+review_dir = Path(sys.argv[3])
+try:
+    if sys.argv[1] == "prepare":
+        review.prepare(matrix_dir, review_dir)
+    elif sys.argv[1] == "assemble":
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            "w-000000-0123456789abcdef",
+            Path("missing-verdicts.json"),
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,
+        )
+    else:
+        review.resolve_agreement(matrix_dir, review_dir)
+except review.ReviewError as error:
+    raise SystemExit(0 if "must be outside matrix" in str(error) else 2)
+raise SystemExit(1)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, command, str(matrix_dir), str(review_dir)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=3,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not review_dir.exists()
+    assert not (matrix_dir / "matrix.lock").exists()
+
+
+@pytest.mark.parametrize("command", ["prepare", "assemble", "resolve"])
+def test_review_commands_reject_mocked_parent_identity_before_locks_or_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    review_parent = tmp_path / "review-parent"
+    review_parent.mkdir(mode=0o700)
+    review_dir = review_parent / "prepared"
+    matrix_root = matrix_dir.resolve()
+    review_root = review_dir.resolve()
+    identity_calls: list[Path] = []
+
+    def filesystem_identity(path: Path) -> tuple[int, int] | None:
+        identity_calls.append(path)
+        if path in {matrix_root, review_root.parent}:
+            return (7, 11)
+        return None
+
+    def unexpected_target_index(_path: Path) -> None:
+        pytest.fail("matrix inspection must follow root separation")
+
+    class UnexpectedLock:
+        def __init__(self, _path: Path) -> None:
+            pytest.fail("lock acquisition must follow root separation")
+
+    monkeypatch.setattr(review, "_filesystem_identity", filesystem_identity)
+    monkeypatch.setattr(review.judge, "_target_index", unexpected_target_index)
+    monkeypatch.setattr(review.matrix, "MatrixLock", UnexpectedLock)
+
+    with pytest.raises(review.ReviewError, match="must be outside matrix"):
+        if command == "prepare":
+            review.prepare(matrix_dir, review_dir)
+        elif command == "assemble":
+            review.assemble_judgment(
+                matrix_dir,
+                review_dir,
+                WORK_ITEM_ID,
+                tmp_path / "missing-verdicts.json",
+                judge_identifier="judge-1",
+                attempt_count=1,
+                duration_ms=1,
+                isolation_attestation=review._ISOLATION_ATTESTATION,
+            )
+        else:
+            review.resolve_agreement(matrix_dir, review_dir)
+
+    assert identity_calls == [matrix_root, review_root, review_root.parent]
+    assert not review_dir.exists()
+    assert list(review_parent.iterdir()) == []
+    assert not (matrix_dir / "matrix.lock").exists()
+
+
 def test_review_root_rejects_non_string_work_item_without_type_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

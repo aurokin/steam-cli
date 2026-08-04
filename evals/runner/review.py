@@ -290,13 +290,32 @@ def _private_dir(path: Path) -> None:
         raise ReviewError("qualitative review directory is unavailable") from None
 
 
+def _filesystem_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        item_stat = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ReviewError("qualitative review roots are unavailable") from None
+    return item_stat.st_dev, item_stat.st_ino
+
+
 def _separated_review_roots(
     matrix_dir: Path, review_dir: Path
 ) -> tuple[Path, Path]:
-    matrix_root = Path(matrix_dir).resolve()
-    review_root = Path(review_dir).resolve()
+    try:
+        matrix_root = Path(matrix_dir).resolve()
+        review_root = Path(review_dir).resolve()
+    except (OSError, RuntimeError):
+        raise ReviewError("qualitative review roots are unavailable") from None
+    matrix_identity = _filesystem_identity(matrix_root)
+    if matrix_identity is None:
+        raise ReviewError("qualitative review roots are unavailable")
     if review_root.is_relative_to(matrix_root):
         raise ReviewError("qualitative review directory must be outside matrix")
+    for candidate in (review_root, *review_root.parents):
+        if _filesystem_identity(candidate) == matrix_identity:
+            raise ReviewError("qualitative review directory must be outside matrix")
     return matrix_root, review_root
 
 
