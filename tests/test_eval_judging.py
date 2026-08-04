@@ -1384,6 +1384,7 @@ def test_judgment_requires_a_parser_conforming_rationale(
         ("Privacy's status was false.", "deterministic outcome"),
         ("The oracle result was a pass.", "deterministic outcome"),
         ("The oracle check definitely failed.", "deterministic outcome"),
+        ("The oracle marked the result unresolved.", "deterministic outcome"),
     ),
 )
 def test_judgment_rejects_route_or_deterministic_leaks_in_rationales(
@@ -1425,6 +1426,7 @@ def test_judgment_rejects_route_or_deterministic_leaks_in_rationales(
         "Claims a price instead of explicitly mentioning the null offer.",
         "The answer claims unknown ownership.",
         "The answer claims failed checks without evidence.",
+        "The answer claims the result is null.",
     ),
 )
 def test_judgment_allows_ordinary_criterion_rationales(

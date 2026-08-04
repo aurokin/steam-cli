@@ -236,6 +236,8 @@ def _contains_candidate_route_material(
 def _contains_deterministic_outcome_material(value: str) -> bool:
     """Detect an outcome predicated of a named deterministic layer."""
 
+    # Clause-local matching avoids conflating unrelated evidence/outcome prose;
+    # cross-sentence anaphora is intentionally out of scope.
     for segment in _SENTENCE_BOUNDARY.split(value):
         tokens = _identity_tokens(segment)
         for index, token in enumerate(tokens):
@@ -279,6 +281,33 @@ def _contains_deterministic_outcome_material(value: str) -> bool:
             ):
                 return True
             if predicate not in _OUTCOME_AUXILIARIES | _OUTCOME_COPULAS:
+                if token == "claims" and not (
+                    index == 0 or possessive or qualified
+                ):
+                    continue
+                cursor += 1
+                if cursor < len(tokens) and tokens[cursor] in _OUTCOME_ARTICLES:
+                    cursor += 1
+                qualifier_start = cursor
+                while (
+                    cursor < len(tokens)
+                    and tokens[cursor] in _DETERMINISTIC_LAYER_QUALIFIERS
+                ):
+                    cursor += 1
+                if cursor == qualifier_start:
+                    continue
+                while cursor < len(tokens) and (
+                    tokens[cursor] == "as"
+                    or tokens[cursor] == "not"
+                    or tokens[cursor] in _OUTCOME_AUXILIARIES | _OUTCOME_COPULAS
+                    or tokens[cursor].endswith("ly")
+                ):
+                    cursor += 1
+                if (
+                    cursor < len(tokens)
+                    and tokens[cursor] in _DETERMINISTIC_OUTCOME_IDENTITIES
+                ):
+                    return True
                 continue
             cursor += 1
             while cursor < len(tokens) and (
