@@ -92,6 +92,39 @@ _DETERMINISTIC_OUTCOME_IDENTITIES = frozenset(
         "unresolved",
     }
 )
+_DETERMINISTIC_OUTCOME_PREDICATES = frozenset(
+    {
+        "fail",
+        "failed",
+        "failing",
+        "fails",
+        "pass",
+        "passed",
+        "passes",
+        "passing",
+        "succeed",
+        "succeeded",
+        "succeeds",
+        "succeeding",
+    }
+)
+_DETERMINISTIC_LAYER_QUALIFIERS = frozenset(
+    {
+        "check",
+        "checks",
+        "layer",
+        "metric",
+        "metrics",
+        "outcome",
+        "result",
+        "results",
+        "status",
+    }
+)
+_CLAIMS_VERB_OUTCOME_NOUNS = frozenset({"check", "checks"})
+_OUTCOME_ARTICLES = frozenset({"a", "an", "the"})
+_OUTCOME_AUXILIARIES = frozenset({"did", "do", "does", "had", "has", "have"})
+_OUTCOME_COPULAS = frozenset({"are", "be", "been", "being", "is", "was", "were"})
 _BOUND_RATIONALE_IDENTITIES = (
     ("agent", "turns"),
     ("deterministic", "passed"),
@@ -196,6 +229,71 @@ def _contains_candidate_route_material(
                 for context_index in range(start, stop)
                 if context_index != index
             ):
+                return True
+    return False
+
+
+def _contains_deterministic_outcome_material(value: str) -> bool:
+    """Detect an outcome predicated of a named deterministic layer."""
+
+    for segment in _SENTENCE_BOUNDARY.split(value):
+        tokens = _identity_tokens(segment)
+        for index, token in enumerate(tokens):
+            if token not in _DETERMINISTIC_LAYER_IDENTITIES:
+                continue
+            if (
+                0 < index == len(tokens) - 1
+                and tokens[index - 1] in _DETERMINISTIC_OUTCOME_PREDICATES
+                and all(item in {"a", "an", "the"} for item in tokens[: index - 1])
+            ):
+                return True
+            cursor = index + 1
+            possessive = cursor < len(tokens) and tokens[cursor] == "s"
+            if possessive:
+                cursor += 1
+            qualified = False
+            while (
+                cursor < len(tokens)
+                and tokens[cursor] in _DETERMINISTIC_LAYER_QUALIFIERS
+            ):
+                qualified = True
+                cursor += 1
+            while cursor < len(tokens) and tokens[cursor].endswith("ly"):
+                cursor += 1
+            if cursor >= len(tokens):
+                continue
+            predicate = tokens[cursor]
+            if predicate in _DETERMINISTIC_OUTCOME_PREDICATES:
+                if (
+                    token == "claims"
+                    and cursor + 1 < len(tokens)
+                    and tokens[cursor + 1] in _CLAIMS_VERB_OUTCOME_NOUNS
+                ):
+                    continue
+                return True
+            if predicate in _DETERMINISTIC_OUTCOME_IDENTITIES and (
+                token != "claims"
+                or possessive
+                or qualified
+                or cursor == len(tokens) - 1
+            ):
+                return True
+            if predicate not in _OUTCOME_AUXILIARIES | _OUTCOME_COPULAS:
+                continue
+            cursor += 1
+            while cursor < len(tokens) and (
+                tokens[cursor] == "not"
+                or tokens[cursor] in _OUTCOME_ARTICLES
+                or tokens[cursor].endswith("ly")
+            ):
+                cursor += 1
+            if cursor >= len(tokens):
+                continue
+            outcome = tokens[cursor]
+            if predicate in _OUTCOME_COPULAS:
+                if outcome in _DETERMINISTIC_OUTCOME_IDENTITIES:
+                    return True
+            elif outcome in _DETERMINISTIC_OUTCOME_PREDICATES:
                 return True
     return False
 
@@ -602,7 +700,6 @@ def _reject_unsafe_metadata(
 
     def reject_rationale(value: str) -> None:
         token_sequence = _identity_tokens(value)
-        tokens = frozenset(token_sequence)
         if _contains_candidate_route_material(
             value, candidate_model=candidate_model
         ):
@@ -612,10 +709,7 @@ def _reject_unsafe_metadata(
         if any(
             _contains_token_sequence(token_sequence, identity)
             for identity in _BOUND_RATIONALE_IDENTITIES
-        ) or (
-            tokens & _DETERMINISTIC_LAYER_IDENTITIES
-            and tokens & _DETERMINISTIC_OUTCOME_IDENTITIES
-        ):
+        ) or _contains_deterministic_outcome_material(value):
             raise JudgmentError(
                 "qualitative rationale contains deterministic outcome material"
             )

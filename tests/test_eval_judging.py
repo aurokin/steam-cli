@@ -99,6 +99,31 @@ def test_verified_judge_calibration_labels_bind_the_complete_case_set() -> None:
         )
 
 
+def test_verified_judge_calibration_rationales_pass_runtime_metadata_safety(
+    tmp_path: Path,
+) -> None:
+    results = json.loads(
+        (ROOT / "evals" / "calibration" / "judge-v1-results.json").read_text()
+    )
+    observation = _inspection(tmp_path / "matrix-20260802T120000Z").observations[0]
+
+    checked = 0
+    for reviewer_index, reviewer in enumerate(results["reviewers"]):
+        for item in reviewer["results"]:
+            judge._reject_unsafe_metadata(  # noqa: SLF001
+                {
+                    "judgment_id": (
+                        f"judgment-calibration-{reviewer_index}-{item['id']}"
+                    ),
+                    "verdicts": [{"rationale": item["rationale"]}],
+                },
+                observation,
+            )
+            checked += 1
+
+    assert checked == 105
+
+
 def test_judge_calibration_covers_required_defect_classes() -> None:
     calibration_root = ROOT / "evals" / "calibration"
     cases = json.loads((calibration_root / "judge-v1-cases.json").read_text())[
@@ -1349,6 +1374,16 @@ def test_judgment_requires_a_parser_conforming_rationale(
         ("The tool_policy result was pass.", "deterministic outcome"),
         ("Privacy was false.", "deterministic outcome"),
         ("The agent_turns layer passed.", "deterministic outcome"),
+        ("The oracle result was passed.", "deterministic outcome"),
+        ("The claims layer was false.", "deterministic outcome"),
+        ("Claims a price; oracle passed.", "deterministic outcome"),
+        ("Failed claims.", "deterministic outcome"),
+        ("Oracle success.", "deterministic outcome"),
+        ("The oracle was a success.", "deterministic outcome"),
+        ("The oracle's failure is decisive.", "deterministic outcome"),
+        ("Privacy's status was false.", "deterministic outcome"),
+        ("The oracle result was a pass.", "deterministic outcome"),
+        ("The oracle check definitely failed.", "deterministic outcome"),
     ),
 )
 def test_judgment_rejects_route_or_deterministic_leaks_in_rationales(
@@ -1387,6 +1422,9 @@ def test_judgment_rejects_route_or_deterministic_leaks_in_rationales(
         "The lunar recommendation follows the stated criterion.",
         "The agent failed to explain the criterion.",
         "The claim passes because evidence is explicit.",
+        "Claims a price instead of explicitly mentioning the null offer.",
+        "The answer claims unknown ownership.",
+        "The answer claims failed checks without evidence.",
     ),
 )
 def test_judgment_allows_ordinary_criterion_rationales(
