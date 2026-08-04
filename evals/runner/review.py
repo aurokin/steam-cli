@@ -30,9 +30,35 @@ _OPERATION_SCHEMA = "steam-agent-eval-review-operation/0.1"
 _MAX_CASES = 1024
 _MAX_ATTEMPTS = 3
 _MAX_DURATION_MS = 24 * 60 * 60 * 1000
-_ISOLATION_ATTESTATION = "codex-0.146-restricted-profile-v1"
+_HOST_ISOLATION_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "multi_agent",
+    "apps",
+    "plugins",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "image_generation",
+    "in_app_browser",
+    "goals",
+    "skill_search",
+    "workspace_dependencies",
+    "tool_suggest",
+    "current_time_reminder",
+    "hooks",
+)
+_ISOLATION_ATTESTATION = "codex-0.146-no-shell-host-isolated-profile-v1"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _SAFE_WORK_ITEM = re.compile(r"w-[0-9]{6}-[0-9a-f]{16}\Z", re.ASCII)
+_CODEX_LIFECYCLE_EVENTS = frozenset(
+    {"thread.started", "turn.started", "turn.completed"}
+)
+_CODEX_ITEM_EVENTS = frozenset(
+    {"item.started", "item.updated", "item.completed"}
+)
+_ALLOWED_JUDGE_ITEM_TYPES = frozenset({"agent_message", "reasoning"})
 
 
 class ReviewError(RuntimeError):
@@ -61,13 +87,7 @@ def _valid_timestamp(value: Any) -> bool:
     return True
 
 
-def _read_json(
-    path: Path,
-    *,
-    schema_name: str | None = None,
-    require_private: bool = False,
-    require_canonical: bool = False,
-) -> dict[str, Any]:
+def _read_bytes(path: Path, *, require_private: bool = False) -> bytes:
     descriptor = -1
     try:
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
@@ -91,17 +111,31 @@ def _read_json(
             content.extend(chunk)
         if len(content) > _MAX_DOCUMENT_BYTES:
             raise ReviewError("qualitative review input is invalid")
-        document = matrix._strict_json_loads(  # noqa: SLF001
-            bytes(content).decode("utf-8")
-        )
-    except (OSError, UnicodeError, ValueError, matrix.MatrixError):
+        return bytes(content)
+    except OSError:
         raise ReviewError("qualitative review input is invalid") from None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _read_json(
+    path: Path,
+    *,
+    schema_name: str | None = None,
+    require_private: bool = False,
+    require_canonical: bool = False,
+) -> dict[str, Any]:
+    try:
+        content = _read_bytes(path, require_private=require_private)
+        document = matrix._strict_json_loads(  # noqa: SLF001
+            content.decode("utf-8")
+        )
+    except (OSError, UnicodeError, ValueError, matrix.MatrixError):
+        raise ReviewError("qualitative review input is invalid") from None
     if not isinstance(document, dict):
         raise ReviewError("qualitative review input is invalid")
-    if require_canonical and bytes(content) != _canonical_bytes(document):
+    if require_canonical and content != _canonical_bytes(document):
         raise ReviewError("qualitative review input is not canonical")
     if schema_name is not None:
         try:
@@ -109,6 +143,42 @@ def _read_json(
         except judge.JudgmentError as error:
             raise ReviewError(str(error)) from None
     return document
+
+
+def check_event_log(path: Path) -> dict[str, int]:
+    """Reject malformed, failed, or tool-using Codex JSONL judge events."""
+
+    try:
+        text = _read_bytes(Path(path), require_private=True).decode("utf-8")
+        lines = text.splitlines()
+    except UnicodeError:
+        raise ReviewError("qualitative review event log is invalid") from None
+    if not lines or any(not line.strip() for line in lines):
+        raise ReviewError("qualitative review event log is invalid")
+    seen_lifecycle: set[str] = set()
+    agent_messages = 0
+    for line in lines:
+        try:
+            event = matrix._strict_json_loads(line)  # noqa: SLF001
+        except (ValueError, matrix.MatrixError):
+            raise ReviewError("qualitative review event log is invalid") from None
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            raise ReviewError("qualitative review event log is invalid")
+        event_type = event["type"]
+        if event_type in _CODEX_LIFECYCLE_EVENTS:
+            seen_lifecycle.add(event_type)
+            continue
+        if event_type not in _CODEX_ITEM_EVENTS:
+            raise ReviewError("qualitative review event log is invalid")
+        item = event.get("item")
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if item_type not in _ALLOWED_JUDGE_ITEM_TYPES:
+            raise ReviewError("qualitative review event log contains tool use")
+        if item_type == "agent_message" and event_type == "item.completed":
+            agent_messages += 1
+    if seen_lifecycle != _CODEX_LIFECYCLE_EVENTS or agent_messages != 1:
+        raise ReviewError("qualitative review event log is invalid")
+    return {"events": len(lines), "agent_messages": agent_messages}
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -124,6 +194,16 @@ def _private_dir(path: Path) -> None:
         path.chmod(0o700)
     except OSError:
         raise ReviewError("qualitative review directory is unavailable") from None
+
+
+def _separated_review_roots(
+    matrix_dir: Path, review_dir: Path
+) -> tuple[Path, Path]:
+    matrix_root = Path(matrix_dir).resolve()
+    review_root = Path(review_dir).resolve()
+    if review_root.is_relative_to(matrix_root):
+        raise ReviewError("qualitative review directory must be outside matrix")
+    return matrix_root, review_root
 
 
 def _asset_text(matrix_dir: Path, name: str, expected_sha256: str) -> str:
@@ -393,11 +473,8 @@ def _validate_review_root(
 def prepare(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
     """Publish one immutable route-blind case package for a benchmark."""
 
-    matrix_dir = Path(matrix_dir).resolve()
-    review_dir = Path(review_dir).resolve()
+    matrix_dir, review_dir = _separated_review_roots(matrix_dir, review_dir)
     try:
-        if review_dir.is_relative_to(matrix_dir):
-            raise ReviewError("qualitative review directory must be outside matrix")
         target_index = judge._target_index(matrix_dir)  # noqa: SLF001
     except (judge.JudgmentError, inspection.InspectionError) as error:
         raise ReviewError(str(error)) from None
@@ -804,8 +881,7 @@ def assemble_judgment(
         or isolation_attestation != _ISOLATION_ATTESTATION
     ):
         raise ReviewError("qualitative review operational measurement is invalid")
-    matrix_dir = Path(matrix_dir).resolve()
-    review_dir = Path(review_dir).resolve()
+    matrix_dir, review_dir = _separated_review_roots(matrix_dir, review_dir)
     with matrix.MatrixLock(review_dir):
         with matrix.MatrixLock(matrix_dir):
             try:
@@ -979,8 +1055,7 @@ def _existing_operation_artifact(
 def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
     """Import one mechanical agreement adjudication for every complete roster."""
 
-    matrix_dir = Path(matrix_dir).resolve()
-    review_dir = Path(review_dir).resolve()
+    matrix_dir, review_dir = _separated_review_roots(matrix_dir, review_dir)
     imported = 0
     retained_count = 0
     with matrix.MatrixLock(review_dir):
@@ -1099,6 +1174,8 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("matrix_dir", type=Path)
     prepare_parser.add_argument("review_dir", type=Path)
+    events_parser = subparsers.add_parser("check-events")
+    events_parser.add_argument("events", type=Path)
     assemble_parser = subparsers.add_parser("assemble")
     assemble_parser.add_argument("matrix_dir", type=Path)
     assemble_parser.add_argument("review_dir", type=Path)
@@ -1119,6 +1196,8 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "prepare":
             result = prepare(args.matrix_dir, args.review_dir)
+        elif args.command == "check-events":
+            result = check_event_log(args.events)
         elif args.command == "assemble":
             result = assemble_judgment(
                 args.matrix_dir,

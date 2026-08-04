@@ -161,6 +161,35 @@ def _verdict_document(judge_identifier: str = "judge-1") -> dict[str, object]:
     }
 
 
+def _write_event_log(path: Path, events: list[dict[str, object]]) -> None:
+    path.write_bytes(
+        b"".join(
+            review._canonical_bytes(event) for event in events  # noqa: SLF001
+        )
+    )
+    path.chmod(0o600)
+
+
+def _valid_event_log() -> list[dict[str, object]]:
+    return [
+        {"type": "thread.started", "thread_id": "thread-1"},
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"id": "item-1", "type": "reasoning", "text": ""},
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item-2",
+                "type": "agent_message",
+                "text": "structured verdict",
+            },
+        },
+        {"type": "turn.completed", "usage": {}},
+    ]
+
+
 def test_case_document_is_the_exact_route_blind_model_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -266,6 +295,55 @@ def test_review_cli_redacts_filesystem_error_paths(
     captured = capsys.readouterr()
     assert str(private_path) not in captured.err
     assert captured.err == "qualitative review filesystem operation failed\n"
+
+
+@pytest.mark.parametrize("command", ["assemble", "resolve"])
+@pytest.mark.parametrize("root_alias", ["same", "symlink"])
+def test_review_operations_reject_overlapping_roots_without_hanging(
+    tmp_path: Path, command: str, root_alias: str
+) -> None:
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir(mode=0o700)
+    review_dir = matrix_dir
+    if root_alias == "symlink":
+        review_dir = tmp_path / "review-alias"
+        review_dir.symlink_to(matrix_dir, target_is_directory=True)
+    script = """
+from pathlib import Path
+import sys
+from evals.runner import review
+
+matrix_dir = Path(sys.argv[2])
+review_dir = Path(sys.argv[3])
+try:
+    if sys.argv[1] == "assemble":
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            "w-000000-0123456789abcdef",
+            Path("missing-verdicts.json"),
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,
+        )
+    else:
+        review.resolve_agreement(matrix_dir, review_dir)
+except review.ReviewError as error:
+    raise SystemExit(0 if "must be outside matrix" in str(error) else 2)
+raise SystemExit(1)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, command, str(matrix_dir), str(review_dir)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=3,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (matrix_dir / "matrix.lock").exists()
 
 
 def test_review_root_rejects_non_string_work_item_without_type_error(
@@ -375,6 +453,86 @@ def test_json_reader_caps_file_growth_after_fstat(
     with pytest.raises(review.ReviewError, match="input is invalid"):
         review._read_json(path, require_private=True)  # noqa: SLF001
     assert bytes_returned == review._MAX_DOCUMENT_BYTES + 1  # noqa: SLF001
+
+
+def test_event_log_accepts_only_reasoning_and_one_agent_message(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.stdout"
+    events = _valid_event_log()
+    _write_event_log(path, events)
+
+    assert review.check_event_log(path) == {
+        "events": len(events),
+        "agent_messages": 1,
+    }
+
+
+@pytest.mark.parametrize("item_type", ["command_execution", "file_change", "tool_call"])
+def test_event_log_rejects_any_tool_use(tmp_path: Path, item_type: str) -> None:
+    path = tmp_path / "codex.stdout"
+    events = _valid_event_log()
+    events.insert(
+        -1,
+        {
+            "type": "item.completed",
+            "item": {"id": "tool-1", "type": item_type},
+        },
+    )
+    _write_event_log(path, events)
+
+    with pytest.raises(review.ReviewError, match="contains tool use"):
+        review.check_event_log(path)
+
+
+@pytest.mark.parametrize("mutation", ["failed", "missing_message", "two_messages"])
+def test_event_log_rejects_failed_or_ambiguous_completion(
+    tmp_path: Path, mutation: str
+) -> None:
+    path = tmp_path / "codex.stdout"
+    events = _valid_event_log()
+    if mutation == "failed":
+        events[-1] = {"type": "turn.failed", "error": {}}
+    elif mutation == "missing_message":
+        events.pop(-2)
+    else:
+        events.insert(-1, events[-2])
+    _write_event_log(path, events)
+
+    with pytest.raises(review.ReviewError, match="event log is invalid"):
+        review.check_event_log(path)
+
+
+def test_event_log_rejects_public_file(tmp_path: Path) -> None:
+    path = tmp_path / "codex.stdout"
+    _write_event_log(path, _valid_event_log())
+    path.chmod(0o644)
+
+    with pytest.raises(review.ReviewError, match="not a regular file"):
+        review.check_event_log(path)
+
+
+def test_event_log_rejects_malformed_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "codex.stdout"
+    path.write_text('{"type":"thread.started"}\n{"type":')
+    path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="event log is invalid"):
+        review.check_event_log(path)
+
+
+def test_check_events_cli_emits_only_counts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "private-account" / "codex.stdout"
+    path.parent.mkdir()
+    _write_event_log(path, _valid_event_log())
+
+    assert review.review_cli(["check-events", str(path)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == '{"agent_messages":1,"events":5}\n'
+    assert str(path) not in captured.out
 
 
 def test_judgment_operation_rejects_non_object_judge() -> None:
@@ -524,6 +682,17 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     assert 'test "$(stat -f \'%Lp\' "$VERDICT_PATH")" = 600' in documentation
     assert '>"$STDOUT_LOG" 2>"$STDERR_LOG"' in documentation
     assert 'HOME="$JUDGE_ROOT/workspace"' in documentation
+    for feature in review._HOST_ISOLATION_DISABLED_FEATURES:  # noqa: SLF001
+        assert f"--disable {feature}" in documentation
+    assert "--config 'agents.enabled=false'" in documentation
+    assert "--config 'tools.update_plan.enabled=false'" in documentation
+    assert (
+        "--config 'tools.experimental_request_user_input.enabled=false'"
+        in documentation
+    )
+    assert 'exec --json --ephemeral' in documentation
+    assert 'review check-events "$STDOUT_LOG"' in documentation
+    assert "tool-free" not in documentation
     invocation = documentation.split(
         "Then invoke the judge with the isolated environment:", maxsplit=1
     )[1].split("Import the result", maxsplit=1)[0]
@@ -609,7 +778,7 @@ def test_restricted_judge_profile_live_denies_auth_and_host_tmp(
     shutil.which("codex") is None,
     reason="requires the pinned Codex App Server",
 )
-def test_restricted_judge_profile_live_config_preflight(tmp_path: Path) -> None:
+def test_no_shell_judge_profile_live_config_preflight(tmp_path: Path) -> None:
     executable = shutil.which("codex")
     assert executable is not None
     version = subprocess.run(
@@ -627,13 +796,26 @@ def test_restricted_judge_profile_live_config_preflight(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     isolated_home.mkdir(mode=0o700)
     workspace.mkdir(mode=0o700)
+    process_args = codex_driver._app_server_process_args(  # noqa: SLF001
+        executable,
+        workspace,
+        include_runtime_roots=False,
+        approval_policy="never",
+    )
+    for feature in review._HOST_ISOLATION_DISABLED_FEATURES:  # noqa: SLF001
+        process_args.extend(("--disable", feature))
+    process_args.extend(
+        (
+            "-c",
+            "agents.enabled=false",
+            "-c",
+            "tools.update_plan.enabled=false",
+            "-c",
+            "tools.experimental_request_user_input.enabled=false",
+        )
+    )
     process = subprocess.Popen(
-        codex_driver._app_server_process_args(  # noqa: SLF001
-            executable,
-            workspace,
-            include_runtime_roots=False,
-            approval_policy="never",
-        ),
+        process_args,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -666,6 +848,23 @@ def test_restricted_judge_profile_live_config_preflight(tmp_path: Path) -> None:
             include_runtime_roots=False,
             approval_policy="never",
         )
+        response = session.request(
+            "config/read", {"cwd": str(workspace), "includeLayers": False}
+        )
+        config = response.get("config")
+        assert isinstance(config, dict)
+        features = config.get("features")
+        agents = config.get("agents")
+        assert isinstance(features, dict)
+        assert isinstance(agents, dict)
+        assert all(
+            features.get(feature) is False
+            for feature in review._HOST_ISOLATION_DISABLED_FEATURES  # noqa: SLF001
+        )
+        assert agents.get("enabled") is False
+        # Codex 0.146 omits these two accepted tool settings from config/read.
+        # Strict-config initialization proves syntax support, not effective
+        # model-visible inventory; source/wire evidence supplies that boundary.
     finally:
         codex_driver._terminate_process_group(process)  # noqa: SLF001
 

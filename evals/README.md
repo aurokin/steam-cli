@@ -207,12 +207,19 @@ including a retry, uses a newly created private root with a fresh `CODEX_HOME`
 containing only a mode-`0600` copy of the authenticated source `auth.json` and
 an otherwise empty, invocation-exclusive workspace. Never reuse that root or
 workspace for another judge, case, or retry. Codex
-0.146.0 must use the exact restricted permission profile below: host root and
-temporary paths are denied, only Codex's minimal platform files and the empty
-workspace are visible, network is disabled, and the model shell inherits only
-`PATH` and locale variables. User configuration, rules, hooks, apps, plugins,
-MCP servers, and web search are disabled. Keep the isolated root temporary and
-remove it after the import.
+0.146.0 must use the exact no-shell, host-isolated profile below. Both shell
+implementations, delegation, browser/computer/image features, goals, skill and
+workspace discovery, tool suggestions, time reminders, hooks, apps, plugins,
+MCP servers, and web search are disabled. Sol's CodeModeOnly request still
+exposes top-level `exec`/`wait` with nested `apply_patch` and `view_image` despite
+those feature settings. That residual V8 dispatcher has no Node, filesystem,
+network, or console APIs; its nested file operations remain constrained by the
+turn filesystem sandbox. The generic `:minimal` platform files may still expose
+a coarse platform fingerprint. Host root and temporary paths are denied,
+network is disabled, and the fresh empty workspace is the only writable path.
+This prevents shell/process/environment access, delegation, external sources,
+personal filesystem access, and account or process identity disclosure. Keep
+the isolated root temporary and remove it after the import.
 
 The structured response must echo `target.work_item_id`,
 `target.projection_sha256`, and the complete `invocation` object from that case.
@@ -259,7 +266,7 @@ CODEX_BIN="$(command -v codex)"
 env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
   HOME="$JUDGE_ROOT/workspace" \
   TMPDIR="$JUDGE_ROOT/codex-home" PATH=/usr/bin:/bin LANG=C.UTF-8 \
-  "$CODEX_BIN" exec --ephemeral --ignore-user-config --ignore-rules \
+  "$CODEX_BIN" exec --json --ephemeral --ignore-user-config --ignore-rules \
   --skip-git-repo-check --strict-config \
   --cd "$JUDGE_ROOT/workspace" \
   --config 'approval_policy="never"' \
@@ -267,8 +274,16 @@ env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
   --config 'apps._default.enabled=false' \
   --config 'apps._default.destructive_enabled=false' \
   --config 'apps._default.open_world_enabled=false' \
+  --config 'agents.enabled=false' \
+  --config 'tools.update_plan.enabled=false' \
+  --config 'tools.experimental_request_user_input.enabled=false' \
   --config 'mcp_servers={}' \
-  --disable hooks --disable plugins --disable apps \
+  --disable shell_tool --disable unified_exec --disable multi_agent \
+  --disable apps --disable plugins --disable browser_use \
+  --disable browser_use_external --disable browser_use_full_cdp_access \
+  --disable computer_use --disable image_generation --disable in_app_browser \
+  --disable goals --disable skill_search --disable workspace_dependencies \
+  --disable tool_suggest --disable current_time_reminder --disable hooks \
   --config 'shell_environment_policy.inherit="core"' \
   --config 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","LC_CTYPE","TERM"]' \
   --config "shell_environment_policy.set.HOME=\"$JUDGE_ROOT/workspace\"" \
@@ -282,6 +297,7 @@ env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
   >"$STDOUT_LOG" 2>"$STDERR_LOG"
 test -f "$VERDICT_PATH" && test ! -L "$VERDICT_PATH"
 test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600
+uv run python -m evals.runner review check-events "$STDOUT_LOG"
 ```
 
 Import the result for each of `judge-1`, `judge-2`, and `judge-3`, recording the
@@ -292,7 +308,7 @@ uv run python -m evals.runner review assemble \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
   "$VERDICT_PATH" --judge judge-1 \
   --attempt-count 1 --duration-ms 12345 \
-  --isolation-attestation codex-0.146-restricted-profile-v1
+  --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1
 ```
 
 The attempt count includes the initial call and at most two retries. Retry only
@@ -301,10 +317,20 @@ a transport failure or structurally invalid response. Never retry a valid
 external calls, so the operator supplies these bounded operational fields;
 usage remains explicitly unavailable. The required isolation attestation means
 the operator used Codex CLI 0.146.0 with the exact fresh-home, auth-only,
-source-disabled, environment-minimized, filesystem-restricted, and
-network-disabled profile above; the runner cannot infer that fact from an
-external process. The `umask 077`, precreated output, and post-call checks are
-also required: the assembler rejects a verdict output unless it is a mode-`0600`
+source-disabled, no-shell, delegation-disabled, environment-minimized,
+filesystem-restricted, and network-disabled profile above; the runner cannot
+infer that fact from an external process. Configuration readback proves the
+settings were accepted, not the effective model-visible inventory; the residual
+inventory described above was established separately from source and wire
+evidence. Any CLI, model catalog, or profile change invalidates this
+attestation. `check-events` privately parses the `--json` log and accepts exactly
+one completed `agent_message`, optional reasoning items, and normal thread/turn
+lifecycle events. Any actual tool-use item, failed/unknown event, malformed log,
+or missing completion invalidates that attempt. Treat it like a transport or
+structural failure: discard that invocation root and retry from a new root,
+counting it toward the initial-plus-two limit. Never retry a valid `uncertain`
+verdict. The `umask 077`, precreated output, and post-call checks are also
+required: the assembler rejects a verdict output unless it is a mode-`0600`
 regular file no larger than 16 MiB. Import the result before the `EXIT` trap
 removes its fresh root. Operation timestamps use the existing matrix invariant:
 a non-empty, parseable, timezone-aware timestamp.
