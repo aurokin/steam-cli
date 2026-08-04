@@ -1202,6 +1202,36 @@ def test_checked_in_screen_config_binds_exact_calibrated_asset_bytes() -> None:
     } == {hashlib.sha256(settings_path.read_bytes()).hexdigest()}
 
 
+def test_checked_in_product_use_config_is_sol_medium_diagnostic() -> None:
+    loaded = matrix.load_config(ROOT / "evals" / "matrices" / "product-use-v1.json")
+
+    assert loaded.campaign.campaign_kind == "screen"
+    assert loaded.document["models"] == ["gpt-5.6-sol"]
+    assert loaded.document["efforts"] == ["medium"]
+    assert loaded.document["tracks"] == ["answer", "discovery"]
+    assert loaded.campaign.replicates == 3
+    assert loaded.document["scenario_ids"] == [
+        "m7-o05",
+        "m7-o03",
+        "m6-d03",
+        "m6-d01",
+        "m4-w02",
+        "m4-p01",
+        "m4-r03",
+        "m4-r01",
+        "m3-d01",
+        "m3-d02",
+        "m5-c01",
+        "m6-g03",
+        "m7-s03",
+    ]
+
+    anchor = matrix.load_config(
+        ROOT / "evals" / "matrices" / "screen-anchor-v1.json"
+    )
+    assert loaded.document["judge_policy"] == anchor.document["judge_policy"]
+
+
 def test_matrix_promotes_must_mention_paths_into_the_blinded_rubric() -> None:
     scenarios, documents = matrix._scenario_documents(  # noqa: SLF001
         ("m2-b02",), root=ROOT

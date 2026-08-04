@@ -198,7 +198,7 @@ blind comparison and task-specific rubrics while retaining expert review.
   and recheck the revision, worktree, selected input inventories, and snapshot
   seal throughout the run. The snapshot attests the product source, loaded
   harness bytes, selected scenarios, and schema; only the product source is
-  executed from the snapshot. The active corpus contains 53 live scenarios
+  executed from the snapshot. The active corpus contains 56 live scenarios
   and classifies M5-c03, M5-c04, and M5-c11 as deterministic-only.
   Eight scripted controls call the integrated production-layer evaluators.
   Scenario publication verifies mode-`0600` reports and transcripts or skip

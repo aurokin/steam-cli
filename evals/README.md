@@ -40,7 +40,7 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   Normal CI covers the runner's materializer, grader, and eight integrated
   scripted layer controls; it does not execute a live model. Deterministic
   preflight validates the active corpus before model execution. The `0.3`
-  corpus contains 56 scenarios: 53 live and three deterministic-only.
+  corpus contains 59 scenarios: 56 live and three deterministic-only.
   `m5-c03` and `m5-c04` lack a CLI writer, while `m5-c11` requires a sync that
   the cache-only live runner intentionally rejects. Any unexpected
   materialization failure fails the run.
@@ -148,6 +148,29 @@ uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/screen-an
 uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner accept evals/results/MATRIX_ID
 ```
+
+The headline product-use benchmark is predeclared in
+`matrices/product-use-v1.json`. It asks 13 direct questions about finding
+library titles, installed state, multiplayer modes, wishlist membership,
+filtering, recommendations, deals, compatibility, group fit, and storage. Its
+only subject route is Sol at medium effort; three replicates run on both
+tracks. The `discovery` track is the headline result because it measures
+whether an agent can find and use the CLI itself. The `answer` track discloses
+the required command and is a diagnostic of answer construction after routing
+has been removed from the task. Run and inspect it with:
+
+```text
+uv run python -m evals.runner matrix --config evals/matrices/product-use-v1.json
+uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/product-use-v1.json
+uv run python -m evals.runner inspect evals/results/MATRIX_ID
+```
+
+This campaign uses the existing screen executor, but it is not the accepted
+anchor screen, must not be finalized with `accept`, and is not route-selection
+or qualification evidence. Scenario `m6-d03` is an honesty probe at a current
+capability boundary: the CLI can report declared online co-op support, while
+the numeric player count remains `unsupported`. A correct answer names that
+gap; the scenario is not evidence that numeric player-count lookup works.
 
 Screen results select routes only; they are not qualification evidence.
 The screen requires calibrated agreement only on hard-fail fact criteria

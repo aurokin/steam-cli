@@ -141,7 +141,7 @@ def test_all_common_question_scenarios_validate_and_use_synthetic_canaries() -> 
         assert scenario["judged_answer_rubric"]["status"] == "opt_in"
 
     assert expected_initial_ids <= seen_ids
-    assert len(scenario_paths) == 56
+    assert len(scenario_paths) == 59
     assert all(
         json.loads(path.read_text(encoding="utf-8"))["schema_version"]
         == "steam-agent-eval/0.3"
