@@ -4,7 +4,7 @@
   "title": "Steam Agent external qualitative review verdicts 0.1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "target", "verdicts"],
+  "required": ["schema", "target", "invocation", "verdicts"],
   "properties": {
     "schema": {"const": "steam-agent-eval-review-verdicts/0.1"},
     "target": {
@@ -14,6 +14,15 @@
       "properties": {
         "work_item_id": {"type": "string", "pattern": "^w-[0-9]{6}-[0-9a-f]{16}$"},
         "projection_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["judge_identifier", "binding_sha256"],
+      "properties": {
+        "judge_identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"},
+        "binding_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "verdicts": {

@@ -51,6 +51,16 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _valid_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        run_state._parse_time(value)  # noqa: SLF001
+    except run_state.ManifestStateError:
+        return False
+    return True
+
+
 def _read_json(
     path: Path,
     *,
@@ -58,23 +68,40 @@ def _read_json(
     require_private: bool = False,
     require_canonical: bool = False,
 ) -> dict[str, Any]:
+    descriptor = -1
     try:
-        item_stat = path.lstat()
-        content = path.read_bytes()
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        item_stat = os.fstat(descriptor)
         if not stat.S_ISREG(item_stat.st_mode) or (
             require_private and stat.S_IMODE(item_stat.st_mode) != 0o600
         ):
             raise ReviewError("qualitative review input is not a regular file")
+        if item_stat.st_size > _MAX_DOCUMENT_BYTES:
+            raise ReviewError("qualitative review input is invalid")
+        content = bytearray()
+        while len(content) <= _MAX_DOCUMENT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _MAX_DOCUMENT_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
         if len(content) > _MAX_DOCUMENT_BYTES:
             raise ReviewError("qualitative review input is invalid")
         document = matrix._strict_json_loads(  # noqa: SLF001
-            content.decode("utf-8")
+            bytes(content).decode("utf-8")
         )
     except (OSError, UnicodeError, ValueError, matrix.MatrixError):
         raise ReviewError("qualitative review input is invalid") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(document, dict):
         raise ReviewError("qualitative review input is invalid")
-    if require_canonical and content != _canonical_bytes(document):
+    if require_canonical and bytes(content) != _canonical_bytes(document):
         raise ReviewError("qualitative review input is not canonical")
     if schema_name is not None:
         try:
@@ -165,10 +192,28 @@ def _target_for(
     return target, projection
 
 
+def _invocation_binding(
+    target: dict[str, Any], judge_identifier: str
+) -> dict[str, str]:
+    return {
+        "judge_identifier": judge_identifier,
+        "binding_sha256": _sha256(
+            {
+                "schema": "steam-agent-eval-review-invocation/0.1",
+                "matrix_id": target["matrix_id"],
+                "work_item_id": target["work_item_id"],
+                "projection_sha256": target["projection_sha256"],
+                "judge_identifier": judge_identifier,
+            }
+        ),
+    }
+
+
 def _case_document(
     matrix_dir: Path,
     target_index: judge._TargetIndex,  # noqa: SLF001
     work_item_id: str,
+    judge_identifier: str,
 ) -> dict[str, Any]:
     campaign = target_index.inspection_result.manifest.campaign
     target, projection = _target_for(target_index, work_item_id)
@@ -183,6 +228,7 @@ def _case_document(
                 "schema": _VERDICTS_SCHEMA,
                 "sha256": _sha256(response_schema),
             },
+            "invocation": _invocation_binding(target, judge_identifier),
         },
         "target": target,
         "prompt": {
@@ -276,32 +322,55 @@ def _validate_review_root(
     ):
         raise ReviewError("qualitative review response schema is invalid")
     cases = ledger.get("cases")
-    if not isinstance(cases, list) or not 1 <= len(cases) <= _MAX_CASES:
+    expected_case_count = len(result.manifest.work_items) * len(
+        result.manifest.campaign.judges
+    )
+    if (
+        not isinstance(cases, list)
+        or len(cases) != expected_case_count
+        or expected_case_count > _MAX_CASES * len(result.manifest.campaign.judges)
+    ):
         raise ReviewError("qualitative review ledger is invalid")
     expected_work_items = {item.work_item_id for item in result.manifest.work_items}
-    seen_work_items: set[str] = set()
+    expected_judges = {
+        item.identifier for item in result.manifest.campaign.judges
+    }
+    expected_invocations = {
+        (work_item_id, judge_identifier)
+        for work_item_id in expected_work_items
+        for judge_identifier in expected_judges
+    }
+    seen_invocations: set[tuple[str, str]] = set()
     for item in cases:
         work_item_id = item.get("work_item_id") if isinstance(item, dict) else None
+        judge_identifier = (
+            item.get("judge_identifier") if isinstance(item, dict) else None
+        )
         if (
             not isinstance(item, dict)
-            or set(item) != {"work_item_id", "path", "sha256"}
+            or set(item)
+            != {"work_item_id", "judge_identifier", "path", "sha256"}
             or not isinstance(work_item_id, str)
             or _SAFE_WORK_ITEM.fullmatch(work_item_id) is None
-            or item.get("path") != f"cases/{work_item_id}.json"
+            or not isinstance(judge_identifier, str)
+            or judge_identifier not in expected_judges
+            or item.get("path")
+            != f"cases/{work_item_id}-{judge_identifier}.json"
             or not isinstance(item.get("sha256"), str)
             or len(item["sha256"]) != 64
-            or work_item_id in seen_work_items
+            or (work_item_id, judge_identifier) in seen_invocations
         ):
             raise ReviewError("qualitative review ledger is invalid")
-        seen_work_items.add(work_item_id)
-    if seen_work_items != expected_work_items:
+        seen_invocations.add((work_item_id, judge_identifier))
+    if seen_invocations != expected_invocations:
         raise ReviewError("qualitative review ledger does not cover matrix")
     if {item.name for item in (review_dir / "cases").iterdir()} != {
-        f"{work_item_id}.json" for work_item_id in expected_work_items
+        f"{work_item_id}-{judge_identifier}.json"
+        for work_item_id, judge_identifier in expected_invocations
     }:
         raise ReviewError("qualitative review case directory is invalid")
     operation_names = {item.name for item in (review_dir / "operations").iterdir()}
-    if len(operation_names) > len(cases) * (len(result.manifest.campaign.judges) + 1):
+    if len(operation_names) > len(cases) + len(expected_work_items):
         raise ReviewError("qualitative review operation ledger exceeds limits")
     valid_operation_names = {
         f"judgment-{work_item_id}-{judge_config.identifier}.json"
@@ -356,20 +425,31 @@ def prepare(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
         _write_json(staging / "response-schema.json", response_schema)
         case_entries: list[dict[str, Any]] = []
         for work_item in result.manifest.work_items:
-            document = _case_document(matrix_dir, target_index, work_item.work_item_id)
-            try:
-                judge._validate_schema(document, "review-case-0.1.json")  # noqa: SLF001
-            except judge.JudgmentError as error:
-                raise ReviewError(str(error)) from None
-            filename = f"{work_item.work_item_id}.json"
-            _write_json(cases_dir / filename, document)
-            case_entries.append(
-                {
-                    "work_item_id": work_item.work_item_id,
-                    "path": f"cases/{filename}",
-                    "sha256": _sha256(document),
-                }
-            )
+            for judge_config in result.manifest.campaign.judges:
+                document = _case_document(
+                    matrix_dir,
+                    target_index,
+                    work_item.work_item_id,
+                    judge_config.identifier,
+                )
+                try:
+                    judge._validate_schema(  # noqa: SLF001
+                        document, "review-case-0.1.json"
+                    )
+                except judge.JudgmentError as error:
+                    raise ReviewError(str(error)) from None
+                filename = (
+                    f"{work_item.work_item_id}-{judge_config.identifier}.json"
+                )
+                _write_json(cases_dir / filename, document)
+                case_entries.append(
+                    {
+                        "work_item_id": work_item.work_item_id,
+                        "judge_identifier": judge_config.identifier,
+                        "path": f"cases/{filename}",
+                        "sha256": _sha256(document),
+                    }
+                )
         ledger = {
             "schema": _LEDGER_SCHEMA,
             "matrix_id": result.manifest.matrix_id,
@@ -393,20 +473,24 @@ def prepare(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
         raise
     return {
         "matrix_id": result.manifest.matrix_id,
-        "cases": len(result.manifest.work_items),
+        "cases": len(case_entries),
     }
 
 
-def _case_entry(ledger: dict[str, Any], work_item_id: str) -> dict[str, Any]:
+def _case_entry(
+    ledger: dict[str, Any], work_item_id: str, judge_identifier: str
+) -> dict[str, Any]:
     matches = [
         item
         for item in ledger["cases"]
-        if isinstance(item, dict) and item.get("work_item_id") == work_item_id
+        if isinstance(item, dict)
+        and item.get("work_item_id") == work_item_id
+        and item.get("judge_identifier") == judge_identifier
     ]
     if len(matches) != 1:
         raise ReviewError("qualitative review case is unavailable")
     item = matches[0]
-    if set(item) != {"work_item_id", "path", "sha256"}:
+    if set(item) != {"work_item_id", "judge_identifier", "path", "sha256"}:
         raise ReviewError("qualitative review ledger is invalid")
     return item
 
@@ -417,11 +501,12 @@ def _load_bound_case(
     target_index: judge._TargetIndex,  # noqa: SLF001
     ledger: dict[str, Any],
     work_item_id: str,
+    judge_identifier: str,
 ) -> dict[str, Any]:
     if _SAFE_WORK_ITEM.fullmatch(work_item_id) is None:
         raise ReviewError("qualitative review work item is invalid")
-    entry = _case_entry(ledger, work_item_id)
-    if entry["path"] != f"cases/{work_item_id}.json":
+    entry = _case_entry(ledger, work_item_id, judge_identifier)
+    if entry["path"] != f"cases/{work_item_id}-{judge_identifier}.json":
         raise ReviewError("qualitative review case path is invalid")
     case_path = review_dir / entry["path"]
     document = _read_json(
@@ -430,7 +515,9 @@ def _load_bound_case(
         require_private=True,
         require_canonical=True,
     )
-    expected = _case_document(matrix_dir, target_index, work_item_id)
+    expected = _case_document(
+        matrix_dir, target_index, work_item_id, judge_identifier
+    )
     if document != expected or _sha256(document) != entry["sha256"]:
         raise ReviewError("qualitative review case does not match matrix")
     return document
@@ -495,6 +582,7 @@ def _validate_judgment_operation(
         or not isinstance(artifact_judge, dict)
         or artifact_judge.get("identifier") != judge_identifier
         or operation.get("artifact_sha256") != _sha256(artifact)
+        or not _valid_timestamp(operation.get("recorded_at"))
     ):
         raise ReviewError("qualitative review operation is invalid")
     return artifact
@@ -524,6 +612,7 @@ def _validate_adjudication_operation(
         or not isinstance(artifact, dict)
         or artifact.get("target") != case["target"]
         or operation.get("artifact_sha256") != _sha256(artifact)
+        or not _valid_timestamp(operation.get("recorded_at"))
     ):
         raise ReviewError("qualitative review operation is invalid")
     return artifact
@@ -647,11 +736,14 @@ def _matching_judgment_files(
 def _bound_judgment_roster(
     review_dir: Path,
     *,
-    case: dict[str, Any],
+    cases_by_judge: dict[str, dict[str, Any]],
     campaign: run_state.MatrixCampaign,
     files: list[tuple[Path, str, dict[str, Any]]],
 ) -> dict[str, tuple[str, dict[str, Any]]]:
     configured = {item.identifier: item for item in campaign.judges}
+    if set(cases_by_judge) != set(configured):
+        raise ReviewError("qualitative review case roster is incomplete")
+    case = cases_by_judge[campaign.judges[0].identifier]
     by_judge: dict[str, tuple[str, dict[str, Any]]] = {}
     for _path, digest, document in files:
         if document["target"] != case["target"]:
@@ -677,7 +769,7 @@ def _bound_judgment_roster(
         )
         operation_artifact = _validate_judgment_operation(
             operation,
-            case=case,
+            case=cases_by_judge[judge_config.identifier],
             judge_identifier=judge_config.identifier,
         )
         digest, retained_artifact = by_judge[judge_config.identifier]
@@ -722,15 +814,20 @@ def assemble_judgment(
             except judge.JudgmentError as error:
                 raise ReviewError(str(error)) from None
             ledger = _validate_review_root(review_dir, target_index.inspection_result)
-            case = _load_bound_case(
-                matrix_dir, review_dir, target_index, ledger, work_item_id
-            )
             campaign = target_index.inspection_result.manifest.campaign
             judges = [
                 item for item in campaign.judges if item.identifier == judge_identifier
             ]
             if len(judges) != 1:
                 raise ReviewError("qualitative review judge is not configured")
+            case = _load_bound_case(
+                matrix_dir,
+                review_dir,
+                target_index,
+                ledger,
+                work_item_id,
+                judge_identifier,
+            )
             retained_judgments = judge._retained_judgments(  # noqa: SLF001
                 matrix_dir, target_index
             )
@@ -788,6 +885,8 @@ def assemble_judgment(
             }
             if verdict_document["target"] != expected_response_target:
                 raise ReviewError("qualitative verdicts target a different case")
+            if verdict_document["invocation"] != case["execution"]["invocation"]:
+                raise ReviewError("qualitative verdicts target a different invocation")
             criteria = [item["id"] for item in case["projection"]["criteria"]]
             verdict_map = judge._criterion_map(  # noqa: SLF001
                 verdict_document["verdicts"], field="verdict"
@@ -900,17 +999,26 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 matrix_dir, target_index, retained
             )
             campaign = target_index.inspection_result.manifest.campaign
-            for entry in ledger["cases"]:
-                work_item_id = entry["work_item_id"]
-                case = _load_bound_case(
-                    matrix_dir, review_dir, target_index, ledger, work_item_id
-                )
+            for work_item in target_index.inspection_result.manifest.work_items:
+                work_item_id = work_item.work_item_id
+                cases_by_judge = {
+                    judge_config.identifier: _load_bound_case(
+                        matrix_dir,
+                        review_dir,
+                        target_index,
+                        ledger,
+                        work_item_id,
+                        judge_config.identifier,
+                    )
+                    for judge_config in campaign.judges
+                }
+                case = cases_by_judge[campaign.judges[0].identifier]
                 operation_path = _operation_path(
                     review_dir, "adjudication", work_item_id, "agreement"
                 )
                 by_judge = _bound_judgment_roster(
                     review_dir,
-                    case=case,
+                    cases_by_judge=cases_by_judge,
                     campaign=campaign,
                     files=retained_files,
                 )

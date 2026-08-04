@@ -79,7 +79,7 @@ def _result() -> SimpleNamespace:
     )
 
 
-def _case() -> dict[str, object]:
+def _case(judge_identifier: str = "judge-1") -> dict[str, object]:
     return {
         "schema": review._CASE_SCHEMA,  # noqa: SLF001
         "execution": {
@@ -90,6 +90,9 @@ def _case() -> dict[str, object]:
                 "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
                 "sha256": "5" * 64,
             },
+            "invocation": review._invocation_binding(  # noqa: SLF001
+                TARGET, judge_identifier
+            ),
         },
         "target": TARGET,
         "prompt": {
@@ -115,9 +118,13 @@ def _review_root(path: Path) -> dict[str, object]:
         "cases": [
             {
                 "work_item_id": WORK_ITEM_ID,
-                "path": f"cases/{WORK_ITEM_ID}.json",
-                "sha256": review._sha256(_case()),  # noqa: SLF001
+                "judge_identifier": configured.identifier,
+                "path": f"cases/{WORK_ITEM_ID}-{configured.identifier}.json",
+                "sha256": review._sha256(  # noqa: SLF001
+                    _case(configured.identifier)
+                ),
             }
+            for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS
         ]
     }
     return ledger
@@ -129,13 +136,16 @@ def _matrix_root(path: Path) -> Path:
     return path
 
 
-def _verdict_document() -> dict[str, object]:
+def _verdict_document(judge_identifier: str = "judge-1") -> dict[str, object]:
     return {
         "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
         "target": {
             "work_item_id": WORK_ITEM_ID,
             "projection_sha256": TARGET["projection_sha256"],
         },
+        "invocation": review._invocation_binding(  # noqa: SLF001
+            TARGET, judge_identifier
+        ),
         "verdicts": [
             {
                 "criterion_id": "aligned",
@@ -166,7 +176,9 @@ def test_case_document_is_the_exact_route_blind_model_input(
     )
     monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
 
-    document = review._case_document(tmp_path, index, WORK_ITEM_ID)  # noqa: SLF001
+    document = review._case_document(  # noqa: SLF001
+        tmp_path, index, WORK_ITEM_ID, "judge-1"
+    )
 
     encoded = review._canonical_bytes(document)  # noqa: SLF001
     assert review.judge._validate_schema(document, "review-case-0.1.json") == document  # noqa: SLF001
@@ -175,6 +187,9 @@ def test_case_document_is_the_exact_route_blind_model_input(
     assert b'"metrics"' not in encoded
     assert document["projection"] == PROJECTION
     assert document["execution"]["model_input"] == "this_document_verbatim"
+    assert document["execution"]["invocation"] == review._invocation_binding(  # noqa: SLF001
+        TARGET, "judge-1"
+    )
     assert document["prompt"]["text"].startswith("# Matrix qualitative judge")
 
 
@@ -184,7 +199,13 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
     result = _result()
     index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
-    monkeypatch.setattr(review, "_case_document", lambda *_args: _case())
+    monkeypatch.setattr(
+        review,
+        "_case_document",
+        lambda _matrix, _index, _work_item, judge_identifier: _case(
+            judge_identifier
+        ),
+    )
     monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
     matrix_dir = tmp_path / "matrix"
     matrix_dir.mkdir()
@@ -192,7 +213,7 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
 
     output = review.prepare(matrix_dir, review_dir)
 
-    assert output == {"matrix_id": "matrix-test", "cases": 1}
+    assert output == {"matrix_id": "matrix-test", "cases": 3}
     assert str(review_dir) not in review._canonical_bytes(output).decode()  # noqa: SLF001
     assert stat.S_IMODE(review_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "cases").stat().st_mode) == 0o700
@@ -207,6 +228,24 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
         "model_invocation": "external",
         "usage_accounting": "unavailable",
     }
+    assert {
+        (item["judge_identifier"], item["path"])
+        for item in ledger["cases"]
+    } == {
+        (
+            configured.identifier,
+            f"cases/{WORK_ITEM_ID}-{configured.identifier}.json",
+        )
+        for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS
+    }
+    assert len(
+        {
+            review._read_json(  # noqa: SLF001
+                review_dir / item["path"], require_private=True
+            )["execution"]["invocation"]["binding_sha256"]
+            for item in ledger["cases"]
+        }
+    ) == 3
 
 
 def test_review_cli_redacts_filesystem_error_paths(
@@ -260,7 +299,7 @@ def test_bound_case_rejects_semantically_equal_noncanonical_bytes(
     matrix_dir = _matrix_root(tmp_path / "matrix")
     review_dir = tmp_path / "prepared"
     review.prepare(matrix_dir, review_dir)
-    case_path = review_dir / "cases" / f"{WORK_ITEM_ID}.json"
+    case_path = review_dir / "cases" / f"{WORK_ITEM_ID}-judge-1.json"
     case_path.write_text(json.dumps(_case(), indent=2))
     case_path.chmod(0o600)
     ledger = review._read_json(  # noqa: SLF001
@@ -269,8 +308,73 @@ def test_bound_case_rejects_semantically_equal_noncanonical_bytes(
 
     with pytest.raises(review.ReviewError, match="not canonical"):
         review._load_bound_case(  # noqa: SLF001
-            matrix_dir, review_dir, index, ledger, WORK_ITEM_ID
+            matrix_dir, review_dir, index, ledger, WORK_ITEM_ID, "judge-1"
         )
+
+
+def test_json_reader_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "verdicts.fifo"
+    os.mkfifo(path, mode=0o600)
+    script = """
+from pathlib import Path
+import sys
+from evals.runner import review
+
+try:
+    review._read_json(Path(sys.argv[1]), require_private=True)
+except review.ReviewError as error:
+    raise SystemExit(0 if "not a regular file" in str(error) else 2)
+raise SystemExit(1)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=3,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_json_reader_rejects_preflight_oversize_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "verdicts.json"
+    path.touch(mode=0o600)
+    os.truncate(path, review._MAX_DOCUMENT_BYTES + 1)  # noqa: SLF001
+
+    def unexpected_read(_descriptor: int, _size: int) -> bytes:
+        raise AssertionError("oversized input must be rejected before read")
+
+    monkeypatch.setattr(review.os, "read", unexpected_read)
+    with pytest.raises(review.ReviewError, match="input is invalid"):
+        review._read_json(path, require_private=True)  # noqa: SLF001
+
+
+def test_json_reader_caps_file_growth_after_fstat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "verdicts.json"
+    path.touch(mode=0o600)
+    actual_fstat = os.fstat
+    bytes_returned = 0
+
+    def stale_fstat(descriptor: int) -> SimpleNamespace:
+        item_stat = actual_fstat(descriptor)
+        return SimpleNamespace(st_mode=item_stat.st_mode, st_size=0)
+
+    def growing_read(_descriptor: int, size: int) -> bytes:
+        nonlocal bytes_returned
+        bytes_returned += size
+        return b"x" * size
+
+    monkeypatch.setattr(review.os, "fstat", stale_fstat)
+    monkeypatch.setattr(review.os, "read", growing_read)
+    with pytest.raises(review.ReviewError, match="input is invalid"):
+        review._read_json(path, require_private=True)  # noqa: SLF001
+    assert bytes_returned == review._MAX_DOCUMENT_BYTES + 1  # noqa: SLF001
 
 
 def test_judgment_operation_rejects_non_object_judge() -> None:
@@ -295,6 +399,70 @@ def test_judgment_operation_rejects_non_object_judge() -> None:
         review._validate_judgment_operation(  # noqa: SLF001
             operation, case=_case(), judge_identifier="judge-1"
         )
+
+
+@pytest.mark.parametrize(
+    "recorded_at",
+    [None, 7, "", "not-a-timestamp", "2026-08-04T12:00:00"],
+)
+def test_operation_validators_reject_invalid_recorded_at(recorded_at: object) -> None:
+    judgment_artifact = {
+        "target": TARGET,
+        "judge": run_state.CALIBRATED_JUDGE_CONFIGURATIONS[0].to_dict(),
+    }
+    judgment_operation = {
+        "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "kind": "judgment_import",
+        "matrix_id": TARGET["matrix_id"],
+        "work_item_id": WORK_ITEM_ID,
+        "judge_identifier": "judge-1",
+        "attempt_count": 1,
+        "duration_ms": 1,
+        "usage": {"state": "unavailable"},
+        "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "case_sha256": review._sha256(_case()),  # noqa: SLF001
+        "artifact_sha256": review._sha256(judgment_artifact),  # noqa: SLF001
+        "artifact": judgment_artifact,
+        "recorded_at": recorded_at,
+    }
+    adjudication_artifact = {"target": TARGET}
+    adjudication_operation = {
+        "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "kind": "adjudication_import",
+        "matrix_id": TARGET["matrix_id"],
+        "work_item_id": WORK_ITEM_ID,
+        "case_sha256": review._sha256(_case()),  # noqa: SLF001
+        "artifact_sha256": review._sha256(adjudication_artifact),  # noqa: SLF001
+        "artifact": adjudication_artifact,
+        "recorded_at": recorded_at,
+    }
+
+    with pytest.raises(review.ReviewError, match="operation is invalid"):
+        review._validate_judgment_operation(  # noqa: SLF001
+            judgment_operation, case=_case(), judge_identifier="judge-1"
+        )
+    with pytest.raises(review.ReviewError, match="operation is invalid"):
+        review._validate_adjudication_operation(  # noqa: SLF001
+            adjudication_operation, case=_case()
+        )
+
+
+def test_operation_validators_accept_timezone_aware_recorded_at() -> None:
+    artifact = {"target": TARGET}
+    operation = {
+        "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "kind": "adjudication_import",
+        "matrix_id": TARGET["matrix_id"],
+        "work_item_id": WORK_ITEM_ID,
+        "case_sha256": review._sha256(_case()),  # noqa: SLF001
+        "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
+        "artifact": artifact,
+        "recorded_at": "2026-08-04T12:00:00-06:00",
+    }
+
+    assert review._validate_adjudication_operation(  # noqa: SLF001
+        operation, case=_case()
+    ) == artifact
 
 
 def test_restricted_judge_profile_has_no_host_or_runtime_roots(tmp_path: Path) -> None:
@@ -346,6 +514,13 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     assert profile in documentation
     assert 'approval_policy="never"' in documentation
     assert "umask 077" in documentation
+    assert 'JUDGE_ROOT="$(mktemp -d ' in documentation
+    assert "Never reuse that root or" in documentation
+    assert "WORK_ITEM_ID-judge-1.json" in documentation
+    assert 'install -m 600 /dev/null "$VERDICT_PATH"' in documentation
+    assert 'test "$(stat -f \'%Lp\' "$VERDICT_PATH")" = 600' in documentation
+    assert '>"$STDOUT_LOG" 2>"$STDERR_LOG"' in documentation
+    assert 'HOME="$JUDGE_ROOT/workspace"' in documentation
     assert "--sandbox read-only" not in documentation
     assert review._ISOLATION_ATTESTATION in documentation  # noqa: SLF001
 
@@ -546,7 +721,13 @@ def _mock_assembly(
     index = SimpleNamespace(inspection_result=_result())
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
-    monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
+    monkeypatch.setattr(
+        review,
+        "_load_bound_case",
+        lambda _matrix, _review, _index, _ledger, _work_item, judge_identifier: (
+            _case(judge_identifier)
+        ),
+    )
     monkeypatch.setattr(
         review.judge, "_validate_judgment_document", lambda *_args: None
     )
@@ -578,6 +759,31 @@ def test_assemble_rejects_verdicts_bound_to_another_case(
         )
     assert not (
         review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+
+
+def test_assemble_rejects_verdicts_bound_to_another_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "judge-1-verdicts.json"
+    review._write_json(  # noqa: SLF001
+        verdicts_path, _verdict_document("judge-1")
+    )
+
+    with pytest.raises(review.ReviewError, match="different invocation"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-2",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
     ).exists()
 
 
@@ -877,6 +1083,9 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
                     "work_item_id": WORK_ITEM_ID,
                     "projection_sha256": TARGET["projection_sha256"],
                 },
+                "invocation": review._invocation_binding(  # noqa: SLF001
+                    TARGET, "judge-1"
+                ),
                 "verdicts": [
                     {
                         "criterion_id": "clear",
@@ -929,7 +1138,13 @@ def _mock_resolution(
     target_index = SimpleNamespace(inspection_result=_result())
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
-    monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
+    monkeypatch.setattr(
+        review,
+        "_load_bound_case",
+        lambda _matrix, _review, _index, _ledger, _work_item, judge_identifier: (
+            _case(judge_identifier)
+        ),
+    )
     judgments = {}
     for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS:
         document = {
@@ -960,7 +1175,9 @@ def _mock_resolution(
             "duration_ms": 100,
             "usage": {"state": "unavailable"},
             "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
-            "case_sha256": review._sha256(_case()),  # noqa: SLF001
+            "case_sha256": review._sha256(  # noqa: SLF001
+                _case(configured.identifier)
+            ),
             "artifact_sha256": digest,
             "artifact": document,
             "recorded_at": "2026-08-04T12:00:00Z",
@@ -1081,7 +1298,13 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
     index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
-    monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
+    monkeypatch.setattr(
+        review,
+        "_load_bound_case",
+        lambda _matrix, _review, _index, _ledger, _work_item, judge_identifier: (
+            _case(judge_identifier)
+        ),
+    )
     judgments = {}
     for index_value, configured in enumerate(run_state.CALIBRATED_JUDGE_CONFIGURATIONS):
         clear = "fail" if index_value == 2 else "pass"
@@ -1113,7 +1336,9 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
             "duration_ms": 100,
             "usage": {"state": "unavailable"},
             "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
-            "case_sha256": review._sha256(_case()),  # noqa: SLF001
+            "case_sha256": review._sha256(  # noqa: SLF001
+                _case(configured.identifier)
+            ),
             "artifact_sha256": digest,
             "artifact": document,
             "recorded_at": "2026-08-04T12:00:00Z",

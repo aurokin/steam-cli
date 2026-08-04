@@ -10,7 +10,7 @@
     "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["model_input", "criterion_coverage", "external_context", "response_schema"],
+      "required": ["model_input", "criterion_coverage", "external_context", "response_schema", "invocation"],
       "properties": {
         "model_input": {"const": "this_document_verbatim"},
         "criterion_coverage": {"const": "every_projection_criterion_exactly_once"},
@@ -22,6 +22,15 @@
           "properties": {
             "schema": {"const": "steam-agent-eval-review-verdicts/0.1"},
             "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "invocation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["judge_identifier", "binding_sha256"],
+          "properties": {
+            "judge_identifier": {"$ref": "#/$defs/token"},
+            "binding_sha256": {"$ref": "#/$defs/sha256"}
           }
         }
       }

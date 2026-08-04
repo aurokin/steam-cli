@@ -201,10 +201,12 @@ uv run python -m evals.runner review prepare \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review
 ```
 
-Each `cases/WORK_ITEM_ID.json` file is the complete prompt for one fresh judge
-call. Pipe it verbatim; do not add a wrapper prompt. Use a fresh private
-`CODEX_HOME` containing only a mode-`0600` copy of the authenticated source
-`auth.json`, and set `HOME` to an otherwise empty private workspace. Codex
+Each `cases/WORK_ITEM_ID-JUDGE_ID.json` file is the complete prompt for exactly
+one judge slot. Pipe it verbatim; do not add a wrapper prompt. Every invocation,
+including a retry, uses a newly created private root with a fresh `CODEX_HOME`
+containing only a mode-`0600` copy of the authenticated source `auth.json` and
+an otherwise empty, invocation-exclusive workspace. Never reuse that root or
+workspace for another judge, case, or retry. Codex
 0.146.0 must use the exact restricted permission profile below: host root and
 temporary paths are denied, only Codex's minimal platform files and the empty
 workspace are visible, network is disabled, and the model shell inherits only
@@ -212,30 +214,44 @@ workspace are visible, network is disabled, and the model shell inherits only
 MCP servers, and web search are disabled. Keep the isolated root temporary and
 remove it after the import.
 
-The structured response must echo `target.work_item_id` and
-`target.projection_sha256` from that case. The assembler requires both exact
-matches, so a response copied from another replicate cannot be imported.
+The structured response must echo `target.work_item_id`,
+`target.projection_sha256`, and the complete `invocation` object from that case.
+The assembler requires all three exact matches, so a response copied from
+another replicate or judge slot cannot be imported.
 
 One setup pattern is:
 
 ```text
 umask 077
-mkdir -m 700 /private/judge-root
-mkdir -m 700 /private/judge-root/codex-home /private/judge-root/workspace
+PRIVATE_JUDGE_PARENT=/operator-owned/private-parent
+test -d "$PRIVATE_JUDGE_PARENT" && test ! -L "$PRIVATE_JUDGE_PARENT"
+test "$(stat -f '%Lp' "$PRIVATE_JUDGE_PARENT")" = 700
+JUDGE_ROOT="$(mktemp -d "$PRIVATE_JUDGE_PARENT/steam-agent-judge.XXXXXX")"
+trap 'rm -rf "$JUDGE_ROOT"' EXIT
+mkdir -m 700 "$JUDGE_ROOT/codex-home" "$JUDGE_ROOT/workspace"
 install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
-  /private/judge-root/codex-home/auth.json
+  "$JUDGE_ROOT/codex-home/auth.json"
+VERDICT_PATH="$JUDGE_ROOT/verdict-judge-1.json"
+STDOUT_LOG="$JUDGE_ROOT/codex.stdout"
+STDERR_LOG="$JUDGE_ROOT/codex.stderr"
+test ! -e "$VERDICT_PATH"
+install -m 600 /dev/null "$VERDICT_PATH"
+test -f "$VERDICT_PATH" && test ! -L "$VERDICT_PATH"
+test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600
 ```
 
-Then invoke the judge with the isolated environment:
+`JUDGE_ROOT` is outside the model workspace. The case, response schema, verdict,
+and private stdout/stderr logs also remain outside that empty workspace. Then
+invoke the judge with the isolated environment:
 
 ```text
 CODEX_BIN="$(command -v codex)"
-env -i CODEX_HOME=/private/judge-root/codex-home \
-  HOME=/private/judge-root/workspace \
-  TMPDIR=/private/judge-root/codex-home PATH=/usr/bin:/bin LANG=C.UTF-8 \
+env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
+  HOME="$JUDGE_ROOT/workspace" \
+  TMPDIR="$JUDGE_ROOT/codex-home" PATH=/usr/bin:/bin LANG=C.UTF-8 \
   "$CODEX_BIN" exec --ephemeral --ignore-user-config --ignore-rules \
   --skip-git-repo-check --strict-config \
-  --cd /private/judge-root/workspace \
+  --cd "$JUDGE_ROOT/workspace" \
   --config 'approval_policy="never"' \
   --config 'web_search="disabled"' \
   --config 'apps._default.enabled=false' \
@@ -245,14 +261,17 @@ env -i CODEX_HOME=/private/judge-root/codex-home \
   --disable hooks --disable plugins --disable apps \
   --config 'shell_environment_policy.inherit="core"' \
   --config 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","LC_CTYPE","TERM"]' \
-  --config 'shell_environment_policy.set.HOME="/private/judge-root/workspace"' \
-  --config 'shell_environment_policy.set.TMPDIR="/private/judge-root/workspace"' \
+  --config "shell_environment_policy.set.HOME=\"$JUDGE_ROOT/workspace\"" \
+  --config "shell_environment_policy.set.TMPDIR=\"$JUDGE_ROOT/workspace\"" \
   --config 'default_permissions="steam-agent-eval"' \
   --config 'permissions.steam-agent-eval={extends=":workspace",filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny"},network={enabled=false}}' \
   --model gpt-5.6-sol --config model_reasoning_effort=xhigh \
   --output-schema /private/path/MATRIX_ID-review/response-schema.json \
-  --output-last-message /private/path/verdicts.json \
-  - < /private/path/MATRIX_ID-review/cases/WORK_ITEM_ID.json
+  --output-last-message "$VERDICT_PATH" \
+  - < /private/path/MATRIX_ID-review/cases/WORK_ITEM_ID-judge-1.json \
+  >"$STDOUT_LOG" 2>"$STDERR_LOG"
+test -f "$VERDICT_PATH" && test ! -L "$VERDICT_PATH"
+test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600
 ```
 
 Import the result for each of `judge-1`, `judge-2`, and `judge-3`, recording the
@@ -261,7 +280,7 @@ externally measured total attempts and duration:
 ```text
 uv run python -m evals.runner review assemble \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
-  /private/path/verdicts.json --judge judge-1 \
+  "$VERDICT_PATH" --judge judge-1 \
   --attempt-count 1 --duration-ms 12345 \
   --isolation-attestation codex-0.146-restricted-profile-v1
 ```
@@ -274,8 +293,11 @@ usage remains explicitly unavailable. The required isolation attestation means
 the operator used Codex CLI 0.146.0 with the exact fresh-home, auth-only,
 source-disabled, environment-minimized, filesystem-restricted, and
 network-disabled profile above; the runner cannot infer that fact from an
-external process. The `umask 077` is also required: the assembler rejects a
-verdict output unless it is a mode-`0600` regular file.
+external process. The `umask 077`, precreated output, and post-call checks are
+also required: the assembler rejects a verdict output unless it is a mode-`0600`
+regular file no larger than 16 MiB. Import the result before the `EXIT` trap
+removes its fresh root. Operation timestamps use the existing matrix invariant:
+a non-empty, parseable, timezone-aware timestamp.
 
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:
