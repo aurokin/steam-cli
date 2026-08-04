@@ -35,7 +35,7 @@
       {"path": "$.data.items[*].deal.current_offer.store_class", "operator": "ordered_equals", "expected": ["official", "official", "official"]}
     ]
   },
-  "fact_rubric": {"grading":"deterministic","must_mention":["$.data.items[*].appid","$.data.items[*].deal.current_offer.fresh","$.data.items[*].deal.current_offer.store_class"],"support_if_claimed":["$.context.country","$.context.currency","$.context.store_class","$.data.items[*].deal.current_offer.provider"],"criteria":[{"id":"correct-order","weight":5,"requirement":"Preserve the deterministic deal order.","hard_fail":true},{"id":"price-context","weight":5,"requirement":"State US, USD, official-store, freshness, and attribution."}]},
+  "fact_rubric": {"grading":"deterministic","must_mention":["$.data.items[*].appid","$.data.items[*].deal.current_offer.fresh","$.data.items[*].deal.current_offer.store_class","$.data.items[*].deal.current_offer.provider"],"support_if_claimed":["$.context.country","$.context.currency","$.context.store_class"],"criteria":[{"id":"correct-order","weight":5,"requirement":"Preserve the deterministic deal order.","hard_fail":true},{"id":"price-context","weight":5,"requirement":"State US, USD, official-store, freshness, and attribution."}]},
   "judged_answer_rubric": {"grading": "model_or_human", "status": "opt_in", "criteria": [
     {"id": "useful-summary", "weight": 3, "requirement": "Explain the leading deals concisely without overstating history."}
   ]},
