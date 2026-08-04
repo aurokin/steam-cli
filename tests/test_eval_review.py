@@ -249,6 +249,30 @@ def test_review_root_rejects_non_string_work_item_without_type_error(
         review._validate_review_root(review_dir, result)  # noqa: SLF001
 
 
+def test_bound_case_rejects_semantically_equal_noncanonical_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result()
+    index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(review, "_case_document", lambda *_args: _case())
+    monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    review_dir = tmp_path / "prepared"
+    review.prepare(matrix_dir, review_dir)
+    case_path = review_dir / "cases" / f"{WORK_ITEM_ID}.json"
+    case_path.write_text(json.dumps(_case(), indent=2))
+    case_path.chmod(0o600)
+    ledger = review._read_json(  # noqa: SLF001
+        review_dir / "ledger.json", require_private=True
+    )
+
+    with pytest.raises(review.ReviewError, match="not canonical"):
+        review._load_bound_case(  # noqa: SLF001
+            matrix_dir, review_dir, index, ledger, WORK_ITEM_ID
+        )
+
+
 def test_judgment_operation_rejects_non_object_judge() -> None:
     artifact = {"target": TARGET, "judge": []}
     operation = {
@@ -321,6 +345,7 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     )
     assert profile in documentation
     assert 'approval_policy="never"' in documentation
+    assert "umask 077" in documentation
     assert "--sandbox read-only" not in documentation
     assert review._ISOLATION_ATTESTATION in documentation  # noqa: SLF001
 
@@ -624,10 +649,76 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
     assert calls == 2
 
 
+@pytest.mark.parametrize("retained_state", ["mismatch", "duplicate"])
+def test_assemble_resume_requires_one_exact_semantic_judgment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retained_state: str,
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("simulated interruption")),
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    operation = review._read_json(  # noqa: SLF001
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    retained_document = json.loads(json.dumps(operation["artifact"]))
+    if retained_state == "mismatch":
+        retained_document["created_at"] = "2026-08-04T12:00:00Z"
+    digest = review._sha256(retained_document)  # noqa: SLF001
+    monkeypatch.setattr(
+        review.judge,
+        "_retained_judgments",
+        lambda *_args: {digest: retained_document},
+    )
+    retained_files = [(Path("alternate-name.json"), digest, retained_document)]
+    if retained_state == "duplicate":
+        retained_files.append((Path("duplicate-name.json"), digest, retained_document))
+    monkeypatch.setattr(
+        review,
+        "_retained_judgment_files",
+        lambda *_args: retained_files,
+    )
+    verdicts_path.unlink()
+
+    with pytest.raises(
+        review.ReviewError,
+        match="does not match review operation|roster is ambiguous",
+    ):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+
 def test_assemble_detects_target_conflict_before_publishing_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: {})
+    monkeypatch.setattr(review, "_retained_judgment_files", lambda *_args: [])
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
     judgments = matrix_dir / "judgments"
@@ -664,6 +755,85 @@ def test_assemble_rejects_more_than_initial_plus_two_retries(tmp_path: Path) -> 
             duration_ms=1,
             isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
         )
+
+
+@pytest.mark.parametrize(
+    ("attempt_count", "duration_ms"),
+    [(True, 1), (1, False), (1.0, 1), (1, 1.0)],
+)
+def test_assemble_rejects_non_integer_operational_measurements(
+    tmp_path: Path, attempt_count: object, duration_ms: object
+) -> None:
+    with pytest.raises(review.ReviewError, match="operational measurement"):
+        review.assemble_judgment(
+            tmp_path / "matrix",
+            tmp_path / "review",
+            WORK_ITEM_ID,
+            tmp_path / "verdicts.json",
+            judge_identifier="judge-1",
+            attempt_count=attempt_count,  # type: ignore[arg-type]
+            duration_ms=duration_ms,  # type: ignore[arg-type]
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+
+def test_assemble_rejects_public_external_verdict_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    verdicts_path.write_bytes(  # deliberately bypass the private writer
+        review._canonical_bytes(_verdict_document())  # noqa: SLF001
+    )
+    verdicts_path.chmod(0o644)
+
+    with pytest.raises(review.ReviewError, match="not a regular file"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+
+def test_assemble_rejects_semantic_same_target_judge_before_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    retained_document = {
+        "target": TARGET,
+        "judge": run_state.CALIBRATED_JUDGE_CONFIGURATIONS[0].to_dict(),
+    }
+    digest = review._sha256(retained_document)  # noqa: SLF001
+    monkeypatch.setattr(
+        review.judge,
+        "_retained_judgments",
+        lambda *_args: {digest: retained_document},
+    )
+    monkeypatch.setattr(
+        review,
+        "_retained_judgment_files",
+        lambda *_args: [(Path("alternate-name.json"), digest, retained_document)],
+    )
+
+    with pytest.raises(review.ReviewError, match="already exists for judge"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            tmp_path / "missing-verdicts.json",
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
 
 
 def test_policy_invalid_response_does_not_poison_corrected_retry(
@@ -803,6 +973,14 @@ def _mock_resolution(
         )
     monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: judgments)
     monkeypatch.setattr(
+        review,
+        "_retained_judgment_files",
+        lambda *_args: [
+            (Path(f"{digest}.json"), digest, document)
+            for digest, document in judgments.items()
+        ],
+    )
+    monkeypatch.setattr(
         review.judge, "_validate_adjudication_document", lambda *_args, **_kwargs: None
     )
     return matrix_dir, review_dir
@@ -812,6 +990,7 @@ def test_resolve_detects_target_conflict_before_publishing_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    monkeypatch.setattr(review, "_retained_adjudication_files", lambda *_args: [])
     adjudications = matrix_dir / "adjudications"
     adjudications.mkdir(mode=0o700)
     target = adjudications / f"adjudication-{WORK_ITEM_ID}.json"
@@ -853,6 +1032,43 @@ def test_resolve_resumes_adjudication_from_operation_after_interruption(
         "retained": 1,
     }
     assert calls == 2
+
+
+@pytest.mark.parametrize("mutation", ["missing", "altered"])
+def test_adjudication_resume_requires_bound_judgment_operation_roster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    calls = 0
+
+    def interrupted_import(
+        _matrix: Path, _kind: str, _document: dict[str, object]
+    ) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    judgment_operation = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    )
+    if mutation == "missing":
+        judgment_operation.unlink()
+    else:
+        operation = review._read_json(  # noqa: SLF001
+            judgment_operation, require_private=True
+        )
+        operation["artifact_sha256"] = "f" * 64
+        judgment_operation.write_bytes(  # deliberately replace retained bytes
+            review._canonical_bytes(operation)  # noqa: SLF001
+        )
+        judgment_operation.chmod(0o600)
+
+    with pytest.raises(review.ReviewError):
+        review.resolve_agreement(matrix_dir, review_dir)
+    assert calls == 1
 
 
 def test_resolve_mechanically_preserves_disagreement_as_unresolved(
@@ -909,6 +1125,14 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
             operation,
         )
     monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: judgments)
+    monkeypatch.setattr(
+        review,
+        "_retained_judgment_files",
+        lambda *_args: [
+            (Path(f"{digest}.json"), digest, document)
+            for digest, document in judgments.items()
+        ],
+    )
     monkeypatch.setattr(
         review.judge, "_validate_adjudication_document", lambda *_args, **_kwargs: None
     )

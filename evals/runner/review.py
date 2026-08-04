@@ -56,20 +56,26 @@ def _read_json(
     *,
     schema_name: str | None = None,
     require_private: bool = False,
+    require_canonical: bool = False,
 ) -> dict[str, Any]:
     try:
         item_stat = path.lstat()
+        content = path.read_bytes()
         if not stat.S_ISREG(item_stat.st_mode) or (
             require_private and stat.S_IMODE(item_stat.st_mode) != 0o600
         ):
             raise ReviewError("qualitative review input is not a regular file")
-        document = matrix._read_strict_json(  # noqa: SLF001
-            path, max_bytes=_MAX_DOCUMENT_BYTES
+        if len(content) > _MAX_DOCUMENT_BYTES:
+            raise ReviewError("qualitative review input is invalid")
+        document = matrix._strict_json_loads(  # noqa: SLF001
+            content.decode("utf-8")
         )
-    except (OSError, matrix.MatrixError):
+    except (OSError, UnicodeError, ValueError, matrix.MatrixError):
         raise ReviewError("qualitative review input is invalid") from None
     if not isinstance(document, dict):
         raise ReviewError("qualitative review input is invalid")
+    if require_canonical and content != _canonical_bytes(document):
+        raise ReviewError("qualitative review input is not canonical")
     if schema_name is not None:
         try:
             return judge._validate_schema(document, schema_name)  # noqa: SLF001
@@ -422,6 +428,7 @@ def _load_bound_case(
         case_path,
         schema_name="review-case-0.1.json",
         require_private=True,
+        require_canonical=True,
     )
     expected = _case_document(matrix_dir, target_index, work_item_id)
     if document != expected or _sha256(document) != entry["sha256"]:
@@ -573,6 +580,115 @@ def _reject_existing_target(path: Path, *, kind: str) -> None:
     raise ReviewError(f"qualitative {kind} target already exists")
 
 
+def _retained_judgment_files(
+    matrix_dir: Path,
+    retained: dict[str, dict[str, Any]],
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    """Preserve every validated retained file, including duplicate digests."""
+
+    root = matrix_dir / "judgments"
+    if not root.is_dir():
+        return []
+    files: list[tuple[Path, str, dict[str, Any]]] = []
+    for path in sorted(root.glob("*.json")):
+        document = _read_json(
+            path,
+            schema_name="judgment-0.1.json",
+            require_private=True,
+            require_canonical=True,
+        )
+        digest = _sha256(document)
+        if retained.get(digest) != document:
+            raise ReviewError("retained judgment does not match validated roster")
+        files.append((path, digest, document))
+    return files
+
+
+def _retained_adjudication_files(
+    matrix_dir: Path,
+    target_index: judge._TargetIndex,  # noqa: SLF001
+    retained_judgments: dict[str, dict[str, Any]],
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    root = matrix_dir / "adjudications"
+    if not root.is_dir():
+        return []
+    files: list[tuple[Path, str, dict[str, Any]]] = []
+    for path in sorted(root.glob("*.json")):
+        document = _read_json(
+            path,
+            schema_name="adjudication-0.1.json",
+            require_private=True,
+            require_canonical=True,
+        )
+        judge._validate_adjudication_document(  # noqa: SLF001
+            matrix_dir,
+            target_index,
+            document,
+            retained=retained_judgments,
+        )
+        files.append((path, _sha256(document), document))
+    return files
+
+
+def _matching_judgment_files(
+    files: list[tuple[Path, str, dict[str, Any]]],
+    *,
+    target: dict[str, Any],
+    judge_identifier: str,
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    return [
+        (path, digest, document)
+        for path, digest, document in files
+        if document["target"] == target
+        and document["judge"]["identifier"] == judge_identifier
+    ]
+
+
+def _bound_judgment_roster(
+    review_dir: Path,
+    *,
+    case: dict[str, Any],
+    campaign: run_state.MatrixCampaign,
+    files: list[tuple[Path, str, dict[str, Any]]],
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    configured = {item.identifier: item for item in campaign.judges}
+    by_judge: dict[str, tuple[str, dict[str, Any]]] = {}
+    for _path, digest, document in files:
+        if document["target"] != case["target"]:
+            continue
+        identifier = document["judge"]["identifier"]
+        if identifier not in configured or identifier in by_judge:
+            raise ReviewError("qualitative judgment roster is ambiguous")
+        by_judge[identifier] = (digest, document)
+    if set(by_judge) != set(configured):
+        raise ReviewError(
+            f"qualitative judgment roster is incomplete for "
+            f"{case['target']['work_item_id']}"
+        )
+    for judge_config in campaign.judges:
+        operation = _read_json(
+            _operation_path(
+                review_dir,
+                "judgment",
+                case["target"]["work_item_id"],
+                judge_config.identifier,
+            ),
+            require_private=True,
+        )
+        operation_artifact = _validate_judgment_operation(
+            operation,
+            case=case,
+            judge_identifier=judge_config.identifier,
+        )
+        digest, retained_artifact = by_judge[judge_config.identifier]
+        if (
+            operation.get("artifact_sha256") != digest
+            or operation_artifact != retained_artifact
+        ):
+            raise ReviewError("qualitative judgment does not match operation ledger")
+    return by_judge
+
+
 def assemble_judgment(
     matrix_dir: Path,
     review_dir: Path,
@@ -587,7 +703,11 @@ def assemble_judgment(
     """Validate external verdicts, assemble judgment 0.1, and import it."""
 
     if (
-        not 1 <= attempt_count <= _MAX_ATTEMPTS
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or not 1 <= attempt_count <= _MAX_ATTEMPTS
+        or not isinstance(duration_ms, int)
+        or isinstance(duration_ms, bool)
         or not 0 <= duration_ms <= _MAX_DURATION_MS
         or isolation_attestation != _ISOLATION_ATTESTATION
     ):
@@ -611,6 +731,15 @@ def assemble_judgment(
             ]
             if len(judges) != 1:
                 raise ReviewError("qualitative review judge is not configured")
+            retained_judgments = judge._retained_judgments(  # noqa: SLF001
+                matrix_dir, target_index
+            )
+            retained_files = _retained_judgment_files(matrix_dir, retained_judgments)
+            matching_files = _matching_judgment_files(
+                retained_files,
+                target=case["target"],
+                judge_identifier=judge_identifier,
+            )
             operation_path = _operation_path(
                 review_dir, "judgment", work_item_id, judge_identifier
             )
@@ -628,14 +757,30 @@ def assemble_judgment(
                     target_index, document
                 )
                 digest = operation["artifact_sha256"]
+                if len(matching_files) > 1:
+                    raise ReviewError("qualitative judgment roster is ambiguous")
+                if matching_files:
+                    path, retained_digest, retained_document = matching_files[0]
+                    if retained_digest != digest or retained_document != document:
+                        raise ReviewError(
+                            "retained judgment does not match review operation"
+                        )
+                    retained = _retained_target(path, document, digest, kind="judgment")
+                    if retained is None:
+                        raise ReviewError("retained judgment is unavailable")
+                    return {"path": retained[0].name, "sha256": retained[1]}
                 target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
                 retained = _retained_target(target, document, digest, kind="judgment")
                 if retained is None:
                     retained = _import_document_locked(matrix_dir, "judgment", document)
                 return {"path": retained[0].name, "sha256": retained[1]}
 
+            if matching_files:
+                raise ReviewError("qualitative judgment already exists for judge")
             verdict_document = _read_json(
-                Path(verdicts_path), schema_name="review-verdicts-0.1.json"
+                Path(verdicts_path),
+                schema_name="review-verdicts-0.1.json",
+                require_private=True,
             )
             expected_response_target = {
                 "work_item_id": case["target"]["work_item_id"],
@@ -703,6 +848,7 @@ def _existing_operation_artifact(
     case: dict[str, Any],
     target_index: judge._TargetIndex,  # noqa: SLF001
     retained: dict[str, dict[str, Any]],
+    matching_files: list[tuple[Path, str, dict[str, Any]]],
 ) -> tuple[Path, str] | None:
     if not path.exists():
         return None
@@ -712,6 +858,18 @@ def _existing_operation_artifact(
         matrix_dir, target_index, artifact, retained=retained
     )
     digest = operation["artifact_sha256"]
+    if len(matching_files) > 1:
+        raise ReviewError("qualitative adjudication roster is ambiguous")
+    if matching_files:
+        target, retained_digest, retained_artifact = matching_files[0]
+        if retained_digest != digest or retained_artifact != artifact:
+            raise ReviewError("retained adjudication does not match review operation")
+        retained_target = _retained_target(
+            target, artifact, digest, kind="adjudication"
+        )
+        if retained_target is None:
+            raise ReviewError("retained adjudication is unavailable")
+        return retained_target
     target = matrix_dir / "adjudications" / f"{artifact.get('adjudication_id')}.json"
     retained_target = _retained_target(target, artifact, digest, kind="adjudication")
     if retained_target is not None:
@@ -737,6 +895,10 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
             retained = judge._retained_judgments(  # noqa: SLF001
                 matrix_dir, target_index
             )
+            retained_files = _retained_judgment_files(matrix_dir, retained)
+            retained_adjudications = _retained_adjudication_files(
+                matrix_dir, target_index, retained
+            )
             campaign = target_index.inspection_result.manifest.campaign
             for entry in ledger["cases"]:
                 work_item_id = entry["work_item_id"]
@@ -746,55 +908,30 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 operation_path = _operation_path(
                     review_dir, "adjudication", work_item_id, "agreement"
                 )
+                by_judge = _bound_judgment_roster(
+                    review_dir,
+                    case=case,
+                    campaign=campaign,
+                    files=retained_files,
+                )
+                matching_adjudications = [
+                    item
+                    for item in retained_adjudications
+                    if item[2]["target"] == case["target"]
+                ]
                 existing = _existing_operation_artifact(
                     operation_path,
                     matrix_dir,
                     case=case,
                     target_index=target_index,
                     retained=retained,
+                    matching_files=matching_adjudications,
                 )
                 if existing is not None:
                     retained_count += 1
                     continue
-                matching = [
-                    (digest, document)
-                    for digest, document in retained.items()
-                    if document["target"] == case["target"]
-                ]
-                configured = {item.identifier: item for item in campaign.judges}
-                by_judge: dict[str, tuple[str, dict[str, Any]]] = {}
-                for digest, document in matching:
-                    identifier = document["judge"]["identifier"]
-                    if identifier not in configured or identifier in by_judge:
-                        raise ReviewError("qualitative judgment roster is ambiguous")
-                    by_judge[identifier] = (digest, document)
-                if set(by_judge) != set(configured):
-                    raise ReviewError(
-                        f"qualitative judgment roster is incomplete for {work_item_id}"
-                    )
-                for judge_config in campaign.judges:
-                    operation = _read_json(
-                        _operation_path(
-                            review_dir,
-                            "judgment",
-                            work_item_id,
-                            judge_config.identifier,
-                        ),
-                        require_private=True,
-                    )
-                    operation_artifact = _validate_judgment_operation(
-                        operation,
-                        case=case,
-                        judge_identifier=judge_config.identifier,
-                    )
-                    digest, retained_artifact = by_judge[judge_config.identifier]
-                    if (
-                        operation.get("artifact_sha256") != digest
-                        or operation_artifact != retained_artifact
-                    ):
-                        raise ReviewError(
-                            "qualitative judgment does not match operation ledger"
-                        )
+                if matching_adjudications:
+                    raise ReviewError("qualitative adjudication already exists")
                 hashes = [by_judge[item.identifier][0] for item in campaign.judges]
                 verdict_maps = [
                     judge._criterion_map(  # noqa: SLF001

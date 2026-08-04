@@ -219,6 +219,7 @@ matches, so a response copied from another replicate cannot be imported.
 One setup pattern is:
 
 ```text
+umask 077
 mkdir -m 700 /private/judge-root
 mkdir -m 700 /private/judge-root/codex-home /private/judge-root/workspace
 install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
@@ -273,7 +274,8 @@ usage remains explicitly unavailable. The required isolation attestation means
 the operator used Codex CLI 0.146.0 with the exact fresh-home, auth-only,
 source-disabled, environment-minimized, filesystem-restricted, and
 network-disabled profile above; the runner cannot infer that fact from an
-external process.
+external process. The `umask 077` is also required: the assembler rejects a
+verdict output unless it is a mode-`0600` regular file.
 
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:

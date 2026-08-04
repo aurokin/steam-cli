@@ -35,6 +35,8 @@ package ledger binds the matrix manifest, every case digest, the
 response-schema digest, and an explicit policy that usage accounting is
 unavailable. Import requires the operator to attest to that exact versioned
 isolation profile because the runner cannot observe an external process.
+Prepared cases must remain their exact canonical bytes, and external verdict
+outputs must be private mode-`0600` regular files.
 
 The assembler accepts one exact-rubric verdict response whose work-item and
 projection hashes must match the prepared case, creates the existing
@@ -54,7 +56,11 @@ append-only operation. The review lock is always acquired before the matrix
 lock, and the matrix conflict check, operation publication, and target import
 occur under both. An interrupted import resumes from the bound operation
 before consulting any disposable response file, without regenerating model
-output.
+output. Judgment uniqueness is semantic rather than filename-based: one target
+and configured judge can have at most one retained artifact, and resume accepts
+it only when it exactly matches the operation artifact. Adjudication creation
+and resume both revalidate the full configured judgment-operation roster first,
+and apply the same one-exact-artifact rule to the adjudication target.
 
 Review packages, cases, operations, and schemas are private and bounded. They
 are operational material rather than benchmark acceptance evidence; the
