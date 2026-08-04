@@ -1240,6 +1240,18 @@ def test_checked_in_product_use_config_is_sol_medium_benchmark() -> None:
         "m7-s03",
     ]
 
+    confirmation = matrix.load_config(
+        ROOT / "evals" / "matrices" / "product-use-discovery-v1.json"
+    )
+    assert confirmation.campaign.campaign_kind == "benchmark"
+    assert confirmation.document["routes"] == [
+        {"model": "gpt-5.6-sol", "reasoning_effort": "medium"}
+    ]
+    assert confirmation.document["tracks"] == ["discovery"]
+    assert confirmation.campaign.required_tracks == ("discovery",)
+    assert confirmation.campaign.replicates == 3
+    assert confirmation.document["scenario_ids"] == loaded.document["scenario_ids"]
+
     anchor = matrix.load_config(
         ROOT / "evals" / "matrices" / "screen-anchor-v1.json"
     )

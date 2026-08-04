@@ -173,6 +173,18 @@ uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner report evals/results/MATRIX_ID
 ```
 
+After changing CLI discoverability or question-aligned rubrics, use the
+immutable discovery-only confirmation in
+`matrices/product-use-discovery-v1.json`. It runs the same 13 questions for
+three Sol-medium discovery replicates (39 observations) without rerunning the
+answer track:
+
+```text
+uv run python -m evals.runner matrix --config evals/matrices/product-use-discovery-v1.json
+uv run python -m evals.runner inspect evals/results/MATRIX_ID
+uv run python -m evals.runner report evals/results/MATRIX_ID
+```
+
 Benchmark campaigns are diagnostic and cannot be accepted or finalized. Their
 five deterministic layer outcomes and qualitative criterion outcomes remain
 separate vectors; there is no benchmark score, survivor, qualified route, or
