@@ -1427,6 +1427,7 @@ def test_judgment_rejects_route_or_deterministic_leaks_in_rationales(
         "The answer claims unknown ownership.",
         "The answer claims failed checks without evidence.",
         "The answer claims the result is null.",
+        "Claims the result is null.",
     ),
 )
 def test_judgment_allows_ordinary_criterion_rationales(

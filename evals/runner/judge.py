@@ -281,9 +281,7 @@ def _contains_deterministic_outcome_material(value: str) -> bool:
             ):
                 return True
             if predicate not in _OUTCOME_AUXILIARIES | _OUTCOME_COPULAS:
-                if token == "claims" and not (
-                    index == 0 or possessive or qualified
-                ):
+                if token == "claims" and not (possessive or qualified):
                     continue
                 cursor += 1
                 if cursor < len(tokens) and tokens[cursor] in _OUTCOME_ARTICLES:
