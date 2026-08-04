@@ -187,6 +187,85 @@ uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner report evals/results/MATRIX_ID
 ```
 
+`matrices/product-use-discovery-v2.json` is the current-main qualitative-review
+cohort. It preserves the same 13-question, three-replicate Sol-medium discovery
+denominator under a new immutable config identity because scenario rubrics and
+accepted command equivalents changed after `product-use-discovery-v1.json` was
+observed.
+
+After its 39 observations complete, prepare exact route-blind judge inputs in a
+private directory outside the matrix:
+
+```text
+uv run python -m evals.runner review prepare \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review
+```
+
+Each `cases/WORK_ITEM_ID.json` file is the complete prompt for one fresh judge
+call. Pipe it verbatim; do not add a wrapper prompt. Use a fresh private
+`CODEX_HOME` containing only a mode-`0600` copy of the authenticated source
+`auth.json`, and set `HOME` to an otherwise empty private workspace. This is the
+same isolation pattern as the generator driver: it prevents repository rules,
+user configuration, plugins, and user-scope skills from entering the judge
+context. Keep the isolated root temporary and remove it after the import.
+
+One setup pattern is:
+
+```text
+mkdir -m 700 /private/judge-root
+mkdir -m 700 /private/judge-root/codex-home /private/judge-root/workspace
+install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
+  /private/judge-root/codex-home/auth.json
+```
+
+Then invoke the judge with the isolated environment:
+
+```text
+CODEX_HOME=/private/judge-root/codex-home \
+HOME=/private/judge-root/workspace \
+TMPDIR=/private/judge-root \
+codex exec --ephemeral --ignore-user-config --ignore-rules \
+  --skip-git-repo-check --sandbox read-only \
+  --cd /private/judge-root/workspace \
+  --model gpt-5.6-sol --config model_reasoning_effort=xhigh \
+  --output-schema /private/path/MATRIX_ID-review/response-schema.json \
+  --output-last-message /private/path/verdicts.json \
+  - < /private/path/MATRIX_ID-review/cases/WORK_ITEM_ID.json
+```
+
+Import the result for each of `judge-1`, `judge-2`, and `judge-3`, recording the
+externally measured total attempts and duration:
+
+```text
+uv run python -m evals.runner review assemble \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
+  /private/path/verdicts.json --judge judge-1 \
+  --attempt-count 1 --duration-ms 12345 \
+  --isolation-attestation isolated-home-no-skills
+```
+
+The attempt count includes the initial call and at most two retries. Retry only
+a transport failure or structurally invalid response. Never retry a valid
+`uncertain` verdict or a later disagreement. The runner cannot observe failed
+external calls, so the operator supplies these bounded operational fields;
+usage remains explicitly unavailable. The required isolation attestation means
+the operator used a fresh `HOME` and auth-only `CODEX_HOME` with no repository
+or user skills; the runner cannot infer that fact from an external process.
+
+Once all three judgments exist for every case, resolve agreement mechanically
+and render the updated benchmark report:
+
+```text
+uv run python -m evals.runner review resolve \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review
+uv run python -m evals.runner report evals/results/MATRIX_ID
+```
+
+The resolver preserves every disagreement or `uncertain` verdict as
+`unresolved`; it never calls a model or retries for agreement. The exact-input
+and append-only operation contract is recorded in
+[ADR 0023](../docs/adr/0023-orchestrated-qualitative-review.md).
+
 The immutable edge confirmation in
 `matrices/product-use-discovery-edge-v1.json` isolates the compatibility
 `--explain` equivalence and the multiplayer query with or without its

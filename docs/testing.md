@@ -28,6 +28,11 @@ invariants and the matrix plan, resume, inspection, comparison, judgment, and
 adjudication artifact contracts without making provider requests.
 Natural-language answer judging remains opt-in; deterministic evidence, gate,
 ordering, and truth-state oracles are part of CI.
+The opt-in qualitative workflow prepares exact route-blind model inputs and a
+structured response schema but never invokes a judge. Normal tests cover
+private package bounds, stale-input rejection, existing judgment-envelope
+validation, the initial-plus-two structural retry cap, and deterministic
+agreement resolution.
 
 The suite also validates the repository skill's structure and the diagnostic
 skill-track boundary: sealed source binding, exact App Server inventory,

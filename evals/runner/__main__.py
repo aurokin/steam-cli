@@ -2688,6 +2688,10 @@ def main(argv: list[str] | None = None) -> int:
             from evals.runner import judge
 
             return judge.judge_cli(command_argv)
+        if command == "review":
+            from evals.runner import review
+
+            return review.review_cli(command_argv)
         if command == "accept":
             from evals.runner import acceptance
 

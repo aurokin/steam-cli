@@ -34,6 +34,12 @@ remain opt-in follow-up work and cannot compensate for a contract failure.
    assess relevance, clarity, tradeoffs, and actionability. These scores remain
    separate from contract and fact failures. The repository validates imported
    blinded judgments and adjudications; it does not automate a model judge.
+   The review workflow emits an exact route-blind input and response schema for
+   external orchestration, then assembles and validates existing judgment
+   artifacts and resolves configured agreement mechanically. Its maximum of
+   three externally reported attempts means one initial call plus two retries
+   for transport or structurally invalid output only; valid uncertainty and
+   disagreement are retained rather than retried.
 
 The scenario corpus under [`evals/`](../../evals/) represents these layers
 explicitly. Normal CI schema- and privacy-validates every M2, M3, M4, M5, M6,

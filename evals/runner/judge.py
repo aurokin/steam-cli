@@ -986,9 +986,10 @@ def _reject_finalized_screen(matrix_dir: Path) -> None:
     raise JudgmentError("finalized screen cannot accept qualitative artifacts")
 
 
-def _import_judgment_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
-    document, content = _read_import(source, "judgment-0.1.json")
-    target_index = _target_index(matrix_dir)
+def _validate_judgment_document(
+    target_index: _TargetIndex, document: dict[str, Any]
+) -> None:
+    _validate_schema(document, "judgment-0.1.json")
     result, observation, scenario = _target_observation(
         target_index, document["target"]
     )
@@ -998,6 +999,12 @@ def _import_judgment_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
         raise JudgmentError("judgment does not cover the exact rubric")
     if _requires_calibrated_policy(result.manifest.campaign, scenario):
         _validate_judgment_policy(result.manifest.campaign, document)
+
+
+def _import_judgment_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
+    document, content = _read_import(source, "judgment-0.1.json")
+    target_index = _target_index(matrix_dir)
+    _validate_judgment_document(target_index, document)
     return _publish_artifact(
         matrix_dir,
         collection="judgments",
@@ -1052,9 +1059,14 @@ def _retained_judgments(
     return result
 
 
-def _import_adjudication_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
-    document, content = _read_import(source, "adjudication-0.1.json")
-    target_index = _target_index(matrix_dir)
+def _validate_adjudication_document(
+    matrix_dir: Path,
+    target_index: _TargetIndex,
+    document: dict[str, Any],
+    *,
+    retained: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    _validate_schema(document, "adjudication-0.1.json")
     inspection_result, observation, scenario = _target_observation(
         target_index, document["target"]
     )
@@ -1062,7 +1074,11 @@ def _import_adjudication_locked(matrix_dir: Path, source: Path) -> tuple[Path, s
     outcomes = _criterion_map(document["outcomes"], field="outcome")
     if set(outcomes) != set(scenario.criterion_ids):
         raise JudgmentError("adjudication does not cover the exact rubric")
-    retained = _retained_judgments(matrix_dir, target_index)
+    retained = (
+        _retained_judgments(matrix_dir, target_index)
+        if retained is None
+        else retained
+    )
     hashes = document["judgment_sha256s"]
     if any(digest not in retained for digest in hashes):
         raise JudgmentError("adjudication references an unavailable judgment")
@@ -1102,6 +1118,12 @@ def _import_adjudication_locked(matrix_dir: Path, source: Path) -> tuple[Path, s
             )
             if outcome != expected:
                 raise JudgmentError("agreement outcome does not match judgments")
+
+
+def _import_adjudication_locked(matrix_dir: Path, source: Path) -> tuple[Path, str]:
+    document, content = _read_import(source, "adjudication-0.1.json")
+    target_index = _target_index(matrix_dir)
+    _validate_adjudication_document(matrix_dir, target_index, document)
     return _publish_artifact(
         matrix_dir,
         collection="adjudications",
