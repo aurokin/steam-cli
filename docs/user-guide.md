@@ -105,6 +105,32 @@ Synchronization commands acquire local or provider evidence and may write the
 tool's database. Query, ranking, assessment, and planning commands below read
 the cache only unless the [CLI contract](design/cli-contract.md) says otherwise.
 
+### Choose a command by intent
+
+This is the read-only, cache-only question map. It does not acquire evidence or
+change Steam; use the setup and synchronization workflows elsewhere in this
+guide when a result reports missing or stale evidence.
+
+| Question | Command leaf |
+| --- | --- |
+| Find owned, installed, or wishlist games | `games query` |
+| Filter candidates by declared multiplayer evidence | `discovery query` |
+| Choose what to play next | `recommendations query` |
+| Rank wishlist fit | `recommendations wishlist` |
+| Ask whether a game will work on an explicit target | `compatibility assess` |
+| Rank group fit or required copies | `group recommend` |
+| Inspect group copies or hard eligibility for explicit AppIDs | `group ownership` or `group eligibility` |
+| Rank candidates for reclaiming space or travel | `storage rank` |
+| Rank cached wishlist deals | `deals query` |
+
+`games query --scope library` joins visible-owned and installed games, while
+`--scope wishlist` reports wishlist membership rather than ownership.
+`discovery query --scope appids` requires one repeated `--appid` option per
+candidate. Its multiplayer declarations are positive-only, three-valued cached
+evidence: a matching declaration can pass a mode filter, while absence remains
+unknown. Exact numeric player counts from providers are unsupported; do not
+interpret a declared multiplayer mode as a minimum or maximum player count.
+
 ### Wishlist deals
 
 ```text

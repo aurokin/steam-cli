@@ -267,6 +267,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = AgentArgumentParser(
         prog="steam-agent",
         description="Local-first Steam evidence and operations for agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Intent index (read-only, cache-only; no network or Steam changes):
+  Find owned, installed, or wishlist games  -> games query
+  Filter by declared multiplayer evidence  -> discovery query
+  Choose what to play next                  -> recommendations query
+  Rank wishlist fit                         -> recommendations wishlist
+  Ask whether a game will work              -> compatibility assess
+  Check group fit or required copies        -> group recommend
+  Inspect group copies or eligibility       -> group ownership | group eligibility
+  Rank reclaim-space or travel candidates  -> storage rank
+  Find wishlist deals                       -> deals query
+""",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
@@ -278,14 +291,30 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     status_parser = commands.add_parser(
-        "status", help="Show local data and M1 readiness."
+        "status",
+        help="Show narrow local M1 installed.read readiness; not product capabilities.",
+        description=(
+            "Show narrow local M1 installed.read readiness; not product capabilities."
+        ),
     )
     _add_leaf_format(status_parser)
     capabilities_parser = commands.add_parser(
-        "capabilities", help="Show available M1 capabilities."
+        "capabilities",
+        help="Show M1 installed.read readiness only; not a command index.",
+        description="Show M1 installed.read readiness only; not a command index.",
     )
     _add_leaf_format(capabilities_parser)
-    doctor = commands.add_parser("doctor", help="Check local M1 prerequisites.")
+    doctor = commands.add_parser(
+        "doctor",
+        help=(
+            "Check narrow local M1 installed.read prerequisites; not product "
+            "capabilities."
+        ),
+        description=(
+            "Check narrow local M1 installed.read prerequisites; not product "
+            "capabilities."
+        ),
+    )
     _add_leaf_format(doctor)
     doctor.add_argument(
         "--offline", action="store_true", help="Do not use the network."
@@ -400,10 +429,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
-    query = game_commands.add_parser("query", help="Query games in a scope.")
+    query = game_commands.add_parser(
+        "query", help="Read one cached game-membership scope."
+    )
     _add_leaf_format(query)
     query.add_argument(
-        "--scope", choices=("installed", "owned", "wishlist", "library"), required=True
+        "--scope",
+        choices=("installed", "owned", "wishlist", "library"),
+        required=True,
+        help=(
+            "library joins cached visible-owned and installed games; wishlist "
+            "selects cached membership only, not ownership."
+        ),
     )
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
@@ -422,7 +459,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="discovery_command", required=True
     )
     discovery_query = discovery_commands.add_parser(
-        "query", help="Query declared facts without network access."
+        "query",
+        help=(
+            "Filter positive-only, three-valued cached declarations; exact numeric "
+            "player counts are unsupported."
+        ),
+        description=(
+            "Filter positive-only, three-valued cached declarations. Exact numeric "
+            "player counts are unsupported."
+        ),
     )
     _add_leaf_format(discovery_query)
     discovery_query.add_argument(
@@ -430,13 +475,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("known", "library", "wishlist", "installed", "appids"),
         required=True,
     )
-    discovery_query.add_argument("--appid", action="append", type=int, default=[])
+    discovery_query.add_argument(
+        "--appid",
+        action="append",
+        type=int,
+        default=[],
+        help="For --scope appids, repeat --appid once per candidate.",
+    )
     discovery_query.add_argument("--limit", type=int, required=True)
     discovery_query.add_argument("--account", default="primary")
     discovery_query.add_argument("--machine", default="local")
     discovery_query.add_argument("--country", required=True)
     discovery_query.add_argument("--language", required=True)
-    discovery_query.add_argument("--require-mode")
+    discovery_query.add_argument(
+        "--require-mode",
+        help=(
+            "Require positive-only, three-valued cached multiplayer evidence: a "
+            "declaration passes; absence remains unknown."
+        ),
+    )
 
     profiles = commands.add_parser(
         "profiles", help="Manage local-only group participant profiles."
@@ -542,7 +599,8 @@ def build_parser() -> argparse.ArgumentParser:
             leaf.add_argument("--host")
             leaf.add_argument("--policy")
     group_recommend = group_commands.add_parser(
-        "recommend", help="Rank a bounded cache-only group candidate set."
+        "recommend",
+        help="Rank cached group fit and missing-copy ranges for bounded candidates.",
     )
     _add_leaf_format(group_recommend)
     group_recommend.add_argument(
@@ -577,6 +635,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--objective",
         choices=("no-purchase", "min-copies", "preference-fit"),
         required=True,
+        help=(
+            "no-purchase requires zero missing copies; min-copies prioritizes the "
+            "smallest missing-copy range; preference-fit ranks explicit member "
+            "preferences after copy certainty."
+        ),
     )
     group_recommend.add_argument("--like", action="append", default=[])
     group_recommend.add_argument("--dislike", action="append", default=[])
@@ -709,7 +772,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf_format(compatibility_assess)
     compatibility_assess.add_argument("appids", metavar="APPID", nargs="+", type=int)
     compatibility_assess.add_argument("--account", required=True)
-    compatibility_assess.add_argument("--target", required=True)
+    compatibility_assess.add_argument(
+        "--target",
+        required=True,
+        help="Explicit cached assessment target: machine:ALIAS or valve:steam-deck.",
+    )
     compatibility_assess.add_argument(
         "--context-machine",
         help="Machine alias carrying declared-fact lineage for non-machine targets.",
@@ -759,13 +826,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--recipe",
         choices=("reclaim-space/0.1", "travel-install/0.1"),
         required=True,
+        help=(
+            "reclaim-space/0.1 ranks cached installed content sizes; "
+            "travel-install/0.1 ranks cached owned candidates against a byte budget."
+        ),
     )
     storage_rank.add_argument("--machine", required=True)
     storage_rank.add_argument("--account")
     storage_rank.add_argument("--country")
     storage_rank.add_argument("--language")
-    storage_rank.add_argument("--target-bytes", type=int)
-    storage_rank.add_argument("--budget-bytes", type=int)
+    storage_rank.add_argument(
+        "--target-bytes",
+        type=int,
+        help="Request-local reclaim target for each candidate, not an uninstall set.",
+    )
+    storage_rank.add_argument(
+        "--budget-bytes",
+        type=int,
+        help=(
+            "Request-local travel space budget; not download size or actual footprint."
+        ),
+    )
     storage_rank.add_argument("--limit", type=int, required=True)
     storage_rank.add_argument("--explain", action="store_true")
 
