@@ -430,7 +430,16 @@ Intent index (read-only, cache-only; no network or Steam changes):
     games = commands.add_parser("games", help="Query normalized games.")
     game_commands = games.add_subparsers(dest="games_command", required=True)
     query = game_commands.add_parser(
-        "query", help="Read one cached game-membership scope."
+        "query",
+        help="Read one cached game-membership scope.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only examples (no network or Steam changes):
+  steam-agent games query --scope installed --machine local --format json
+  steam-agent --data-dir ./steam-agent-data games query --scope library --account primary --machine local --format json
+
+Global --data-dir goes before the command; --format may follow the leaf.
+""",
     )
     _add_leaf_format(query)
     query.add_argument(
@@ -468,6 +477,11 @@ Intent index (read-only, cache-only; no network or Steam changes):
             "Filter positive-only, three-valued cached declarations. Exact numeric "
             "player counts are unsupported."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only example (no network or Steam changes):
+  steam-agent discovery query --scope appids --appid 123456 --appid 234567 --limit 2 --country US --language english --require-mode online_co_op --format json
+""",
     )
     _add_leaf_format(discovery_query)
     discovery_query.add_argument(
@@ -482,13 +496,19 @@ Intent index (read-only, cache-only; no network or Steam changes):
         default=[],
         help="For --scope appids, repeat --appid once per candidate.",
     )
-    discovery_query.add_argument("--limit", type=int, required=True)
+    discovery_query.add_argument(
+        "--limit",
+        type=int,
+        required=True,
+        help="Bound returned candidates; for an explicit AppID list, use its count.",
+    )
     discovery_query.add_argument("--account", default="primary")
     discovery_query.add_argument("--machine", default="local")
     discovery_query.add_argument("--country", required=True)
     discovery_query.add_argument("--language", required=True)
     discovery_query.add_argument(
         "--require-mode",
+        choices=tuple(sorted(MULTIPLAYER_CATEGORY_SLUGS.values())),
         help=(
             "Require positive-only, three-valued cached multiplayer evidence: a "
             "declaration passes; absence remains unknown."
@@ -601,6 +621,11 @@ Intent index (read-only, cache-only; no network or Steam changes):
     group_recommend = group_commands.add_parser(
         "recommend",
         help="Rank cached group fit and missing-copy ranges for bounded candidates.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only example (no network or Steam changes):
+  steam-agent group recommend --scope appids --appid 123456 --appid 234567 --limit 2 --member synthetic:alpha --member synthetic:beta --context-account primary --context-machine local --country US --language english --mode online_coop --objective min-copies --include-member-evidence --format json
+""",
     )
     _add_leaf_format(group_recommend)
     group_recommend.add_argument(
@@ -667,7 +692,13 @@ Intent index (read-only, cache-only; no network or Steam changes):
         dest="recommendations_command", required=True
     )
     recommendation_query = recommendation_commands.add_parser(
-        "query", help="Rank visible-owned games from one cached evidence snapshot."
+        "query",
+        help="Rank visible-owned games from one cached evidence snapshot.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only example (no network or Steam changes):
+  steam-agent recommendations query --account primary --machine local --recipe preference-fit/0.1 --require installed=true --format json
+""",
     )
     _add_leaf_format(recommendation_query)
     recommendation_query.add_argument("--account", required=True)
@@ -693,7 +724,12 @@ Intent index (read-only, cache-only; no network or Steam changes):
         ),
     )
     recommendation_query.add_argument("--time-minutes", type=int)
-    recommendation_query.add_argument("--require", action="append", default=[])
+    recommendation_query.add_argument(
+        "--require",
+        action="append",
+        default=[],
+        help="Repeat hard requirements such as --require installed=true.",
+    )
     recommendation_query.add_argument(
         "--unknown",
         choices=("include", "exclude"),
@@ -767,7 +803,13 @@ Intent index (read-only, cache-only; no network or Steam changes):
         dest="compatibility_command", required=True
     )
     compatibility_assess = compatibility_commands.add_parser(
-        "assess", help="Assess explicit AppIDs against one explicit target."
+        "assess",
+        help="Assess explicit AppIDs against one explicit target.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only example (no network or Steam changes):
+  steam-agent compatibility assess 123456 --account primary --target machine:local --country US --language english --format json
+""",
     )
     _add_leaf_format(compatibility_assess)
     compatibility_assess.add_argument("appids", metavar="APPID", nargs="+", type=int)
@@ -819,7 +861,15 @@ Intent index (read-only, cache-only; no network or Steam changes):
         dest="storage_command", required=True
     )
     storage_rank = storage_commands.add_parser(
-        "rank", help="Run a deterministic read-only storage recipe."
+        "rank",
+        help="Run a deterministic read-only storage recipe.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Cache-only, read-only example (no network or Steam changes):
+  steam-agent storage rank --recipe reclaim-space/0.1 --machine local --target-bytes 3000000000 --limit 10 --format json
+
+For reclaim-space, do not add account, country, language, or budget-bytes.
+""",
     )
     _add_leaf_format(storage_rank)
     storage_rank.add_argument(
