@@ -38,6 +38,45 @@ _SHELL_WORD_WHITESPACE = frozenset(" \t\r\n")
 _OPTION_NAME = re.compile(r"--[a-z][a-z0-9-]{0,63}\Z")
 _MAX_OPTION_VALUE_CHARACTERS = 256
 
+# Only these public CLI spellings may cross the failed-trace retention boundary.
+# Values are compared internally but are never returned by the audit helper.
+_COMMAND_AUDIT_OPTIONS = {
+    "--account": True,
+    "--appid": True,
+    "--budget-bytes": True,
+    "--context-account": True,
+    "--context-machine": True,
+    "--copy-source": True,
+    "--country": True,
+    "--destination-library-ordinal": True,
+    "--dislike": True,
+    "--explain": False,
+    "--exclude-trait": True,
+    "--expires-minutes": True,
+    "--host": True,
+    "--include-paths": False,
+    "--include-member-evidence": False,
+    "--language": True,
+    "--like": True,
+    "--limit": True,
+    "--machine": True,
+    "--member": True,
+    "--mode": True,
+    "--objective": True,
+    "--override": True,
+    "--playtime": True,
+    "--policy": True,
+    "--recipe": True,
+    "--require": True,
+    "--require-mode": True,
+    "--scope": True,
+    "--store-class": True,
+    "--target": True,
+    "--target-bytes": True,
+    "--time-minutes": True,
+    "--unknown": True,
+}
+
 
 def _has_path_boundary(text: str, index: int, *, posix: bool = False) -> bool:
     if index == 0:
@@ -1814,6 +1853,163 @@ def _normalize_actual_arguments(
             positionals.append(token)
         index += 1
     return options, positionals
+
+
+def _audit_actual_arguments(
+    tokens: Sequence[str],
+) -> tuple[dict[str, list[str | None]], list[str]] | None:
+    """Parse only the finite public option grammar used by command auditing."""
+
+    options: dict[str, list[str | None]] = {}
+    positionals: list[str] = []
+    saw_format = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        option, equals, inline = token.partition("=")
+        if option == "--format":
+            if saw_format:
+                return None
+            if equals:
+                if inline != "json":
+                    return None
+            elif index + 1 >= len(tokens) or tokens[index + 1] != "json":
+                return None
+            else:
+                index += 1
+            saw_format = True
+            index += 1
+            continue
+        if option.startswith("--"):
+            takes_value = _COMMAND_AUDIT_OPTIONS.get(option)
+            if takes_value is None:
+                return None
+            if equals:
+                if not takes_value or not inline:
+                    return None
+                value: str | None = inline
+            elif takes_value:
+                if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+                    return None
+                value = tokens[index + 1]
+                index += 1
+            else:
+                value = None
+            options.setdefault(option, []).append(value)
+        elif token.startswith("-"):
+            return None
+        else:
+            positionals.append(token)
+        index += 1
+    return options, positionals
+
+
+def _audit_requirement_mismatches(
+    *,
+    actual_head: tuple[str, ...],
+    actual_arguments: tuple[dict[str, list[str | None]], list[str]],
+    requirement: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return fixed-vocabulary mismatches without returning command values."""
+
+    expected = normalized_steam_agent_argv(str(requirement["command"]))
+    expected_tail = _cli_command_tail(expected or ())
+    if expected_tail is None or tuple(expected_tail[:2]) != actual_head:
+        return [{"kind": "wrong_head"}]
+
+    expected_options, expected_positionals = _required_arguments(
+        list(requirement.get("arguments", ()))
+    )
+    accepted_options = _accepted_optional_options(requirement, expected_options)
+    if accepted_options is None or any(
+        name not in _COMMAND_AUDIT_OPTIONS
+        for name in {*expected_options, *accepted_options}
+    ):
+        return [{"kind": "invalid_argument_shape"}]
+    actual_options, actual_positionals = actual_arguments
+    mismatches: list[dict[str, Any]] = []
+
+    for name, values in expected_options.items():
+        actual_values = actual_options.get(name)
+        if actual_values is None:
+            mismatches.append({"kind": "missing_option", "option": name})
+        elif len(actual_values) < len(values):
+            mismatches.append({"kind": "missing_option", "option": name})
+        elif len(actual_values) > len(values):
+            mismatches.append({"kind": "duplicate_option", "option": name})
+        elif actual_values != values:
+            mismatches.append({"kind": "wrong_value", "option": name})
+    for name, values in accepted_options.items():
+        actual_values = actual_options.get(name)
+        if actual_values is None:
+            continue
+        if len(actual_values) < len(values):
+            mismatches.append({"kind": "missing_option", "option": name})
+        elif len(actual_values) > len(values):
+            mismatches.append({"kind": "duplicate_option", "option": name})
+        elif actual_values != values:
+            mismatches.append({"kind": "wrong_value", "option": name})
+    recognized = {*expected_options, *accepted_options}
+    for name in sorted(set(actual_options) - recognized):
+        mismatches.append({"kind": "unexpected_known_option", "option": name})
+    if actual_positionals != expected_positionals:
+        mismatches.append({"kind": "positionals"})
+    return mismatches
+
+
+def privacy_safe_command_audit(
+    command: str,
+    requirements: Sequence[Mapping[str, Any]],
+    *,
+    expected_executable: str,
+    expected_data_dir: str,
+) -> dict[str, Any] | None:
+    """Describe one strict CLI call without retaining arguments or values.
+
+    ``None`` means even structural projection is unsafe. Known safe reads with
+    an option outside the finite audit grammar remain opaque.
+    """
+
+    argv = normalized_steam_agent_argv(
+        command, expected_executable=expected_executable
+    )
+    if argv is None:
+        return None
+    global_state = {
+        "expected_data_dir": _has_expected_data_dir(argv, expected_data_dir),
+        "json_format": _has_json_format(argv),
+    }
+    if _is_help_call(argv):
+        return {"class": "help", "global": global_state}
+    tail = _cli_command_tail(argv)
+    if tail is None or len(tail) < 2:
+        return None
+    head = tuple(tail[:2])
+    if head not in _DISCOVERY_SAFE_READ_HEADS:
+        return {"class": "opaque", "global": global_state}
+    actual_arguments = _audit_actual_arguments(tail[2:])
+    if actual_arguments is None:
+        return {
+            "class": "opaque",
+            "head": " ".join(head),
+            "global": global_state,
+        }
+    requirement_results = []
+    for index, requirement in enumerate(requirements):
+        mismatches = _audit_requirement_mismatches(
+            actual_head=head,
+            actual_arguments=actual_arguments,
+            requirement=requirement,
+        )
+        requirement_results.append(
+            {"index": index, "matched": not mismatches, "mismatches": mismatches}
+        )
+    return {
+        "class": "safe_read",
+        "head": " ".join(head),
+        "global": global_state,
+        "requirements": requirement_results,
+    }
 
 
 _STEAM_ID64_VALUE = re.compile(r"7656119[0-9]{10}\Z", re.ASCII)

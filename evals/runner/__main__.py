@@ -863,6 +863,12 @@ def _has_exact_pinned_route_attestation(report: dict[str, Any]) -> bool:
 
 def _omit_unsafe_report_content(report: dict[str, Any]) -> None:
     retain_route_attestation = _has_exact_pinned_route_attestation(report)
+    diagnostics = report.get("diagnostics")
+    if isinstance(diagnostics, dict) and (
+        report.get("metrics", {}).get("privacy", {}).get("passed") is not True
+        or "unsafe_activity" in diagnostics.get("observed_conditions", ())
+    ):
+        diagnostics["command_audit"] = None
     if report.get("turn_error") is not None:
         report["turn_error"] = _omitted_content(report["turn_error"])
     if report.get("final_message") is not None:
@@ -1573,6 +1579,59 @@ def _grade_tool_policy(
         item["satisfied"] for item in metric["required"]
     )
     return metric
+
+
+def _privacy_safe_command_audit(
+    turns: list[dict[str, Any]],
+    policy: dict[str, Any],
+    *,
+    privacy_metric: dict[str, Any],
+    tool_policy_metric: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Project bounded command structure only after the privacy boundary."""
+
+    if privacy_metric.get("passed") is not True:
+        return None
+    unsafe_reasons = {
+        "cache_only_boundary",
+        "execution_boundary",
+        "mutating_or_network",
+    }
+    for violation in tool_policy_metric.get("violations", ()):
+        if not isinstance(violation, dict):
+            return None
+        reason = str(violation.get("reason", ""))
+        if reason in unsafe_reasons or reason.startswith("disallowed_"):
+            return None
+
+    requirements = policy.get("required", ())
+    audit: list[dict[str, Any]] = []
+    for turn in turns:
+        for ordinal, result in enumerate(turn.get("_command_results", ())):
+            command = result.get("command")
+            if not isinstance(command, str):
+                return None
+            item = grade.privacy_safe_command_audit(
+                command,
+                requirements,
+                expected_executable=_LIVE_EXECUTABLE,
+                expected_data_dir="steam-agent-data",
+            )
+            if item is None:
+                return None
+            audit.append(
+                {
+                    "turn": turn["index"],
+                    "ordinal": ordinal,
+                    "outcome": (
+                        "success"
+                        if _is_successful_command_result(result)
+                        else "failed"
+                    ),
+                    **item,
+                }
+            )
+    return audit
 
 
 def _is_successful_command_result(result: dict[str, Any]) -> bool:
@@ -2367,6 +2426,12 @@ def run_scenario(
     diagnostics = {
         "evidence_capture": capture.diagnostic(),
         "observed_conditions": _observed_diagnostic_conditions(metrics, capture),
+        "command_audit": _privacy_safe_command_audit(
+            turns,
+            scenario["tool_policy"],
+            privacy_metric=privacy_metric,
+            tool_policy_metric=tool_policy_metric,
+        ),
     }
     retain_transcript_content = _safe_to_retain_content(metrics)
     qualitative_review_answers = _qualitative_review_answers(

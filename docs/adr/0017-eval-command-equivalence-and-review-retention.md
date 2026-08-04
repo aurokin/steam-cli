@@ -1,6 +1,7 @@
 # ADR 0017: bounded eval command alternatives and review-answer retention
 
-Status: accepted 2026-07-31; route-attestation clarification 2026-08-03
+Status: accepted 2026-07-31; route-attestation clarification 2026-08-03;
+privacy-safe command diagnostics clarification 2026-08-04
 
 ## Context
 
@@ -65,6 +66,17 @@ is valid and confirmed and every such value equals it. Otherwise those derived
 fields keep the prior hash-only representation. This bounded provenance is
 excluded from `qualitative_review_answers` and every judge projection.
 
+Reports may also retain a non-gating `diagnostics.command_audit` projection
+after the complete command surface passes privacy grading. It contains only
+turn and ordinal, success or failure, a finite allowlisted cache-only command
+head, expected-data-directory and JSON-format booleans, and fixed-vocabulary
+required-command mismatch codes. Mismatches may name only finite allowlisted
+public option spellings. The projection never retains argument or positional
+values, aliases, identifiers, paths, output, hashes, or lengths. Unknown
+options remain opaque, and privacy failure, non-normalizable activity, or an
+unsafe command makes the projection null. The audit is diagnostic provenance,
+not oracle evidence, and is excluded from judge inputs.
+
 ## Consequences
 
 M4 calibration can inspect a privacy-cleared answer when the only failure is
@@ -82,3 +94,8 @@ the prior retention behavior. Matrix observations with failed or pending hard
 layers can still prove their exact route without retaining the failed trace;
 unconfirmed, inconsistent, or malformed derived route metadata remains
 ineligible and hash-only.
+
+Exact-command misses can now distinguish wrong heads, missing or unexpected
+known options, wrong values, duplicates, and positional-shape differences
+without disclosing the values themselves. This avoids broadening scenario
+equivalence based on guesses while preserving the failed-trace boundary.

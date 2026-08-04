@@ -416,6 +416,12 @@ blind comparison and task-specific rubrics while retaining expert review.
   it is never copied into the qualitative projection. This boundary is
   recorded in
   [ADR 0017](../adr/0017-eval-command-equivalence-and-review-retention.md).
+  A separate non-gating command audit may retain only finite allowlisted
+  cache-only command heads, public option names in fixed mismatch codes,
+  success state, and transport booleans after command-surface privacy passes.
+  It retains no argument values, positionals, aliases, identifiers, paths,
+  output, hashes, or lengths; unknown options are opaque, unsafe activity or
+  privacy failure makes it null, and judges never receive it.
 - Each scenario uses a private temporary writable workspace. Its synthetic
   data directory contains a hidden canary file that the product CLI ignores,
   making prohibited filesystem inspection observable. The entire workspace,

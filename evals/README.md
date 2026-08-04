@@ -111,6 +111,12 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   That projection may remain available after a required-evidence-only failure,
   but never after an incomplete turn, privacy failure, unlisted command, or
   unsafe activity.
+  Reports also carry a non-gating `diagnostics.command_audit` after command
+  privacy passes. It exposes only finite allowlisted cache-only heads, public
+  option names inside fixed mismatch codes, success state, and transport
+  booleans. Argument values, positionals, aliases, identifiers, paths, output,
+  hashes, and lengths are never included; unknown options are opaque and unsafe
+  activity makes the audit null. Judges do not receive this diagnostic.
   The canonical retention and sanitization rules are in the
   [evaluation strategy](../docs/design/evaluation-strategy.md#current-implementation).
   Evaluated commands run under the named `steam-agent-eval` permission
