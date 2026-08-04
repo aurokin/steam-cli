@@ -797,6 +797,88 @@ def test_m4_r07_prompt_exposes_intent_without_oracle_facts() -> None:
     ]
 
 
+_RECOMMENDATION_DEFAULT_OPTIONS = [
+    {"name": "--machine", "value": "local"},
+    {"name": "--scope", "value": "owned"},
+    {"name": "--explain"},
+]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_options", "accepted_command"),
+    (
+        (
+            "m4/m4-w02-wishlist-membership.json",
+            [{"name": "--machine", "value": "local"}],
+            "steam-agent games query --scope wishlist --account synthetic "
+            "--machine local",
+        ),
+        (
+            "m4/m4-p01-never-played-backlog.json",
+            [{"name": "--machine", "value": "local"}],
+            "steam-agent games query --scope owned --account synthetic "
+            "--playtime zero --machine local",
+        ),
+        (
+            "m4/m4-r01-resume.json",
+            _RECOMMENDATION_DEFAULT_OPTIONS,
+            "steam-agent recommendations query --account synthetic-primary "
+            "--recipe resume/0.1 --machine local --scope owned --explain",
+        ),
+        (
+            "m4/m4-r03-installed-tonight.json",
+            _RECOMMENDATION_DEFAULT_OPTIONS,
+            "steam-agent recommendations query --account synthetic-primary "
+            "--recipe preference-fit/0.1 --require installed=true "
+            "--machine local --scope owned --explain",
+        ),
+        (
+            "m7/m7-s03-rank-reclaim-evidence.json",
+            [{"name": "--explain"}],
+            "steam-agent storage rank --recipe reclaim-space/0.1 "
+            "--machine synthetic-machine --target-bytes 3000000000 "
+            "--limit 10 --explain",
+        ),
+    ),
+    ids=("m4-w02", "m4-p01", "m4-r01", "m4-r03", "m7-s03"),
+)
+def test_product_use_scenarios_accept_only_declared_default_options(
+    relative_path: str,
+    expected_options: list[dict[str, str]],
+    accepted_command: str,
+) -> None:
+    scenario = json.loads(
+        (EVAL_ROOT / "scenarios" / relative_path).read_text(encoding="utf-8")
+    )
+    requirement = scenario["tool_policy"]["required"][0]
+
+    assert requirement["accepted_optional_options"] == expected_options
+    assert runner_grade.command_satisfies_requirement(accepted_command, requirement)
+
+
+def test_m4_r03_does_not_accept_an_installed_games_shortcut() -> None:
+    path = EVAL_ROOT / "scenarios" / "m4" / "m4-r03-installed-tonight.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    requirement = scenario["tool_policy"]["required"][0]
+
+    assert not runner_grade.command_satisfies_requirement(
+        "steam-agent games query --scope installed --account synthetic-primary",
+        requirement,
+    )
+
+
+def test_m7_s03_requires_the_canonical_limit() -> None:
+    path = EVAL_ROOT / "scenarios" / "m7" / "m7-s03-rank-reclaim-evidence.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    requirement = scenario["tool_policy"]["required"][0]
+
+    assert not runner_grade.command_satisfies_requirement(
+        "steam-agent storage rank --recipe reclaim-space/0.1 "
+        "--machine synthetic-machine --target-bytes 3000000000 --limit 9",
+        requirement,
+    )
+
+
 def test_m5_named_override_prompt_exposes_the_required_override_name() -> None:
     path = EVAL_ROOT / "scenarios" / "m5" / "m5-c07-named-override.json"
     scenario = json.loads(path.read_text(encoding="utf-8"))

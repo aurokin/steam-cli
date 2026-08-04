@@ -5,7 +5,7 @@
     {"subject": "synthetic:appid:1101", "state": "recent_sustained_unfinished"}, {"subject": "synthetic:appid:1102", "state": "old_unfinished"}, {"subject": "synthetic:appid:1103", "state": "recent_finished"}
   ]},
   "conversation": {"user": ["What should I resume next?"], "paraphrase": "Pick a game I have momentum in and have not finished."},
-  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "resume/0.1"]}], "prohibited": ["sync", "feedback mutation", "browser"]},
+  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "resume/0.1"], "accepted_optional_options": [{"name": "--machine", "value": "local"}, {"name": "--scope", "value": "owned"}, {"name": "--explain"}]}], "prohibited": ["sync", "feedback mutation", "browser"]},
   "deterministic_oracle": {"recipe_or_contract": "resume/0.1", "assertions": [
     {"path": "$.data.eligible[*].appid", "operator": "ordered_equals", "expected": [1101, 1102]},
     {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1103},

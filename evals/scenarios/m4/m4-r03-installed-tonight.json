@@ -3,7 +3,7 @@
   "question_family": "installed next play", "tags": ["hard-constraint", "installed", "next-play"], "frozen_time": "2030-01-15T12:00:00Z",
   "fixture": {"kind": "synthetic_normalized", "description": "A high-fit uninstalled candidate competes with a lower-fit installed candidate.", "facts": [{"subject": "synthetic:appid:1301", "state": "installed_fit_60"}, {"subject": "synthetic:appid:1302", "state": "uninstalled_fit_95"}]},
   "conversation": {"user": ["What installed game should I play tonight?"], "paraphrase": "Only recommend something already installed."},
-  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "installed=true"]}], "prohibited": ["sync", "install", "launch"]},
+  "tool_policy": {"allowed": ["steam-agent recommendations query"], "required": [{"command": "steam-agent recommendations query", "arguments": ["--account", "synthetic-primary", "--recipe", "preference-fit/0.1", "--require", "installed=true"], "accepted_optional_options": [{"name": "--machine", "value": "local"}, {"name": "--scope", "value": "owned"}, {"name": "--explain"}]}], "prohibited": ["sync", "install", "launch"]},
   "deterministic_oracle": {"recipe_or_contract": "recommendations/0.1 three-valued gates", "assertions": [
     {"path": "$.data.eligible[0].appid", "operator": "equals", "expected": 1301}, {"path": "$.data.excluded[0].appid", "operator": "equals", "expected": 1302}, {"path": "$.data.excluded[0].gates[?(@.name=='installed')].effective", "operator": "equals", "expected": "fail"}
   ]},
