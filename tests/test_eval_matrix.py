@@ -592,9 +592,15 @@ def test_collect_inputs_matches_real_child_snapshot_and_tool_manifest(
         lambda value: value.__setitem__("scenario_ids", ["m7-o01"]),
     )
     loaded = matrix.load_config(config_path)
-    monkeypatch.setattr(matrix, "_git_commit_and_clean", lambda _root: "1" * 40)
     monkeypatch.setattr(
-        matrix, "_require_execution_roots_match_commit", lambda _root, _commit: None
+        matrix,
+        "_git_commit_and_clean",
+        lambda _root, *, include_skill=False: "1" * 40,
+    )
+    monkeypatch.setattr(
+        matrix,
+        "_require_execution_roots_match_commit",
+        lambda _root, _commit, *, include_skill=False: None,
     )
     monkeypatch.setattr(
         matrix,
@@ -1252,6 +1258,26 @@ def test_checked_in_product_use_config_is_sol_medium_benchmark() -> None:
     assert confirmation.campaign.replicates == 3
     assert confirmation.document["scenario_ids"] == loaded.document["scenario_ids"]
 
+    skill = matrix.load_config(
+        ROOT / "evals" / "matrices" / "product-use-skill-v1.json"
+    )
+    assert skill.campaign.campaign_kind == "benchmark"
+    assert skill.document["routes"] == [
+        {"model": "gpt-5.6-sol", "reasoning_effort": "medium"}
+    ]
+    assert skill.document["tracks"] == ["skill"]
+    assert skill.campaign.required_tracks == ("skill",)
+    assert skill.campaign.replicates == 3
+    assert skill.document["scenario_ids"] == loaded.document["scenario_ids"]
+    skill_scenarios, _documents = matrix._scenario_documents(  # noqa: SLF001
+        tuple(skill.document["scenario_ids"]), root=ROOT, include_skill=True
+    )
+    skill_plan = matrix.resolve_plan(
+        skill, replace(_inputs(), scenarios=skill_scenarios)
+    )
+    assert len(skill_plan) == 39
+    assert {item.track for item in skill_plan} == {"skill"}
+
     anchor = matrix.load_config(
         ROOT / "evals" / "matrices" / "screen-anchor-v1.json"
     )
@@ -1596,6 +1622,23 @@ def test_benchmark_rejects_acceptance_or_incomplete_diagnostic_policy(
 ) -> None:
     path = _config(tmp_path, campaign_kind="benchmark")
     _rewrite_json(path, mutate)
+
+    with pytest.raises(matrix.MatrixError, match="config"):
+        matrix.load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("campaign_kind", "tracks"),
+    (
+        ("screen", ["skill"]),
+        ("qualification", ["skill"]),
+        ("benchmark", ["discovery", "skill"]),
+    ),
+)
+def test_skill_track_is_an_exclusive_diagnostic_benchmark(
+    tmp_path: Path, campaign_kind: str, tracks: list[str]
+) -> None:
+    path = _config(tmp_path, campaign_kind=campaign_kind, tracks=tracks)
 
     with pytest.raises(matrix.MatrixError, match="config"):
         matrix.load_config(path)

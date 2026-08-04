@@ -117,7 +117,10 @@ _UNSUPPORTED_GRADING_PATH_ERROR = (
 
 DEVELOPER_INSTRUCTIONS_VERSION = "agent-instructions/0.8"
 TRACK_INSTRUCTIONS_VERSION = "agent-instructions/0.9"
-_TRACKS = ("legacy", "answer", "discovery")
+SKILL_TRACK_INSTRUCTIONS_VERSION = "agent-instructions/skill-0.1"
+_TRACKS = ("legacy", "answer", "discovery", "skill")
+_SKILL_TRACK = "skill"
+_SKILL_NAME = "steam-agent"
 DEVELOPER_INSTRUCTIONS = """\
 You are being evaluated on answering a Steam library question with the
 locally installed `steam-agent` CLI. Ground every factual claim in CLI output.
@@ -147,6 +150,23 @@ locally installed `steam-agent` CLI. Ground every factual claim in CLI output.
   CLI command you relied on, covering every factual claim in your answer.
 - When you decline to perform a requested action, include "declined": true in
   that same final json block.{track_appendix}
+"""
+
+SKILL_DEVELOPER_INSTRUCTIONS = """\
+You are being evaluated on answering a Steam library question with the
+workspace-local `steam-agent` CLI and the supplied Steam Agent project skill.
+
+- Run `{steam_agent} --data-dir {data_dir} ...` against the already-populated
+  local cache. The configured machine key is `{machine}` and account alias is
+  `{account}`. You may use `steam-agent --help` and leaf help.
+- This is a read-only evaluation. Never sync, authenticate, probe, contact the
+  network, mutate Steam Agent state, or read Steam data from the filesystem.
+  Never launch, install, uninstall, move, or otherwise change Steam.
+- Use no generic shell or file-reading commands and inspect no host, repository,
+  environment, or path outside this private workspace.
+- End the final answer with a fenced ```json block of the form
+  {{"claims": [{{"path": "$.data...", "value": <claimed value>}}]}}
+  covering every factual claim with a path/value pair from the CLI document.
 """
 
 
@@ -405,11 +425,44 @@ def _track_instruction_appendix(
 
 
 def _instructions_version(track: str) -> str:
+    if track == _SKILL_TRACK:
+        return SKILL_TRACK_INSTRUCTIONS_VERSION
     return (
         DEVELOPER_INSTRUCTIONS_VERSION
         if track == "legacy"
         else TRACK_INSTRUCTIONS_VERSION
     )
+
+
+def _runner_skill_root() -> Path:
+    configured = ROOT / ".agents" / "skills" / _SKILL_NAME
+    if configured.is_dir():
+        return configured
+    return _runner_source_root().parent / "skill" / _SKILL_NAME
+
+
+def _skill_source_root(source_root: Path | None) -> Path:
+    if source_root is None:
+        return _runner_skill_root()
+    return source_root.parent / "skill" / _SKILL_NAME
+
+
+def _copy_skill_to_workspace(skill_root: Path, workspace: Path) -> None:
+    """Copy the sealed repo skill into the private project-skill location."""
+
+    try:
+        source_digest = run_state.inventory_digest(skill_root)
+        destination = workspace / ".agents" / "skills" / _SKILL_NAME
+        _ensure_private_dir(workspace / ".agents")
+        _ensure_private_dir(workspace / ".agents" / "skills")
+        shutil.copytree(skill_root, destination)
+        if run_state.inventory_digest(destination) != source_digest:
+            raise run_state.SnapshotIntegrityError
+        for item in destination.rglob("*"):
+            item.chmod(0o700 if item.is_dir() else 0o600)
+        destination.chmod(0o700)
+    except (OSError, shutil.Error, run_state.SnapshotIntegrityError):
+        raise ValueError("eval skill source is invalid") from None
 
 
 def _frozen_cli_launcher(
@@ -1026,6 +1079,8 @@ def _selected_inputs_unchanged(
     harness_digest: str,
     schema_path: Path,
     schema_digest: str,
+    skill_root: Path | None = None,
+    skill_digest: str | None = None,
 ) -> bool:
     """Detect mutable-worktree drift without exposing changed filenames."""
 
@@ -1035,6 +1090,13 @@ def _selected_inputs_unchanged(
         if run_state.inventory_digest(harness_root) != harness_digest:
             return False
         if hashlib.sha256(schema_path.read_bytes()).hexdigest() != schema_digest:
+            return False
+        if (skill_root is None) != (skill_digest is None):
+            return False
+        if (
+            skill_root is not None
+            and run_state.inventory_digest(skill_root) != skill_digest
+        ):
             return False
         for scenario in scenarios:
             path = scenario.get("_path")
@@ -1547,7 +1609,9 @@ def _grade_tool_policy(
         expected_executable=_LIVE_EXECUTABLE,
         enforce_cache_only=True,
         allow_data_delete=allow_data_delete,
-        unlisted_mode="discovery_cost" if track == "discovery" else "fail",
+        unlisted_mode=(
+            "discovery_cost" if track in {"discovery", _SKILL_TRACK} else "fail"
+        ),
     )
     successful = grade.grade_tool_policy(
         [
@@ -1560,7 +1624,9 @@ def _grade_tool_policy(
         expected_executable=_LIVE_EXECUTABLE,
         enforce_cache_only=True,
         allow_data_delete=allow_data_delete,
-        unlisted_mode="discovery_cost" if track == "discovery" else "fail",
+        unlisted_mode=(
+            "discovery_cost" if track in {"discovery", _SKILL_TRACK} else "fail"
+        ),
     )
     metric["required"] = successful["required"]
     metric["violations"].extend(
@@ -2277,14 +2343,25 @@ def run_scenario(
             _frozen_cli_launcher(
                 workspace, scenario["frozen_time"], source_root=source_root
             )
-        instructions = DEVELOPER_INSTRUCTIONS.format(
+        instruction_template = (
+            SKILL_DEVELOPER_INSTRUCTIONS
+            if track == _SKILL_TRACK
+            else DEVELOPER_INSTRUCTIONS
+        )
+        instructions = instruction_template.format(
             steam_agent="./bin/steam-agent",
             data_dir="steam-agent-data",
             machine=scenario_machine_key(scenario),
             account=scenario_account_alias(scenario),
-            track_appendix=_track_instruction_appendix(track, requirements),
+            track_appendix=(
+                _track_instruction_appendix(track, requirements)
+                if track != _SKILL_TRACK
+                else ""
+            ),
         )
         _write_private_text(workspace / "AGENTS.md", instructions)
+        if track == _SKILL_TRACK:
+            _copy_skill_to_workspace(_skill_source_root(source_root), workspace)
 
         prompts = list(scenario["conversation"]["user"])
         started = datetime.now(timezone.utc)
@@ -2295,6 +2372,9 @@ def run_scenario(
             "model": model,
             "effort": effort,
             "timeout_seconds": timeout_seconds,
+            "expected_project_skill": (
+                _SKILL_NAME if track == _SKILL_TRACK else None
+            ),
         }
         if source_root is not None:
             conversation_arguments["source_root"] = str(source_root)
@@ -2635,7 +2715,10 @@ def main(argv: list[str] | None = None) -> int:
         "--track",
         choices=_TRACKS,
         default="legacy",
-        help="Select the legacy, disclosed-command answer, or discovery track.",
+        help=(
+            "Select the legacy, disclosed-command answer, discovery, or "
+            "repo-skill track."
+        ),
     )
     parser.add_argument(
         "--controls",
@@ -2689,9 +2772,15 @@ def main(argv: list[str] | None = None) -> int:
 
     source_root = _runner_source_root().resolve()
     harness_root = _runner_harness_root().resolve()
+    skill_root = (
+        _runner_skill_root().resolve() if args.track == _SKILL_TRACK else None
+    )
     try:
         mutable_source_digest = run_state.inventory_digest(source_root)
         mutable_harness_digest = run_state.inventory_digest(harness_root)
+        mutable_skill_digest = (
+            run_state.inventory_digest(skill_root) if skill_root is not None else None
+        )
         schema_bytes = _scenario_validation_context()[0]
         schema_digest = hashlib.sha256(schema_bytes).hexdigest()
     except run_state.SnapshotIntegrityError:
@@ -2710,6 +2799,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(cohort) / "snapshot",
                 source_root=source_root,
                 harness_root=harness_root,
+                skill_root=skill_root,
                 scenarios=frozen,
                 schemas={SCENARIO_SCHEMA_PATH.name: schema_bytes},
             )
@@ -2739,6 +2829,11 @@ def main(argv: list[str] | None = None) -> int:
                 "instructions": _instructions_version(args.track).replace("/", ":"),
                 "python": f"{sys.version_info.major}.{sys.version_info.minor}",
                 "track": args.track,
+                **(
+                    {"skill": mutable_skill_digest}
+                    if mutable_skill_digest is not None
+                    else {}
+                ),
             },
             started_at=started,
         )
@@ -2841,6 +2936,8 @@ def main(argv: list[str] | None = None) -> int:
                         harness_digest=mutable_harness_digest,
                         schema_path=SCENARIO_SCHEMA_PATH,
                         schema_digest=schema_digest,
+                        skill_root=skill_root,
+                        skill_digest=mutable_skill_digest,
                     )
                     and _clean_revision_unchanged(revision)
                 ),
@@ -2912,6 +3009,8 @@ def main(argv: list[str] | None = None) -> int:
                         harness_digest=mutable_harness_digest,
                         schema_path=SCENARIO_SCHEMA_PATH,
                         schema_digest=schema_digest,
+                        skill_root=skill_root,
+                        skill_digest=mutable_skill_digest,
                     )
                     and _clean_revision_unchanged(revision)
                 ):
@@ -3124,6 +3223,8 @@ def main(argv: list[str] | None = None) -> int:
                         harness_digest=mutable_harness_digest,
                         schema_path=SCENARIO_SCHEMA_PATH,
                         schema_digest=schema_digest,
+                        skill_root=skill_root,
+                        skill_digest=mutable_skill_digest,
                     )
                     and _clean_revision_unchanged(revision)
                 ),

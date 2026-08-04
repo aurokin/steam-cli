@@ -37,7 +37,7 @@ _CONTROL_SET_VERSION = re.compile(
 )
 _REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 _CLEANLINESS_STATES = frozenset({"clean", "dirty", "unknown"})
-_TRACKS = frozenset({"legacy", "answer", "discovery"})
+_TRACKS = frozenset({"legacy", "answer", "discovery", "skill"})
 _MATRIX_HARD_LAYERS = frozenset(
     {"agent_turns", "tool_policy", "oracle", "claims", "privacy"}
 )
@@ -518,15 +518,17 @@ class SourceSnapshot:
         *,
         source_root: Path,
         harness_root: Path,
+        skill_root: Path | None = None,
         scenarios: Sequence[FrozenScenario],
         schemas: Mapping[str, bytes],
     ) -> Self:
         """Copy and seal one deterministic execution source cohort.
 
-        ``source_root`` becomes ``snapshot/src`` and ``harness_root`` becomes
-        ``snapshot/evals/runner``. Scenario names are relative to their normal
-        scenario root, and schema names are relative to the schema root; no
-        host source path is retained in the inventory.
+        ``source_root`` becomes ``snapshot/src``, ``harness_root`` becomes
+        ``snapshot/evals/runner``, and an optional repo skill becomes
+        ``snapshot/skill/steam-agent``. Scenario names are relative to their
+        normal scenario root, and schema names are relative to the schema root;
+        no host source path is retained in the inventory.
         """
 
         destination = Path(destination)
@@ -534,6 +536,7 @@ class SourceSnapshot:
             source_stat = source_root.lstat()
             harness_stat = harness_root.lstat()
             parent_stat = destination.parent.lstat()
+            skill_stat = skill_root.lstat() if skill_root is not None else None
         except OSError:
             raise SnapshotIntegrityError(
                 "source snapshot input is inaccessible"
@@ -542,6 +545,7 @@ class SourceSnapshot:
             not stat.S_ISDIR(source_stat.st_mode)
             or not stat.S_ISDIR(harness_stat.st_mode)
             or not stat.S_ISDIR(parent_stat.st_mode)
+            or (skill_stat is not None and not stat.S_ISDIR(skill_stat.st_mode))
         ):
             raise SnapshotIntegrityError("source snapshot requires real directories")
         try:
@@ -588,6 +592,26 @@ class SourceSnapshot:
                 == _normalized_content_inventory(harness_destination)
             ):
                 raise SnapshotIntegrityError("source changed while being snapshotted")
+
+            if skill_root is not None:
+                skill_destination = destination / "skill" / "steam-agent"
+                skill_destination.mkdir(mode=0o700, parents=True)
+                skill_before = _normalized_content_inventory(skill_root)
+                skill_fd = os.open(skill_root, flags)
+                try:
+                    _copy_source_directory(
+                        skill_fd, skill_destination, file_counter=file_counter
+                    )
+                finally:
+                    os.close(skill_fd)
+                if not (
+                    skill_before
+                    == _normalized_content_inventory(skill_root)
+                    == _normalized_content_inventory(skill_destination)
+                ):
+                    raise SnapshotIntegrityError(
+                        "source changed while being snapshotted"
+                    )
 
             for scenario in scenarios:
                 _write_snapshot_input(

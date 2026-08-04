@@ -50,7 +50,10 @@ def _parse_test_time(value: str | None) -> datetime:
 
 
 def _campaign(
-    kind: str, *, source_screen_manifest_sha256: str | None = None
+    kind: str,
+    *,
+    source_screen_manifest_sha256: str | None = None,
+    required_tracks: tuple[str, ...] | None = None,
 ) -> run_state.MatrixCampaign:
     return run_state.MatrixCampaign(
         campaign_kind=kind,
@@ -60,7 +63,8 @@ def _campaign(
             "diagnostic-corpus/0.1" if kind == "benchmark" else "fixed-corpus/0.1"
         ),
         hard_layers=LAYERS,
-        required_tracks=(
+        required_tracks=required_tracks
+        or (
             ("answer", "discovery")
             if kind in {"screen", "benchmark"}
             else ("discovery",)
@@ -217,9 +221,12 @@ def _result(
     unavailable: set[str] | None = None,
     orphan_work_ids: set[str] | None = None,
     scenario_id: str = "m7-z99",
+    required_tracks: tuple[str, ...] | None = None,
 ) -> inspection.MatrixInspection:
     campaign = _campaign(
-        kind, source_screen_manifest_sha256=source_screen_manifest_sha256
+        kind,
+        source_screen_manifest_sha256=source_screen_manifest_sha256,
+        required_tracks=required_tracks,
     )
     tracks = campaign.required_tracks
     work_items: list[run_state.MatrixWorkItem] = []
@@ -2350,6 +2357,41 @@ def test_benchmark_report_keeps_deterministic_and_qualitative_vectors_separate(
     assert [
         item["criteria"][0]["outcome"] for item in report["qualitative"]
     ] == ["pass", "fail", "unresolved", "unreviewed", "unreviewed", "unreviewed"]
+
+
+def test_benchmark_report_preserves_skill_track_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _result(
+        kind="benchmark",
+        matrix_id="skill-benchmark",
+        routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+        started_at="2026-08-04T11:00:00Z",
+        finished_at="2026-08-04T12:00:00Z",
+        required_tracks=("skill",),
+    )
+    evidence = acceptance.QualitativeEvidence(
+        outcomes=(), judgment_sha256s=(), adjudication_sha256s=()
+    )
+    monkeypatch.setattr(
+        diagnostic_report.inspection, "inspect_matrix", lambda _path: benchmark
+    )
+    monkeypatch.setattr(
+        diagnostic_report.acceptance,
+        "load_qualitative_outcomes",
+        lambda _result, *, require_all_judgments_adjudicated: evidence,
+    )
+
+    report = diagnostic_report.benchmark_report(Path("skill-benchmark"))
+
+    assert len(report["deterministic"]) == 3
+    assert {item["track"] for item in report["deterministic"]} == {"skill"}
+    assert {item["track"] for item in report["qualitative"]} == {"skill"}
+    assert report["aggregates"]["deterministic_work_items"] == {
+        "observed": 3,
+        "unavailable": 0,
+        "unaccounted": 0,
+    }
 
 
 def test_benchmark_report_missing_review_is_unreviewed_but_malformed_fails(

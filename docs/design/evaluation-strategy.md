@@ -332,7 +332,14 @@ blind comparison and task-specific rubrics while retaining expert review.
   (with every source workspace-local) before any model turn.
 - App Server runs with a disposable private `CODEX_HOME` containing only a
   mode-`0600` copy of the existing `auth.json`; personal config, MCP servers,
-  plugins, hooks, skills, state, and history are not inherited. It is launched
+  plugins, hooks, skills, state, and history are not inherited. Bare tracks
+  require the workspace skill inventory to contain no user- or repo-scoped
+  skills. The diagnostic `skill` track instead copies one sealed repository
+  skill into the private workspace, requires it to be the only enabled
+  user/repo skill at the exact canonical path, and supplies it as a native
+  skill input before the unchanged user text on every turn. System and
+  administrator skills may remain visible. This proves explicit skill-backed
+  use, not implicit invocation. It is launched
   from the private scenario workspace before protocol initialization, so
   startup project discovery cannot inherit configuration from the repository
   running the harness. Web search, hooks, plugins, apps, and configured MCP
@@ -342,7 +349,9 @@ blind comparison and task-specific rubrics while retaining expert review.
   resolved web/app settings and hook/app/plugin feature flags to remain
   disabled; resolved MCP and plugin declarations to be empty; the workspace's
   `hooks/list` result to contain no hooks, warnings, or errors; and the
-  threadless MCP inventory to be empty. Invalid declarations stop the preflight
+  threadless MCP inventory to be empty. An exact forced-reload `skills/list`
+  inventory enforces the track-specific boundary before thread creation.
+  Invalid declarations stop the preflight
   before hook or MCP inventory. Hook-origin protocol activity aborts the run.
   Authentication and protocol failures use generic errors and never include raw
   App Server payloads. Codex 0.146's generated response schema and live JSONL

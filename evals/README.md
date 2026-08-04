@@ -29,8 +29,10 @@ a contract corpus, not captured user data and not a live-provider benchmark.
   subject activity, and every observed setting or reroute must remain equal to
   it; otherwise the cohort fails structurally. Runs also name a run-level evaluation
   track: `legacy` is the default and preserves the original instructions,
-  `answer` discloses the exact required command manifest, and `discovery`
-  leaves command selection to the subject. Answer results are diagnostic and
+  `answer` discloses the exact required command manifest, `discovery` leaves
+  command selection to the subject, and `skill` explicitly supplies the sealed
+  repository skill with otherwise minimal instructions. Skill is an exclusive
+  benchmark track, not an acceptance track. Answer results are diagnostic and
   are not the headline product score. In discovery, only fully validated Steam
   Agent reads whose command head is in the runner's explicit positive set of
   known cache-only reads can be counted as exploration cost. They never
@@ -197,6 +199,20 @@ uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner report evals/results/MATRIX_ID
 ```
 
+The repository-skill benchmark is predeclared in
+`matrices/product-use-skill-v1.json`. It runs the same 13 questions for three
+Sol-medium replicates (39 observations). Each turn explicitly supplies the
+attested `steam-agent` skill before the unchanged user question, so the result
+measures the skill's operational guidance; it does not measure implicit skill
+selection. Bare discovery remains skill-free.
+
+```text
+uv run python -m evals.runner matrix --config evals/matrices/product-use-skill-v1.json
+uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/product-use-skill-v1.json
+uv run python -m evals.runner inspect evals/results/MATRIX_ID
+uv run python -m evals.runner report evals/results/MATRIX_ID
+```
+
 Benchmark campaigns are diagnostic and cannot be accepted or finalized. Their
 five deterministic layer outcomes and qualitative criterion outcomes remain
 separate vectors; there is no benchmark score, survivor, qualified route, or
@@ -213,6 +229,8 @@ diagnostic config. Keep it unchanged when questions or benchmark semantics
 change; create a new version and collect fresh observations instead. The
 benchmark contract is recorded in
 [ADR 0021](../docs/adr/0021-diagnostic-product-benchmark-campaigns.md).
+The repo-skill isolation contract is recorded in
+[ADR 0022](../docs/adr/0022-repo-skill-evaluation-track.md).
 
 Screen results select routes only; they are not qualification evidence.
 The screen requires calibrated agreement only on hard-fail fact criteria

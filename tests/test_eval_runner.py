@@ -4329,6 +4329,134 @@ def test_codex_driver_external_tool_preflight_attests_resolved_process_policy() 
     )
 
 
+def test_codex_driver_project_skill_preflight_attests_exact_enabled_skill(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    skill_path = workspace / ".agents" / "skills" / "steam-agent" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("---\nname: steam-agent\n---\n")
+
+    class FakeSession:
+        def request(self, method, params):
+            assert method == "skills/list"
+            assert params == {"cwds": [str(workspace)], "forceReload": True}
+            return {
+                "data": [
+                    {
+                        "cwd": str(workspace),
+                        "skills": [
+                            {
+                                "name": "skill-creator",
+                                "scope": "system",
+                                "enabled": True,
+                                "path": "/synthetic/system/SKILL.md",
+                            },
+                            {
+                                "name": "steam-agent",
+                                "scope": "user",
+                                "enabled": True,
+                                "path": str(skill_path),
+                            },
+                        ],
+                        "errors": [],
+                    }
+                ]
+            }
+
+    assert (
+        codex_driver._validate_project_skill_boundary(  # noqa: SLF001
+            FakeSession(),
+            str(workspace),
+            expected_project_skill="steam-agent",
+        )
+        == str(skill_path.resolve())
+    )
+
+
+def test_codex_driver_bare_preflight_allows_only_system_or_admin_skills() -> None:
+    workspace = "/synthetic/workspace"
+
+    class FakeSession:
+        def request(self, method, params):
+            assert method == "skills/list"
+            assert params == {"cwds": [workspace], "forceReload": True}
+            return {
+                "data": [
+                    {
+                        "cwd": workspace,
+                        "skills": [
+                            {
+                                "name": "skill-creator",
+                                "scope": "system",
+                                "enabled": True,
+                                "path": "/synthetic/system/SKILL.md",
+                            }
+                        ],
+                        "errors": [],
+                    }
+                ]
+            }
+
+    assert (
+        codex_driver._validate_project_skill_boundary(  # noqa: SLF001
+            FakeSession(), workspace, expected_project_skill=None
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        None,
+        {"data": []},
+        {
+            "data": [
+                {
+                    "cwd": "/synthetic/workspace",
+                    "skills": [],
+                    "errors": ["private-must-not-appear"],
+                }
+            ]
+        },
+        {
+            "data": [
+                {
+                    "cwd": "/synthetic/workspace",
+                    "skills": [
+                        {
+                            "name": "private-must-not-appear",
+                            "scope": "user",
+                            "enabled": True,
+                            "path": "/private/must-not-appear/SKILL.md",
+                        }
+                    ],
+                    "errors": [],
+                }
+            ]
+        },
+    ),
+)
+def test_codex_driver_project_skill_preflight_fails_closed_without_logging_values(
+    response: object,
+) -> None:
+    class FakeSession:
+        def request(self, method, params):
+            del method, params
+            return response
+
+    with pytest.raises(codex_driver.CodexProtocolError) as captured:
+        codex_driver._validate_project_skill_boundary(  # noqa: SLF001
+            FakeSession(),
+            "/synthetic/workspace",
+            expected_project_skill="steam-agent",
+        )
+
+    assert str(captured.value) == codex_driver._EXTERNAL_SOURCE_ERROR  # noqa: SLF001
+    assert "private-must-not-appear" not in str(captured.value)
+
+
 def test_codex_driver_rejects_declared_mcp_before_inventory() -> None:
     workspace = "/synthetic/workspace"
     config = _resolved_app_server_config(workspace)
@@ -6538,6 +6666,16 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
                 }
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
+            if method == "skills/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": "/synthetic/workspace",
+                            "skills": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             if method == "turn/start":
                 self.turn += 1
                 turn_id = f"turn-{self.turn}"
@@ -6639,6 +6777,98 @@ def test_codex_driver_pins_model_and_effort_for_every_turn(monkeypatch) -> None:
     ]
 
 
+def test_codex_driver_supplies_attested_skill_before_unchanged_user_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = "/synthetic/workspace"
+    skill_path = f"{workspace}/.agents/skills/steam-agent/SKILL.md"
+
+    class FakeProcess:
+        stdin = object()
+        stdout = object()
+
+    class FakeSession:
+        latest = None
+
+        def __init__(self, stdin, stdout, timeout_seconds) -> None:
+            del stdin, stdout, timeout_seconds
+            self.requests = []
+            FakeSession.latest = self
+
+        def request(self, method, params):
+            self.requests.append((method, params))
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-1"},
+                    "model": "gpt-5.6-sol",
+                    "reasoningEffort": "medium",
+                }
+            if method == "turn/start":
+                return {"turn": {"id": "turn-1", "status": "inProgress"}}
+            return {}
+
+        def notify(self, method, params) -> None:
+            del method, params
+
+    monkeypatch.setattr(codex_driver, "_Session", FakeSession)
+    monkeypatch.setattr(codex_driver, "_validate_account_boundary", lambda _session: None)
+    monkeypatch.setattr(
+        codex_driver,
+        "_validate_external_tool_boundary",
+        lambda _session, _workspace, *, source_root: None,
+    )
+
+    def validate_skill(_session, actual_workspace, *, expected_project_skill):
+        assert actual_workspace == workspace
+        assert expected_project_skill == "steam-agent"
+        return skill_path
+
+    monkeypatch.setattr(
+        codex_driver, "_validate_project_skill_boundary", validate_skill
+    )
+    monkeypatch.setattr(
+        codex_driver, "_validate_thread_boundary", lambda _response, _workspace: None
+    )
+    monkeypatch.setattr(
+        codex_driver,
+        "_collect_turn",
+        lambda *_args, **_kwargs: codex_driver.AgentTranscript(
+            turn_status="completed",
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="medium",
+        ),
+    )
+    monkeypatch.setattr(
+        codex_driver, "_validate_post_turn_boundary", lambda _session, _thread: None
+    )
+    prompts = ["Is Portal installed?", "What about its wishlist status?"]
+
+    codex_driver._converse(  # noqa: SLF001
+        FakeProcess(),
+        prompts=prompts,
+        workspace=workspace,
+        developer_instructions="minimal contract",
+        model="gpt-5.6-sol",
+        effort="medium",
+        timeout_seconds=30,
+        expected_project_skill="steam-agent",
+    )
+
+    assert FakeSession.latest is not None
+    turn_params = [
+        params
+        for method, params in FakeSession.latest.requests
+        if method == "turn/start"
+    ]
+    assert [params["input"] for params in turn_params] == [
+        [
+            {"type": "skill", "name": "steam-agent", "path": skill_path},
+            {"type": "text", "text": prompt},
+        ]
+        for prompt in prompts
+    ]
+
+
 def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6676,6 +6906,16 @@ def test_codex_driver_catches_prior_turn_activity_without_carrying_reroute(
                 }
             if method == "mcpServerStatus/list":
                 return {"data": [], "nextCursor": None}
+            if method == "skills/list":
+                return {
+                    "data": [
+                        {
+                            "cwd": "/synthetic/workspace",
+                            "skills": [],
+                            "errors": [],
+                        }
+                    ]
+                }
             if method == "turn/start":
                 self.turn += 1
                 turn_id = f"turn-{self.turn}"
@@ -7157,6 +7397,79 @@ def test_run_scenario_uses_and_removes_private_workspace(
     assert all(
         value not in persisted for value in scenario["privacy_canaries"].values()
     )
+
+
+def test_skill_track_uses_private_repo_skill_and_minimal_developer_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scenario_path = SCENARIO_ROOT / "m7" / "m7-o05-find-library-title.json"
+    scenario = json.loads(scenario_path.read_text())
+    scenario["_path"] = scenario_path
+    observed: dict[str, Path] = {}
+
+    def fake_materialize(_scenario, data_dir: Path) -> None:
+        (data_dir / "fixture-marker").write_text("fixture")
+
+    def fake_conversation(**kwargs):
+        workspace = Path(kwargs["workspace"])
+        observed["workspace"] = workspace
+        instructions = kwargs["developer_instructions"]
+        assert kwargs["prompts"] == scenario["conversation"]["user"]
+        assert kwargs["expected_project_skill"] == "steam-agent"
+        assert "supplied Steam Agent project skill" in instructions
+        assert "games query" not in instructions
+        assert "recommendations query" not in instructions
+        assert "Preserve the CLI's distinctions" not in instructions
+        assert "Answer-track control" not in instructions
+        assert "EVAL_CANARY" not in instructions
+        skill = workspace / ".agents" / "skills" / "steam-agent"
+        assert (skill / "SKILL.md").read_bytes() == (
+            ROOT / ".agents" / "skills" / "steam-agent" / "SKILL.md"
+        ).read_bytes()
+        assert stat.S_IMODE((workspace / ".agents").stat().st_mode) == 0o700
+        assert stat.S_IMODE((workspace / ".agents" / "skills").stat().st_mode) == 0o700
+        assert stat.S_IMODE(skill.stat().st_mode) == 0o700
+        for item in skill.rglob("*"):
+            assert stat.S_IMODE(item.stat().st_mode) == (
+                0o700 if item.is_dir() else 0o600
+            )
+        return [
+            codex_driver.AgentTranscript(
+                agent_messages=['No supported claim.\n```json\n{"claims": []}\n```'],
+                turn_status="completed",
+                effective_model="gpt-5.6-sol",
+                effective_reasoning_effort="medium",
+            )
+        ]
+
+    monkeypatch.setattr(runner_main, "materialize", fake_materialize)
+    monkeypatch.setattr(runner_main, "_frozen_cli_launcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(codex_driver, "run_agent_conversation", fake_conversation)
+    monkeypatch.setattr(codex_driver, "codex_version", lambda: "codex-cli test")
+
+    report = runner_main.run_scenario(
+        scenario,
+        tmp_path / "run",
+        model="gpt-5.6-sol",
+        effort="medium",
+        timeout_seconds=1,
+        track="skill",
+    )
+
+    assert report["generator"]["instructions_version"] == (
+        runner_main.SKILL_TRACK_INSTRUCTIONS_VERSION
+    )
+    assert not observed["workspace"].exists()
+
+
+def test_runner_help_names_repo_skill_track(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as captured:
+        runner_main.main(["--help"])
+
+    assert captured.value.code == 0
+    output = capsys.readouterr().out
+    assert "{legacy,answer,discovery,skill}" in output
+    assert "repo-skill track" in output
 
 
 def test_earlier_visible_contradiction_stays_pending_and_auditable(

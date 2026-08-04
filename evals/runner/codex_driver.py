@@ -447,6 +447,7 @@ def run_agent_conversation(
     effort: str | None = None,
     timeout_seconds: float = 900.0,
     source_root: str | None = None,
+    expected_project_skill: str | None = None,
 ) -> list[AgentTranscript]:
     """Run every prompt as a sequential turn on one thread.
 
@@ -492,6 +493,7 @@ def run_agent_conversation(
                 effort=effort,
                 timeout_seconds=timeout_seconds,
                 source_root=Path(source_root) if source_root is not None else None,
+                expected_project_skill=expected_project_skill,
             )
         finally:
             _terminate_process_group(process)
@@ -792,6 +794,7 @@ def _converse(
     effort: str | None,
     timeout_seconds: float,
     source_root: Path | None = None,
+    expected_project_skill: str | None = None,
 ) -> list[AgentTranscript]:
     assert process.stdin is not None and process.stdout is not None
     session = _Session(process.stdin, process.stdout, timeout_seconds)
@@ -812,6 +815,9 @@ def _converse(
     _validate_external_tool_boundary(
         session, workspace, source_root=source_root
     )
+    project_skill_path = _validate_project_skill_boundary(
+        session, workspace, expected_project_skill=expected_project_skill
+    )
     thread = session.request(
         "thread/start",
         _thread_start_params(workspace, developer_instructions, model),
@@ -824,9 +830,20 @@ def _converse(
 
     transcripts: list[AgentTranscript] = []
     for prompt in prompts:
+        turn_inputs: list[dict[str, str]] = []
+        if project_skill_path is not None:
+            assert expected_project_skill is not None
+            turn_inputs.append(
+                {
+                    "type": "skill",
+                    "name": expected_project_skill,
+                    "path": project_skill_path,
+                }
+            )
+        turn_inputs.append({"type": "text", "text": prompt})
         turn_params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": turn_inputs,
         }
         if effort is not None:
             turn_params["effort"] = effort
@@ -1084,6 +1101,75 @@ def _validate_external_tool_boundary(
     mcp_valid = mcp.get("data") == [] and mcp.get("nextCursor") is None
     if not mcp_valid:
         raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+
+
+def _validate_project_skill_boundary(
+    session: _Session,
+    workspace: str,
+    *,
+    expected_project_skill: str | None,
+) -> str | None:
+    """Attest the exact repo skill exposed from the private workspace."""
+
+    response = session.request(
+        "skills/list", {"cwds": [workspace], "forceReload": True}
+    )
+    if not isinstance(response, dict):
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+    data = response.get("data")
+    if not isinstance(data, list) or len(data) != 1:
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+    entry = data[0]
+    if (
+        not isinstance(entry, dict)
+        or entry.get("cwd") != workspace
+        or entry.get("errors") != []
+        or not isinstance(entry.get("skills"), list)
+    ):
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+    project_skills: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for skill in entry["skills"]:
+        if not isinstance(skill, dict):
+            raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+        name = skill.get("name")
+        scope = skill.get("scope")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in seen_names
+            or scope not in {"user", "repo", "system", "admin"}
+        ):
+            raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+        seen_names.add(name)
+        if scope in {"user", "repo"}:
+            project_skills.append(skill)
+    if expected_project_skill is None:
+        if project_skills:
+            raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+        return None
+    expected_path = (
+        Path(workspace)
+        / ".agents"
+        / "skills"
+        / expected_project_skill
+        / "SKILL.md"
+    ).resolve()
+    if len(project_skills) != 1:
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+    skill = project_skills[0]
+    path = skill.get("path")
+    try:
+        resolved = Path(path).resolve() if isinstance(path, str) else None
+    except (OSError, RuntimeError):
+        resolved = None
+    if (
+        skill.get("name") != expected_project_skill
+        or skill.get("enabled") is not True
+        or resolved != expected_path
+    ):
+        raise CodexProtocolError(_EXTERNAL_SOURCE_ERROR)
+    return str(expected_path)
 
 
 def _validate_permission_profile_config(

@@ -157,6 +157,52 @@ def test_source_snapshot_copies_declared_inputs_seals_and_verifies(
     assert not snapshot.root.exists()
 
 
+def test_source_snapshot_binds_and_seals_optional_project_skill(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "entry.py").write_text("VALUE = 'source'\n")
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    (harness / "grade.py").write_text("VALUE = 'harness'\n")
+    skill = tmp_path / "skill"
+    (skill / "agents").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: steam-agent\n---\n")
+    (skill / "agents" / "openai.yaml").write_text(
+        'interface:\n  display_name: "Steam Agent"\n'
+    )
+
+    without_skill = SourceSnapshot.create(
+        tmp_path / "without-skill",
+        source_root=source,
+        harness_root=harness,
+        scenarios=[_scenario()],
+        schemas={"scenario-0.2.json": b"{}"},
+    )
+    with_skill = SourceSnapshot.create(
+        tmp_path / "with-skill",
+        source_root=source,
+        harness_root=harness,
+        skill_root=skill,
+        scenarios=[_scenario()],
+        schemas={"scenario-0.2.json": b"{}"},
+    )
+    try:
+        copied = with_skill.root / "skill" / "steam-agent"
+        assert (copied / "SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
+        assert (copied / "agents" / "openai.yaml").read_bytes() == (
+            skill / "agents" / "openai.yaml"
+        ).read_bytes()
+        assert with_skill.digest != without_skill.digest
+        assert with_skill.verify() == with_skill.digest
+        assert stat.S_IMODE(copied.stat().st_mode) == 0o555
+        assert stat.S_IMODE((copied / "SKILL.md").stat().st_mode) == 0o444
+    finally:
+        with_skill.cleanup()
+        without_skill.cleanup()
+
+
 def test_source_snapshot_rejects_symlink_without_reading_target(
     tmp_path: Path,
 ) -> None:

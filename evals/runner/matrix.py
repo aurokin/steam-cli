@@ -371,7 +371,7 @@ def load_config(
     return loaded
 
 
-def _git_commit_and_clean(root: Path) -> str:
+def _git_commit_and_clean(root: Path, *, include_skill: bool = False) -> str:
     try:
         commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -393,7 +393,7 @@ def _git_commit_and_clean(root: Path) -> str:
         raise MatrixError("matrix requires a known clean source revision") from None
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit) or status_result.stdout:
         raise MatrixError("matrix requires a known clean source revision")
-    _require_execution_roots_match_commit(root, commit)
+    _require_execution_roots_match_commit(root, commit, include_skill=include_skill)
     return commit
 
 
@@ -404,8 +404,11 @@ def _generated_source_name(relative: PurePosixPath) -> bool:
 
 
 def _committed_execution_files(
-    root: Path, commit: str
+    root: Path, commit: str, *, include_skill: bool = False
 ) -> dict[str, tuple[str, bool]]:
+    roots = ["src", "evals/runner"]
+    if include_skill:
+        roots.append(".agents/skills/steam-agent")
     try:
         result = subprocess.run(
             [
@@ -416,8 +419,7 @@ def _committed_execution_files(
                 "--full-tree",
                 commit,
                 "--",
-                "src",
-                "evals/runner",
+                *roots,
             ],
             cwd=root,
             capture_output=True,
@@ -438,22 +440,22 @@ def _committed_execution_files(
                 or mode not in {"100644", "100755"}
                 or not re.fullmatch(r"[0-9a-f]{40,64}", object_id)
                 or relative.is_absolute()
-                or not (
-                    relative.is_relative_to(PurePosixPath("src"))
-                    or relative.is_relative_to(PurePosixPath("evals/runner"))
+                or not any(
+                    relative.is_relative_to(PurePosixPath(root_name))
+                    for root_name in roots
                 )
             ):
                 raise ValueError
-            root_name = (
-                PurePosixPath("src")
-                if relative.parts[0] == "src"
-                else PurePosixPath("evals/runner")
+            root_name = next(
+                PurePosixPath(item)
+                for item in roots
+                if relative.is_relative_to(PurePosixPath(item))
             )
             local_name = relative.relative_to(root_name)
             if _generated_source_name(local_name):
                 continue
             if any(
-                _SAFE_SOURCE_COMPONENT.fullmatch(part) is None
+                part != ".agents" and _SAFE_SOURCE_COMPONENT.fullmatch(part) is None
                 for part in relative.parts
             ):
                 raise ValueError
@@ -467,11 +469,18 @@ def _committed_execution_files(
         raise MatrixError("matrix committed source inventory is invalid") from None
 
 
-def _require_execution_roots_match_commit(root: Path, commit: str) -> None:
-    committed = _committed_execution_files(root, commit)
+def _require_execution_roots_match_commit(
+    root: Path, commit: str, *, include_skill: bool = False
+) -> None:
+    committed = _committed_execution_files(
+        root, commit, include_skill=include_skill
+    )
     actual_files: dict[str, run_state.InventoryEntry] = {}
     actual_directories: set[str] = set()
-    for prefix in (PurePosixPath("src"), PurePosixPath("evals/runner")):
+    prefixes = [PurePosixPath("src"), PurePosixPath("evals/runner")]
+    if include_skill:
+        prefixes.append(PurePosixPath(".agents/skills/steam-agent"))
+    for prefix in prefixes:
         try:
             entries = run_state._scan_inventory(  # noqa: SLF001
                 root / prefix.as_posix(), ignore_generated=True
@@ -492,10 +501,11 @@ def _require_execution_roots_match_commit(root: Path, commit: str) -> None:
                 raise MatrixError("matrix committed source inventory is invalid")
 
     expected_files = set(committed)
-    expected_directories = {"src", "evals/runner"}
+    expected_directories = {prefix.as_posix() for prefix in prefixes}
+    prefix_parents = {prefix.parent.as_posix() for prefix in prefixes}
     for name in expected_files:
         parent = PurePosixPath(name).parent
-        while parent.as_posix() not in {".", "evals"}:
+        while parent.as_posix() not in prefix_parents:
             expected_directories.add(parent.as_posix())
             parent = parent.parent
     if set(actual_files) != expected_files or actual_directories != expected_directories:
@@ -746,6 +756,7 @@ def _expected_child_source_digest(
     document: Mapping[str, Any],
     schema_name: str,
     schema_bytes: bytes,
+    include_skill: bool = False,
 ) -> str:
     frozen = run_state.FrozenScenario.create(
         source_name=source_name,
@@ -762,6 +773,11 @@ def _expected_child_source_digest(
                 workspace / "snapshot",
                 source_root=root / "src",
                 harness_root=root / "evals" / "runner",
+                skill_root=(
+                    root / ".agents" / "skills" / "steam-agent"
+                    if include_skill
+                    else None
+                ),
                 scenarios=[frozen],
                 schemas={schema_name: schema_bytes},
             ) as snapshot:
@@ -827,6 +843,7 @@ def _scenario_inputs(
     *,
     root: Path,
     corpus_seal: _SelectedCorpusSeal | None = None,
+    include_skill: bool = False,
 ) -> tuple[
     tuple[run_state.MatrixScenario, ...],
     dict[str, Mapping[str, Any]],
@@ -939,6 +956,7 @@ def _scenario_inputs(
                     document=document,
                     schema_name=schema_path.name,
                     schema_bytes=schema_bytes,
+                    include_skill=include_skill,
                 ),
                 schema_version=schema_version.replace("/", ":"),
                 schema_sha256=hashlib.sha256(schema_bytes).hexdigest(),
@@ -959,9 +977,13 @@ def _scenario_documents(
     *,
     root: Path,
     corpus_seal: _SelectedCorpusSeal | None = None,
+    include_skill: bool = False,
 ) -> tuple[tuple[run_state.MatrixScenario, ...], dict[str, Mapping[str, Any]]]:
     scenarios, documents, _sources = _scenario_inputs(
-        scenario_ids, root=root, corpus_seal=corpus_seal
+        scenario_ids,
+        root=root,
+        corpus_seal=corpus_seal,
+        include_skill=include_skill,
     )
     return scenarios, documents
 
@@ -970,20 +992,33 @@ def collect_inputs(
     config: LoadedConfig, *, root: Path = ROOT
 ) -> run_state.MatrixInputs:
     root = Path(root)
-    commit = _git_commit_and_clean(root)
+    include_skill = config.document["tracks"] == ["skill"]
+    commit = _git_commit_and_clean(root, include_skill=include_skill)
     corpus_seal = _seal_selected_corpus_inputs(
         root, commit, config.document["scenario_ids"]
     )
     scenarios, _documents = _scenario_documents(
-        config.document["scenario_ids"], root=root, corpus_seal=corpus_seal
+        config.document["scenario_ids"],
+        root=root,
+        corpus_seal=corpus_seal,
+        include_skill=include_skill,
     )
     try:
         source_digest = run_state.inventory_digest(root / "src")
         harness_digest = run_state.inventory_digest(root / "evals" / "runner")
         codex_version = codex_driver.codex_version().rsplit(" ", 1)[-1]
+        skill_digest = (
+            run_state.inventory_digest(
+                root / ".agents" / "skills" / "steam-agent"
+            )
+            if include_skill
+            else None
+        )
     except (OSError, ValueError, run_state.SnapshotIntegrityError):
         raise MatrixError("matrix input attestation failed") from None
-    _require_execution_roots_match_commit(root, commit)
+    _require_execution_roots_match_commit(
+        root, commit, include_skill=include_skill
+    )
     return run_state.MatrixInputs(
         commit=commit,
         source_digest=source_digest,
@@ -995,6 +1030,7 @@ def collect_inputs(
                     "codex": codex_version,
                     "controls": controls.CONTROL_SCHEMA_VERSION.replace("/", ":"),
                     "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                    **({"skill": skill_digest} if skill_digest is not None else {}),
                 }.items()
             )
         ),

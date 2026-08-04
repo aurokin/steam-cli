@@ -61,6 +61,12 @@ Continue with the [user guide](docs/user-guide.md) for account setup, provider
 credentials, deals, recommendations, compatibility, group decisions, safe
 operation plans, data locations, and deletion.
 
+Agents working from this checkout can use the repository-owned `steam-agent`
+project skill in `.agents/skills/steam-agent`. It maps common library questions
+to cache-only commands and carries the same evidence, privacy, and read-only
+Steam boundaries as the CLI. It is checkout-local; installing the CLI does not
+install a global agent skill.
+
 ## Develop
 
 Set up a checkout:

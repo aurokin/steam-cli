@@ -29,6 +29,12 @@ adjudication artifact contracts without making provider requests.
 Natural-language answer judging remains opt-in; deterministic evidence, gate,
 ordering, and truth-state oracles are part of CI.
 
+The suite also validates the repository skill's structure and the diagnostic
+skill-track boundary: sealed source binding, exact App Server inventory,
+explicit native skill input with unchanged user text, private workspace copy,
+exclusive benchmark configuration, and report identity. Live model execution
+remains opt-in.
+
 Repository documentation checks also require local Markdown links to resolve,
 every design document to declare its status near the top, and committed
 Markdown to omit personal home-directory paths. These checks make navigation

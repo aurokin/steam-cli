@@ -1,0 +1,6 @@
+interface:
+  display_name: "Steam Agent"
+  short_description: "Answer Steam questions from local evidence"
+  default_prompt: "Use $steam-agent to answer a Steam library question from cached evidence."
+policy:
+  allow_implicit_invocation: true
