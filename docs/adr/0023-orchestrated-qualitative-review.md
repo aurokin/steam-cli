@@ -25,13 +25,19 @@ Model invocation remains external to the repository runner. The configured
 judge identity, model, and effort are selected by the orchestrator, while every
 invocation receives only one prepared case. No ad hoc wrapper prompt is
 permitted. Each call uses a fresh empty `HOME` and an isolated `CODEX_HOME`
-containing only copied authentication, with user configuration and rules
-disabled. The package ledger binds the matrix manifest, every case digest, the
+containing only copied authentication. The pinned Codex 0.146.0 invocation
+disables user configuration, rules, hooks, apps, plugins, MCP servers, and web
+search; minimizes the inherited shell environment; and selects the same named
+permission boundary as the generator without its Python or source read roots.
+That boundary denies host root and temporary paths, allows only minimal
+platform files plus the empty workspace, and disables network access. The
+package ledger binds the matrix manifest, every case digest, the
 response-schema digest, and an explicit policy that usage accounting is
-unavailable. Import requires the operator to attest to that isolation because
-the runner cannot observe an external process.
+unavailable. Import requires the operator to attest to that exact versioned
+isolation profile because the runner cannot observe an external process.
 
-The assembler accepts one exact-rubric verdict response, creates the existing
+The assembler accepts one exact-rubric verdict response whose work-item and
+projection hashes must match the prepared case, creates the existing
 `steam-agent-eval-judgment/0.1` envelope, and imports it through the existing
 privacy and policy validator. Its append-only private operation records the
 case and artifact digests, externally measured duration, unavailable usage
@@ -44,8 +50,11 @@ After one configured judgment per judge identity exists for every case, the
 resolver derives agreement outcomes without a model call. Unanimous `pass` or
 `fail` is retained; any disagreement or `uncertain` verdict becomes
 `unresolved`. It imports the existing adjudication schema and records another
-append-only operation. Interrupted imports can be resumed from the bound
-operation without regenerating model output.
+append-only operation. The review lock is always acquired before the matrix
+lock, and the matrix conflict check, operation publication, and target import
+occur under both. An interrupted import resumes from the bound operation
+before consulting any disposable response file, without regenerating model
+output.
 
 Review packages, cases, operations, and schemas are private and bounded. They
 are operational material rather than benchmark acceptance evidence; the

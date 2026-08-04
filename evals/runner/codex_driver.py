@@ -309,7 +309,9 @@ def advertised_model_routes(
     normalized = _validate_model_route_queries(routes)
     if not posix_runner_supported():
         raise CodexProtocolError(_POSIX_ONLY_ERROR)
-    with tempfile.TemporaryDirectory(prefix="steam-agent-eval-model-list-") as root_name:
+    with tempfile.TemporaryDirectory(
+        prefix="steam-agent-eval-model-list-"
+    ) as root_name:
         isolated_home = Path(root_name)
         isolated_home.chmod(0o700)
         workspace = isolated_home / "workspace"
@@ -583,6 +585,8 @@ def _app_server_process_args(
     workspace: Path,
     *,
     source_root: Path | None = None,
+    include_runtime_roots: bool = True,
+    approval_policy: str | None = None,
 ) -> list[str]:
     policy_overrides = (
         'shell_environment_policy.inherit="core"',
@@ -592,8 +596,13 @@ def _app_server_process_args(
         "shell_environment_policy.set.TMPDIR=" + json.dumps(str(workspace)),
         "default_permissions=" + json.dumps(_PERMISSION_PROFILE),
         f"permissions.{_PERMISSION_PROFILE}="
-        + _permission_profile_toml(source_root=source_root),
+        + _permission_profile_toml(
+            source_root=source_root,
+            include_runtime_roots=include_runtime_roots,
+        ),
     )
+    if approval_policy is not None:
+        policy_overrides += ("approval_policy=" + json.dumps(approval_policy),)
     args = [*_launch_args(launch_prefix), *_APP_SERVER_ARGS[1:]]
     for override in policy_overrides:
         args.extend(("-c", override))
@@ -658,7 +667,7 @@ def _python_framework_binary() -> Path | None:
 
 
 def _permission_filesystem_rules(
-    *, source_root: Path | None = None
+    *, source_root: Path | None = None, include_runtime_roots: bool = True
 ) -> dict[str, str]:
     rules = {
         ":root": "deny",
@@ -666,20 +675,24 @@ def _permission_filesystem_rules(
         ":tmpdir": "deny",
         ":slash_tmp": "deny",
     }
-    rules.update(
-        {
-            str(path): "read"
-            for path in _permission_read_roots(source_root=source_root)
-        }
-    )
+    if include_runtime_roots:
+        rules.update(
+            {
+                str(path): "read"
+                for path in _permission_read_roots(source_root=source_root)
+            }
+        )
     return rules
 
 
-def _permission_profile_toml(*, source_root: Path | None = None) -> str:
+def _permission_profile_toml(
+    *, source_root: Path | None = None, include_runtime_roots: bool = True
+) -> str:
     filesystem = ",".join(
         f"{json.dumps(path)}={json.dumps(access)}"
         for path, access in _permission_filesystem_rules(
-            source_root=source_root
+            source_root=source_root,
+            include_runtime_roots=include_runtime_roots,
         ).items()
     )
     return (
@@ -981,9 +994,7 @@ _SERVER_MODEL = re.compile(
     re.ASCII,
 )
 _SERVER_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
-_CATALOG_REASONING_EFFORT = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z", re.ASCII
-)
+_CATALOG_REASONING_EFFORT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z", re.ASCII)
 
 
 def _validated_server_model(value: Any) -> str:
@@ -1047,7 +1058,12 @@ def _validate_account_boundary(session: _Session) -> None:
 
 
 def _validate_external_tool_boundary(
-    session: _Session, workspace: str, *, source_root: Path | None = None
+    session: _Session,
+    workspace: str,
+    *,
+    source_root: Path | None = None,
+    include_runtime_roots: bool = True,
+    approval_policy: str | None = None,
 ) -> None:
     """Fail before thread creation if App Server retained an external source."""
 
@@ -1072,8 +1088,14 @@ def _validate_external_tool_boundary(
             and features.get("plugins") is False
             and config.get("mcp_servers") == {}
             and config.get("plugins") == {}
+            and (
+                approval_policy is None
+                or config.get("approval_policy") == approval_policy
+            )
             and _validate_permission_profile_config(
-                config, source_root=source_root
+                config,
+                source_root=source_root,
+                include_runtime_roots=include_runtime_roots,
             )
             and _validate_shell_environment_policy(
                 config.get("shell_environment_policy"), workspace
@@ -1173,13 +1195,19 @@ def _validate_project_skill_boundary(
 
 
 def _validate_permission_profile_config(
-    config: dict[str, Any], *, source_root: Path | None = None
+    config: dict[str, Any],
+    *,
+    source_root: Path | None = None,
+    include_runtime_roots: bool = True,
 ) -> bool:
     profiles = config.get("permissions")
     profile = profiles.get(_PERMISSION_PROFILE) if isinstance(profiles, dict) else None
     filesystem = {
         "glob_scan_max_depth": None,
-        **_permission_filesystem_rules(source_root=source_root),
+        **_permission_filesystem_rules(
+            source_root=source_root,
+            include_runtime_roots=include_runtime_roots,
+        ),
     }
     network = {
         "enabled": False,
@@ -1382,17 +1410,13 @@ def _collect_turn(
     transcript = AgentTranscript(
         effective_model=effective_model,
         effective_reasoning_effort=effective_reasoning_effort,
-        observed_models=(
-            [effective_model] if effective_model is not None else []
-        ),
+        observed_models=([effective_model] if effective_model is not None else []),
         observed_reasoning_efforts=(
             [effective_reasoning_effort]
             if effective_reasoning_effort is not None
             else []
         ),
-        pre_activity_models=(
-            [effective_model] if effective_model is not None else []
-        ),
+        pre_activity_models=([effective_model] if effective_model is not None else []),
         pre_activity_reasoning_efforts=(
             [effective_reasoning_effort]
             if effective_reasoning_effort is not None

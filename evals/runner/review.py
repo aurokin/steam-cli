@@ -30,7 +30,7 @@ _OPERATION_SCHEMA = "steam-agent-eval-review-operation/0.1"
 _MAX_CASES = 1024
 _MAX_ATTEMPTS = 3
 _MAX_DURATION_MS = 24 * 60 * 60 * 1000
-_ISOLATION_ATTESTATION = "isolated-home-no-skills"
+_ISOLATION_ATTESTATION = "codex-0.146-restricted-profile-v1"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _SAFE_WORK_ITEM = re.compile(r"w-[0-9]{6}-[0-9a-f]{16}\Z", re.ASCII)
 
@@ -99,7 +99,9 @@ def _asset_text(matrix_dir: Path, name: str, expected_sha256: str) -> str:
         item_stat = path.lstat()
         content = path.read_bytes()
     except OSError:
-        raise ReviewError("qualitative review calibration asset is unavailable") from None
+        raise ReviewError(
+            "qualitative review calibration asset is unavailable"
+        ) from None
     if (
         not stat.S_ISREG(item_stat.st_mode)
         or len(content) > _MAX_DOCUMENT_BYTES
@@ -164,9 +166,7 @@ def _case_document(
 ) -> dict[str, Any]:
     campaign = target_index.inspection_result.manifest.campaign
     target, projection = _target_for(target_index, work_item_id)
-    response_schema = _read_json(
-        judge.SCHEMA_ROOT / "review-verdicts-0.1.json"
-    )
+    response_schema = _read_json(judge.SCHEMA_ROOT / "review-verdicts-0.1.json")
     return {
         "schema": _CASE_SCHEMA,
         "execution": {
@@ -202,7 +202,9 @@ def _case_document(
     }
 
 
-def _validate_review_root(review_dir: Path, result: inspection.MatrixInspection) -> dict[str, Any]:
+def _validate_review_root(
+    review_dir: Path, result: inspection.MatrixInspection
+) -> dict[str, Any]:
     try:
         item_stat = review_dir.lstat()
     except OSError:
@@ -258,30 +260,34 @@ def _validate_review_root(review_dir: Path, result: inspection.MatrixInspection)
     expected_response_schema = _read_json(
         judge.SCHEMA_ROOT / "review-verdicts-0.1.json"
     )
-    if ledger.get("response_schema") != {
-        "path": "response-schema.json",
-        "sha256": _sha256(response_schema),
-    } or response_schema != expected_response_schema:
+    if (
+        ledger.get("response_schema")
+        != {
+            "path": "response-schema.json",
+            "sha256": _sha256(response_schema),
+        }
+        or response_schema != expected_response_schema
+    ):
         raise ReviewError("qualitative review response schema is invalid")
     cases = ledger.get("cases")
     if not isinstance(cases, list) or not 1 <= len(cases) <= _MAX_CASES:
         raise ReviewError("qualitative review ledger is invalid")
-    expected_work_items = {
-        item.work_item_id for item in result.manifest.work_items
-    }
+    expected_work_items = {item.work_item_id for item in result.manifest.work_items}
     seen_work_items: set[str] = set()
     for item in cases:
+        work_item_id = item.get("work_item_id") if isinstance(item, dict) else None
         if (
             not isinstance(item, dict)
             or set(item) != {"work_item_id", "path", "sha256"}
-            or _SAFE_WORK_ITEM.fullmatch(item.get("work_item_id", "")) is None
-            or item.get("path") != f"cases/{item.get('work_item_id')}.json"
+            or not isinstance(work_item_id, str)
+            or _SAFE_WORK_ITEM.fullmatch(work_item_id) is None
+            or item.get("path") != f"cases/{work_item_id}.json"
             or not isinstance(item.get("sha256"), str)
             or len(item["sha256"]) != 64
-            or item["work_item_id"] in seen_work_items
+            or work_item_id in seen_work_items
         ):
             raise ReviewError("qualitative review ledger is invalid")
-        seen_work_items.add(item["work_item_id"])
+        seen_work_items.add(work_item_id)
     if seen_work_items != expected_work_items:
         raise ReviewError("qualitative review ledger does not cover matrix")
     if {item.name for item in (review_dir / "cases").iterdir()} != {
@@ -340,9 +346,7 @@ def prepare(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
         operations_dir = staging / "operations"
         _private_dir(cases_dir)
         _private_dir(operations_dir)
-        response_schema = _read_json(
-            judge.SCHEMA_ROOT / "review-verdicts-0.1.json"
-        )
+        response_schema = _read_json(judge.SCHEMA_ROOT / "review-verdicts-0.1.json")
         _write_json(staging / "response-schema.json", response_schema)
         case_entries: list[dict[str, Any]] = []
         for work_item in result.manifest.work_items:
@@ -425,7 +429,9 @@ def _load_bound_case(
     return document
 
 
-def _operation_path(review_dir: Path, kind: str, work_item_id: str, suffix: str) -> Path:
+def _operation_path(
+    review_dir: Path, kind: str, work_item_id: str, suffix: str
+) -> Path:
     return review_dir / "operations" / f"{kind}-{work_item_id}-{suffix}.json"
 
 
@@ -460,6 +466,7 @@ def _validate_judgment_operation(
         "recorded_at",
     }
     artifact = operation.get("artifact")
+    artifact_judge = artifact.get("judge") if isinstance(artifact, dict) else None
     if (
         set(operation) != required
         or operation.get("schema") != _OPERATION_SCHEMA
@@ -478,7 +485,8 @@ def _validate_judgment_operation(
         or operation.get("case_sha256") != _sha256(case)
         or not isinstance(artifact, dict)
         or artifact.get("target") != case["target"]
-        or artifact.get("judge", {}).get("identifier") != judge_identifier
+        or not isinstance(artifact_judge, dict)
+        or artifact_judge.get("identifier") != judge_identifier
         or operation.get("artifact_sha256") != _sha256(artifact)
     ):
         raise ReviewError("qualitative review operation is invalid")
@@ -514,15 +522,55 @@ def _validate_adjudication_operation(
     return artifact
 
 
-def _import_document(matrix_dir: Path, kind: str, document: dict[str, Any]) -> tuple[Path, str]:
+def _import_document_locked(
+    matrix_dir: Path, kind: str, document: dict[str, Any]
+) -> tuple[Path, str]:
+    """Import a validated artifact while the caller holds the matrix lock."""
+
     with tempfile.TemporaryDirectory(prefix="steam-agent-review-import-") as name:
         root = Path(name)
         root.chmod(0o700)
         source = root / f"{kind}.json"
         _write_json(source, document)
         if kind == "judgment":
-            return judge.import_judgment(matrix_dir, source)
-        return judge.import_adjudication(matrix_dir, source)
+            return judge._import_judgment_locked(matrix_dir, source)  # noqa: SLF001
+        return judge._import_adjudication_locked(matrix_dir, source)  # noqa: SLF001
+
+
+def _retained_target(
+    path: Path,
+    document: dict[str, Any],
+    digest: str,
+    *,
+    kind: str,
+) -> tuple[Path, str] | None:
+    """Return an exact private retained target, or ``None`` when absent."""
+
+    try:
+        item_stat = path.lstat()
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ReviewError(f"retained {kind} is unavailable") from None
+    if (
+        not stat.S_ISREG(item_stat.st_mode)
+        or stat.S_IMODE(item_stat.st_mode) != 0o600
+        or content != _canonical_bytes(document)
+        or hashlib.sha256(content).hexdigest() != digest
+    ):
+        raise ReviewError(f"retained {kind} does not match review operation")
+    return path, digest
+
+
+def _reject_existing_target(path: Path, *, kind: str) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ReviewError(f"qualitative {kind} target is unavailable") from None
+    raise ReviewError(f"qualitative {kind} target already exists")
 
 
 def assemble_judgment(
@@ -546,89 +594,106 @@ def assemble_judgment(
         raise ReviewError("qualitative review operational measurement is invalid")
     matrix_dir = Path(matrix_dir).resolve()
     review_dir = Path(review_dir).resolve()
-    try:
-        target_index = judge._target_index(matrix_dir)  # noqa: SLF001
-    except judge.JudgmentError as error:
-        raise ReviewError(str(error)) from None
     with matrix.MatrixLock(review_dir):
-        ledger = _validate_review_root(review_dir, target_index.inspection_result)
-        case = _load_bound_case(
-            matrix_dir, review_dir, target_index, ledger, work_item_id
-        )
-        verdict_document = _read_json(
-            Path(verdicts_path), schema_name="review-verdicts-0.1.json"
-        )
-        criteria = [
-            item["id"] for item in case["projection"]["criteria"]
-        ]
-        verdict_map = judge._criterion_map(  # noqa: SLF001
-            verdict_document["verdicts"], field="verdict"
-        )
-        if set(verdict_map) != set(criteria):
-            raise ReviewError("qualitative verdicts do not cover the exact rubric")
-        campaign = target_index.inspection_result.manifest.campaign
-        judges = [item for item in campaign.judges if item.identifier == judge_identifier]
-        if len(judges) != 1:
-            raise ReviewError("qualitative review judge is not configured")
-        ordered_verdicts = sorted(
-            verdict_document["verdicts"], key=lambda item: criteria.index(item["criterion_id"])
-        )
-        document = {
-            "schema": "steam-agent-eval-judgment/0.1",
-            "judgment_id": f"judgment-{work_item_id}-{judge_identifier}",
-            "target": case["target"],
-            "judge": judges[0].to_dict(),
-            "prompt": {
-                "version": campaign.prompt_version,
-                "sha256": campaign.prompt_sha256,
-            },
-            "parser": {
-                "version": campaign.parser_version,
-                "sha256": campaign.parser_sha256,
-            },
-            "presentation": case["presentation"],
-            "verdicts": ordered_verdicts,
-            "created_at": _now(),
-        }
-        judge._validate_judgment_document(target_index, document)  # noqa: SLF001
-        artifact_sha256 = _sha256(document)
-        operation = {
-            "schema": _OPERATION_SCHEMA,
-            "kind": "judgment_import",
-            "matrix_id": case["target"]["matrix_id"],
-            "work_item_id": work_item_id,
-            "judge_identifier": judge_identifier,
-            "attempt_count": attempt_count,
-            "duration_ms": duration_ms,
-            "usage": {"state": "unavailable"},
-            "isolation_attestation": isolation_attestation,
-            "case_sha256": _sha256(case),
-            "artifact_sha256": artifact_sha256,
-            "artifact": document,
-            "recorded_at": _now(),
-        }
-        operation_path = _operation_path(
-            review_dir, "judgment", work_item_id, judge_identifier
-        )
-        if operation_path.exists():
-            retained = _read_json(operation_path, require_private=True)
-            document = _validate_judgment_operation(
-                retained,
-                case=case,
-                judge_identifier=judge_identifier,
+        with matrix.MatrixLock(matrix_dir):
+            try:
+                judge._reject_finalized_screen(matrix_dir)  # noqa: SLF001
+                target_index = judge._target_index(matrix_dir)  # noqa: SLF001
+            except judge.JudgmentError as error:
+                raise ReviewError(str(error)) from None
+            ledger = _validate_review_root(review_dir, target_index.inspection_result)
+            case = _load_bound_case(
+                matrix_dir, review_dir, target_index, ledger, work_item_id
             )
-            artifact_sha256 = retained.get("artifact_sha256")
-        else:
+            campaign = target_index.inspection_result.manifest.campaign
+            judges = [
+                item for item in campaign.judges if item.identifier == judge_identifier
+            ]
+            if len(judges) != 1:
+                raise ReviewError("qualitative review judge is not configured")
+            operation_path = _operation_path(
+                review_dir, "judgment", work_item_id, judge_identifier
+            )
+
+            # The durable operation is the recovery source. Resuming must not
+            # depend on the disposable external response still existing.
+            if operation_path.exists():
+                operation = _read_json(operation_path, require_private=True)
+                document = _validate_judgment_operation(
+                    operation,
+                    case=case,
+                    judge_identifier=judge_identifier,
+                )
+                judge._validate_judgment_document(  # noqa: SLF001
+                    target_index, document
+                )
+                digest = operation["artifact_sha256"]
+                target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
+                retained = _retained_target(target, document, digest, kind="judgment")
+                if retained is None:
+                    retained = _import_document_locked(matrix_dir, "judgment", document)
+                return {"path": retained[0].name, "sha256": retained[1]}
+
+            verdict_document = _read_json(
+                Path(verdicts_path), schema_name="review-verdicts-0.1.json"
+            )
+            expected_response_target = {
+                "work_item_id": case["target"]["work_item_id"],
+                "projection_sha256": case["target"]["projection_sha256"],
+            }
+            if verdict_document["target"] != expected_response_target:
+                raise ReviewError("qualitative verdicts target a different case")
+            criteria = [item["id"] for item in case["projection"]["criteria"]]
+            verdict_map = judge._criterion_map(  # noqa: SLF001
+                verdict_document["verdicts"], field="verdict"
+            )
+            if set(verdict_map) != set(criteria):
+                raise ReviewError("qualitative verdicts do not cover the exact rubric")
+            ordered_verdicts = sorted(
+                verdict_document["verdicts"],
+                key=lambda item: criteria.index(item["criterion_id"]),
+            )
+            document = {
+                "schema": "steam-agent-eval-judgment/0.1",
+                "judgment_id": f"judgment-{work_item_id}-{judge_identifier}",
+                "target": case["target"],
+                "judge": judges[0].to_dict(),
+                "prompt": {
+                    "version": campaign.prompt_version,
+                    "sha256": campaign.prompt_sha256,
+                },
+                "parser": {
+                    "version": campaign.parser_version,
+                    "sha256": campaign.parser_sha256,
+                },
+                "presentation": case["presentation"],
+                "verdicts": ordered_verdicts,
+                "created_at": _now(),
+            }
+            judge._validate_judgment_document(  # noqa: SLF001
+                target_index, document
+            )
+            artifact_sha256 = _sha256(document)
+            target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
+            _reject_existing_target(target, kind="judgment")
+            operation = {
+                "schema": _OPERATION_SCHEMA,
+                "kind": "judgment_import",
+                "matrix_id": case["target"]["matrix_id"],
+                "work_item_id": work_item_id,
+                "judge_identifier": judge_identifier,
+                "attempt_count": attempt_count,
+                "duration_ms": duration_ms,
+                "usage": {"state": "unavailable"},
+                "isolation_attestation": isolation_attestation,
+                "case_sha256": _sha256(case),
+                "artifact_sha256": artifact_sha256,
+                "artifact": document,
+                "recorded_at": _now(),
+            }
             _publish_operation(operation_path, operation)
-        target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
-        if target.exists():
-            if hashlib.sha256(target.read_bytes()).hexdigest() != artifact_sha256:
-                raise ReviewError("retained judgment does not match review operation")
-            path = target
-            digest = artifact_sha256
-        else:
-            path, digest = _import_document(matrix_dir, "judgment", document)
-        return {"path": path.name, "sha256": digest}
+            path, digest = _import_document_locked(matrix_dir, "judgment", document)
+            return {"path": path.name, "sha256": digest}
 
 
 def _existing_operation_artifact(
@@ -636,19 +701,22 @@ def _existing_operation_artifact(
     matrix_dir: Path,
     *,
     case: dict[str, Any],
+    target_index: judge._TargetIndex,  # noqa: SLF001
+    retained: dict[str, dict[str, Any]],
 ) -> tuple[Path, str] | None:
     if not path.exists():
         return None
     operation = _read_json(path, require_private=True)
     artifact = _validate_adjudication_operation(operation, case=case)
-    digest = operation.get("artifact_sha256")
-    assert isinstance(digest, str)
+    judge._validate_adjudication_document(  # noqa: SLF001
+        matrix_dir, target_index, artifact, retained=retained
+    )
+    digest = operation["artifact_sha256"]
     target = matrix_dir / "adjudications" / f"{artifact.get('adjudication_id')}.json"
-    if target.exists():
-        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
-            raise ReviewError("retained adjudication does not match review operation")
-        return target, digest
-    return _import_document(matrix_dir, "adjudication", artifact)
+    retained_target = _retained_target(target, artifact, digest, kind="adjudication")
+    if retained_target is not None:
+        return retained_target
+    return _import_document_locked(matrix_dir, "adjudication", artifact)
 
 
 def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
@@ -656,117 +724,127 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
 
     matrix_dir = Path(matrix_dir).resolve()
     review_dir = Path(review_dir).resolve()
-    try:
-        target_index = judge._target_index(matrix_dir)  # noqa: SLF001
-    except judge.JudgmentError as error:
-        raise ReviewError(str(error)) from None
     imported = 0
     retained_count = 0
     with matrix.MatrixLock(review_dir):
-        ledger = _validate_review_root(review_dir, target_index.inspection_result)
-        retained = judge._retained_judgments(matrix_dir, target_index)  # noqa: SLF001
-        campaign = target_index.inspection_result.manifest.campaign
-        for entry in ledger["cases"]:
-            work_item_id = entry["work_item_id"]
-            case = _load_bound_case(
-                matrix_dir, review_dir, target_index, ledger, work_item_id
+        with matrix.MatrixLock(matrix_dir):
+            try:
+                judge._reject_finalized_screen(matrix_dir)  # noqa: SLF001
+                target_index = judge._target_index(matrix_dir)  # noqa: SLF001
+            except judge.JudgmentError as error:
+                raise ReviewError(str(error)) from None
+            ledger = _validate_review_root(review_dir, target_index.inspection_result)
+            retained = judge._retained_judgments(  # noqa: SLF001
+                matrix_dir, target_index
             )
-            operation_path = _operation_path(
-                review_dir, "adjudication", work_item_id, "agreement"
-            )
-            existing = _existing_operation_artifact(
-                operation_path, matrix_dir, case=case
-            )
-            if existing is not None:
-                retained_count += 1
-                continue
-            matching = [
-                (digest, document)
-                for digest, document in retained.items()
-                if document["target"] == case["target"]
-            ]
-            configured = {
-                item.identifier: item for item in campaign.judges
-            }
-            by_judge: dict[str, tuple[str, dict[str, Any]]] = {}
-            for digest, document in matching:
-                identifier = document["judge"]["identifier"]
-                if identifier not in configured or identifier in by_judge:
-                    raise ReviewError("qualitative judgment roster is ambiguous")
-                by_judge[identifier] = (digest, document)
-            if set(by_judge) != set(configured):
-                raise ReviewError(
-                    f"qualitative judgment roster is incomplete for {work_item_id}"
+            campaign = target_index.inspection_result.manifest.campaign
+            for entry in ledger["cases"]:
+                work_item_id = entry["work_item_id"]
+                case = _load_bound_case(
+                    matrix_dir, review_dir, target_index, ledger, work_item_id
                 )
-            for judge_config in campaign.judges:
-                operation = _read_json(
-                    _operation_path(
-                        review_dir,
-                        "judgment",
-                        work_item_id,
-                        judge_config.identifier,
-                    ),
-                    require_private=True,
+                operation_path = _operation_path(
+                    review_dir, "adjudication", work_item_id, "agreement"
                 )
-                operation_artifact = _validate_judgment_operation(
-                    operation,
+                existing = _existing_operation_artifact(
+                    operation_path,
+                    matrix_dir,
                     case=case,
-                    judge_identifier=judge_config.identifier,
+                    target_index=target_index,
+                    retained=retained,
                 )
-                digest, retained_artifact = by_judge[judge_config.identifier]
-                if (
-                    operation.get("artifact_sha256") != digest
-                    or operation_artifact != retained_artifact
-                ):
+                if existing is not None:
+                    retained_count += 1
+                    continue
+                matching = [
+                    (digest, document)
+                    for digest, document in retained.items()
+                    if document["target"] == case["target"]
+                ]
+                configured = {item.identifier: item for item in campaign.judges}
+                by_judge: dict[str, tuple[str, dict[str, Any]]] = {}
+                for digest, document in matching:
+                    identifier = document["judge"]["identifier"]
+                    if identifier not in configured or identifier in by_judge:
+                        raise ReviewError("qualitative judgment roster is ambiguous")
+                    by_judge[identifier] = (digest, document)
+                if set(by_judge) != set(configured):
                     raise ReviewError(
-                        "qualitative judgment does not match operation ledger"
+                        f"qualitative judgment roster is incomplete for {work_item_id}"
                     )
-            hashes = [by_judge[item.identifier][0] for item in campaign.judges]
-            verdict_maps = [
-                judge._criterion_map(  # noqa: SLF001
-                    by_judge[item.identifier][1]["verdicts"], field="verdict"
+                for judge_config in campaign.judges:
+                    operation = _read_json(
+                        _operation_path(
+                            review_dir,
+                            "judgment",
+                            work_item_id,
+                            judge_config.identifier,
+                        ),
+                        require_private=True,
+                    )
+                    operation_artifact = _validate_judgment_operation(
+                        operation,
+                        case=case,
+                        judge_identifier=judge_config.identifier,
+                    )
+                    digest, retained_artifact = by_judge[judge_config.identifier]
+                    if (
+                        operation.get("artifact_sha256") != digest
+                        or operation_artifact != retained_artifact
+                    ):
+                        raise ReviewError(
+                            "qualitative judgment does not match operation ledger"
+                        )
+                hashes = [by_judge[item.identifier][0] for item in campaign.judges]
+                verdict_maps = [
+                    judge._criterion_map(  # noqa: SLF001
+                        by_judge[item.identifier][1]["verdicts"], field="verdict"
+                    )
+                    for item in campaign.judges
+                ]
+                criteria = [item["id"] for item in case["projection"]["criteria"]]
+                outcomes = []
+                for criterion_id in criteria:
+                    values = {item[criterion_id] for item in verdict_maps}
+                    outcome = (
+                        next(iter(values))
+                        if len(values) == 1 and "uncertain" not in values
+                        else "unresolved"
+                    )
+                    outcomes.append({"criterion_id": criterion_id, "outcome": outcome})
+                document = {
+                    "schema": "steam-agent-eval-adjudication/0.1",
+                    "adjudication_id": f"adjudication-{work_item_id}",
+                    "target": case["target"],
+                    "method": campaign.adjudication_method,
+                    "adjudicator": campaign.adjudicator,
+                    "judgment_sha256s": hashes,
+                    "outcomes": outcomes,
+                    "created_at": _now(),
+                }
+                judge._validate_adjudication_document(  # noqa: SLF001
+                    matrix_dir,
+                    target_index,
+                    document,
+                    retained=retained,
                 )
-                for item in campaign.judges
-            ]
-            criteria = [item["id"] for item in case["projection"]["criteria"]]
-            outcomes = []
-            for criterion_id in criteria:
-                values = {item[criterion_id] for item in verdict_maps}
-                outcome = (
-                    next(iter(values))
-                    if len(values) == 1 and "uncertain" not in values
-                    else "unresolved"
+                target = (
+                    matrix_dir / "adjudications" / f"{document['adjudication_id']}.json"
                 )
-                outcomes.append({"criterion_id": criterion_id, "outcome": outcome})
-            document = {
-                "schema": "steam-agent-eval-adjudication/0.1",
-                "adjudication_id": f"adjudication-{work_item_id}",
-                "target": case["target"],
-                "method": campaign.adjudication_method,
-                "adjudicator": campaign.adjudicator,
-                "judgment_sha256s": hashes,
-                "outcomes": outcomes,
-                "created_at": _now(),
-            }
-            judge._validate_adjudication_document(  # noqa: SLF001
-                matrix_dir,
-                target_index,
-                document,
-                retained=retained,
-            )
-            operation = {
-                "schema": _OPERATION_SCHEMA,
-                "kind": "adjudication_import",
-                "matrix_id": case["target"]["matrix_id"],
-                "work_item_id": work_item_id,
-                "case_sha256": _sha256(case),
-                "artifact_sha256": _sha256(document),
-                "artifact": document,
-                "recorded_at": _now(),
-            }
-            _publish_operation(operation_path, operation)
-            _import_document(matrix_dir, "adjudication", document)
-            imported += 1
+                _reject_existing_target(target, kind="adjudication")
+                operation = {
+                    "schema": _OPERATION_SCHEMA,
+                    "kind": "adjudication_import",
+                    "matrix_id": case["target"]["matrix_id"],
+                    "work_item_id": work_item_id,
+                    "case_sha256": _sha256(case),
+                    "artifact_sha256": _sha256(document),
+                    "artifact": document,
+                    "recorded_at": _now(),
+                }
+                _publish_operation(operation_path, operation)
+                _import_document_locked(matrix_dir, "adjudication", document)
+                imported += 1
     return {"imported": imported, "retained": retained_count}
 
 
@@ -809,7 +887,12 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
             )
         else:
             result = resolve_agreement(args.matrix_dir, args.review_dir)
-    except (ReviewError, judge.JudgmentError, inspection.InspectionError, matrix.MatrixError) as error:
+    except (
+        ReviewError,
+        judge.JudgmentError,
+        inspection.InspectionError,
+        matrix.MatrixError,
+    ) as error:
         print(str(error), file=sys.stderr)
         return 1
     except OSError:

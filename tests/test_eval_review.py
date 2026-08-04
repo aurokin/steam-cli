@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import shutil
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -10,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from evals.runner import review, run_state  # noqa: E402
+from evals.runner import codex_driver, review, run_state  # noqa: E402
 
 
 WORK_ITEM_ID = "w-000000-0123456789abcdef"
@@ -119,6 +123,34 @@ def _review_root(path: Path) -> dict[str, object]:
     return ledger
 
 
+def _matrix_root(path: Path) -> Path:
+    path.mkdir(mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def _verdict_document() -> dict[str, object]:
+    return {
+        "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+        "target": {
+            "work_item_id": WORK_ITEM_ID,
+            "projection_sha256": TARGET["projection_sha256"],
+        },
+        "verdicts": [
+            {
+                "criterion_id": "aligned",
+                "verdict": "pass",
+                "rationale": "Claims align.",
+            },
+            {
+                "criterion_id": "clear",
+                "verdict": "pass",
+                "rationale": "Answer is clear.",
+            },
+        ],
+    }
+
+
 def test_case_document_is_the_exact_route_blind_model_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -189,12 +221,244 @@ def test_review_cli_redacts_filesystem_error_paths(
         lambda *_args: (_ for _ in ()).throw(OSError(str(private_path))),
     )
 
-    assert review.review_cli(
-        ["prepare", str(tmp_path / "matrix"), str(private_path)]
-    ) == 1
+    assert (
+        review.review_cli(["prepare", str(tmp_path / "matrix"), str(private_path)]) == 1
+    )
     captured = capsys.readouterr()
     assert str(private_path) not in captured.err
     assert captured.err == "qualitative review filesystem operation failed\n"
+
+
+def test_review_root_rejects_non_string_work_item_without_type_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result()
+    index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(review, "_case_document", lambda *_args: _case())
+    monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    review_dir = tmp_path / "prepared"
+    review.prepare(matrix_dir, review_dir)
+    ledger_path = review_dir / "ledger.json"
+    ledger = review._read_json(ledger_path, require_private=True)  # noqa: SLF001
+    ledger["cases"][0]["work_item_id"] = 7
+    ledger_path.write_bytes(review._canonical_bytes(ledger))  # noqa: SLF001
+
+    with pytest.raises(review.ReviewError, match="ledger is invalid"):
+        review._validate_review_root(review_dir, result)  # noqa: SLF001
+
+
+def test_judgment_operation_rejects_non_object_judge() -> None:
+    artifact = {"target": TARGET, "judge": []}
+    operation = {
+        "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "kind": "judgment_import",
+        "matrix_id": TARGET["matrix_id"],
+        "work_item_id": WORK_ITEM_ID,
+        "judge_identifier": "judge-1",
+        "attempt_count": 1,
+        "duration_ms": 1,
+        "usage": {"state": "unavailable"},
+        "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "case_sha256": review._sha256(_case()),  # noqa: SLF001
+        "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
+        "artifact": artifact,
+        "recorded_at": "2026-08-04T12:00:00Z",
+    }
+
+    with pytest.raises(review.ReviewError, match="operation is invalid"):
+        review._validate_judgment_operation(  # noqa: SLF001
+            operation, case=_case(), judge_identifier="judge-1"
+        )
+
+
+def test_restricted_judge_profile_has_no_host_or_runtime_roots(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    rules = codex_driver._permission_filesystem_rules(  # noqa: SLF001
+        include_runtime_roots=False
+    )
+    assert rules == {
+        ":root": "deny",
+        ":minimal": "read",
+        ":tmpdir": "deny",
+        ":slash_tmp": "deny",
+    }
+    args = codex_driver._app_server_process_args(  # noqa: SLF001
+        "codex",
+        workspace,
+        include_runtime_roots=False,
+        approval_policy="never",
+    )
+    overrides = [args[index + 1] for index, item in enumerate(args) if item == "-c"]
+    assert 'default_permissions="steam-agent-eval"' in overrides
+    assert 'approval_policy="never"' in overrides
+    assert (
+        "permissions.steam-agent-eval="
+        + codex_driver._permission_profile_toml(  # noqa: SLF001
+            include_runtime_roots=False
+        )
+        in overrides
+    )
+    assert 'shell_environment_policy.inherit="core"' in overrides
+    assert (
+        "shell_environment_policy.include_only="
+        + json.dumps(
+            list(codex_driver._SHELL_ENV_INCLUDE_ONLY),  # noqa: SLF001
+            separators=(",", ":"),
+        )
+        in overrides
+    )
+
+
+def test_documented_judge_profile_matches_runner_configuration() -> None:
+    documentation = (ROOT / "evals" / "README.md").read_text()
+    profile = (
+        f"permissions.{codex_driver._PERMISSION_PROFILE}="  # noqa: SLF001
+        + codex_driver._permission_profile_toml(  # noqa: SLF001
+            include_runtime_roots=False
+        )
+    )
+    assert profile in documentation
+    assert 'approval_policy="never"' in documentation
+    assert "--sandbox read-only" not in documentation
+    assert review._ISOLATION_ATTESTATION in documentation  # noqa: SLF001
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("codex") is None,
+    reason="requires the pinned macOS Codex sandbox",
+)
+def test_restricted_judge_profile_live_denies_auth_and_host_tmp(
+    tmp_path: Path,
+) -> None:
+    executable = shutil.which("codex")
+    assert executable is not None
+    version = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if (
+        version.returncode != 0
+        or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION  # noqa: SLF001
+    ):
+        pytest.skip("requires the pinned Codex version")
+    isolated_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    isolated_home.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o700)
+    auth = isolated_home / "auth.json"
+    auth.write_text('{"token":"synthetic"}')
+    auth.chmod(0o600)
+    host_secret = tmp_path / "host-secret"
+    host_secret.write_text("private")
+    host_secret.chmod(0o600)
+    profile_override = (
+        f"permissions.{codex_driver._PERMISSION_PROFILE}="  # noqa: SLF001
+        + codex_driver._permission_profile_toml(  # noqa: SLF001
+            include_runtime_roots=False
+        )
+    )
+    environment = {
+        "CODEX_HOME": str(isolated_home),
+        "HOME": str(workspace),
+        "TMPDIR": str(isolated_home),
+        "PATH": os.defpath,
+    }
+    result = subprocess.run(
+        [
+            executable,
+            "sandbox",
+            "-C",
+            str(workspace),
+            "-P",
+            codex_driver._PERMISSION_PROFILE,  # noqa: SLF001
+            "-c",
+            "default_permissions=" + json.dumps(codex_driver._PERMISSION_PROFILE),  # noqa: SLF001
+            "-c",
+            profile_override,
+            "--",
+            "/bin/sh",
+            "-c",
+            'test ! -r "$CODEX_HOME/auth.json" && test ! -r "$1" && touch allowed',
+            "judge-canary",
+            str(host_secret),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (workspace / "allowed").is_file()
+
+
+@pytest.mark.skipif(
+    shutil.which("codex") is None,
+    reason="requires the pinned Codex App Server",
+)
+def test_restricted_judge_profile_live_config_preflight(tmp_path: Path) -> None:
+    executable = shutil.which("codex")
+    assert executable is not None
+    version = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if (
+        version.returncode != 0
+        or version.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION  # noqa: SLF001
+    ):
+        pytest.skip("requires the pinned Codex version")
+    isolated_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    isolated_home.mkdir(mode=0o700)
+    workspace.mkdir(mode=0o700)
+    process = subprocess.Popen(
+        codex_driver._app_server_process_args(  # noqa: SLF001
+            executable,
+            workspace,
+            include_runtime_roots=False,
+            approval_policy="never",
+        ),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=workspace,
+        env=codex_driver._app_server_environment(  # noqa: SLF001
+            isolated_home, workspace
+        ),
+        start_new_session=True,
+    )
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        session = codex_driver._Session(  # noqa: SLF001
+            process.stdin, process.stdout, 30
+        )
+        session.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "steam-agent-review-test",
+                    "title": "Steam Agent qualitative review test",
+                    "version": "0.1.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        session.notify("initialized", {})
+        codex_driver._validate_external_tool_boundary(  # noqa: SLF001
+            session,
+            str(workspace),
+            include_runtime_roots=False,
+            approval_policy="never",
+        )
+    finally:
+        codex_driver._terminate_process_group(process)  # noqa: SLF001
 
 
 def test_assemble_wraps_external_verdicts_and_records_operation(
@@ -202,40 +466,34 @@ def test_assemble_wraps_external_verdicts_and_records_operation(
 ) -> None:
     review_dir = tmp_path / "prepared"
     ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
     result = _result()
     index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
     monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
-    monkeypatch.setattr(review.judge, "_validate_judgment_document", lambda *_args: None)
+    monkeypatch.setattr(
+        review.judge, "_validate_judgment_document", lambda *_args: None
+    )
     imported: list[dict[str, object]] = []
 
     def fake_import(_matrix: Path, kind: str, document: dict[str, object]):
         imported.append(document)
         return Path(f"{kind}-retained.json"), review._sha256(document)  # noqa: SLF001
 
-    monkeypatch.setattr(review, "_import_document", fake_import)
+    monkeypatch.setattr(review, "_import_document_locked", fake_import)
     verdicts = tmp_path / "verdicts.json"
-    review._write_json(  # noqa: SLF001
-        verdicts,
-        {
-            "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
-            "verdicts": [
-                {"criterion_id": "aligned", "verdict": "pass", "rationale": "Claims align."},
-                {"criterion_id": "clear", "verdict": "pass", "rationale": "Answer is clear."},
-            ],
-        },
-    )
+    review._write_json(verdicts, _verdict_document())  # noqa: SLF001
 
     output = review.assemble_judgment(
-        tmp_path / "matrix",
+        matrix_dir,
         review_dir,
         WORK_ITEM_ID,
         verdicts,
         judge_identifier="judge-1",
         attempt_count=2,
         duration_ms=1234,
-        isolation_attestation="isolated-home-no-skills",
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
     )
 
     assert output["path"] == "judgment-retained.json"
@@ -250,8 +508,148 @@ def test_assemble_wraps_external_verdicts_and_records_operation(
     assert operation["attempt_count"] == 2
     assert operation["duration_ms"] == 1234
     assert operation["usage"] == {"state": "unavailable"}
-    assert operation["isolation_attestation"] == "isolated-home-no-skills"
+    assert operation["isolation_attestation"] == review._ISOLATION_ATTESTATION  # noqa: SLF001
     assert operation["case_sha256"] == review._sha256(_case())  # noqa: SLF001
+
+
+def _mock_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    review_dir = tmp_path / "prepared"
+    ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
+    monkeypatch.setattr(
+        review.judge, "_validate_judgment_document", lambda *_args: None
+    )
+    return matrix_dir, review_dir
+
+
+def test_assemble_rejects_verdicts_bound_to_another_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts = _verdict_document()
+    verdicts["target"] = {
+        "work_item_id": "w-000001-fedcba9876543210",
+        "projection_sha256": "6" * 64,
+    }
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, verdicts)  # noqa: SLF001
+
+    with pytest.raises(review.ReviewError, match="different case"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+
+
+def test_assemble_rejects_unconfigured_judge_before_resolving_operation_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    escaped = review_dir / "escaped.json"
+    review._write_json(escaped, {"private": True})  # noqa: SLF001
+
+    with pytest.raises(review.ReviewError, match="judge is not configured"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            tmp_path / "missing-verdicts.json",
+            judge_identifier="../escaped",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert review._read_json(escaped) == {"private": True}  # noqa: SLF001
+
+
+def test_assemble_resumes_from_operation_after_verdict_is_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    calls = 0
+
+    def interrupted_import(
+        _matrix: Path, kind: str, document: dict[str, object]
+    ) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated interruption")
+        return Path(f"{kind}-retained.json"), review._sha256(document)  # noqa: SLF001
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    operation_path = review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    assert operation_path.is_file()
+    verdicts_path.unlink()
+
+    output = review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdicts_path,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=10,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    assert output["path"] == "judgment-retained.json"
+    assert calls == 2
+
+
+def test_assemble_detects_target_conflict_before_publishing_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    judgments = matrix_dir / "judgments"
+    judgments.mkdir(mode=0o700)
+    target = judgments / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    target.write_text("{}")
+    target.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="target already exists"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
 
 
 def test_assemble_rejects_more_than_initial_plus_two_retries(tmp_path: Path) -> None:
@@ -264,7 +662,7 @@ def test_assemble_rejects_more_than_initial_plus_two_retries(tmp_path: Path) -> 
             judge_identifier="judge-1",
             attempt_count=4,
             duration_ms=1,
-            isolation_attestation="isolated-home-no-skills",
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
         )
 
 
@@ -273,6 +671,7 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
 ) -> None:
     review_dir = tmp_path / "prepared"
     ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
     result = _result()
     target_index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
@@ -288,7 +687,7 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
     monkeypatch.setattr(review.judge, "_validate_judgment_document", validate)
     monkeypatch.setattr(
         review,
-        "_import_document",
+        "_import_document_locked",
         lambda _matrix, kind, document: (
             Path(f"{kind}-retained.json"),
             review._sha256(document),  # noqa: SLF001
@@ -304,62 +703,79 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
             path,
             {
                 "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+                "target": {
+                    "work_item_id": WORK_ITEM_ID,
+                    "projection_sha256": TARGET["projection_sha256"],
+                },
                 "verdicts": [
-                    {"criterion_id": "clear", "verdict": "pass", "rationale": rationale},
-                    {"criterion_id": "aligned", "verdict": "pass", "rationale": "Claims align."},
+                    {
+                        "criterion_id": "clear",
+                        "verdict": "pass",
+                        "rationale": rationale,
+                    },
+                    {
+                        "criterion_id": "aligned",
+                        "verdict": "pass",
+                        "rationale": "Claims align.",
+                    },
                 ],
             },
         )
 
     with pytest.raises(review.judge.JudgmentError, match="deterministic outcome"):
         review.assemble_judgment(
-            tmp_path / "matrix",
+            matrix_dir,
             review_dir,
             WORK_ITEM_ID,
             invalid,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=100,
-            isolation_attestation="isolated-home-no-skills",
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
         )
-    operation = (
-        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
-    )
+    operation = review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
     assert not operation.exists()
 
     output = review.assemble_judgment(
-        tmp_path / "matrix",
+        matrix_dir,
         review_dir,
         WORK_ITEM_ID,
         corrected,
         judge_identifier="judge-1",
         attempt_count=2,
         duration_ms=200,
-        isolation_attestation="isolated-home-no-skills",
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
     )
     assert output["path"] == "judgment-retained.json"
     assert operation.exists()
 
 
-def test_resolve_mechanically_preserves_disagreement_as_unresolved(
+def _mock_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> tuple[Path, Path]:
     review_dir = tmp_path / "prepared"
     ledger = _review_root(review_dir)
-    result = _result()
-    index = SimpleNamespace(inspection_result=result)
-    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    target_index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
     monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
     judgments = {}
-    for index_value, configured in enumerate(run_state.CALIBRATED_JUDGE_CONFIGURATIONS):
-        clear = "fail" if index_value == 2 else "pass"
+    for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS:
         document = {
             "target": TARGET,
             "judge": configured.to_dict(),
             "verdicts": [
-                {"criterion_id": "clear", "verdict": clear, "rationale": "Clear verdict."},
-                {"criterion_id": "aligned", "verdict": "pass", "rationale": "Claims align."},
+                {
+                    "criterion_id": "clear",
+                    "verdict": "pass",
+                    "rationale": "Clear verdict.",
+                },
+                {
+                    "criterion_id": "aligned",
+                    "verdict": "pass",
+                    "rationale": "Claims align.",
+                },
             ],
         }
         digest = review._sha256(document)  # noqa: SLF001
@@ -373,7 +789,114 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
             "attempt_count": 1,
             "duration_ms": 100,
             "usage": {"state": "unavailable"},
-            "isolation_attestation": "isolated-home-no-skills",
+            "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            "case_sha256": review._sha256(_case()),  # noqa: SLF001
+            "artifact_sha256": digest,
+            "artifact": document,
+            "recorded_at": "2026-08-04T12:00:00Z",
+        }
+        review._write_json(  # noqa: SLF001
+            review_dir
+            / "operations"
+            / f"judgment-{WORK_ITEM_ID}-{configured.identifier}.json",
+            operation,
+        )
+    monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: judgments)
+    monkeypatch.setattr(
+        review.judge, "_validate_adjudication_document", lambda *_args, **_kwargs: None
+    )
+    return matrix_dir, review_dir
+
+
+def test_resolve_detects_target_conflict_before_publishing_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    adjudications = matrix_dir / "adjudications"
+    adjudications.mkdir(mode=0o700)
+    target = adjudications / f"adjudication-{WORK_ITEM_ID}.json"
+    target.write_text("{}")
+    target.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="target already exists"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    assert not (
+        review_dir / "operations" / f"adjudication-{WORK_ITEM_ID}-agreement.json"
+    ).exists()
+
+
+def test_resolve_resumes_adjudication_from_operation_after_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    calls = 0
+
+    def interrupted_import(
+        _matrix: Path, kind: str, document: dict[str, object]
+    ) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated interruption")
+        return Path(f"{kind}-retained.json"), review._sha256(document)  # noqa: SLF001
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    operation_path = (
+        review_dir / "operations" / f"adjudication-{WORK_ITEM_ID}-agreement.json"
+    )
+    assert operation_path.is_file()
+
+    assert review.resolve_agreement(matrix_dir, review_dir) == {
+        "imported": 0,
+        "retained": 1,
+    }
+    assert calls == 2
+
+
+def test_resolve_mechanically_preserves_disagreement_as_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_dir = tmp_path / "prepared"
+    ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    result = _result()
+    index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
+    judgments = {}
+    for index_value, configured in enumerate(run_state.CALIBRATED_JUDGE_CONFIGURATIONS):
+        clear = "fail" if index_value == 2 else "pass"
+        document = {
+            "target": TARGET,
+            "judge": configured.to_dict(),
+            "verdicts": [
+                {
+                    "criterion_id": "clear",
+                    "verdict": clear,
+                    "rationale": "Clear verdict.",
+                },
+                {
+                    "criterion_id": "aligned",
+                    "verdict": "pass",
+                    "rationale": "Claims align.",
+                },
+            ],
+        }
+        digest = review._sha256(document)  # noqa: SLF001
+        judgments[digest] = document
+        operation = {
+            "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "kind": "judgment_import",
+            "matrix_id": TARGET["matrix_id"],
+            "work_item_id": WORK_ITEM_ID,
+            "judge_identifier": configured.identifier,
+            "attempt_count": 1,
+            "duration_ms": 100,
+            "usage": {"state": "unavailable"},
+            "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
             "case_sha256": review._sha256(_case()),  # noqa: SLF001
             "artifact_sha256": digest,
             "artifact": document,
@@ -395,9 +918,9 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
         imported.append(document)
         return Path("adjudication-retained.json"), review._sha256(document)  # noqa: SLF001
 
-    monkeypatch.setattr(review, "_import_document", fake_import)
+    monkeypatch.setattr(review, "_import_document_locked", fake_import)
 
-    output = review.resolve_agreement(tmp_path / "matrix", review_dir)
+    output = review.resolve_agreement(matrix_dir, review_dir)
 
     assert output == {"imported": 1, "retained": 0}
     assert imported[0]["outcomes"] == [

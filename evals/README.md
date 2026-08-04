@@ -204,10 +204,17 @@ uv run python -m evals.runner review prepare \
 Each `cases/WORK_ITEM_ID.json` file is the complete prompt for one fresh judge
 call. Pipe it verbatim; do not add a wrapper prompt. Use a fresh private
 `CODEX_HOME` containing only a mode-`0600` copy of the authenticated source
-`auth.json`, and set `HOME` to an otherwise empty private workspace. This is the
-same isolation pattern as the generator driver: it prevents repository rules,
-user configuration, plugins, and user-scope skills from entering the judge
-context. Keep the isolated root temporary and remove it after the import.
+`auth.json`, and set `HOME` to an otherwise empty private workspace. Codex
+0.146.0 must use the exact restricted permission profile below: host root and
+temporary paths are denied, only Codex's minimal platform files and the empty
+workspace are visible, network is disabled, and the model shell inherits only
+`PATH` and locale variables. User configuration, rules, hooks, apps, plugins,
+MCP servers, and web search are disabled. Keep the isolated root temporary and
+remove it after the import.
+
+The structured response must echo `target.work_item_id` and
+`target.projection_sha256` from that case. The assembler requires both exact
+matches, so a response copied from another replicate cannot be imported.
 
 One setup pattern is:
 
@@ -221,12 +228,26 @@ install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
 Then invoke the judge with the isolated environment:
 
 ```text
-CODEX_HOME=/private/judge-root/codex-home \
-HOME=/private/judge-root/workspace \
-TMPDIR=/private/judge-root \
-codex exec --ephemeral --ignore-user-config --ignore-rules \
-  --skip-git-repo-check --sandbox read-only \
+CODEX_BIN="$(command -v codex)"
+env -i CODEX_HOME=/private/judge-root/codex-home \
+  HOME=/private/judge-root/workspace \
+  TMPDIR=/private/judge-root/codex-home PATH=/usr/bin:/bin LANG=C.UTF-8 \
+  "$CODEX_BIN" exec --ephemeral --ignore-user-config --ignore-rules \
+  --skip-git-repo-check --strict-config \
   --cd /private/judge-root/workspace \
+  --config 'approval_policy="never"' \
+  --config 'web_search="disabled"' \
+  --config 'apps._default.enabled=false' \
+  --config 'apps._default.destructive_enabled=false' \
+  --config 'apps._default.open_world_enabled=false' \
+  --config 'mcp_servers={}' \
+  --disable hooks --disable plugins --disable apps \
+  --config 'shell_environment_policy.inherit="core"' \
+  --config 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","LC_CTYPE","TERM"]' \
+  --config 'shell_environment_policy.set.HOME="/private/judge-root/workspace"' \
+  --config 'shell_environment_policy.set.TMPDIR="/private/judge-root/workspace"' \
+  --config 'default_permissions="steam-agent-eval"' \
+  --config 'permissions.steam-agent-eval={extends=":workspace",filesystem={":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny"},network={enabled=false}}' \
   --model gpt-5.6-sol --config model_reasoning_effort=xhigh \
   --output-schema /private/path/MATRIX_ID-review/response-schema.json \
   --output-last-message /private/path/verdicts.json \
@@ -241,7 +262,7 @@ uv run python -m evals.runner review assemble \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
   /private/path/verdicts.json --judge judge-1 \
   --attempt-count 1 --duration-ms 12345 \
-  --isolation-attestation isolated-home-no-skills
+  --isolation-attestation codex-0.146-restricted-profile-v1
 ```
 
 The attempt count includes the initial call and at most two retries. Retry only
@@ -249,8 +270,10 @@ a transport failure or structurally invalid response. Never retry a valid
 `uncertain` verdict or a later disagreement. The runner cannot observe failed
 external calls, so the operator supplies these bounded operational fields;
 usage remains explicitly unavailable. The required isolation attestation means
-the operator used a fresh `HOME` and auth-only `CODEX_HOME` with no repository
-or user skills; the runner cannot infer that fact from an external process.
+the operator used Codex CLI 0.146.0 with the exact fresh-home, auth-only,
+source-disabled, environment-minimized, filesystem-restricted, and
+network-disabled profile above; the runner cannot infer that fact from an
+external process.
 
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:
