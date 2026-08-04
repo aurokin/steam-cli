@@ -166,7 +166,8 @@ workspace-local `steam-agent` CLI and the supplied Steam Agent project skill.
   environment, or path outside this private workspace.
 - End the final answer with a fenced ```json block of the form
   {{"claims": [{{"path": "$.data...", "value": <claimed value>}}]}}
-  covering every factual claim with a path/value pair from the CLI document.
+  covering every distinct factual value with a path/value pair from the CLI
+  document. An entity's displayed name is a factual value when you name it.
 """
 
 

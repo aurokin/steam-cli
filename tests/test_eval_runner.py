@@ -7422,6 +7422,7 @@ def test_skill_track_uses_private_repo_skill_and_minimal_developer_contract(
         assert "Preserve the CLI's distinctions" not in instructions
         assert "Answer-track control" not in instructions
         assert "EVAL_CANARY" not in instructions
+        assert "displayed name is a factual value" in instructions
         skill = workspace / ".agents" / "skills" / "steam-agent"
         assert (skill / "SKILL.md").read_bytes() == (
             ROOT / ".agents" / "skills" / "steam-agent" / "SKILL.md"
