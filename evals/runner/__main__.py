@@ -2546,6 +2546,10 @@ def main(argv: list[str] | None = None) -> int:
             from evals.runner import acceptance
 
             return acceptance.accept_cli(command_argv)
+        if command == "report":
+            from evals.runner import benchmark_report
+
+            return benchmark_report.report_cli(command_argv)
 
     parser = argparse.ArgumentParser(prog="evals.runner")
     parser.add_argument(

@@ -908,7 +908,7 @@ def _requires_calibrated_policy(
     campaign: run_state.MatrixCampaign,
     scenario: run_state.MatrixScenario,
 ) -> bool:
-    return campaign.campaign_kind == "qualification" or any(
+    return campaign.campaign_kind in {"qualification", "benchmark"} or any(
         item.source == "fact_rubric.criteria.hard_fail"
         for item in scenario.qualitative_criteria
     )

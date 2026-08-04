@@ -15,7 +15,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from evals.runner import acceptance, grade, inspection, judge, matrix, run_state  # noqa: E402
+from evals.runner import (  # noqa: E402
+    acceptance,
+    benchmark_report as diagnostic_report,
+    grade,
+    inspection,
+    judge,
+    matrix,
+    run_state,
+)
 
 
 LAYERS = ("agent_turns", "tool_policy", "oracle", "claims", "privacy")
@@ -48,14 +56,24 @@ def _campaign(
         campaign_kind=kind,
         selection_version="fixed-ordered-scenarios/0.1",
         selection_mode="fixed_ordered",
-        acceptance_version="fixed-corpus/0.1",
+        acceptance_version=(
+            "diagnostic-corpus/0.1" if kind == "benchmark" else "fixed-corpus/0.1"
+        ),
         hard_layers=LAYERS,
-        required_tracks=("answer", "discovery") if kind == "screen" else ("discovery",),
-        replicates=3 if kind == "screen" else 5,
+        required_tracks=(
+            ("answer", "discovery")
+            if kind in {"screen", "benchmark"}
+            else ("discovery",)
+        ),
+        replicates=3 if kind in {"screen", "benchmark"} else 5,
         qualitative_rule=(
             "fact_hard_safety_resolved_pass"
             if kind == "screen"
-            else "all_hard_criteria_resolved_pass"
+            else (
+                "diagnostic_criterion_vector"
+                if kind == "benchmark"
+                else "all_hard_criteria_resolved_pass"
+            )
         ),
         judge_version="blinded-qualitative/0.1",
         judgment_schema="steam-agent-eval-judgment/0.1",
@@ -130,6 +148,7 @@ def _report(
 ) -> dict[str, Any]:
     return {
         "metrics": _metrics(failure=failure, unresolved_claims=unresolved_claims),
+        "operational": {"duration_seconds": 1.0, "command_executions": 2},
         "diagnostics": {"observed_conditions": []},
         "qualitative_review_answers": [{"turn": 0, "text": "A useful answer."}],
         "qualitative_review_claims_sidecars": [
@@ -2231,3 +2250,342 @@ def test_open_campaign_uses_the_exact_inspected_manifest_digest(
 
     assert accepted.status == "pending"
     assert accepted.manifest_sha256 == inspected_digest
+
+
+def test_benchmark_cannot_be_evaluated_or_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    benchmark = _result(
+        kind="benchmark",
+        matrix_id="benchmark",
+        routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+        started_at="2026-08-04T11:00:00Z",
+        finished_at="2026-08-04T12:00:00Z",
+    )
+    monkeypatch.setattr(acceptance, "_strict_inspection", lambda _path: benchmark)
+
+    with pytest.raises(
+        acceptance.AcceptanceError,
+        match="benchmark campaigns are diagnostic and cannot be accepted or finalized",
+    ):
+        acceptance.evaluate_campaign(Path("benchmark"))
+
+    assert acceptance.accept_cli(["benchmark"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        captured.err.strip()
+        == "benchmark campaigns are diagnostic and cannot be accepted or finalized"
+    )
+
+
+def test_benchmark_report_keeps_deterministic_and_qualitative_vectors_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _result(
+        kind="benchmark",
+        matrix_id="benchmark",
+        routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+        started_at="2026-08-04T11:00:00Z",
+        finished_at="2026-08-04T12:00:00Z",
+    )
+    benchmark.observations[0].report["metrics"]["oracle"]["passed"] = False
+    benchmark.observations[1].report["metrics"]["claims"][
+        "deterministic_passed"
+    ] = None
+    work_ids = [item.work_item_id for item in benchmark.manifest.work_items]
+    evidence = acceptance.QualitativeEvidence(
+        outcomes=(
+            (work_ids[0], (("quality", "pass"),)),
+            (work_ids[1], (("quality", "fail"),)),
+            (work_ids[2], (("quality", "unresolved"),)),
+        ),
+        judgment_sha256s=(),
+        adjudication_sha256s=(),
+    )
+    monkeypatch.setattr(
+        diagnostic_report.inspection, "inspect_matrix", lambda _path: benchmark
+    )
+    monkeypatch.setattr(
+        diagnostic_report.acceptance,
+        "load_qualitative_outcomes",
+        lambda _result, *, require_all_judgments_adjudicated: evidence,
+    )
+
+    report = diagnostic_report.benchmark_report(Path("benchmark"))
+
+    assert report["schema"] == "steam-agent-eval-benchmark-report/0.1"
+    assert not {"passed", "score", "survivors", "qualified_routes"} & set(report)
+    assert report["aggregates"]["deterministic"] == {
+        "agent_turns": {"true": 6, "false": 0, "null": 0},
+        "tool_policy": {"true": 6, "false": 0, "null": 0},
+        "oracle": {"true": 5, "false": 1, "null": 0},
+        "claims": {"true": 5, "false": 0, "null": 1},
+        "privacy": {"true": 6, "false": 0, "null": 0},
+    }
+    assert report["aggregates"]["deterministic_work_items"] == {
+        "observed": 6,
+        "unavailable": 0,
+        "unaccounted": 0,
+    }
+    assert report["aggregates"]["operational"] == {
+        "duration_seconds": {"median": 1.0, "minimum": 1.0, "maximum": 1.0},
+        "command_executions": {"median": 2.0, "minimum": 2, "maximum": 2},
+    }
+    assert report["aggregates"]["qualitative"] == {
+        "pass": 1,
+        "fail": 1,
+        "unresolved": 1,
+        "unreviewed": 3,
+    }
+    assert report["aggregates"]["qualitative_work_items"] == {
+        "reviewed": 3,
+        "unreviewed": 3,
+    }
+    assert report["deterministic"][0]["layers"] == {
+        **dict.fromkeys(LAYERS, True),
+        "oracle": False,
+    }
+    assert [
+        item["criteria"][0]["outcome"] for item in report["qualitative"]
+    ] == ["pass", "fail", "unresolved", "unreviewed", "unreviewed", "unreviewed"]
+
+
+def test_benchmark_report_missing_review_is_unreviewed_but_malformed_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = _result(
+        kind="benchmark",
+        matrix_id="benchmark",
+        routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+        started_at="2026-08-04T11:00:00Z",
+        finished_at="2026-08-04T12:00:00Z",
+        unavailable={"w-000005"},
+    )
+    monkeypatch.setattr(
+        diagnostic_report.inspection, "inspect_matrix", lambda _path: benchmark
+    )
+    monkeypatch.setattr(
+        diagnostic_report.acceptance,
+        "load_qualitative_outcomes",
+        lambda _result, *, require_all_judgments_adjudicated: (
+            acceptance.QualitativeEvidence((), (), ())
+        ),
+    )
+
+    report = diagnostic_report.benchmark_report(Path("benchmark"))
+    assert report["aggregates"]["deterministic_work_items"] == {
+        "observed": 5,
+        "unavailable": 1,
+        "unaccounted": 0,
+    }
+    assert report["aggregates"]["qualitative"] == {
+        "pass": 0,
+        "fail": 0,
+        "unresolved": 0,
+        "unreviewed": 6,
+    }
+
+    def malformed(
+        _result: inspection.MatrixInspection,
+        *,
+        require_all_judgments_adjudicated: bool,
+    ) -> acceptance.QualitativeEvidence:
+        assert require_all_judgments_adjudicated is False
+        raise acceptance.AcceptanceError("retained judgment is invalid")
+
+    monkeypatch.setattr(
+        diagnostic_report.acceptance, "load_qualitative_outcomes", malformed
+    )
+    with pytest.raises(
+        diagnostic_report.BenchmarkReportError,
+        match="retained judgment is invalid",
+    ):
+        diagnostic_report.benchmark_report(Path("benchmark"))
+
+
+def _write_partial_benchmark_review(
+    result: inspection.MatrixInspection,
+    *,
+    extra_on_adjudicated_target: bool,
+) -> tuple[str, str]:
+    matrix_dir = result.matrix_dir
+    judgment_dir = matrix_dir / "judgments"
+    adjudication_dir = matrix_dir / "adjudications"
+    judgment_dir.mkdir(mode=0o700)
+    adjudication_dir.mkdir(mode=0o700)
+    scenario = result.manifest.inputs.scenarios[0]
+    campaign = result.manifest.campaign
+
+    def target(index: int) -> dict[str, str]:
+        observation = result.observations[index]
+        return {
+            "matrix_id": result.manifest.matrix_id,
+            "work_item_id": observation.work_item.work_item_id,
+            "report_sha256": dict(observation.completion.artifact_hashes)[
+                "report.json"
+            ],
+            "scenario_sha256": scenario.source_sha256,
+            "rubric_sha256": scenario.rubric_sha256,
+            "projection_sha256": judge._projection_digest(  # noqa: SLF001
+                observation,
+                scenario,
+                campaign=campaign,
+            ),
+        }
+
+    def judgment_document(
+        *, artifact_id: str, target_value: dict[str, str], judge_index: int
+    ) -> dict[str, Any]:
+        return {
+            "schema": "steam-agent-eval-judgment/0.1",
+            "judgment_id": artifact_id,
+            "target": target_value,
+            "judge": campaign.judges[judge_index].to_dict(),
+            "prompt": {
+                "version": campaign.prompt_version,
+                "sha256": campaign.prompt_sha256,
+            },
+            "parser": {
+                "version": campaign.parser_version,
+                "sha256": campaign.parser_sha256,
+            },
+            "presentation": {"blinded_label": "candidate-A", "order": 0},
+            "verdicts": [
+                {
+                    "criterion_id": "quality",
+                    "verdict": "pass",
+                    "rationale": "The criterion is satisfied.",
+                }
+            ],
+            "created_at": "2026-08-04T11:30:00Z",
+        }
+
+    adjudicated_target = target(0)
+    unreviewed_target = target(1)
+    adjudicated_hashes: list[str] = []
+    for index in range(3):
+        document = judgment_document(
+            artifact_id=f"judgment-adjudicated-{index + 1}",
+            target_value=adjudicated_target,
+            judge_index=index,
+        )
+        content = matrix._canonical_json_bytes(document)  # noqa: SLF001
+        run_state.atomic_publish_private_bytes(
+            judgment_dir / f"judgment-adjudicated-{index + 1}.json", content
+        )
+        adjudicated_hashes.append(hashlib.sha256(content).hexdigest())
+
+    pending = judgment_document(
+        artifact_id="judgment-pending-other-target",
+        target_value=unreviewed_target,
+        judge_index=0,
+    )
+    run_state.atomic_publish_private_bytes(
+        judgment_dir / "judgment-pending-other-target.json",
+        matrix._canonical_json_bytes(pending),  # noqa: SLF001
+    )
+    if extra_on_adjudicated_target:
+        extra = judgment_document(
+            artifact_id="judgment-extra-adjudicated-target",
+            target_value=adjudicated_target,
+            judge_index=0,
+        )
+        run_state.atomic_publish_private_bytes(
+            judgment_dir / "judgment-extra-adjudicated-target.json",
+            matrix._canonical_json_bytes(extra),  # noqa: SLF001
+        )
+
+    adjudication = {
+        "schema": "steam-agent-eval-adjudication/0.1",
+        "adjudication_id": "adjudication-complete-target",
+        "target": adjudicated_target,
+        "method": campaign.adjudication_method,
+        "adjudicator": campaign.adjudicator,
+        "judgment_sha256s": adjudicated_hashes,
+        "outcomes": [{"criterion_id": "quality", "outcome": "pass"}],
+        "created_at": "2026-08-04T11:45:00Z",
+    }
+    run_state.atomic_publish_private_bytes(
+        adjudication_dir / "adjudication-complete-target.json",
+        matrix._canonical_json_bytes(adjudication),  # noqa: SLF001
+    )
+    return (
+        adjudicated_target["work_item_id"],
+        unreviewed_target["work_item_id"],
+    )
+
+
+def test_partial_benchmark_review_allows_wholly_unadjudicated_work_items(
+    tmp_path: Path,
+) -> None:
+    result = replace(
+        _result(
+            kind="benchmark",
+            matrix_id="benchmark",
+            routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+            started_at="2026-08-04T11:00:00Z",
+            finished_at="2026-08-04T12:00:00Z",
+        ),
+        matrix_dir=tmp_path,
+    )
+    adjudicated, unreviewed = _write_partial_benchmark_review(
+        result, extra_on_adjudicated_target=False
+    )
+
+    evidence = acceptance.load_qualitative_outcomes(
+        result, require_all_judgments_adjudicated=False
+    )
+
+    assert evidence.outcome_map == {adjudicated: {"quality": "pass"}}
+    assert unreviewed not in evidence.outcome_map
+    assert len(evidence.judgment_sha256s) == 4
+    assert len(evidence.adjudication_sha256s) == 1
+
+
+def test_partial_benchmark_review_rejects_extra_judgment_on_adjudicated_target(
+    tmp_path: Path,
+) -> None:
+    result = replace(
+        _result(
+            kind="benchmark",
+            matrix_id="benchmark",
+            routes=(run_state.MatrixRoute("gpt-5.6-sol", "medium"),),
+            started_at="2026-08-04T11:00:00Z",
+            finished_at="2026-08-04T12:00:00Z",
+        ),
+        matrix_dir=tmp_path,
+    )
+    _write_partial_benchmark_review(
+        result, extra_on_adjudicated_target=True
+    )
+
+    with pytest.raises(
+        acceptance.AcceptanceError,
+        match="retained judgment selection is ambiguous",
+    ):
+        acceptance.load_qualitative_outcomes(
+            result, require_all_judgments_adjudicated=False
+        )
+
+
+def test_benchmark_report_rejects_a_nonbenchmark_campaign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    screen = _result(
+        kind="screen",
+        matrix_id="screen",
+        routes=_screen_routes(),
+        started_at="2026-08-02T11:00:00Z",
+        finished_at="2026-08-02T12:00:00Z",
+    )
+    monkeypatch.setattr(
+        diagnostic_report.inspection, "inspect_matrix", lambda _path: screen
+    )
+
+    with pytest.raises(
+        diagnostic_report.BenchmarkReportError,
+        match="requires a benchmark campaign",
+    ):
+        diagnostic_report.benchmark_report(Path("screen"))

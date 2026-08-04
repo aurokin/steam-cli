@@ -1009,7 +1009,7 @@ def resolve_plan(
         for item in inputs.scenarios
         if item.execution_support == "live"
     ]
-    if config.document["campaign_kind"] == "qualification":
+    if config.document["campaign_kind"] in {"qualification", "benchmark"}:
         routes = [
             run_state.MatrixRoute(route["model"], route["reasoning_effort"])
             for route in config.document["routes"]

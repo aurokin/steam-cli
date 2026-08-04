@@ -149,28 +149,40 @@ uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner accept evals/results/MATRIX_ID
 ```
 
-The headline product-use benchmark is predeclared in
-`matrices/product-use-v1.json`. It asks 13 direct questions about finding
+The canonical product-use benchmark is predeclared in
+`matrices/product-use-v2.json`. It asks 13 direct questions about finding
 library titles, installed state, multiplayer modes, wishlist membership,
 filtering, recommendations, deals, compatibility, group fit, and storage. Its
 only subject route is Sol at medium effort; three replicates run on both
 tracks. The `discovery` track is the headline result because it measures
 whether an agent can find and use the CLI itself. The `answer` track discloses
 the required command and is a diagnostic of answer construction after routing
-has been removed from the task. Run and inspect it with:
+has been removed from the task. Run, inspect, and render its diagnostic vectors
+with:
 
 ```text
-uv run python -m evals.runner matrix --config evals/matrices/product-use-v1.json
-uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/product-use-v1.json
+uv run python -m evals.runner matrix --config evals/matrices/product-use-v2.json
+uv run python -m evals.runner resume MATRIX_ID --config evals/matrices/product-use-v2.json
 uv run python -m evals.runner inspect evals/results/MATRIX_ID
+uv run python -m evals.runner report evals/results/MATRIX_ID
 ```
 
-This campaign uses the existing screen executor, but it is not the accepted
-anchor screen, must not be finalized with `accept`, and is not route-selection
-or qualification evidence. Scenario `m6-d03` is an honesty probe at a current
-capability boundary: the CLI can report declared online co-op support, while
-the numeric player count remains `unsupported`. A correct answer names that
-gap; the scenario is not evidence that numeric player-count lookup works.
+Benchmark campaigns are diagnostic and cannot be accepted or finalized. Their
+five deterministic layer outcomes and qualitative criterion outcomes remain
+separate vectors; there is no benchmark score, survivor, qualified route, or
+overall pass. Missing qualitative artifacts remain `unreviewed`, while retained
+malformed artifacts fail report generation. Imported qualitative judgments use
+the calibrated, route-blind policy for every criterion; the repository does not
+call a model judge. Scenario `m6-d03` is an honesty probe at a current capability
+boundary: the CLI can report declared online co-op support, while the numeric
+player count remains `unsupported`. A correct answer names that gap; the
+scenario is not evidence that numeric player-count lookup works.
+
+`matrices/product-use-v1.json` is an immutable historical screen-shaped
+diagnostic config. Keep it unchanged when questions or benchmark semantics
+change; create a new version and collect fresh observations instead. The
+benchmark contract is recorded in
+[ADR 0021](../docs/adr/0021-diagnostic-product-benchmark-campaigns.md).
 
 Screen results select routes only; they are not qualification evidence.
 The screen requires calibrated agreement only on hard-fail fact criteria

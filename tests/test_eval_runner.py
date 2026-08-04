@@ -7925,6 +7925,7 @@ def test_live_runner_uses_versioned_deterministic_only_metadata() -> None:
         ("compare", "inspection", "compare_cli", {}),
         ("adjudicate", "judge", "judge_cli", {}),
         ("accept", "acceptance", "accept_cli", {}),
+        ("report", "benchmark_report", "report_cli", {}),
     ),
 )
 def test_main_dispatches_campaign_commands(

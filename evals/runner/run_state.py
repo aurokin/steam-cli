@@ -1330,12 +1330,11 @@ class MatrixCampaign:
     source_screen_qualitative_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.campaign_kind not in {"screen", "qualification"}:
+        if self.campaign_kind not in {"screen", "qualification", "benchmark"}:
             raise ManifestStateError("invalid matrix campaign kind")
         if (
             self.selection_version != "fixed-ordered-scenarios/0.1"
             or self.selection_mode != "fixed_ordered"
-            or self.acceptance_version != "fixed-corpus/0.1"
             or self.judge_version != "blinded-qualitative/0.1"
             or self.judgment_schema != "steam-agent-eval-judgment/0.1"
             or self.adjudication_schema != "steam-agent-eval-adjudication/0.1"
@@ -1372,7 +1371,8 @@ class MatrixCampaign:
             raise ManifestStateError("invalid matrix calibrated judge policy")
         if self.campaign_kind == "screen":
             if (
-                self.qualitative_rule != "fact_hard_safety_resolved_pass"
+                self.acceptance_version != "fixed-corpus/0.1"
+                or self.qualitative_rule != "fact_hard_safety_resolved_pass"
                 or any(
                     value is not None
                     for value in (
@@ -1384,8 +1384,9 @@ class MatrixCampaign:
                 )
             ):
                 raise ManifestStateError("invalid screen campaign policy")
-        elif (
-            self.qualitative_rule != "all_hard_criteria_resolved_pass"
+        elif self.campaign_kind == "qualification" and (
+            self.acceptance_version != "fixed-corpus/0.1"
+            or self.qualitative_rule != "all_hard_criteria_resolved_pass"
             or not isinstance(self.source_screen_matrix_id, str)
             or _SAFE_TOKEN.fullmatch(self.source_screen_matrix_id) is None
             or not isinstance(self.source_screen_manifest_sha256, str)
@@ -1399,6 +1400,20 @@ class MatrixCampaign:
             is None
         ):
             raise ManifestStateError("qualification lacks screen provenance")
+        elif self.campaign_kind == "benchmark" and (
+            self.acceptance_version != "diagnostic-corpus/0.1"
+            or self.qualitative_rule != "diagnostic_criterion_vector"
+            or any(
+                value is not None
+                for value in (
+                    self.source_screen_manifest_sha256,
+                    self.source_screen_matrix_id,
+                    self.source_screen_acceptance_sha256,
+                    self.source_screen_qualitative_evidence_sha256,
+                )
+            )
+        ):
+            raise ManifestStateError("invalid benchmark campaign policy")
 
     @classmethod
     def from_config(cls, value: Mapping[str, Any]) -> Self:

@@ -745,6 +745,8 @@ class QualitativeEvidence:
 
 def _qualitative_outcomes(
     result: inspection.MatrixInspection,
+    *,
+    require_all_judgments_adjudicated: bool = True,
 ) -> QualitativeEvidence:
     manifest = result.manifest
     observations = {item.work_item.work_item_id: item for item in result.observations}
@@ -834,7 +836,13 @@ def _qualitative_outcomes(
                     raise AcceptanceError("agreement outcome does not match judgments")
         adjudications[work_item_id] = outcomes
         adjudication_sha256s.append(hashlib.sha256(content).hexdigest())
-    if referenced != set(judgments):
+    unreferenced = set(judgments) - referenced
+    if require_all_judgments_adjudicated and unreferenced:
+        raise AcceptanceError("retained judgment selection is ambiguous")
+    if not require_all_judgments_adjudicated and any(
+        judgments[digest]["target"]["work_item_id"] in adjudications
+        for digest in unreferenced
+    ):
         raise AcceptanceError("retained judgment selection is ambiguous")
     return QualitativeEvidence(
         outcomes=tuple(
@@ -845,6 +853,19 @@ def _qualitative_outcomes(
         ),
         judgment_sha256s=tuple(sorted(judgments)),
         adjudication_sha256s=tuple(sorted(adjudication_sha256s)),
+    )
+
+
+def load_qualitative_outcomes(
+    result: inspection.MatrixInspection,
+    *,
+    require_all_judgments_adjudicated: bool = True,
+) -> QualitativeEvidence:
+    """Validate retained qualitative artifacts and load criterion outcomes."""
+
+    return _qualitative_outcomes(
+        result,
+        require_all_judgments_adjudicated=require_all_judgments_adjudicated,
     )
 
 
@@ -1293,6 +1314,10 @@ def _evaluate_inspected(
     screen_dir: Path | None,
 ) -> AcceptanceResult:
     manifest = result.manifest
+    if manifest.campaign.campaign_kind == "benchmark":
+        raise AcceptanceError(
+            "benchmark campaigns are diagnostic and cannot be accepted or finalized"
+        )
     _policy_shape(manifest)
     _verify_unique_child_runs(manifest)
     if manifest.campaign.campaign_kind == "screen":
@@ -1414,11 +1439,14 @@ def accept_cli(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         inspected = _strict_inspection(args.matrix_dir)
-        result = (
-            finalize_screen(args.matrix_dir)
-            if inspected.manifest.campaign.campaign_kind == "screen"
-            else evaluate_campaign(args.matrix_dir, screen_dir=args.screen_dir)
-        )
+        if inspected.manifest.campaign.campaign_kind == "screen":
+            result = finalize_screen(args.matrix_dir)
+        elif inspected.manifest.campaign.campaign_kind == "benchmark":
+            raise AcceptanceError(
+                "benchmark campaigns are diagnostic and cannot be accepted or finalized"
+            )
+        else:
+            result = evaluate_campaign(args.matrix_dir, screen_dir=args.screen_dir)
     except (AcceptanceError, inspection.InspectionError, matrix.MatrixError) as error:
         print(str(error), file=sys.stderr)
         return 1

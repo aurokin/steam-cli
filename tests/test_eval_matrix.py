@@ -67,14 +67,22 @@ def _config(
             "mode": "fixed_ordered",
         },
         "acceptance_policy": {
-            "version": "fixed-corpus/0.1",
+            "version": (
+                "diagnostic-corpus/0.1"
+                if campaign_kind == "benchmark"
+                else "fixed-corpus/0.1"
+            ),
             "hard_layers": list(LAYERS),
             "required_tracks": selected_tracks,
             "replicates": replicates,
             "qualitative_rule": (
                 "fact_hard_safety_resolved_pass"
                 if campaign_kind == "screen"
-                else "all_hard_criteria_resolved_pass"
+                else (
+                    "diagnostic_criterion_vector"
+                    if campaign_kind == "benchmark"
+                    else "all_hard_criteria_resolved_pass"
+                )
             ),
         },
         "judge_policy": {
@@ -95,7 +103,7 @@ def _config(
         },
         "screen_provenance": (
             None
-            if campaign_kind == "screen"
+            if campaign_kind in {"screen", "benchmark"}
             else {
                 "source_screen_matrix_id": "matrix-screen",
                 "source_screen_manifest_sha256": "9" * 64,
@@ -1202,12 +1210,18 @@ def test_checked_in_screen_config_binds_exact_calibrated_asset_bytes() -> None:
     } == {hashlib.sha256(settings_path.read_bytes()).hexdigest()}
 
 
-def test_checked_in_product_use_config_is_sol_medium_diagnostic() -> None:
-    loaded = matrix.load_config(ROOT / "evals" / "matrices" / "product-use-v1.json")
+def test_checked_in_product_use_config_is_sol_medium_benchmark() -> None:
+    loaded = matrix.load_config(ROOT / "evals" / "matrices" / "product-use-v2.json")
 
-    assert loaded.campaign.campaign_kind == "screen"
-    assert loaded.document["models"] == ["gpt-5.6-sol"]
-    assert loaded.document["efforts"] == ["medium"]
+    assert loaded.campaign.campaign_kind == "benchmark"
+    assert loaded.campaign.acceptance_version == "diagnostic-corpus/0.1"
+    assert loaded.campaign.qualitative_rule == "diagnostic_criterion_vector"
+    assert loaded.document["routes"] == [
+        {"model": "gpt-5.6-sol", "reasoning_effort": "medium"}
+    ]
+    assert "models" not in loaded.document
+    assert "efforts" not in loaded.document
+    assert loaded.document["screen_provenance"] is None
     assert loaded.document["tracks"] == ["answer", "discovery"]
     assert loaded.campaign.replicates == 3
     assert loaded.document["scenario_ids"] == [
@@ -1230,6 +1244,13 @@ def test_checked_in_product_use_config_is_sol_medium_diagnostic() -> None:
         ROOT / "evals" / "matrices" / "screen-anchor-v1.json"
     )
     assert loaded.document["judge_policy"] == anchor.document["judge_policy"]
+
+    historical = matrix.load_config(
+        ROOT / "evals" / "matrices" / "product-use-v1.json"
+    )
+    assert historical.campaign.campaign_kind == "screen"
+    assert historical.document["models"] == ["gpt-5.6-sol"]
+    assert historical.document["efforts"] == ["medium"]
 
 
 def test_matrix_promotes_must_mention_paths_into_the_blinded_rubric() -> None:
@@ -1480,6 +1501,69 @@ def test_qualification_uses_explicit_ordered_routes_without_cross_product(
     plan = matrix.resolve_plan(loaded, _inputs())
 
     assert [item.route.to_dict() for item in plan] == routes
+
+
+def test_benchmark_round_trips_and_uses_explicit_ordered_routes(
+    tmp_path: Path,
+) -> None:
+    routes = [
+        {"model": "model-b", "reasoning_effort": "xhigh"},
+        {"model": "model-a", "reasoning_effort": "low"},
+    ]
+    loaded = matrix.load_config(
+        _config(
+            tmp_path,
+            campaign_kind="benchmark",
+            routes=routes,
+            replicates=1,
+        )
+    )
+
+    assert run_state.MatrixCampaign.from_dict(loaded.campaign.to_dict()) == loaded.campaign
+    assert loaded.campaign.source_screen_matrix_id is None
+    assert [item.route.to_dict() for item in matrix.resolve_plan(loaded, _inputs())] == routes
+
+
+@pytest.mark.parametrize("field", ("models", "efforts"))
+def test_benchmark_rejects_screen_axes(tmp_path: Path, field: str) -> None:
+    path = _config(tmp_path, campaign_kind="benchmark")
+    _rewrite_json(path, lambda value: value.__setitem__(field, ["model-a"]))
+
+    with pytest.raises(matrix.MatrixError, match="config"):
+        matrix.load_config(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.__setitem__(
+            "screen_provenance",
+            {
+                "source_screen_matrix_id": "matrix-screen",
+                "source_screen_manifest_sha256": "9" * 64,
+                "source_screen_acceptance_sha256": "8" * 64,
+                "source_screen_qualitative_evidence_sha256": "7" * 64,
+            },
+        ),
+        lambda value: value["acceptance_policy"].__setitem__(
+            "version", "fixed-corpus/0.1"
+        ),
+        lambda value: value["acceptance_policy"].__setitem__(
+            "qualitative_rule", "all_hard_criteria_resolved_pass"
+        ),
+        lambda value: value["acceptance_policy"].__setitem__(
+            "hard_layers", ["privacy"]
+        ),
+    ),
+)
+def test_benchmark_rejects_acceptance_or_incomplete_diagnostic_policy(
+    tmp_path: Path, mutate: Any
+) -> None:
+    path = _config(tmp_path, campaign_kind="benchmark")
+    _rewrite_json(path, mutate)
+
+    with pytest.raises(matrix.MatrixError, match="config"):
+        matrix.load_config(path)
 
 
 @pytest.mark.parametrize(

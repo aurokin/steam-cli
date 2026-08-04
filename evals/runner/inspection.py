@@ -194,10 +194,16 @@ def _passed_value(value: Any) -> bool | None:
     raise InspectionError("report layer outcome is invalid")
 
 
-def _deterministic_layer_value(report: dict[str, Any], layer: str) -> bool | None:
+def deterministic_layer_value(report: dict[str, Any], layer: str) -> bool | None:
+    """Return one canonical deterministic layer value from an inspected report."""
+
     metric = report["metrics"][layer]
     field = "deterministic_passed" if layer == "claims" else "passed"
     return _passed_value(metric.get(field))
+
+
+def _deterministic_layer_value(report: dict[str, Any], layer: str) -> bool | None:
+    return deterministic_layer_value(report, layer)
 
 
 def _compatibility(
@@ -633,6 +639,12 @@ def _operational(observations: Sequence[Observation]) -> dict[str, Any]:
             "maximum": max(command_counts),
         },
     }
+
+
+def operational_vector(observations: Sequence[Observation]) -> dict[str, Any]:
+    """Aggregate validated operational measurements without a quality score."""
+
+    return _operational(observations)
 
 
 _CompatibilityCell = tuple[str | None, str | None, str, str]

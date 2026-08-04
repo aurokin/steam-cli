@@ -139,6 +139,29 @@ last-good behavior, and the M7 no-execution boundary do not vary by track. This
 qualification contract is recorded in
 [ADR 0018](../adr/0018-eval-qualification-cohorts-and-tracks.md).
 
+### Diagnostic product benchmarks
+
+A `benchmark` matrix is a diagnostic campaign over explicit ordered routes. It
+uses the same sealed child cohorts, complete five-layer deterministic vector,
+and strict route-blind qualitative imports as screen and qualification
+campaigns, but it has no screen provenance and makes no acceptance claim.
+Every qualitative criterion uses the calibrated policy. The repository only
+validates imported judgments and adjudications; it does not invoke a model
+judge.
+
+Benchmark reports keep deterministic true, false, and null layer outcomes,
+operational measurements, and qualitative `pass`, `fail`, `unresolved`, and
+`unreviewed` outcomes separate. They define no scalar score, survivor,
+qualified route, or overall pass. Benchmark campaigns are diagnostic and
+cannot be accepted or finalized. Missing qualitative artifacts remain
+unreviewed; malformed retained artifacts fail closed.
+
+An observed benchmark config is historical evidence and is not rewritten.
+Changing a product question, scenario selection, rubric, route, track, or
+replicate policy requires a new versioned config and fresh observations. These
+semantics are recorded in
+[ADR 0021](../adr/0021-diagnostic-product-benchmark-campaigns.md).
+
 ## Corpus and volatility
 
 Normative scenarios use synthetic AppIDs, aliases, evidence identifiers,
@@ -233,6 +256,11 @@ blind comparison and task-specific rubrics while retaining expert review.
   report and rubric; they cannot override deterministic failure. These
   contracts are recorded in
   [ADR 0020](../adr/0020-eval-matrix-campaigns-and-fixed-corpus-qualification.md).
+  The same matrix schema also supports diagnostic benchmark campaigns with
+  explicit routes, null screen provenance, calibrated review of every
+  criterion, and a separate vector report. Benchmark campaigns have no
+  acceptance or finalization path, as recorded in
+  [ADR 0021](../adr/0021-diagnostic-product-benchmark-campaigns.md).
 - M3, M4, M5, and M7 oracle modules execute installed command behavior
   against deterministic scenarios; M2 and M6 contract scenarios are executed
   through the materializer round trip, and boundary probes (refusal,

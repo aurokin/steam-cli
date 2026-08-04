@@ -212,14 +212,20 @@ def _campaign(kind: str = "screen") -> run_state.MatrixCampaign:
         campaign_kind=kind,
         selection_version="fixed-ordered-scenarios/0.1",
         selection_mode="fixed_ordered",
-        acceptance_version="fixed-corpus/0.1",
+        acceptance_version=(
+            "diagnostic-corpus/0.1" if kind == "benchmark" else "fixed-corpus/0.1"
+        ),
         hard_layers=("agent_turns", "tool_policy", "oracle", "claims", "privacy"),
         required_tracks=("discovery",),
         replicates=1,
         qualitative_rule=(
             "fact_hard_safety_resolved_pass"
             if kind == "screen"
-            else "all_hard_criteria_resolved_pass"
+            else (
+                "diagnostic_criterion_vector"
+                if kind == "benchmark"
+                else "all_hard_criteria_resolved_pass"
+            )
         ),
         judge_version="blinded-qualitative/0.1",
         judgment_schema="steam-agent-eval-judgment/0.1",
@@ -231,11 +237,17 @@ def _campaign(kind: str = "screen") -> run_state.MatrixCampaign:
         judges=run_state.CALIBRATED_JUDGE_CONFIGURATIONS,
         adjudication_method=run_state.CALIBRATED_ADJUDICATION_METHOD,
         adjudicator=run_state.CALIBRATED_ADJUDICATOR,
-        source_screen_manifest_sha256=None if kind == "screen" else "9" * 64,
-        source_screen_matrix_id=None if kind == "screen" else "matrix-screen",
-        source_screen_acceptance_sha256=None if kind == "screen" else "8" * 64,
+        source_screen_manifest_sha256=(
+            "9" * 64 if kind == "qualification" else None
+        ),
+        source_screen_matrix_id=(
+            "matrix-screen" if kind == "qualification" else None
+        ),
+        source_screen_acceptance_sha256=(
+            "8" * 64 if kind == "qualification" else None
+        ),
         source_screen_qualitative_evidence_sha256=(
-            None if kind == "screen" else "7" * 64
+            "7" * 64 if kind == "qualification" else None
         ),
     )
 
@@ -1158,6 +1170,24 @@ def test_screen_answer_projects_unavailable_must_mention_as_zero_evidence(
             ],
             {"state": "captured", "successful_candidates": 1},
         ),
+        (
+            "benchmark",
+            "answer",
+            [],
+            {"state": "multiple_candidates", "successful_candidates": 2},
+        ),
+        (
+            "benchmark",
+            "discovery",
+            [
+                {
+                    "omitted": "unsafe-trace-content",
+                    "sha256": "a" * 64,
+                    "length": 128,
+                }
+            ],
+            {"state": "captured", "successful_candidates": 1},
+        ),
     ),
 )
 def test_discovery_and_qualification_require_exact_must_mention_evidence(
@@ -1181,6 +1211,21 @@ def test_discovery_and_qualification_require_exact_must_mention_evidence(
             result.manifest.inputs.scenarios[0],
             campaign=result.manifest.campaign,
         )
+
+
+def test_benchmark_requires_calibrated_policy_for_every_criterion(
+    tmp_path: Path,
+) -> None:
+    result = _inspection(tmp_path, campaign_kind="benchmark")
+    scenario = result.manifest.inputs.scenarios[0]
+
+    assert all(
+        criterion.source == "judged_answer_rubric"
+        for criterion in scenario.qualitative_criteria
+    )
+    assert judge._requires_calibrated_policy(  # noqa: SLF001
+        result.manifest.campaign, scenario
+    )
 
 
 def test_screen_answer_keeps_exact_must_mention_evidence(tmp_path: Path) -> None:
