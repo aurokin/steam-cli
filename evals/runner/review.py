@@ -383,7 +383,6 @@ def prepare(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
         raise
     return {
         "matrix_id": result.manifest.matrix_id,
-        "review_dir": str(review_dir),
         "cases": len(result.manifest.work_items),
     }
 
@@ -812,6 +811,9 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
             result = resolve_agreement(args.matrix_dir, args.review_dir)
     except (ReviewError, judge.JudgmentError, inspection.InspectionError, matrix.MatrixError) as error:
         print(str(error), file=sys.stderr)
+        return 1
+    except OSError:
+        print("qualitative review filesystem operation failed", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0

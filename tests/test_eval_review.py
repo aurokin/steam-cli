@@ -160,7 +160,8 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
 
     output = review.prepare(matrix_dir, review_dir)
 
-    assert output["cases"] == 1
+    assert output == {"matrix_id": "matrix-test", "cases": 1}
+    assert str(review_dir) not in review._canonical_bytes(output).decode()  # noqa: SLF001
     assert stat.S_IMODE(review_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "cases").stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "operations").stat().st_mode) == 0o700
@@ -174,6 +175,26 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
         "model_invocation": "external",
         "usage_accounting": "unavailable",
     }
+
+
+def test_review_cli_redacts_filesystem_error_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_path = tmp_path / "private-account" / "review"
+    monkeypatch.setattr(
+        review,
+        "prepare",
+        lambda *_args: (_ for _ in ()).throw(OSError(str(private_path))),
+    )
+
+    assert review.review_cli(
+        ["prepare", str(tmp_path / "matrix"), str(private_path)]
+    ) == 1
+    captured = capsys.readouterr()
+    assert str(private_path) not in captured.err
+    assert captured.err == "qualitative review filesystem operation failed\n"
 
 
 def test_assemble_wraps_external_verdicts_and_records_operation(
