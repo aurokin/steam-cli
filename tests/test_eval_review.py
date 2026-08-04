@@ -222,6 +222,67 @@ def test_case_document_is_the_exact_route_blind_model_input(
     assert document["prompt"]["text"].startswith("# Matrix qualitative judge")
 
 
+def test_calibration_asset_rejects_symlink(tmp_path: Path) -> None:
+    calibration = tmp_path / "calibration"
+    calibration.mkdir()
+    target = calibration / "target.txt"
+    target.write_text("calibration")
+    (calibration / "asset.txt").symlink_to(target)
+
+    with pytest.raises(review.ReviewError, match="asset is unavailable"):
+        review._asset_text(  # noqa: SLF001
+            tmp_path,
+            "asset.txt",
+            "0" * 64,
+        )
+
+
+def test_calibration_asset_rejects_preflight_oversize_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calibration = tmp_path / "calibration"
+    calibration.mkdir()
+    path = calibration / "asset.txt"
+    path.touch()
+    os.truncate(path, review._MAX_DOCUMENT_BYTES + 1)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        review.os,
+        "read",
+        lambda *_args: pytest.fail("oversized calibration must not be read"),
+    )
+    with pytest.raises(review.ReviewError, match="asset is unavailable"):
+        review._asset_text(tmp_path, "asset.txt", "0" * 64)  # noqa: SLF001
+
+
+def test_calibration_asset_rejects_fifo_without_hanging(tmp_path: Path) -> None:
+    calibration = tmp_path / "calibration"
+    calibration.mkdir()
+    path = calibration / "asset.txt"
+    os.mkfifo(path, mode=0o600)
+    script = """
+from pathlib import Path
+import sys
+from evals.runner import review
+
+try:
+    review._asset_text(Path(sys.argv[1]), "asset.txt", "0" * 64)
+except review.ReviewError as error:
+    raise SystemExit(0 if "asset is unavailable" in str(error) else 2)
+raise SystemExit(1)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=3,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -503,6 +564,112 @@ def test_event_log_rejects_failed_or_ambiguous_completion(
         review.check_event_log(path)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "concatenated",
+        "duplicate_thread",
+        "duplicate_turn_start",
+        "duplicate_turn_complete",
+        "out_of_order",
+        "after_completion",
+    ],
+)
+def test_event_log_requires_one_strictly_ordered_invocation(
+    tmp_path: Path, mutation: str
+) -> None:
+    path = tmp_path / "codex.stdout"
+    events = _valid_event_log()
+    if mutation == "concatenated":
+        events += _valid_event_log()
+    elif mutation == "duplicate_thread":
+        events.insert(1, events[0])
+    elif mutation == "duplicate_turn_start":
+        events.insert(2, events[1])
+    elif mutation == "duplicate_turn_complete":
+        events.insert(-1, events[-1])
+    elif mutation == "out_of_order":
+        events[0], events[1] = events[1], events[0]
+    else:
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {"id": "late", "type": "reasoning"},
+            }
+        )
+    _write_event_log(path, events)
+
+    with pytest.raises(review.ReviewError, match="event log is invalid"):
+        review.check_event_log(path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "incomplete",
+        "changed_type",
+        "changed_id",
+        "updated_without_start",
+        "updated_after_completion",
+    ],
+)
+def test_event_log_requires_stable_completed_item_lifecycles(
+    tmp_path: Path, mutation: str
+) -> None:
+    path = tmp_path / "codex.stdout"
+    events = _valid_event_log()
+    if mutation == "incomplete":
+        events.insert(
+            -1,
+            {
+                "type": "item.started",
+                "item": {"id": "active", "type": "reasoning"},
+            },
+        )
+    elif mutation == "changed_type":
+        events[2:3] = [
+            {
+                "type": "item.started",
+                "item": {"id": "item-1", "type": "reasoning"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"id": "item-1", "type": "agent_message"},
+            },
+        ]
+    elif mutation == "changed_id":
+        events[2:3] = [
+            {
+                "type": "item.started",
+                "item": {"id": "first-id", "type": "reasoning"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"id": "second-id", "type": "reasoning"},
+            },
+        ]
+    elif mutation == "updated_without_start":
+        events.insert(
+            2,
+            {
+                "type": "item.updated",
+                "item": {"id": "unknown", "type": "reasoning"},
+            },
+        )
+    else:
+        events.insert(
+            -1,
+            {
+                "type": "item.updated",
+                "item": {"id": "item-1", "type": "reasoning"},
+            },
+        )
+    _write_event_log(path, events)
+
+    with pytest.raises(review.ReviewError, match="event log is invalid"):
+        review.check_event_log(path)
+
+
 def test_event_log_rejects_public_file(tmp_path: Path) -> None:
     path = tmp_path / "codex.stdout"
     _write_event_log(path, _valid_event_log())
@@ -533,6 +700,87 @@ def test_check_events_cli_emits_only_counts(
     assert captured.err == ""
     assert captured.out == '{"agent_messages":1,"events":5}\n'
     assert str(path) not in captured.out
+
+
+def test_native_codex_preflight_accepts_exact_native_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_bytes(b"\xcf\xfa\xed\xfe" + b"native")
+    executable.chmod(0o700)
+    observed: dict[str, object] = {}
+
+    def version(args: list[str], **kwargs: object) -> SimpleNamespace:
+        observed["args"] = args
+        observed["env"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="codex-cli 0.146.0\n")
+
+    monkeypatch.setattr(review.subprocess, "run", version)
+
+    assert review.preflight_native_codex(executable) == {
+        "payload": "native",
+        "version": "codex-cli 0.146.0",
+    }
+    assert observed["args"] == [str(executable.resolve()), "--version"]
+    assert observed["env"] == {"PATH": os.defpath, "LANG": "C.UTF-8"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"#!/usr/bin/env node\n", b"#!/bin/sh\n", b"not executable payload"],
+)
+def test_native_codex_preflight_rejects_script_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_bytes(payload)
+    executable.chmod(0o700)
+    monkeypatch.setattr(
+        review.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("script payload must not execute"),
+    )
+
+    with pytest.raises(review.ReviewError, match="native Codex 0.146"):
+        review.preflight_native_codex(executable)
+
+
+def test_native_codex_preflight_rejects_path_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_bytes(b"\xcf\xfa\xed\xfe" + b"native-one")
+    executable.chmod(0o700)
+
+    def swapped_version(args: list[str], **_kwargs: object) -> SimpleNamespace:
+        path = Path(args[0])
+        path.unlink()
+        path.write_bytes(b"\xcf\xfa\xed\xfe" + b"native-two")
+        path.chmod(0o700)
+        return SimpleNamespace(returncode=0, stdout="codex-cli 0.146.0\n")
+
+    monkeypatch.setattr(review.subprocess, "run", swapped_version)
+
+    with pytest.raises(review.ReviewError, match="native Codex 0.146"):
+        review.preflight_native_codex(executable)
+
+
+def test_native_codex_preflight_rejects_symlink_to_native(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "personal-native"
+    target.write_bytes(b"\xcf\xfa\xed\xfe" + b"native")
+    target.chmod(0o700)
+    executable = tmp_path / "codex"
+    executable.symlink_to(target)
+    monkeypatch.setattr(
+        review.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("symlink payload must not execute"),
+    )
+
+    with pytest.raises(review.ReviewError, match="native Codex 0.146"):
+        review.preflight_native_codex(executable)
 
 
 def test_judgment_operation_rejects_non_object_judge() -> None:
@@ -674,6 +922,11 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     assert "umask 077" in documentation
     assert 'JUDGE_ROOT="$(mktemp -d /tmp/steam-agent-judge.XXXXXX)"' in documentation
     assert 'test "$(stat -f \'%Lp\' "$JUDGE_ROOT")" = 700' in documentation
+    assert 'CODEX_BIN="$JUDGE_ROOT/codex"' in documentation
+    assert 'cp -c "$SOURCE_CODEX_BIN" "$CODEX_BIN"' in documentation
+    assert 'review preflight-codex "$CODEX_BIN"' in documentation
+    assert "npm/JavaScript launchers" in documentation
+    assert "symlinks, and other scripts fail closed" in documentation
     assert "Never reuse that root or" in documentation
     assert '"$SOURCE_REVIEW_ROOT/cases/WORK_ITEM_ID-judge-1.json"' in documentation
     assert '--output-schema "$SCHEMA_PATH"' in documentation
@@ -697,8 +950,10 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
         "Then invoke the judge with the isolated environment:", maxsplit=1
     )[1].split("Import the result", maxsplit=1)[0]
     assert "SOURCE_REVIEW_ROOT" not in invocation
+    assert "SOURCE_CODEX_BIN" not in invocation
     assert "/operator-owned" not in invocation
     assert "/Users/" not in invocation
+    assert "PATH=/usr/bin:/bin" in invocation
     assert "--sandbox read-only" not in documentation
     assert review._ISOLATION_ATTESTATION in documentation  # noqa: SLF001
 
@@ -1429,6 +1684,100 @@ def test_resolve_detects_target_conflict_before_publishing_operation(
     ).exists()
 
 
+def test_resolve_preflights_every_roster_before_first_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second_work_item = "w-000001-fedcba9876543210"
+    review_dir = tmp_path / "prepared"
+    ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    campaign = _campaign()
+    result = SimpleNamespace(
+        manifest=SimpleNamespace(
+            matrix_id="matrix-test",
+            campaign=campaign,
+            work_items=(
+                SimpleNamespace(work_item_id=WORK_ITEM_ID),
+                SimpleNamespace(work_item_id=second_work_item),
+            ),
+        )
+    )
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+
+    def bound_case(
+        _matrix: Path,
+        _review: Path,
+        _index: object,
+        _ledger: object,
+        work_item_id: str,
+        judge_identifier: str,
+    ) -> dict[str, object]:
+        case = json.loads(json.dumps(_case(judge_identifier)))
+        target = dict(TARGET, work_item_id=work_item_id)
+        case["target"] = target
+        case["execution"]["invocation"] = review._invocation_binding(  # noqa: SLF001
+            target, judge_identifier
+        )
+        return case
+
+    monkeypatch.setattr(review, "_load_bound_case", bound_case)
+    monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: {})
+    monkeypatch.setattr(review, "_retained_judgment_files", lambda *_args: [])
+    monkeypatch.setattr(review, "_retained_adjudication_files", lambda *_args: [])
+
+    def roster(
+        _review: Path,
+        *,
+        cases_by_judge: dict[str, dict[str, object]],
+        campaign: object,
+        files: object,
+    ) -> dict[str, tuple[str, dict[str, object]]]:
+        del files
+        case = next(iter(cases_by_judge.values()))
+        if case["target"]["work_item_id"] == second_work_item:
+            raise review.ReviewError("later qualitative roster is invalid")
+        return {
+            configured.identifier: (
+                configured.identifier[-1] * 64,
+                {
+                    "target": case["target"],
+                    "judge": configured.to_dict(),
+                    "verdicts": [
+                        {
+                            "criterion_id": criterion["id"],
+                            "verdict": "pass",
+                            "rationale": "Valid roster.",
+                        }
+                        for criterion in case["projection"]["criteria"]
+                    ],
+                },
+            )
+            for configured in campaign.judges
+        }
+
+    monkeypatch.setattr(review, "_bound_judgment_roster", roster)
+    monkeypatch.setattr(
+        review.judge, "_validate_adjudication_document", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        review,
+        "_publish_operation",
+        lambda *_args: pytest.fail("preflight failure must precede operation append"),
+    )
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda *_args: pytest.fail("preflight failure must precede artifact append"),
+    )
+
+    with pytest.raises(review.ReviewError, match="later qualitative roster"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    assert list((review_dir / "operations").iterdir()) == []
+    assert not (matrix_dir / "adjudications").exists()
+
+
 def test_resolve_resumes_adjudication_from_operation_after_interruption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1457,6 +1806,128 @@ def test_resolve_resumes_adjudication_from_operation_after_interruption(
         "retained": 1,
     }
     assert calls == 2
+
+
+def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second_work_item = "w-000001-fedcba9876543210"
+    review_dir = tmp_path / "prepared"
+    ledger = _review_root(review_dir)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    campaign = _campaign()
+    result = SimpleNamespace(
+        manifest=SimpleNamespace(
+            matrix_id="matrix-test",
+            campaign=campaign,
+            work_items=(
+                SimpleNamespace(work_item_id=WORK_ITEM_ID),
+                SimpleNamespace(work_item_id=second_work_item),
+            ),
+        )
+    )
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+
+    def bound_case(
+        _matrix: Path,
+        _review: Path,
+        _index: object,
+        _ledger: object,
+        work_item_id: str,
+        judge_identifier: str,
+    ) -> dict[str, object]:
+        case = json.loads(json.dumps(_case(judge_identifier)))
+        target = dict(TARGET, work_item_id=work_item_id)
+        case["target"] = target
+        case["execution"]["invocation"] = review._invocation_binding(  # noqa: SLF001
+            target, judge_identifier
+        )
+        return case
+
+    monkeypatch.setattr(review, "_load_bound_case", bound_case)
+    monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: {})
+    monkeypatch.setattr(review, "_retained_judgment_files", lambda *_args: [])
+    retained_adjudications: list[tuple[Path, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        review,
+        "_retained_adjudication_files",
+        lambda *_args: list(retained_adjudications),
+    )
+    roster_calls: list[str] = []
+
+    def roster(
+        _review: Path,
+        *,
+        cases_by_judge: dict[str, dict[str, object]],
+        campaign: object,
+        files: object,
+    ) -> dict[str, tuple[str, dict[str, object]]]:
+        del files
+        case = next(iter(cases_by_judge.values()))
+        roster_calls.append(case["target"]["work_item_id"])
+        return {
+            configured.identifier: (
+                configured.identifier[-1] * 64,
+                {
+                    "target": case["target"],
+                    "judge": configured.to_dict(),
+                    "verdicts": [
+                        {
+                            "criterion_id": criterion["id"],
+                            "verdict": "pass",
+                            "rationale": "Valid roster.",
+                        }
+                        for criterion in case["projection"]["criteria"]
+                    ],
+                },
+            )
+            for configured in campaign.judges
+        }
+
+    monkeypatch.setattr(review, "_bound_judgment_roster", roster)
+    monkeypatch.setattr(
+        review.judge, "_validate_adjudication_document", lambda *_args, **_kwargs: None
+    )
+    import_calls = 0
+
+    def crash_on_second_import(
+        matrix_root: Path, kind: str, document: dict[str, object]
+    ) -> tuple[Path, str]:
+        nonlocal import_calls
+        import_calls += 1
+        if import_calls == 2:
+            raise RuntimeError("simulated second import crash")
+        artifact_root = matrix_root / "adjudications"
+        artifact_root.mkdir(mode=0o700, exist_ok=True)
+        path = artifact_root / f"{document['adjudication_id']}.json"
+        review._write_json(path, document)  # noqa: SLF001
+        digest = review._sha256(document)  # noqa: SLF001
+        retained_adjudications.append((path, digest, document))
+        assert kind == "adjudication"
+        return path, digest
+
+    monkeypatch.setattr(review, "_import_document_locked", crash_on_second_import)
+
+    with pytest.raises(RuntimeError, match="second import crash"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    assert roster_calls == [WORK_ITEM_ID, second_work_item]
+    assert len(list((review_dir / "operations").glob("adjudication-*.json"))) == 2
+    assert len(retained_adjudications) == 1
+
+    assert review.resolve_agreement(matrix_dir, review_dir) == {
+        "imported": 0,
+        "retained": 2,
+    }
+    assert roster_calls == [
+        WORK_ITEM_ID,
+        second_work_item,
+        WORK_ITEM_ID,
+        second_work_item,
+    ]
+    assert len(retained_adjudications) == 2
+    assert import_calls == 3
 
 
 @pytest.mark.parametrize("mutation", ["missing", "altered"])

@@ -229,12 +229,18 @@ another replicate or judge slot cannot be imported.
 One setup pattern is:
 
 ```text
+set -eu
 umask 077
 JUDGE_ROOT="$(mktemp -d /tmp/steam-agent-judge.XXXXXX)"
 test -d "$JUDGE_ROOT" && test ! -L "$JUDGE_ROOT"
 test "$(stat -f '%Lp' "$JUDGE_ROOT")" = 700
 trap 'rm -rf "$JUDGE_ROOT"' EXIT
 mkdir -m 700 "$JUDGE_ROOT/codex-home" "$JUDGE_ROOT/workspace"
+SOURCE_CODEX_BIN="$(command -v codex)"
+CODEX_BIN="$JUDGE_ROOT/codex"
+cp -c "$SOURCE_CODEX_BIN" "$CODEX_BIN"
+chmod 700 "$CODEX_BIN"
+uv run python -m evals.runner review preflight-codex "$CODEX_BIN"
 install -m 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" \
   "$JUDGE_ROOT/codex-home/auth.json"
 SOURCE_REVIEW_ROOT=/operator-owned/private-review-root
@@ -261,8 +267,16 @@ process. `JUDGE_ROOT` is outside the model workspace. The private case, response
 schema, verdict, and stdout/stderr logs are neutral-path siblings of that empty
 workspace. Then invoke the judge with the isolated environment:
 
+The preflight requires the exact copied payload to be a regular, non-symlink
+native executable and to report `codex-cli 0.146.0`; npm/JavaScript launchers,
+symlinks, and other scripts fail closed. macOS `cp -c` creates an APFS clone
+when supported, avoiding a full binary copy for every invocation. The original
+executable path is used only by the host-side clone and never appears in the
+sanitized environment, working
+directory, or model input. Keep `PATH=/usr/bin:/bin`; do not add a Node or
+package-manager directory.
+
 ```text
-CODEX_BIN="$(command -v codex)"
 env -i CODEX_HOME="$JUDGE_ROOT/codex-home" \
   HOME="$JUDGE_ROOT/workspace" \
   TMPDIR="$JUDGE_ROOT/codex-home" PATH=/usr/bin:/bin LANG=C.UTF-8 \
@@ -323,17 +337,20 @@ infer that fact from an external process. Configuration readback proves the
 settings were accepted, not the effective model-visible inventory; the residual
 inventory described above was established separately from source and wire
 evidence. Any CLI, model catalog, or profile change invalidates this
-attestation. `check-events` privately parses the `--json` log and accepts exactly
-one completed `agent_message`, optional reasoning items, and normal thread/turn
-lifecycle events. Any actual tool-use item, failed/unknown event, malformed log,
-or missing completion invalidates that attempt. Treat it like a transport or
-structural failure: discard that invocation root and retry from a new root,
-counting it toward the initial-plus-two limit. Never retry a valid `uncertain`
-verdict. The `umask 077`, precreated output, and post-call checks are also
-required: the assembler rejects a verdict output unless it is a mode-`0600`
-regular file no larger than 16 MiB. Import the result before the `EXIT` trap
-removes its fresh root. Operation timestamps use the existing matrix invariant:
-a non-empty, parseable, timezone-aware timestamp.
+attestation. `check-events` privately parses the `--json` log and requires one
+`thread.started`, then one `turn.started`, only stable-ID reasoning or
+`agent_message` item lifecycles that all complete, exactly one completed
+`agent_message`, and finally one `turn.completed` with nothing after it. A
+completed-only item is valid. Any actual tool-use item, failed/unknown event,
+duplicate or out-of-order lifecycle, incomplete item, malformed log, or missing
+completion invalidates that attempt. Treat it like a transport or structural
+failure: discard that invocation root and retry from a new root, counting it
+toward the initial-plus-two limit. Never retry a valid `uncertain` verdict. The
+`umask 077`, precreated output, and post-call checks are also required: the
+assembler rejects a verdict output unless it is a mode-`0600` regular file no
+larger than 16 MiB. Import the result before the `EXIT` trap removes its fresh
+root. Operation timestamps use the existing matrix invariant: a non-empty,
+parseable, timezone-aware timestamp.
 
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:

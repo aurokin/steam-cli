@@ -16,11 +16,12 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any, Sequence
 
-from evals.runner import inspection, judge, matrix, run_state
+from evals.runner import codex_driver, inspection, judge, matrix, run_state
 
 
 _CASE_SCHEMA = "steam-agent-eval-review-case/0.1"
@@ -52,13 +53,23 @@ _HOST_ISOLATION_DISABLED_FEATURES = (
 _ISOLATION_ATTESTATION = "codex-0.146-no-shell-host-isolated-profile-v1"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _SAFE_WORK_ITEM = re.compile(r"w-[0-9]{6}-[0-9a-f]{16}\Z", re.ASCII)
-_CODEX_LIFECYCLE_EVENTS = frozenset(
-    {"thread.started", "turn.started", "turn.completed"}
-)
 _CODEX_ITEM_EVENTS = frozenset(
     {"item.started", "item.updated", "item.completed"}
 )
 _ALLOWED_JUDGE_ITEM_TYPES = frozenset({"agent_message", "reasoning"})
+_NATIVE_EXECUTABLE_MAGICS = frozenset(
+    {
+        b"\x7fELF",
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }
+)
 
 
 class ReviewError(RuntimeError):
@@ -155,8 +166,9 @@ def check_event_log(path: Path) -> dict[str, int]:
         raise ReviewError("qualitative review event log is invalid") from None
     if not lines or any(not line.strip() for line in lines):
         raise ReviewError("qualitative review event log is invalid")
-    seen_lifecycle: set[str] = set()
-    agent_messages = 0
+    if len(lines) < 4:
+        raise ReviewError("qualitative review event log is invalid")
+    events: list[dict[str, Any]] = []
     for line in lines:
         try:
             event = matrix._strict_json_loads(line)  # noqa: SLF001
@@ -164,21 +176,103 @@ def check_event_log(path: Path) -> dict[str, int]:
             raise ReviewError("qualitative review event log is invalid") from None
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             raise ReviewError("qualitative review event log is invalid")
+        events.append(event)
+    if (
+        events[0]["type"] != "thread.started"
+        or events[1]["type"] != "turn.started"
+        or events[-1]["type"] != "turn.completed"
+    ):
+        raise ReviewError("qualitative review event log is invalid")
+    agent_messages = 0
+    item_states: dict[str, tuple[str, str]] = {}
+    for event in events[2:-1]:
         event_type = event["type"]
-        if event_type in _CODEX_LIFECYCLE_EVENTS:
-            seen_lifecycle.add(event_type)
-            continue
         if event_type not in _CODEX_ITEM_EVENTS:
             raise ReviewError("qualitative review event log is invalid")
         item = event.get("item")
         item_type = item.get("type") if isinstance(item, dict) else None
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not item_id:
+            raise ReviewError("qualitative review event log is invalid")
         if item_type not in _ALLOWED_JUDGE_ITEM_TYPES:
             raise ReviewError("qualitative review event log contains tool use")
-        if item_type == "agent_message" and event_type == "item.completed":
-            agent_messages += 1
-    if seen_lifecycle != _CODEX_LIFECYCLE_EVENTS or agent_messages != 1:
+        retained = item_states.get(item_id)
+        if event_type == "item.started":
+            if retained is not None:
+                raise ReviewError("qualitative review event log is invalid")
+            item_states[item_id] = (item_type, "active")
+        elif event_type == "item.updated":
+            if retained != (item_type, "active"):
+                raise ReviewError("qualitative review event log is invalid")
+        else:
+            if retained not in {None, (item_type, "active")}:
+                raise ReviewError("qualitative review event log is invalid")
+            item_states[item_id] = (item_type, "completed")
+            if item_type == "agent_message":
+                agent_messages += 1
+    if (
+        agent_messages != 1
+        or not item_states
+        or any(state != "completed" for _item_type, state in item_states.values())
+    ):
         raise ReviewError("qualitative review event log is invalid")
     return {"events": len(lines), "agent_messages": agent_messages}
+
+
+def preflight_native_codex(path: Path) -> dict[str, str]:
+    """Require a standalone native Codex 0.146 executable, never a JS shim."""
+
+    descriptor = -1
+    try:
+        supplied = Path(path)
+        resolved = supplied.parent.resolve(strict=True) / supplied.name
+        supplied_stat = resolved.lstat()
+        if not stat.S_ISREG(supplied_stat.st_mode):
+            raise ReviewError("qualitative judge native Codex 0.146 is unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+        item_stat = os.fstat(descriptor)
+        magic = os.read(descriptor, 4)
+        if (
+            not stat.S_ISREG(item_stat.st_mode)
+            or item_stat.st_dev != supplied_stat.st_dev
+            or item_stat.st_ino != supplied_stat.st_ino
+            or not os.access(resolved, os.X_OK)
+            or magic not in _NATIVE_EXECUTABLE_MAGICS
+        ):
+            raise ReviewError("qualitative judge native Codex 0.146 is unavailable")
+        result = subprocess.run(
+            [str(resolved), "--version"],
+            cwd="/",
+            env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        retained_stat = resolved.stat(follow_symlinks=False)
+        if (
+            retained_stat.st_dev != item_stat.st_dev
+            or retained_stat.st_ino != item_stat.st_ino
+        ):
+            raise ReviewError("qualitative judge native Codex 0.146 is unavailable")
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        raise ReviewError(
+            "qualitative judge native Codex 0.146 is unavailable"
+        ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        result.returncode != 0
+        or result.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION  # noqa: SLF001
+    ):
+        raise ReviewError("qualitative judge native Codex 0.146 is unavailable")
+    return {
+        "payload": "native",
+        "version": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+    }
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -209,17 +303,12 @@ def _separated_review_roots(
 def _asset_text(matrix_dir: Path, name: str, expected_sha256: str) -> str:
     path = matrix_dir / "calibration" / name
     try:
-        item_stat = path.lstat()
-        content = path.read_bytes()
-    except OSError:
+        content = _read_bytes(path)
+    except ReviewError:
         raise ReviewError(
             "qualitative review calibration asset is unavailable"
         ) from None
-    if (
-        not stat.S_ISREG(item_stat.st_mode)
-        or len(content) > _MAX_DOCUMENT_BYTES
-        or hashlib.sha256(content).hexdigest() != expected_sha256
-    ):
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
         raise ReviewError("qualitative review calibration asset does not match")
     try:
         return content.decode("utf-8")
@@ -1016,7 +1105,7 @@ def assemble_judgment(
             return {"path": path.name, "sha256": digest}
 
 
-def _existing_operation_artifact(
+def _existing_operation_plan(
     path: Path,
     matrix_dir: Path,
     *,
@@ -1024,7 +1113,7 @@ def _existing_operation_artifact(
     target_index: judge._TargetIndex,  # noqa: SLF001
     retained: dict[str, dict[str, Any]],
     matching_files: list[tuple[Path, str, dict[str, Any]]],
-) -> tuple[Path, str] | None:
+) -> tuple[str, dict[str, Any]] | None:
     if not path.exists():
         return None
     operation = _read_json(path, require_private=True)
@@ -1044,12 +1133,12 @@ def _existing_operation_artifact(
         )
         if retained_target is None:
             raise ReviewError("retained adjudication is unavailable")
-        return retained_target
+        return "retained", artifact
     target = matrix_dir / "adjudications" / f"{artifact.get('adjudication_id')}.json"
     retained_target = _retained_target(target, artifact, digest, kind="adjudication")
     if retained_target is not None:
-        return retained_target
-    return _import_document_locked(matrix_dir, "adjudication", artifact)
+        return "retained", artifact
+    return "resume", artifact
 
 
 def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
@@ -1074,6 +1163,7 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 matrix_dir, target_index, retained
             )
             campaign = target_index.inspection_result.manifest.campaign
+            plans: list[tuple[str, Path, dict[str, Any]]] = []
             for work_item in target_index.inspection_result.manifest.work_items:
                 work_item_id = work_item.work_item_id
                 cases_by_judge = {
@@ -1102,7 +1192,7 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                     for item in retained_adjudications
                     if item[2]["target"] == case["target"]
                 ]
-                existing = _existing_operation_artifact(
+                existing = _existing_operation_plan(
                     operation_path,
                     matrix_dir,
                     case=case,
@@ -1111,7 +1201,8 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                     matching_files=matching_adjudications,
                 )
                 if existing is not None:
-                    retained_count += 1
+                    action, artifact = existing
+                    plans.append((action, operation_path, artifact))
                     continue
                 if matching_adjudications:
                     raise ReviewError("qualitative adjudication already exists")
@@ -1162,8 +1253,23 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                     "artifact": document,
                     "recorded_at": _now(),
                 }
-                _publish_operation(operation_path, operation)
-                _import_document_locked(matrix_dir, "adjudication", document)
+                plans.append(("new", operation_path, operation))
+
+            # All rosters, retained artifacts, operations, and target paths are
+            # valid before the first append. Phase two retains operation-first
+            # crash recovery for each planned import.
+            for action, operation_path, payload in plans:
+                if action == "retained":
+                    retained_count += 1
+                    continue
+                if action == "resume":
+                    _import_document_locked(matrix_dir, "adjudication", payload)
+                    retained_count += 1
+                    continue
+                _publish_operation(operation_path, payload)
+                _import_document_locked(
+                    matrix_dir, "adjudication", payload["artifact"]
+                )
                 imported += 1
     return {"imported": imported, "retained": retained_count}
 
@@ -1176,6 +1282,8 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     prepare_parser.add_argument("review_dir", type=Path)
     events_parser = subparsers.add_parser("check-events")
     events_parser.add_argument("events", type=Path)
+    codex_parser = subparsers.add_parser("preflight-codex")
+    codex_parser.add_argument("executable", type=Path)
     assemble_parser = subparsers.add_parser("assemble")
     assemble_parser.add_argument("matrix_dir", type=Path)
     assemble_parser.add_argument("review_dir", type=Path)
@@ -1198,6 +1306,8 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
             result = prepare(args.matrix_dir, args.review_dir)
         elif args.command == "check-events":
             result = check_event_log(args.events)
+        elif args.command == "preflight-codex":
+            result = preflight_native_codex(args.executable)
         elif args.command == "assemble":
             result = assemble_judgment(
                 args.matrix_dir,
