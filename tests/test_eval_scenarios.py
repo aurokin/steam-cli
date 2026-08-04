@@ -856,6 +856,60 @@ def test_product_use_scenarios_accept_only_declared_default_options(
     assert runner_grade.command_satisfies_requirement(accepted_command, requirement)
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "expected_options", "canonical_command", "equivalent_command"),
+    (
+        (
+            "m5/m5-c01-compatible-machine.json",
+            [{"name": "--explain"}],
+            "steam-agent compatibility assess 5101 --account synthetic "
+            "--target machine:synthetic-machine --country US --language english",
+            "steam-agent compatibility assess 5101 --account synthetic "
+            "--target machine:synthetic-machine --country US --language english "
+            "--explain",
+        ),
+        (
+            "m6/m6-d03-player-count-unsupported.json",
+            [{"name": "--require-mode", "value": "online_co_op"}],
+            "steam-agent discovery query --scope appids --limit 1 --appid 6411 "
+            "--account synthetic --machine synthetic-machine --country US "
+            "--language english",
+            "steam-agent discovery query --scope appids --limit 1 --appid 6411 "
+            "--account synthetic --machine synthetic-machine --country US "
+            "--language english --require-mode online_co_op",
+        ),
+    ),
+    ids=("m5-c01-explain", "m6-d03-mode-filter"),
+)
+def test_product_use_edge_scenarios_accept_evidenced_equivalent_options(
+    relative_path: str,
+    expected_options: list[dict[str, str]],
+    canonical_command: str,
+    equivalent_command: str,
+) -> None:
+    scenario = json.loads(
+        (EVAL_ROOT / "scenarios" / relative_path).read_text(encoding="utf-8")
+    )
+    requirement = scenario["tool_policy"]["required"][0]
+
+    assert requirement["accepted_optional_options"] == expected_options
+    assert runner_grade.command_satisfies_requirement(canonical_command, requirement)
+    assert runner_grade.command_satisfies_requirement(equivalent_command, requirement)
+
+
+def test_m6_d03_oracle_does_not_depend_on_optional_mode_filter() -> None:
+    path = EVAL_ROOT / "scenarios" / "m6" / "m6-d03-player-count-unsupported.json"
+    scenario = json.loads(path.read_text(encoding="utf-8"))
+    oracle_paths = {
+        assertion["path"]
+        for assertion in scenario["deterministic_oracle"]["assertions"]
+    }
+
+    assert "$.data.items[0].mode_requirement" not in oracle_paths
+    assert "$.data.items[0].multiplayer_modes" in oracle_paths
+    assert "$.data.items[0].player_count.state" in oracle_paths
+
+
 def test_m4_r03_does_not_accept_an_installed_games_shortcut() -> None:
     path = EVAL_ROOT / "scenarios" / "m4" / "m4-r03-installed-tonight.json"
     scenario = json.loads(path.read_text(encoding="utf-8"))

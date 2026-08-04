@@ -1265,6 +1265,29 @@ def test_checked_in_product_use_config_is_sol_medium_benchmark() -> None:
     assert historical.document["efforts"] == ["medium"]
 
 
+def test_checked_in_product_use_edge_confirmation_is_six_discovery_observations() -> None:
+    loaded = matrix.load_config(
+        ROOT / "evals" / "matrices" / "product-use-discovery-edge-v1.json"
+    )
+
+    assert loaded.campaign.campaign_kind == "benchmark"
+    assert loaded.campaign.acceptance_version == "diagnostic-corpus/0.1"
+    assert loaded.campaign.qualitative_rule == "diagnostic_criterion_vector"
+    assert loaded.document["routes"] == [
+        {"model": "gpt-5.6-sol", "reasoning_effort": "medium"}
+    ]
+    assert loaded.document["tracks"] == ["discovery"]
+    assert loaded.campaign.required_tracks == ("discovery",)
+    assert loaded.campaign.replicates == 3
+    assert loaded.document["scenario_ids"] == ["m5-c01", "m6-d03"]
+
+    scenarios, _documents = matrix._scenario_documents(  # noqa: SLF001
+        tuple(loaded.document["scenario_ids"]), root=ROOT
+    )
+    plan = matrix.resolve_plan(loaded, replace(_inputs(), scenarios=scenarios))
+    assert len(plan) == 6
+
+
 def test_matrix_promotes_must_mention_paths_into_the_blinded_rubric() -> None:
     scenarios, documents = matrix._scenario_documents(  # noqa: SLF001
         ("m2-b02",), root=ROOT

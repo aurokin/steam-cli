@@ -185,6 +185,18 @@ uv run python -m evals.runner inspect evals/results/MATRIX_ID
 uv run python -m evals.runner report evals/results/MATRIX_ID
 ```
 
+The immutable edge confirmation in
+`matrices/product-use-discovery-edge-v1.json` isolates the compatibility
+`--explain` equivalence and the multiplayer query with or without its
+`--require-mode online_co_op` filter. It runs only those two questions for
+three Sol-medium discovery replicates (six observations):
+
+```text
+uv run python -m evals.runner matrix --config evals/matrices/product-use-discovery-edge-v1.json
+uv run python -m evals.runner inspect evals/results/MATRIX_ID
+uv run python -m evals.runner report evals/results/MATRIX_ID
+```
+
 Benchmark campaigns are diagnostic and cannot be accepted or finalized. Their
 five deterministic layer outcomes and qualitative criterion outcomes remain
 separate vectors; there is no benchmark score, survivor, qualified route, or
