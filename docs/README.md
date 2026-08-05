@@ -10,6 +10,7 @@ that answers your question, then follow links for detail.
 | Evaluate the project or get a first result | [Project README](../README.md) |
 | Use current commands safely | [User guide](user-guide.md) |
 | Change the code or tests | [Contributor guide](../CONTRIBUTING.md) |
+| Run or interpret model evaluations | [Evaluation guide](../evals/README.md) |
 | Understand the architecture or a contract | [Design map](design/README.md) |
 | Understand an accepted decision | [ADR index](adr/README.md) |
 | Understand project/Linear synchronization | [Project governance](project-governance.md) |
@@ -69,7 +70,8 @@ sentence in a proposed document does not make a choice accepted.
 ## Noncanonical source material
 
 - [Research roadmap](design/roadmap.md) — sequencing hypotheses from discovery.
-- `../steam-library-agent-research-handoff.md` — unverified research handoff.
+- [Research handoff](../steam-library-agent-research-handoff.md) — unverified
+  source material.
 - Linear — work state and acceptance links, not a duplicate specification.
 
 See [project governance](project-governance.md) for how repository evidence and

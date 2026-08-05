@@ -43,6 +43,7 @@ Add new SQLite migrations; do not rewrite an existing migration.
 | Current design map | [docs/design/README.md](docs/design/README.md) |
 | Command and JSON behavior | [docs/design/cli-contract.md](docs/design/cli-contract.md) |
 | Testing and acceptance | [docs/testing.md](docs/testing.md) |
+| Model evaluation corpus and runner | [evals/README.md](evals/README.md) |
 | Decisions and ADR threshold | [docs/adr/README.md](docs/adr/README.md) |
 
 When documentation changes, update one canonical page and link to it. Label

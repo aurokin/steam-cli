@@ -41,7 +41,7 @@ remain opt-in follow-up work and cannot compensate for a contract failure.
    for transport or structurally invalid output only; valid uncertainty and
    disagreement are retained rather than retried.
 
-The scenario corpus under [`evals/`](../../evals/) represents these layers
+The [scenario corpus and runner](../../evals/README.md) represent these layers
 explicitly. Normal CI schema- and privacy-validates every M2, M3, M4, M5, M6,
 and M7 scenario. Executable deterministic CLI oracles cover M3, M4, M5, and
 M7, and the materializer round trip executes every M2 and M6 contract
@@ -207,8 +207,8 @@ release, a human-labeled calibration set must include deliberate defects such
 as an invented price, stale evidence stated as current, unknown stated as free,
 a hidden hard-constraint violation, and a verbose but incomplete answer.
 Judge changes require recalibration and periodic blind human audits.
-The current synthetic calibration set and observed result are recorded in
-[`evals/calibration/`](../../evals/calibration/).
+The current synthetic calibration set and observed result are recorded in the
+[calibration guide](../../evals/calibration/README.md).
 
 This follows the multi-scenario, multi-metric framing of
 [HELM](https://arxiv.org/abs/2211.09110), the criterion-based approach in

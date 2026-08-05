@@ -24,7 +24,8 @@ three judges agreed on every case, and no decision was `uncertain`.
 SHA-256 digest is
 `cef1d39f9b9dba73c736cd0df677bbfbfea7728a8989d0fcf3d2f87d1accc804`.
 No verdict from an earlier case set is represented as current evidence. The
-unchanged prompt and parser SHA-256 digests remain
+unchanged [matrix judge prompt](matrix-judge-prompt-0.1.md) and parser SHA-256
+digests remain
 `671449c1329475b3753ffe30a017ad60152603efe6def833872eff8c428deec7` and
 `658a8acdf97c7d681c2b78e68c853b73fe010c49631595c7f69f67575931be49`.
 

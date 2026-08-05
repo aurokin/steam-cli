@@ -61,11 +61,11 @@ Continue with the [user guide](docs/user-guide.md) for account setup, provider
 credentials, deals, recommendations, compatibility, group decisions, safe
 operation plans, data locations, and deletion.
 
-Agents working from this checkout can use the repository-owned `steam-agent`
-project skill in `.agents/skills/steam-agent`. It maps common library questions
-to cache-only commands and carries the same evidence, privacy, and read-only
-Steam boundaries as the CLI. It is checkout-local; installing the CLI does not
-install a global agent skill.
+Agents working from this checkout can use the
+[repository-owned `steam-agent` project skill](.agents/skills/steam-agent/SKILL.md).
+It maps common library questions to cache-only commands and carries the same
+evidence, privacy, and read-only Steam boundaries as the CLI. It is
+checkout-local; installing the CLI does not install a global agent skill.
 
 ## Develop
 
@@ -85,6 +85,8 @@ Start with the audience-specific entry point:
 
 - [User guide](docs/user-guide.md) — current commands, privacy, and limitations.
 - [Contributor guide](CONTRIBUTING.md) — development and validation workflow.
+- [Evaluation guide](evals/README.md) — scenario corpus, deterministic grading,
+  and opt-in model campaigns.
 - [Documentation map](docs/README.md) — source-of-truth and lifecycle rules.
 - [Design map](docs/design/README.md) — architecture, contracts, policies, and
   historical acceptance records.

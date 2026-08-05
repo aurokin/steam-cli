@@ -30,7 +30,7 @@ the same command as `steam-agent ...`.
 | `src/steam_agent/*query*.py` | Cache-only query composition |
 | `src/steam_agent/steam_*.py` and provider modules | Bounded acquisition adapters |
 | `tests/` | Deterministic unit, CLI, storage, and acceptance tests |
-| `evals/` | Common-question scenarios and deterministic oracles |
+| [`evals/`](evals/README.md) | Common-question scenarios, deterministic oracles, and opt-in model runs |
 | `docs/design/` | Current design and historical milestone records |
 | `docs/adr/` | Accepted decisions and decision register |
 

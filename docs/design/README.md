@@ -16,7 +16,7 @@ Use this page to find the canonical design source. The broader
 | Data privacy, retention, acknowledgment, and deletion | [Steam data lifecycle](steam-data-lifecycle.md) | Accepted M2–M4 policy; index to M5–M6 ADRs |
 | Steam actions and confirmation classes | [Actions](actions.md) | M7 boundary accepted; future classes proposed |
 | Historical pricing providers and fallback | [Pricing strategy](pricing-strategy.md) | M3 boundary accepted; providers time-sensitive |
-| Evaluation and acceptance | [Evaluation strategy](evaluation-strategy.md) and [testing](../testing.md) | Working strategy; deterministic gate accepted |
+| Evaluation and acceptance | [Evaluation strategy](evaluation-strategy.md), [corpus and runner](../../evals/README.md), and [testing](../testing.md) | Working strategy; deterministic gate accepted |
 
 Accepted architectural choices are indexed in the
 [ADR register](../adr/README.md). If a summary conflicts with an ADR, update the
