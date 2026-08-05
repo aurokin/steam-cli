@@ -40,6 +40,12 @@ _CANARY_ATTESTATION_SCHEMA = "steam-agent-eval-review-canary-attestation/0.1"
 _INCIDENT_SCHEMA = "steam-agent-eval-review-incident/0.1"
 _SUPERSESSION_SCHEMA = "steam-agent-eval-review-supersession/0.1"
 _REGISTRY_SCHEMA = "steam-agent-eval-review-package-registry/0.1"
+_MEASUREMENT_AMENDMENT_SCHEMA = (
+    "steam-agent-eval-review-measurement-amendment/0.1"
+)
+_UNAVAILABLE_OPERATION_SCHEMA = (
+    "steam-agent-eval-review-unavailable-duration-operation/0.1"
+)
 _EVENT_VALIDATOR = "codex-jsonl-verdict-binding/0.1"
 _MAX_CASES = 1024
 _MAX_ATTEMPTS = 3
@@ -72,6 +78,7 @@ _CANARY_MODEL = "gpt-5.6-sol"
 _CANARY_REASONING_EFFORT = "xhigh"
 _SUPERSESSION_FILENAME = "supersession.json"
 _REGISTRY_FILENAME = "review-package.json"
+_MEASUREMENT_AMENDMENT_FILENAME = "review-measurement-amendment.json"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _SAFE_WORK_ITEM = re.compile(r"w-[0-9]{6}-[0-9a-f]{16}\Z", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -80,6 +87,13 @@ _INCIDENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z", re.ASCII)
 _CANARY_FAILURE_CLASSES = frozenset(
     {"provider_rejection", "structural_failure", "transport_failure"}
 )
+_MEASUREMENT_AMENDMENT_CLASSES = frozenset(
+    {
+        "interrupted_attempt_duration_unavailable",
+        "recorded_duration_unreliable",
+    }
+)
+_AMENDMENT_UNSET = object()
 _CODEX_ITEM_EVENTS = frozenset(
     {"item.started", "item.updated", "item.completed"}
 )
@@ -1402,8 +1416,17 @@ def _validate_review_root(
     matrix_dir: Path,
     review_dir: Path,
     target_index: judge._TargetIndex,  # noqa: SLF001
+    measurement_amendment: tuple[dict[str, Any], str] | None | object = (
+        _AMENDMENT_UNSET
+    ),
+    validation_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     result = target_index.inspection_result
+    amendment = (
+        _load_measurement_amendment(matrix_dir)
+        if measurement_amendment is _AMENDMENT_UNSET
+        else measurement_amendment
+    )
     try:
         item_stat = review_dir.lstat()
     except OSError:
@@ -1433,7 +1456,7 @@ def _validate_review_root(
             or stat.S_IMODE(directory_stat.st_mode) != 0o700
         ):
             raise ReviewError("qualitative review directory is not private")
-    ledger = _read_json(
+    ledger, ledger_content = _read_json_with_content(
         review_dir / "ledger.json", require_private=True, require_canonical=True
     )
     required = {
@@ -1477,6 +1500,12 @@ def _validate_review_root(
         result,
         package_id=package_id,
     )
+    if validation_context is not None:
+        validation_context.clear()
+        validation_context.update(
+            ledger_sha256=hashlib.sha256(ledger_content).hexdigest(),
+            registry_sha256=_sha256(registry),
+        )
     response_schema = _read_json(
         review_dir / "response-schema.json",
         require_private=True,
@@ -1714,6 +1743,18 @@ def _validate_review_root(
             canary_sha256 = canary_digest
     if operation_names and canary_sha256 is None:
         raise ReviewError("qualitative review canary attestation is unavailable")
+    if amendment is not None and not isinstance(amendment, tuple):
+        raise ReviewError("qualitative review measurement amendment is invalid")
+    _validate_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        target_index,
+        ledger,
+        _sha256(registry),
+        hashlib.sha256(ledger_content).hexdigest(),
+        canary_sha256,
+        amendment,
+    )
     retained_judgments: dict[str, dict[str, Any]] | None = None
     retained_judgment_files: list[tuple[Path, str, dict[str, Any]]] | None = None
     retained_adjudication_files: list[
@@ -1737,11 +1778,12 @@ def _validate_review_root(
                     work_item_id,
                     judge_identifier,
                 )
-                artifact = _validate_judgment_operation(
+                artifact, _effective_duration = _effective_judgment_operation(
                     operation,
                     case=case,
                     judge_identifier=judge_identifier,
                     canary_attestation_sha256=canary_sha256,
+                    measurement_amendment=amendment,
                 )
                 judge._validate_judgment_document(  # noqa: SLF001
                     target_index, artifact
@@ -2593,6 +2635,134 @@ def validate_canary(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
     }
 
 
+def record_measurement_amendment(
+    matrix_dir: Path,
+    review_dir: Path,
+    work_item_id: str,
+    *,
+    judge_identifier: str,
+    amendment_class: str,
+) -> dict[str, Any]:
+    """Publish the matrix's sole package-bound duration amendment."""
+
+    if amendment_class not in _MEASUREMENT_AMENDMENT_CLASSES:
+        raise ReviewError("qualitative review measurement amendment is invalid")
+    matrix_dir, review_dir = _separated_review_roots(matrix_dir, review_dir)
+    with matrix.MatrixLock(review_dir):
+        with matrix.MatrixLock(matrix_dir):
+            try:
+                target_index = judge._target_index(matrix_dir)  # noqa: SLF001
+            except (judge.JudgmentError, inspection.InspectionError) as error:
+                raise ReviewError(str(error)) from None
+            amendment = _load_measurement_amendment(matrix_dir)
+            validation_context: dict[str, str] = {}
+            ledger = _validate_review_root(
+                matrix_dir,
+                review_dir,
+                target_index,
+                amendment,
+                validation_context,
+            )
+            canary_attestation_sha256 = _validate_canary_attestation(
+                review_dir, ledger
+            )
+            case = _load_bound_case(
+                matrix_dir,
+                review_dir,
+                target_index,
+                ledger,
+                work_item_id,
+                judge_identifier,
+            )
+            if (
+                amendment_class == "recorded_duration_unreliable"
+                and target_index.inspection_result.manifest.campaign.required_tracks
+                != ("skill",)
+            ):
+                raise ReviewError(
+                    "qualitative review recorded duration is ineligible"
+                )
+            output = {
+                "package_id": ledger["package_id"],
+                "amendment_class": amendment_class,
+                "work_item_id": work_item_id,
+                "judge_identifier": judge_identifier,
+                "effective_duration": {"state": "unavailable"},
+            }
+            if amendment is not None:
+                document, digest = amendment
+                if (
+                    document.get("amendment_class") != amendment_class
+                    or document.get("work_item_id") != work_item_id
+                    or document.get("judge_identifier") != judge_identifier
+                ):
+                    raise ReviewError(
+                        "qualitative review measurement amendment already exists"
+                    )
+                return {**output, "sha256": digest}
+
+            operation_path = _operation_path(
+                review_dir, "judgment", work_item_id, judge_identifier
+            )
+            retained = judge._retained_judgments(  # noqa: SLF001
+                matrix_dir, target_index
+            )
+            matching = _matching_judgment_files(
+                _retained_judgment_files(matrix_dir, retained),
+                target=case["target"],
+                judge_identifier=judge_identifier,
+            )
+            operation: dict[str, Any] | None = None
+            operation_sha256: str | None = None
+            if amendment_class == "interrupted_attempt_duration_unavailable":
+                if _node_exists(operation_path) or matching:
+                    raise ReviewError(
+                        "qualitative review interrupted attempt is ineligible"
+                    )
+            else:
+                operation, operation_content = _read_json_with_content(
+                    operation_path,
+                    require_private=True,
+                    require_canonical=True,
+                )
+                artifact = _validate_judgment_operation(
+                    operation,
+                    case=case,
+                    judge_identifier=judge_identifier,
+                    canary_attestation_sha256=canary_attestation_sha256,
+                )
+                if (
+                    len(matching) != 1
+                    or matching[0][1] != operation["artifact_sha256"]
+                    or matching[0][2] != artifact
+                ):
+                    raise ReviewError(
+                        "qualitative review recorded duration is ineligible"
+                    )
+                operation_sha256 = hashlib.sha256(operation_content).hexdigest()
+            document = _measurement_amendment_document(
+                result=target_index.inspection_result,
+                ledger=ledger,
+                ledger_sha256=validation_context["ledger_sha256"],
+                registry_sha256=validation_context["registry_sha256"],
+                case=case,
+                judge_identifier=judge_identifier,
+                canary_attestation_sha256=canary_attestation_sha256,
+                amendment_class=amendment_class,
+                operation=operation,
+                operation_sha256=operation_sha256,
+            )
+            digest = _sha256(document)
+            _write_json(matrix_dir / _MEASUREMENT_AMENDMENT_FILENAME, document)
+            _validate_review_root(
+                matrix_dir,
+                review_dir,
+                target_index,
+                (document, digest),
+            )
+            return {**output, "sha256": digest}
+
+
 def _case_entry(
     ledger: dict[str, Any], work_item_id: str, judge_identifier: str
 ) -> dict[str, Any]:
@@ -2775,6 +2945,283 @@ def _validate_judgment_operation(
     return artifact
 
 
+def _load_measurement_amendment(
+    matrix_dir: Path,
+) -> tuple[dict[str, Any], str] | None:
+    path = matrix_dir / _MEASUREMENT_AMENDMENT_FILENAME
+    if not _node_exists(path):
+        return None
+    document, content = _read_json_with_content(
+        path,
+        require_private=True,
+        require_canonical=True,
+    )
+    return document, hashlib.sha256(content).hexdigest()
+
+
+def _measurement_amendment_document(
+    *,
+    result: inspection.MatrixInspection,
+    ledger: dict[str, Any],
+    ledger_sha256: str,
+    registry_sha256: str,
+    case: dict[str, Any],
+    judge_identifier: str,
+    canary_attestation_sha256: str,
+    amendment_class: str,
+    operation: dict[str, Any] | None,
+    operation_sha256: str | None,
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema": _MEASUREMENT_AMENDMENT_SCHEMA,
+        "amendment_class": amendment_class,
+        "matrix_id": result.manifest.matrix_id,
+        "manifest_sha256": result.manifest_sha256,
+        "package_id": ledger["package_id"],
+        "registry_sha256": registry_sha256,
+        "ledger_sha256": ledger_sha256,
+        "work_item_id": case["target"]["work_item_id"],
+        "judge_identifier": judge_identifier,
+        "case_sha256": _sha256(case),
+        "canary_attestation_sha256": canary_attestation_sha256,
+        "affected_attempt_count": (
+            1 if operation is None else operation["attempt_count"]
+        ),
+        "authorized_attempt_count": 2 if operation is None else None,
+        "operation_path": (
+            f"operations/judgment-{case['target']['work_item_id']}-"
+            f"{judge_identifier}.json"
+        ),
+        "operation_sha256": operation_sha256,
+        "artifact_sha256": (
+            None if operation is None else operation["artifact_sha256"]
+        ),
+        "recorded_duration_ms": (
+            None if operation is None else operation["duration_ms"]
+        ),
+        "effective_duration": {"state": "unavailable"},
+        "recorded_at": _now() if recorded_at is None else recorded_at,
+    }
+
+
+def _validate_unavailable_judgment_operation(
+    operation: dict[str, Any],
+    *,
+    case: dict[str, Any],
+    judge_identifier: str,
+    canary_attestation_sha256: str,
+    amendment_sha256: str,
+) -> dict[str, Any]:
+    if (
+        operation.get("schema") != _UNAVAILABLE_OPERATION_SCHEMA
+        or operation.get("attempt_count") != 2
+        or operation.get("duration")
+        != {"state": "unavailable", "amendment_sha256": amendment_sha256}
+        or "duration_ms" in operation
+    ):
+        raise ReviewError("qualitative review operation is invalid")
+    shadow = dict(operation)
+    shadow["schema"] = _OPERATION_SCHEMA
+    shadow["duration_ms"] = 0
+    shadow.pop("duration")
+    return _validate_judgment_operation(
+        shadow,
+        case=case,
+        judge_identifier=judge_identifier,
+        canary_attestation_sha256=canary_attestation_sha256,
+    )
+
+
+def _amendment_targets_slot(
+    measurement_amendment: tuple[dict[str, Any], str] | None,
+    case: dict[str, Any],
+    judge_identifier: str,
+) -> bool:
+    if measurement_amendment is None:
+        return False
+    document = measurement_amendment[0]
+    return (
+        document.get("work_item_id") == case["target"]["work_item_id"]
+        and document.get("judge_identifier") == judge_identifier
+        and document.get("case_sha256") == _sha256(case)
+    )
+
+
+def _effective_judgment_operation(
+    operation: dict[str, Any],
+    *,
+    case: dict[str, Any],
+    judge_identifier: str,
+    canary_attestation_sha256: str,
+    measurement_amendment: tuple[dict[str, Any], str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    targeted = _amendment_targets_slot(
+        measurement_amendment,
+        case,
+        judge_identifier,
+    )
+    amendment_class = (
+        measurement_amendment[0].get("amendment_class")
+        if targeted and measurement_amendment is not None
+        else None
+    )
+    if operation.get("schema") == _UNAVAILABLE_OPERATION_SCHEMA:
+        if amendment_class != "interrupted_attempt_duration_unavailable":
+            raise ReviewError("qualitative review operation is invalid")
+        artifact = _validate_unavailable_judgment_operation(
+            operation,
+            case=case,
+            judge_identifier=judge_identifier,
+            canary_attestation_sha256=canary_attestation_sha256,
+            amendment_sha256=measurement_amendment[1],
+        )
+        return artifact, {
+            "state": "unavailable",
+            "amendment_sha256": measurement_amendment[1],
+        }
+    if amendment_class == "interrupted_attempt_duration_unavailable":
+        raise ReviewError("qualitative review operation is invalid")
+    artifact = _validate_judgment_operation(
+        operation,
+        case=case,
+        judge_identifier=judge_identifier,
+        canary_attestation_sha256=canary_attestation_sha256,
+    )
+    if amendment_class == "recorded_duration_unreliable":
+        if (
+            measurement_amendment[0].get("operation_sha256")
+            != _sha256(operation)
+            or measurement_amendment[0].get("artifact_sha256")
+            != operation["artifact_sha256"]
+            or measurement_amendment[0].get("affected_attempt_count")
+            != operation["attempt_count"]
+            or measurement_amendment[0].get("recorded_duration_ms")
+            != operation["duration_ms"]
+        ):
+            raise ReviewError("qualitative review measurement amendment is invalid")
+        return artifact, {
+            "state": "unavailable",
+            "amendment_sha256": measurement_amendment[1],
+        }
+    return artifact, {"state": "measured", "duration_ms": operation["duration_ms"]}
+
+
+def _validate_measurement_amendment(
+    matrix_dir: Path,
+    review_dir: Path,
+    target_index: judge._TargetIndex,  # noqa: SLF001
+    ledger: dict[str, Any],
+    registry_sha256: str,
+    ledger_sha256: str,
+    canary_attestation_sha256: str | None,
+    measurement_amendment: tuple[dict[str, Any], str] | None,
+) -> None:
+    if measurement_amendment is None:
+        return
+    document, _ = measurement_amendment
+    amendment_class = document.get("amendment_class")
+    required = {
+        "schema",
+        "amendment_class",
+        "matrix_id",
+        "manifest_sha256",
+        "package_id",
+        "registry_sha256",
+        "ledger_sha256",
+        "work_item_id",
+        "judge_identifier",
+        "case_sha256",
+        "canary_attestation_sha256",
+        "affected_attempt_count",
+        "authorized_attempt_count",
+        "operation_path",
+        "operation_sha256",
+        "artifact_sha256",
+        "recorded_duration_ms",
+        "effective_duration",
+        "recorded_at",
+    }
+    if (
+        set(document) != required
+        or document.get("schema") != _MEASUREMENT_AMENDMENT_SCHEMA
+        or amendment_class not in _MEASUREMENT_AMENDMENT_CLASSES
+        or document.get("matrix_id")
+        != target_index.inspection_result.manifest.matrix_id
+        or document.get("manifest_sha256")
+        != target_index.inspection_result.manifest_sha256
+        or document.get("package_id") != ledger["package_id"]
+        or document.get("registry_sha256") != registry_sha256
+        or document.get("ledger_sha256") != ledger_sha256
+        or not isinstance(document.get("work_item_id"), str)
+        or not isinstance(document.get("judge_identifier"), str)
+        or document.get("canary_attestation_sha256")
+        != canary_attestation_sha256
+        or document.get("effective_duration") != {"state": "unavailable"}
+        or not _valid_timestamp(document.get("recorded_at"))
+        or canary_attestation_sha256 is None
+    ):
+        raise ReviewError("qualitative review measurement amendment is invalid")
+    case = _load_bound_case(
+        matrix_dir,
+        review_dir,
+        target_index,
+        ledger,
+        document["work_item_id"],
+        document["judge_identifier"],
+    )
+    if document.get("case_sha256") != _sha256(case):
+        raise ReviewError("qualitative review measurement amendment is invalid")
+    operation_path = _operation_path(
+        review_dir,
+        "judgment",
+        document["work_item_id"],
+        document["judge_identifier"],
+    )
+    if document.get("operation_path") != operation_path.relative_to(
+        review_dir
+    ).as_posix():
+        raise ReviewError("qualitative review measurement amendment is invalid")
+    retained = judge._retained_judgments(matrix_dir, target_index)  # noqa: SLF001
+    matching = _matching_judgment_files(
+        _retained_judgment_files(matrix_dir, retained),
+        target=case["target"],
+        judge_identifier=document["judge_identifier"],
+    )
+    if amendment_class == "recorded_duration_unreliable":
+        if (
+            target_index.inspection_result.manifest.campaign.required_tracks
+            != ("skill",)
+            or not _node_exists(operation_path)
+            or not isinstance(document.get("affected_attempt_count"), int)
+            or isinstance(document.get("affected_attempt_count"), bool)
+            or not 1 <= document["affected_attempt_count"] <= _MAX_ATTEMPTS
+            or document.get("authorized_attempt_count") is not None
+            or not isinstance(document.get("operation_sha256"), str)
+            or _SHA256.fullmatch(document["operation_sha256"]) is None
+            or not isinstance(document.get("artifact_sha256"), str)
+            or _SHA256.fullmatch(document["artifact_sha256"]) is None
+            or not isinstance(document.get("recorded_duration_ms"), int)
+            or isinstance(document.get("recorded_duration_ms"), bool)
+            or len(matching) != 1
+            or matching[0][1] != document["artifact_sha256"]
+        ):
+            raise ReviewError("qualitative review measurement amendment is invalid")
+    elif (
+        not isinstance(document.get("affected_attempt_count"), int)
+        or isinstance(document.get("affected_attempt_count"), bool)
+        or document["affected_attempt_count"] != 1
+        or not isinstance(document.get("authorized_attempt_count"), int)
+        or isinstance(document.get("authorized_attempt_count"), bool)
+        or document["authorized_attempt_count"] != 2
+        or document.get("operation_sha256") is not None
+        or document.get("artifact_sha256") is not None
+        or document.get("recorded_duration_ms") is not None
+        or (not _node_exists(operation_path) and matching)
+    ):
+        raise ReviewError("qualitative review measurement amendment is invalid")
+
+
 def _validate_adjudication_operation(
     operation: dict[str, Any],
     *,
@@ -2942,6 +3389,7 @@ def _bound_judgment_roster(
     campaign: run_state.MatrixCampaign,
     files: list[tuple[Path, str, dict[str, Any]]],
     canary_attestation_sha256: str,
+    measurement_amendment: tuple[dict[str, Any], str] | None = None,
 ) -> dict[str, tuple[str, dict[str, Any]]]:
     configured = {item.identifier: item for item in campaign.judges}
     if set(cases_by_judge) != set(configured):
@@ -2970,11 +3418,12 @@ def _bound_judgment_roster(
             ),
             require_private=True,
         )
-        operation_artifact = _validate_judgment_operation(
+        operation_artifact, _effective_duration = _effective_judgment_operation(
             operation,
             case=cases_by_judge[judge_config.identifier],
             judge_identifier=judge_config.identifier,
             canary_attestation_sha256=canary_attestation_sha256,
+            measurement_amendment=measurement_amendment,
         )
         digest, retained_artifact = by_judge[judge_config.identifier]
         if (
@@ -2994,7 +3443,7 @@ def assemble_judgment(
     events_path: Path | None = None,
     judge_identifier: str,
     attempt_count: int,
-    duration_ms: int,
+    duration_ms: int | None,
     isolation_attestation: str,
 ) -> dict[str, Any]:
     """Validate external verdicts, assemble judgment 0.1, and import it."""
@@ -3003,9 +3452,14 @@ def assemble_judgment(
         not isinstance(attempt_count, int)
         or isinstance(attempt_count, bool)
         or not 1 <= attempt_count <= _MAX_ATTEMPTS
-        or not isinstance(duration_ms, int)
-        or isinstance(duration_ms, bool)
-        or not 0 <= duration_ms <= _MAX_DURATION_MS
+        or (
+            duration_ms is not None
+            and (
+                not isinstance(duration_ms, int)
+                or isinstance(duration_ms, bool)
+                or not 0 <= duration_ms <= _MAX_DURATION_MS
+            )
+        )
         or isolation_attestation != _ISOLATION_ATTESTATION
     ):
         raise ReviewError("qualitative review operational measurement is invalid")
@@ -3017,8 +3471,12 @@ def assemble_judgment(
                 target_index = judge._target_index(matrix_dir)  # noqa: SLF001
             except judge.JudgmentError as error:
                 raise ReviewError(str(error)) from None
+            measurement_amendment = _load_measurement_amendment(matrix_dir)
             ledger = _validate_review_root(
-                matrix_dir, review_dir, target_index
+                matrix_dir,
+                review_dir,
+                target_index,
+                measurement_amendment,
             )
             canary_attestation_sha256 = _validate_canary_attestation(
                 review_dir, ledger
@@ -3054,15 +3512,23 @@ def assemble_judgment(
             # depend on the disposable external response still existing.
             if operation_path.exists():
                 operation = _read_json(operation_path, require_private=True)
-                document = _validate_judgment_operation(
+                document, effective_duration = _effective_judgment_operation(
                     operation,
                     case=case,
                     judge_identifier=judge_identifier,
                     canary_attestation_sha256=canary_attestation_sha256,
+                    measurement_amendment=measurement_amendment,
                 )
                 if (
                     operation["attempt_count"] != attempt_count
-                    or operation["duration_ms"] != duration_ms
+                    or (
+                        effective_duration["state"] == "measured"
+                        and operation["duration_ms"] != duration_ms
+                    )
+                    or (
+                        effective_duration["state"] == "unavailable"
+                        and duration_ms is not None
+                    )
                     or operation["isolation_attestation"] != isolation_attestation
                 ):
                     raise ReviewError(
@@ -3086,15 +3552,40 @@ def assemble_judgment(
                     retained = _retained_target(path, document, digest, kind="judgment")
                     if retained is None:
                         raise ReviewError("retained judgment is unavailable")
-                    return {"path": retained[0].name, "sha256": retained[1]}
+                    output = {"path": retained[0].name, "sha256": retained[1]}
+                    if effective_duration["state"] == "unavailable":
+                        output["duration"] = effective_duration
+                    return output
                 target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
                 retained = _retained_target(target, document, digest, kind="judgment")
                 if retained is None:
                     retained = _import_document_locked(matrix_dir, "judgment", document)
-                return {"path": retained[0].name, "sha256": retained[1]}
+                output = {"path": retained[0].name, "sha256": retained[1]}
+                if effective_duration["state"] == "unavailable":
+                    output["duration"] = effective_duration
+                return output
 
             if matching_files:
                 raise ReviewError("qualitative judgment already exists for judge")
+            discovery_amendment = (
+                measurement_amendment is not None
+                and _amendment_targets_slot(
+                    measurement_amendment,
+                    case,
+                    judge_identifier,
+                )
+                and measurement_amendment[0].get("amendment_class")
+                == "interrupted_attempt_duration_unavailable"
+            )
+            if discovery_amendment:
+                if attempt_count != 2 or duration_ms is not None:
+                    raise ReviewError(
+                        "qualitative review operational measurement is invalid"
+                    )
+            elif duration_ms is None:
+                raise ReviewError(
+                    "qualitative review operational measurement is invalid"
+                )
             verdict_document, verdict_content = _read_json_with_content(
                 Path(verdicts_path),
                 schema_name="review-verdicts-0.2.json",
@@ -3165,14 +3656,17 @@ def assemble_judgment(
                 case, document, invocation_evidence
             )
             operation = {
-                "schema": _OPERATION_SCHEMA,
+                "schema": (
+                    _UNAVAILABLE_OPERATION_SCHEMA
+                    if discovery_amendment
+                    else _OPERATION_SCHEMA
+                ),
                 "package_id": ledger["package_id"],
                 "kind": "judgment_import",
                 "matrix_id": case["target"]["matrix_id"],
                 "work_item_id": work_item_id,
                 "judge_identifier": judge_identifier,
                 "attempt_count": attempt_count,
-                "duration_ms": duration_ms,
                 "usage": {"state": "unavailable"},
                 "isolation_attestation": isolation_attestation,
                 "invocation_evidence": invocation_evidence,
@@ -3182,9 +3676,19 @@ def assemble_judgment(
                 "artifact": document,
                 "recorded_at": _now(),
             }
+            if discovery_amendment:
+                operation["duration"] = {
+                    "state": "unavailable",
+                    "amendment_sha256": measurement_amendment[1],
+                }
+            else:
+                operation["duration_ms"] = duration_ms
             _publish_operation(operation_path, operation)
             path, digest = _import_document_locked(matrix_dir, "judgment", document)
-            return {"path": path.name, "sha256": digest}
+            output = {"path": path.name, "sha256": digest}
+            if discovery_amendment:
+                output["duration"] = operation["duration"]
+            return output
 
 
 def _existing_operation_plan(
@@ -3243,8 +3747,12 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 target_index = judge._target_index(matrix_dir)  # noqa: SLF001
             except judge.JudgmentError as error:
                 raise ReviewError(str(error)) from None
+            measurement_amendment = _load_measurement_amendment(matrix_dir)
             ledger = _validate_review_root(
-                matrix_dir, review_dir, target_index
+                matrix_dir,
+                review_dir,
+                target_index,
+                measurement_amendment,
             )
             canary_attestation_sha256 = _validate_canary_attestation(
                 review_dir, ledger
@@ -3275,12 +3783,16 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 operation_path = _operation_path(
                     review_dir, "adjudication", work_item_id, "agreement"
                 )
+                roster_arguments: dict[str, Any] = {}
+                if measurement_amendment is not None:
+                    roster_arguments["measurement_amendment"] = measurement_amendment
                 by_judge = _bound_judgment_roster(
                     review_dir,
                     cases_by_judge=cases_by_judge,
                     campaign=campaign,
                     files=retained_files,
                     canary_attestation_sha256=canary_attestation_sha256,
+                    **roster_arguments,
                 )
                 matching_adjudications = [
                     item
@@ -3423,6 +3935,16 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     validate_canary_parser = subparsers.add_parser("validate-canary")
     validate_canary_parser.add_argument("matrix_dir", type=Path)
     validate_canary_parser.add_argument("review_dir", type=Path)
+    amendment_parser = subparsers.add_parser("record-measurement-amendment")
+    amendment_parser.add_argument("matrix_dir", type=Path)
+    amendment_parser.add_argument("review_dir", type=Path)
+    amendment_parser.add_argument("work_item_id")
+    amendment_parser.add_argument("--judge", required=True)
+    amendment_parser.add_argument(
+        "--amendment-class",
+        required=True,
+        choices=tuple(sorted(_MEASUREMENT_AMENDMENT_CLASSES)),
+    )
     events_parser = subparsers.add_parser("check-events")
     events_parser.add_argument("events", type=Path)
     codex_parser = subparsers.add_parser("preflight-codex")
@@ -3435,7 +3957,9 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     assemble_parser.add_argument("--events", required=True, type=Path)
     assemble_parser.add_argument("--judge", required=True)
     assemble_parser.add_argument("--attempt-count", required=True, type=int)
-    assemble_parser.add_argument("--duration-ms", required=True, type=int)
+    duration_group = assemble_parser.add_mutually_exclusive_group(required=True)
+    duration_group.add_argument("--duration-ms", type=int)
+    duration_group.add_argument("--duration-unavailable", action="store_true")
     assemble_parser.add_argument(
         "--isolation-attestation",
         required=True,
@@ -3486,6 +4010,14 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "validate-canary":
             result = validate_canary(args.matrix_dir, args.review_dir)
+        elif args.command == "record-measurement-amendment":
+            result = record_measurement_amendment(
+                args.matrix_dir,
+                args.review_dir,
+                args.work_item_id,
+                judge_identifier=args.judge,
+                amendment_class=args.amendment_class,
+            )
         elif args.command == "check-events":
             result = check_event_log(args.events)
         elif args.command == "preflight-codex":
@@ -3499,7 +4031,7 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
                 events_path=args.events,
                 judge_identifier=args.judge,
                 attempt_count=args.attempt_count,
-                duration_ms=args.duration_ms,
+                duration_ms=(None if args.duration_unavailable else args.duration_ms),
                 isolation_attestation=args.isolation_attestation,
             )
         else:

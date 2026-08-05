@@ -58,6 +58,7 @@ PROJECTION = {
 def _campaign() -> SimpleNamespace:
     return SimpleNamespace(
         campaign_kind="benchmark",
+        required_tracks=("skill",),
         judges=run_state.CALIBRATED_JUDGE_CONFIGURATIONS,
         prompt_version=PROMPT_VERSION,
         prompt_sha256=PROMPT_SHA256,
@@ -323,6 +324,78 @@ def _write_canary_result(review_dir: Path, tmp_path: Path) -> tuple[Path, Path]:
     review._write_json(verdict_path, verdict)  # noqa: SLF001
     events_path = _write_bound_event_log(tmp_path / "canary-events.jsonl", verdict_path)
     return verdict_path, events_path
+
+
+def _write_prepared_case_result(
+    review_dir: Path,
+    tmp_path: Path,
+    *,
+    judge_identifier: str = "judge-1",
+) -> tuple[Path, Path]:
+    case = review._read_json(  # noqa: SLF001
+        review_dir / "cases" / f"{WORK_ITEM_ID}-{judge_identifier}.json",
+        require_private=True,
+    )
+    verdict = {
+        "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+        "target": {
+            "work_item_id": WORK_ITEM_ID,
+            "projection_sha256": case["target"]["projection_sha256"],
+        },
+        "invocation": case["execution"]["invocation"],
+        "verdicts": _verdict_document(judge_identifier)["verdicts"],
+    }
+    verdict_path = tmp_path / f"verdict-{judge_identifier}.json"
+    review._write_json(verdict_path, verdict)  # noqa: SLF001
+    events_path = _write_bound_event_log(
+        tmp_path / f"events-{judge_identifier}.jsonl", verdict_path
+    )
+    return verdict_path, events_path
+
+
+def _prepare_measurement_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, SimpleNamespace, dict[str, dict[str, object]]]:
+    matrix_dir, review_dir, target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    canary_verdict, canary_events = _write_canary_result(review_dir, tmp_path)
+    review.record_canary(
+        matrix_dir,
+        review_dir,
+        canary_verdict,
+        events_path=canary_events,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+    retained: dict[str, dict[str, object]] = {}
+    monkeypatch.setattr(
+        review.judge,
+        "_retained_judgments",
+        lambda *_args: retained,
+    )
+    monkeypatch.setattr(
+        review.judge,
+        "_validate_judgment_document",
+        lambda *_args: None,
+    )
+
+    def retain(
+        matrix_dir: Path, kind: str, document: dict[str, object]
+    ) -> tuple[Path, str]:
+        digest = review._sha256(document)  # noqa: SLF001
+        root = matrix_dir / f"{kind}s"
+        root.mkdir(mode=0o700, exist_ok=True)
+        path = root / f"{document[f'{kind}_id']}.json"
+        review._write_json(path, document)  # noqa: SLF001
+        retained[digest] = document
+        return path, digest
+
+    monkeypatch.setattr(review, "_import_document_locked", retain)
+    return matrix_dir, review_dir, target_index, retained
 
 
 def _verdict_document(judge_identifier: str = "judge-1") -> dict[str, object]:
@@ -1422,6 +1495,330 @@ def test_canary_failure_replay_rejects_contradictory_details(
                 review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
             ),
         )
+
+
+def test_interrupted_measurement_amendment_is_fixed_idempotent_and_attempt_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    first = review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    )
+    amendment_path = (
+        matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    )
+    amendment_bytes = amendment_path.read_bytes()
+    assert stat.S_IMODE(amendment_path.stat().st_mode) == 0o600
+    assert review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    ) == first
+    assert amendment_path.read_bytes() == amendment_bytes
+    with pytest.raises(review.ReviewError, match="already exists"):
+        review.record_measurement_amendment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            judge_identifier="judge-2",
+            amendment_class="interrupted_attempt_duration_unavailable",
+        )
+
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+    with pytest.raises(review.ReviewError, match="operational measurement"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=None,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    with pytest.raises(review.ReviewError, match="operational measurement"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=2,
+            duration_ms=9,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    output = review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-1",
+        attempt_count=2,
+        duration_ms=None,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    operation = review._read_json(  # noqa: SLF001
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+        require_canonical=True,
+    )
+    assert output["duration"]["state"] == "unavailable"
+    assert operation["schema"] == review._UNAVAILABLE_OPERATION_SCHEMA  # noqa: SLF001
+    assert operation["attempt_count"] == 2
+    assert "duration_ms" not in operation
+    assert amendment_path.read_bytes() == amendment_bytes
+    with pytest.raises(review.ReviewError, match="does not match operation"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            tmp_path / "discarded-verdict.json",
+            judge_identifier="judge-1",
+            attempt_count=3,
+            duration_ms=None,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+
+def test_recorded_duration_amendment_preserves_valid_output_and_prevents_reroll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+    review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    operation_path = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    judgment_path = matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    operation_bytes = operation_path.read_bytes()
+    judgment_bytes = judgment_path.read_bytes()
+
+    amendment = review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="recorded_duration_unreliable",
+    )
+
+    assert amendment["effective_duration"] == {"state": "unavailable"}
+    assert operation_path.read_bytes() == operation_bytes
+    assert judgment_path.read_bytes() == judgment_bytes
+
+
+    for judge_identifier in ("judge-2", "judge-3"):
+        other_verdict, other_events = _write_prepared_case_result(
+            review_dir,
+            tmp_path,
+            judge_identifier=judge_identifier,
+        )
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            other_verdict,
+            events_path=other_events,
+            judge_identifier=judge_identifier,
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    monkeypatch.setattr(
+        review.judge,
+        "_validate_adjudication_document",
+        lambda *_args, **_kwargs: None,
+    )
+    assert review.resolve_agreement(matrix_dir, review_dir) == {
+        "imported": 1,
+        "retained": 0,
+    }
+    resumed = review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        tmp_path / "discarded-verdict.json",
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=None,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    assert resumed["duration"]["state"] == "unavailable"
+    with pytest.raises(review.ReviewError, match="does not match operation"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=2,
+            duration_ms=None,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert operation_path.read_bytes() == operation_bytes
+    assert judgment_path.read_bytes() == judgment_bytes
+
+
+def test_recorded_duration_amendment_rejects_discovery_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+    review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    campaign = target_index.inspection_result.manifest.campaign
+    campaign.required_tracks = ("discovery",)
+
+    with pytest.raises(review.ReviewError, match="recorded duration is ineligible"):
+        review.record_measurement_amendment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            judge_identifier="judge-1",
+            amendment_class="recorded_duration_unreliable",
+        )
+
+    campaign.required_tracks = ("skill",)
+    review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="recorded_duration_unreliable",
+    )
+    campaign.required_tracks = ("discovery",)
+    with pytest.raises(review.ReviewError, match="measurement amendment is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+def test_measurement_amendment_binding_tamper_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    )
+    path = matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    document = review._read_json(  # noqa: SLF001
+        path, require_private=True, require_canonical=True
+    )
+    document["ledger_sha256"] = "0" * 64
+    path.write_bytes(review._canonical_bytes(document))  # noqa: SLF001
+    path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="measurement amendment is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("affected_attempt_count", True),
+        ("affected_attempt_count", False),
+        ("affected_attempt_count", 1.0),
+        ("affected_attempt_count", 2.0),
+        ("authorized_attempt_count", True),
+        ("authorized_attempt_count", False),
+        ("authorized_attempt_count", 1.0),
+        ("authorized_attempt_count", 2.0),
+    ],
+)
+def test_interrupted_measurement_amendment_attempt_types_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    )
+    path = matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    document = review._read_json(  # noqa: SLF001
+        path, require_private=True, require_canonical=True
+    )
+    document[field] = value
+    path.write_bytes(review._canonical_bytes(document))  # noqa: SLF001
+    path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="measurement amendment is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+def test_normal_package_rejects_unavailable_duration_without_amendment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+
+    with pytest.raises(review.ReviewError, match="operational measurement"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=None,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    ).exists()
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
 
 
 @pytest.mark.parametrize("attestation_state", ["missing", "invalid"])

@@ -411,6 +411,33 @@ both disposable files. An operation-first crash may resume from the bound
 private operation after both files are gone. Operation timestamps use the
 existing matrix invariant: a non-empty, parseable, timezone-aware timestamp.
 
+If the sole retained duration is unavailable because an invocation was
+interrupted before its operation was published, or is known to be unreliable
+despite a valid retained skill-track judgment, record the applicable
+measurement amendment before assembling or resuming that slot:
+
+```text
+uv run python -m evals.runner review record-measurement-amendment \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
+  --judge JUDGE_ID \
+  --amendment-class interrupted_attempt_duration_unavailable
+uv run python -m evals.runner review assemble \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
+  /private/path/verdict.json --judge JUDGE_ID --attempt-count 2 \
+  --duration-unavailable --events /private/path/events.jsonl \
+  --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1
+```
+
+The matrix may contain exactly one private mode-`0600`
+`review-measurement-amendment.json`. It is append-only and binds the matrix,
+review package, external attempt ledger, case, judge slot, canary, and any
+retained operation and judgment. The interrupted-attempt class authorizes only
+attempt 2 at the existing canonical operation path. The unreliable-duration
+class preserves the existing skill-track operation and judgment and authorizes
+only a same-attempt resume; it cannot reroll the verdict. Amended duration is
+non-authoritative and never changes scoring. See
+[ADR 0025](../docs/adr/0025-qualitative-review-measurement-amendments.md).
+
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:
 
