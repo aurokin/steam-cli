@@ -819,7 +819,7 @@ def test_native_codex_preflight_accepts_exact_native_payload(
     def version(args: list[str], **kwargs: object) -> SimpleNamespace:
         observed["args"] = args
         observed["env"] = kwargs["env"]
-        return SimpleNamespace(returncode=0, stdout="codex-cli 0.146.0\n")
+        return SimpleNamespace(returncode=0, stdout=b"codex-cli 0.146.0\n")
 
     monkeypatch.setattr(review.subprocess, "run", version)
 
@@ -829,6 +829,32 @@ def test_native_codex_preflight_accepts_exact_native_payload(
     }
     assert observed["args"] == [str(executable.resolve()), "--version"]
     assert observed["env"] == {"PATH": os.defpath, "LANG": "C.UTF-8"}
+
+
+def test_native_codex_preflight_redacts_non_utf_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_path = tmp_path / "private-account" / "codex"
+    private_path.parent.mkdir()
+    private_path.write_bytes(b"\xcf\xfa\xed\xfe" + b"native")
+    private_path.chmod(0o700)
+    monkeypatch.setattr(
+        review.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout=b"\xff/Users/private-account/Steam",
+            stderr=b"\xfe/private/account",
+        ),
+    )
+
+    assert review.review_cli(["preflight-codex", str(private_path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "qualitative judge native Codex 0.146 is unavailable\n"
+    assert str(private_path) not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -863,7 +889,7 @@ def test_native_codex_preflight_rejects_path_swap(
         path.unlink()
         path.write_bytes(b"\xcf\xfa\xed\xfe" + b"native-two")
         path.chmod(0o700)
-        return SimpleNamespace(returncode=0, stdout="codex-cli 0.146.0\n")
+        return SimpleNamespace(returncode=0, stdout=b"codex-cli 0.146.0\n")
 
     monkeypatch.setattr(review.subprocess, "run", swapped_version)
 
@@ -891,6 +917,34 @@ def test_native_codex_preflight_rejects_symlink_to_native(
 
 def test_judgment_operation_rejects_non_object_judge() -> None:
     artifact = {"target": TARGET, "judge": []}
+    operation = {
+        "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "kind": "judgment_import",
+        "matrix_id": TARGET["matrix_id"],
+        "work_item_id": WORK_ITEM_ID,
+        "judge_identifier": "judge-1",
+        "attempt_count": 1,
+        "duration_ms": 1,
+        "usage": {"state": "unavailable"},
+        "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "case_sha256": review._sha256(_case()),  # noqa: SLF001
+        "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
+        "artifact": artifact,
+        "recorded_at": "2026-08-04T12:00:00Z",
+    }
+
+    with pytest.raises(review.ReviewError, match="operation is invalid"):
+        review._validate_judgment_operation(  # noqa: SLF001
+            operation, case=_case(), judge_identifier="judge-1"
+        )
+
+
+def test_judgment_operation_requires_deterministic_judgment_id() -> None:
+    artifact = {
+        "judgment_id": "judgment-private-account-name",
+        "target": TARGET,
+        "judge": run_state.CALIBRATED_JUDGE_CONFIGURATIONS[0].to_dict(),
+    }
     operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
         "kind": "judgment_import",
@@ -1424,6 +1478,109 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
     assert calls == 2
 
 
+@pytest.mark.parametrize(
+    ("attempt_count", "duration_ms"),
+    [(2, 10), (1, 11)],
+)
+def test_assemble_resume_rejects_different_operational_measurements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempt_count: int,
+    duration_ms: int,
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    calls = 0
+
+    def interrupted_import(*_args: object) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    verdicts_path.unlink()
+
+    with pytest.raises(review.ReviewError, match="does not match operation"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=attempt_count,
+            duration_ms=duration_ms,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    assert calls == 1
+
+
+def test_assemble_resume_never_emits_noncanonical_retained_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("simulated interruption")),
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    operation = review._read_json(  # noqa: SLF001
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    document = operation["artifact"]
+    digest = operation["artifact_sha256"]
+    private_name = "private-account-name.json"
+    monkeypatch.setattr(
+        review.judge, "_retained_judgments", lambda *_args: {digest: document}
+    )
+    monkeypatch.setattr(
+        review,
+        "_retained_judgment_files",
+        lambda *_args: [(Path(private_name), digest, document)],
+    )
+    verdicts_path.unlink()
+
+    with pytest.raises(review.ReviewError, match="filename is invalid") as raised:
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    assert private_name not in str(raised.value)
+
+
 @pytest.mark.parametrize("retained_state", ["mismatch", "duplicate"])
 def test_assemble_resume_requires_one_exact_semantic_judgment(
     tmp_path: Path,
@@ -1611,7 +1768,7 @@ def test_assemble_rejects_semantic_same_target_judge_before_operation(
     ).exists()
 
 
-def test_policy_invalid_response_does_not_poison_corrected_retry(
+def test_privacy_invalid_response_does_not_poison_corrected_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     review_dir = tmp_path / "prepared"
@@ -1622,14 +1779,20 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
     monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
     monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
-
-    def validate(_index: object, document: dict[str, object]) -> None:
-        if document["verdicts"][0]["rationale"] == "Claims passed.":
-            raise review.judge.JudgmentError(
-                "qualitative rationale contains deterministic outcome material"
-            )
-
-    monkeypatch.setattr(review.judge, "_validate_judgment_document", validate)
+    validation_result = SimpleNamespace(
+        manifest=SimpleNamespace(campaign=_campaign())
+    )
+    observation = SimpleNamespace(
+        work_item=SimpleNamespace(route=SimpleNamespace(model="candidate-model"))
+    )
+    scenario = SimpleNamespace(
+        criterion_ids=("clear", "aligned"), qualitative_criteria=()
+    )
+    monkeypatch.setattr(
+        review.judge,
+        "_target_observation",
+        lambda *_args: (validation_result, observation, scenario),
+    )
     monkeypatch.setattr(
         review,
         "_import_document_locked",
@@ -1641,7 +1804,7 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
     invalid = tmp_path / "invalid.json"
     corrected = tmp_path / "corrected.json"
     for path, rationale in (
-        (invalid, "Claims passed."),
+        (invalid, "Found /Users/private-account/Steam"),
         (corrected, "Answer is clear."),
     ):
         review._write_json(  # noqa: SLF001
@@ -1670,7 +1833,7 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
             },
         )
 
-    with pytest.raises(review.judge.JudgmentError, match="deterministic outcome"):
+    with pytest.raises(review.judge.JudgmentError, match="private material"):
         review.assemble_judgment(
             matrix_dir,
             review_dir,
@@ -1683,6 +1846,9 @@ def test_policy_invalid_response_does_not_poison_corrected_retry(
         )
     operation = review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
     assert not operation.exists()
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
 
     output = review.assemble_judgment(
         matrix_dir,
@@ -1717,6 +1883,7 @@ def _mock_resolution(
     judgments = {}
     for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS:
         document = {
+            "judgment_id": f"judgment-{WORK_ITEM_ID}-{configured.identifier}",
             "target": TARGET,
             "judge": configured.to_dict(),
             "verdicts": [
@@ -2094,6 +2261,7 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
     for index_value, configured in enumerate(run_state.CALIBRATED_JUDGE_CONFIGURATIONS):
         clear = "fail" if index_value == 2 else "pass"
         document = {
+            "judgment_id": f"judgment-{WORK_ITEM_ID}-{configured.identifier}",
             "target": TARGET,
             "judge": configured.to_dict(),
             "verdicts": [

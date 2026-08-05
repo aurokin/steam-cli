@@ -247,7 +247,6 @@ def preflight_native_codex(path: Path) -> dict[str, str]:
             cwd="/",
             env={"PATH": os.defpath, "LANG": "C.UTF-8"},
             capture_output=True,
-            text=True,
             check=False,
             timeout=10,
         )
@@ -266,7 +265,8 @@ def preflight_native_codex(path: Path) -> dict[str, str]:
             os.close(descriptor)
     if (
         result.returncode != 0
-        or result.stdout.strip() != codex_driver._REQUIRED_CODEX_VERSION  # noqa: SLF001
+        or result.stdout.strip()
+        != codex_driver._REQUIRED_CODEX_VERSION.encode("ascii")  # noqa: SLF001
     ):
         raise ReviewError("qualitative judge native Codex 0.146 is unavailable")
     return {
@@ -764,6 +764,8 @@ def _validate_judgment_operation(
         or operation.get("case_sha256") != _sha256(case)
         or not isinstance(artifact, dict)
         or artifact.get("target") != case["target"]
+        or artifact.get("judgment_id")
+        != f"judgment-{case['target']['work_item_id']}-{judge_identifier}"
         or not isinstance(artifact_judge, dict)
         or artifact_judge.get("identifier") != judge_identifier
         or operation.get("artifact_sha256") != _sha256(artifact)
@@ -1034,6 +1036,15 @@ def assemble_judgment(
                     case=case,
                     judge_identifier=judge_identifier,
                 )
+                if (
+                    operation["attempt_count"] != attempt_count
+                    or operation["duration_ms"] != duration_ms
+                    or operation["isolation_attestation"] != isolation_attestation
+                ):
+                    raise ReviewError(
+                        "qualitative review operational measurement does not match "
+                        "operation"
+                    )
                 judge._validate_judgment_document(  # noqa: SLF001
                     target_index, document
                 )
@@ -1046,6 +1057,8 @@ def assemble_judgment(
                         raise ReviewError(
                             "retained judgment does not match review operation"
                         )
+                    if path.name != f"{document['judgment_id']}.json":
+                        raise ReviewError("retained judgment filename is invalid")
                     retained = _retained_target(path, document, digest, kind="judgment")
                     if retained is None:
                         raise ReviewError("retained judgment is unavailable")
