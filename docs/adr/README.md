@@ -44,6 +44,7 @@ product and provider choices open until evidence supports them.
 | D035 | Orchestrated qualitative review packages | [Accepted ADR 0023](0023-orchestrated-qualitative-review.md) | Easy; external invocation stays separate and imported artifact schemas remain unchanged | Private exact-input packages, structured response schema, bounded retry ledger, validated judgment assembly, and mechanical agreement resolution |
 | D036 | Pre-inference qualitative-review package supersession | [Accepted ADR 0024](0024-qualitative-review-package-supersession.md) | Moderate; terminal package history and replacement identities are immutable | Whole-package eligibility checks, content-bound incident provenance, provider-subset schema validation, and one exact-profile live canary before judge slots |
 | D037 | Qualitative-review measurement amendments | [Accepted ADR 0025](0025-qualitative-review-measurement-amendments.md) | Easy; one fixed append-only amendment can be ignored by future protocols | Exact package, ledger, case, slot, attempt, canary, operation, and judgment bindings; unavailable duration remains non-authoritative and scoring-independent |
+| D038 | Qualitative-review duration-loss recovery | [Accepted ADR 0026](0026-qualitative-review-duration-loss-recovery.md) | Easy; one distinct operation schema can be ignored by future protocols | Exactly one attempt and one recovery operation per matrix; exact verdict/event, package, case, slot, canary, and isolation bindings; unavailable non-scoring duration |
 
 ## When to create an ADR
 

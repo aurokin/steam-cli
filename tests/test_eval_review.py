@@ -1821,6 +1821,491 @@ def test_normal_package_rejects_unavailable_duration_without_amendment(
     ).exists()
 
 
+def test_duration_loss_recovery_coexists_and_resumes_from_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    )
+    measurement_path = (
+        matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    )
+    measurement_bytes = measurement_path.read_bytes()
+    verdict_path, events_path = _write_prepared_case_result(
+        review_dir, tmp_path, judge_identifier="judge-2"
+    )
+    case = review._read_json(  # noqa: SLF001
+        review_dir / "cases" / f"{WORK_ITEM_ID}-judge-2.json",
+        require_private=True,
+    )
+    retained_import = review._import_document_locked  # noqa: SLF001
+    calls = 0
+
+    def interrupted_import(
+        target_matrix: Path, kind: str, document: dict[str, object]
+    ) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated interruption")
+        return retained_import(target_matrix, kind, document)
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-2",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    operation_path = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    )
+    operation = review._read_json(  # noqa: SLF001
+        operation_path, require_private=True, require_canonical=True
+    )
+    assert stat.S_IMODE(operation_path.stat().st_mode) == 0o600
+    assert operation["schema"] == review._DURATION_LOSS_OPERATION_SCHEMA  # noqa: SLF001
+    assert operation["attempt_count"] == 1
+    assert operation["duration"] == {
+        "state": "unavailable",
+        "reason": review._DURATION_LOSS_REASON,  # noqa: SLF001
+    }
+    assert "duration_ms" not in operation
+    assert operation["isolation_attestation"] == review._ISOLATION_ATTESTATION  # noqa: SLF001
+    assert operation["case_sha256"] == review._sha256(case)  # noqa: SLF001
+    assert operation["canary_attestation_sha256"] == hashlib.sha256(
+        (review_dir / "canary-attestation.json").read_bytes()
+    ).hexdigest()
+    assert operation["invocation_evidence"]["event_log_sha256"] == hashlib.sha256(
+        events_path.read_bytes()
+    ).hexdigest()
+    assert operation["invocation_evidence"]["verdict_bytes_sha256"] == (
+        hashlib.sha256(verdict_path.read_bytes()).hexdigest()
+    )
+    assert measurement_path.read_bytes() == measurement_bytes
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+    verdict_path.unlink()
+    events_path.unlink()
+    output = review.recover_duration_loss_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-2",
+        attempt_count=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    assert output["duration"] == operation["duration"]
+    assert output["path"] == f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    assert calls == 2
+    assert review.recover_duration_loss_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-2",
+        attempt_count=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    ) == output
+    assert calls == 2
+    assert operation_path.read_bytes() == review._canonical_bytes(operation)  # noqa: SLF001
+    assert measurement_path.read_bytes() == measurement_bytes
+
+
+def test_duration_loss_recovery_rejects_measurement_amendment_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    review.record_measurement_amendment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        judge_identifier="judge-1",
+        amendment_class="interrupted_attempt_duration_unavailable",
+    )
+    amendment_path = (
+        matrix_dir / review._MEASUREMENT_AMENDMENT_FILENAME  # noqa: SLF001
+    )
+    amendment_bytes = amendment_path.read_bytes()
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+
+    with pytest.raises(review.ReviewError, match="recovery is ineligible"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert amendment_path.read_bytes() == amendment_bytes
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+
+@pytest.mark.parametrize("attempt_count", [True, 1.0, 2])
+def test_duration_loss_recovery_requires_exact_first_attempt_integer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempt_count: object,
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+
+    with pytest.raises(review.ReviewError, match="operational measurement"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=attempt_count,  # type: ignore[arg-type]
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    "tamper", ["verdict", "schema", "events", "case", "judge", "canary", "isolation"]
+)
+def test_duration_loss_recovery_rejects_nonexact_evidence_transactionally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+    judge_identifier = "judge-1"
+    isolation_attestation = review._ISOLATION_ATTESTATION  # noqa: SLF001
+    if tamper in {"verdict", "schema"}:
+        verdict = review._read_json(verdict_path, require_private=True)  # noqa: SLF001
+        if tamper == "verdict":
+            verdict["target"]["projection_sha256"] = "0" * 64
+        else:
+            verdict["schema"] = "invalid"
+        verdict_path.write_bytes(review._canonical_bytes(verdict))  # noqa: SLF001
+        verdict_path.chmod(0o600)
+        _write_bound_event_log(events_path, verdict_path)
+    elif tamper == "events":
+        events = _valid_event_log()
+        message = events[-2]["item"]
+        assert isinstance(message, dict)
+        message["text"] = "different verdict bytes"
+        _write_event_log(events_path, events)
+    elif tamper == "case":
+        case_path = review_dir / "cases" / f"{WORK_ITEM_ID}-judge-1.json"
+        case = review._read_json(case_path, require_private=True)  # noqa: SLF001
+        case["presentation"]["order"] = 1
+        case_path.write_bytes(review._canonical_bytes(case))  # noqa: SLF001
+        case_path.chmod(0o600)
+    elif tamper == "judge":
+        judge_identifier = "judge-2"
+    elif tamper == "canary":
+        canary_path = review_dir / "canary-attestation.json"
+        canary = review._read_json(canary_path, require_private=True)  # noqa: SLF001
+        canary["schema"] = "invalid"
+        canary_path.write_bytes(review._canonical_bytes(canary))  # noqa: SLF001
+        canary_path.chmod(0o600)
+    else:
+        isolation_attestation = "wrong-isolation"
+
+    with pytest.raises(review.ReviewError):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier=judge_identifier,
+            attempt_count=1,
+            isolation_attestation=isolation_attestation,
+        )
+    assert not (
+        review_dir
+        / "operations"
+        / f"judgment-{WORK_ITEM_ID}-{judge_identifier}.json"
+    ).exists()
+    assert not (
+        matrix_dir
+        / "judgments"
+        / f"judgment-{WORK_ITEM_ID}-{judge_identifier}.json"
+    ).exists()
+
+
+def test_duration_loss_recovery_rejects_occupied_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+    review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=10,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    operation_path = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    operation_bytes = operation_path.read_bytes()
+
+    with pytest.raises(review.ReviewError, match="recovery is ineligible"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert operation_path.read_bytes() == operation_bytes
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+
+def test_duration_loss_recovery_enforces_one_operation_per_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    first_verdict, first_events = _write_prepared_case_result(review_dir, tmp_path)
+    review.recover_duration_loss_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        first_verdict,
+        events_path=first_events,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    first_operation = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    first_judgment = (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    first_operation_bytes = first_operation.read_bytes()
+    first_judgment_bytes = first_judgment.read_bytes()
+    second_verdict, second_events = _write_prepared_case_result(
+        review_dir, tmp_path, judge_identifier="judge-2"
+    )
+
+    with pytest.raises(review.ReviewError, match="operation exceeds limit"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            second_verdict,
+            events_path=second_events,
+            judge_identifier="judge-2",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert first_operation.read_bytes() == first_operation_bytes
+    assert first_judgment.read_bytes() == first_judgment_bytes
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    ).exists()
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    ).exists()
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+    duplicate = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    )
+    duplicate.write_bytes(first_operation_bytes)
+    duplicate.chmod(0o600)
+    with pytest.raises(review.ReviewError, match="operation exceeds limit"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+def test_duration_loss_recovery_rejects_copied_review_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    copied_review_dir = tmp_path / "copied-review"
+    shutil.copytree(review_dir, copied_review_dir)
+    first_verdict, first_events = _write_prepared_case_result(review_dir, tmp_path)
+    review.recover_duration_loss_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        first_verdict,
+        events_path=first_events,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+    second_verdict, second_events = _write_prepared_case_result(
+        copied_review_dir, tmp_path, judge_identifier="judge-2"
+    )
+
+    with pytest.raises(review.ReviewError, match="package registry is invalid"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            copied_review_dir,
+            WORK_ITEM_ID,
+            second_verdict,
+            events_path=second_events,
+            judge_identifier="judge-2",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        copied_review_dir
+        / "operations"
+        / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    ).exists()
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    ).exists()
+
+
+@pytest.mark.parametrize("tamper", ["schema", "attempt", "evidence", "canary"])
+def test_duration_loss_recovery_rejects_tampered_durable_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+
+    def interrupted_import(
+        _matrix: Path, _kind: str, _document: dict[str, object]
+    ) -> tuple[Path, str]:
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    operation_path = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    operation = review._read_json(operation_path, require_private=True)  # noqa: SLF001
+    if tamper == "schema":
+        operation["schema"] = "invalid"
+    elif tamper == "attempt":
+        operation["attempt_count"] = True
+    elif tamper == "evidence":
+        operation["invocation_evidence"]["event_log_sha256"] = "0" * 64
+    else:
+        canary_path = review_dir / "canary-attestation.json"
+        canary = review._read_json(canary_path, require_private=True)  # noqa: SLF001
+        canary["duration_ms"] = 2
+        canary_path.write_bytes(review._canonical_bytes(canary))  # noqa: SLF001
+        canary_path.chmod(0o600)
+    if tamper != "canary":
+        operation_path.write_bytes(review._canonical_bytes(operation))  # noqa: SLF001
+        operation_path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError):
+        review.recover_duration_loss_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdict_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    assert not (
+        matrix_dir / "judgments" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+
+
+def test_duration_loss_recovery_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix_dir, review_dir, _target_index, _retained = _prepare_measurement_fixture(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_prepared_case_result(review_dir, tmp_path)
+
+    assert review.review_cli(
+        [
+            "recover-duration-loss",
+            str(matrix_dir),
+            str(review_dir),
+            WORK_ITEM_ID,
+            str(verdict_path),
+            "--events",
+            str(events_path),
+            "--judge",
+            "judge-1",
+            "--attempt-count",
+            "1",
+            "--isolation-attestation",
+            review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        ]
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["duration"] == {
+        "state": "unavailable",
+        "reason": review._DURATION_LOSS_REASON,  # noqa: SLF001
+    }
+
+
 @pytest.mark.parametrize("attestation_state", ["missing", "invalid"])
 def test_assemble_refuses_missing_or_invalid_canary(
     tmp_path: Path,
@@ -3067,7 +3552,9 @@ def test_assemble_wraps_external_verdicts_and_records_operation(
     result = _result()
     index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
     monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
     monkeypatch.setattr(
         review.judge, "_validate_judgment_document", lambda *_args: None
@@ -3306,7 +3793,9 @@ def _mock_assembly(
     matrix_dir = _matrix_root(tmp_path / "matrix")
     index = SimpleNamespace(inspection_result=_result())
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
     monkeypatch.setattr(
         review,
         "_load_bound_case",
@@ -3875,7 +4364,9 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
     result = _result()
     target_index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
     monkeypatch.setattr(review, "_load_bound_case", lambda *_args: _case())
     validation_result = SimpleNamespace(
         manifest=SimpleNamespace(campaign=_campaign())
@@ -3976,7 +4467,9 @@ def _mock_resolution(
     matrix_dir = _matrix_root(tmp_path / "matrix")
     target_index = SimpleNamespace(inspection_result=_result())
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
     monkeypatch.setattr(
         review,
         "_load_bound_case",
@@ -4086,7 +4579,9 @@ def test_resolve_preflights_every_roster_before_first_append(
     )
     target_index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
 
     def bound_case(
         _matrix: Path,
@@ -4116,6 +4611,7 @@ def test_resolve_preflights_every_roster_before_first_append(
         campaign: object,
         files: object,
         canary_attestation_sha256: str,
+        **_kwargs: object,
     ) -> dict[str, tuple[str, dict[str, object]]]:
         del files, canary_attestation_sha256
         case = next(iter(cases_by_judge.values()))
@@ -4286,7 +4782,9 @@ def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(
     )
     target_index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
 
     def bound_case(
         _matrix: Path,
@@ -4322,6 +4820,7 @@ def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(
         campaign: object,
         files: object,
         canary_attestation_sha256: str,
+        **_kwargs: object,
     ) -> dict[str, tuple[str, dict[str, object]]]:
         del files, canary_attestation_sha256
         case = next(iter(cases_by_judge.values()))
@@ -4435,7 +4934,9 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
     result = _result()
     index = SimpleNamespace(inspection_result=result)
     monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
-    monkeypatch.setattr(review, "_validate_review_root", lambda *_args: ledger)
+    monkeypatch.setattr(
+        review, "_validate_review_root", lambda *_args, **_kwargs: ledger
+    )
     monkeypatch.setattr(
         review,
         "_load_bound_case",

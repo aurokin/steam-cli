@@ -2911,6 +2911,9 @@ def test_matrix_layout_allows_private_qualitative_artifact_directories(
     run_state.atomic_publish_private_json(
         matrix_dir / "review-package.json", {"operational": True}
     )
+    run_state.atomic_publish_private_json(
+        matrix_dir / "review-measurement-amendment.json", {"operational": True}
+    )
 
     completed = matrix.execute_matrix(
         config,
@@ -2923,7 +2926,6 @@ def test_matrix_layout_allows_private_qualitative_artifact_directories(
     )
 
     assert completed.state is run_state.MatrixState.COMPLETED
-
 
 @pytest.mark.parametrize("directory", ("judgments", "adjudications"))
 @pytest.mark.parametrize("unsafe", ("symlink", "unexpected-name", "directory"))

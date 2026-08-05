@@ -46,6 +46,9 @@ _MEASUREMENT_AMENDMENT_SCHEMA = (
 _UNAVAILABLE_OPERATION_SCHEMA = (
     "steam-agent-eval-review-unavailable-duration-operation/0.1"
 )
+_DURATION_LOSS_OPERATION_SCHEMA = (
+    "steam-agent-eval-review-duration-loss-operation/0.1"
+)
 _EVENT_VALIDATOR = "codex-jsonl-verdict-binding/0.1"
 _MAX_CASES = 1024
 _MAX_ATTEMPTS = 3
@@ -93,6 +96,7 @@ _MEASUREMENT_AMENDMENT_CLASSES = frozenset(
         "recorded_duration_unreliable",
     }
 )
+_DURATION_LOSS_REASON = "attempt_duration_lost_before_persist"
 _AMENDMENT_UNSET = object()
 _CODEX_ITEM_EVENTS = frozenset(
     {"item.started", "item.updated", "item.completed"}
@@ -555,6 +559,55 @@ def _bound_event_log(path: Path, verdict_content: bytes) -> tuple[int, str]:
     if message_content != verdict_content:
         raise ReviewError("qualitative review event log does not match verdict")
     return summary["events"], digest
+
+
+def _validated_verdict_evidence(
+    verdicts_path: Path,
+    events_path: Path | None,
+    case: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate one production verdict/event pair and return bounded evidence."""
+
+    verdict_document, verdict_content = _read_json_with_content(
+        Path(verdicts_path),
+        schema_name="review-verdicts-0.2.json",
+        require_private=True,
+    )
+    expected_response_target = {
+        "work_item_id": case["target"]["work_item_id"],
+        "projection_sha256": case["target"]["projection_sha256"],
+    }
+    if verdict_document["target"] != expected_response_target:
+        raise ReviewError("qualitative verdicts target a different case")
+    if verdict_document["invocation"] != case["execution"]["invocation"]:
+        raise ReviewError("qualitative verdicts target a different invocation")
+    criteria = [item["id"] for item in case["projection"]["criteria"]]
+    verdict_map = judge._criterion_map(  # noqa: SLF001
+        verdict_document["verdicts"], field="verdict"
+    )
+    if set(verdict_map) != set(criteria):
+        raise ReviewError("qualitative verdicts do not cover the exact rubric")
+    ordered_verdicts = sorted(
+        verdict_document["verdicts"],
+        key=lambda item: criteria.index(item["criterion_id"]),
+    )
+    if events_path is None:
+        raise ReviewError("qualitative review invocation evidence is unavailable")
+    event_count, event_log_sha256 = _bound_event_log(
+        Path(events_path), verdict_content
+    )
+    bound_verdict = {
+        "schema": _VERDICTS_SCHEMA,
+        "target": expected_response_target,
+        "invocation": case["execution"]["invocation"],
+        "verdicts": ordered_verdicts,
+    }
+    return ordered_verdicts, {
+        "event_log_sha256": event_log_sha256,
+        "event_count": event_count,
+        "verdict_bytes_sha256": hashlib.sha256(verdict_content).hexdigest(),
+        "verdict_document_sha256": _sha256(bound_verdict),
+    }
 
 
 def preflight_native_codex(path: Path) -> dict[str, str]:
@@ -1761,12 +1814,19 @@ def _validate_review_root(
         tuple[Path, str, dict[str, Any]]
     ] | None = None
     first_judge = result.manifest.campaign.judges[0].identifier
+    duration_loss_operations = 0
     for name in sorted(operation_names):
         operation = _read_json(
             review_dir / "operations" / name,
             require_private=True,
             require_canonical=True,
         )
+        if operation.get("schema") == _DURATION_LOSS_OPERATION_SCHEMA:
+            duration_loss_operations += 1
+            if duration_loss_operations > 1:
+                raise ReviewError(
+                    "qualitative review duration-loss operation exceeds limit"
+                )
         try:
             if name in judgment_operations:
                 work_item_id, judge_identifier = judgment_operations[name]
@@ -2763,6 +2823,222 @@ def record_measurement_amendment(
             return {**output, "sha256": digest}
 
 
+def recover_duration_loss_judgment(
+    matrix_dir: Path,
+    review_dir: Path,
+    work_item_id: str,
+    verdicts_path: Path,
+    *,
+    events_path: Path,
+    judge_identifier: str,
+    attempt_count: int,
+    isolation_attestation: str,
+) -> dict[str, Any]:
+    """Import one valid first attempt whose host-side duration was lost."""
+
+    if (
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or attempt_count != 1
+        or isolation_attestation != _ISOLATION_ATTESTATION
+    ):
+        raise ReviewError("qualitative review operational measurement is invalid")
+    matrix_dir, review_dir = _separated_review_roots(matrix_dir, review_dir)
+    with matrix.MatrixLock(review_dir):
+        with matrix.MatrixLock(matrix_dir):
+            try:
+                judge._reject_finalized_screen(matrix_dir)  # noqa: SLF001
+                target_index = judge._target_index(matrix_dir)  # noqa: SLF001
+            except (judge.JudgmentError, inspection.InspectionError) as error:
+                raise ReviewError(str(error)) from None
+            measurement_amendment = _load_measurement_amendment(matrix_dir)
+            ledger = _validate_review_root(
+                matrix_dir,
+                review_dir,
+                target_index,
+                measurement_amendment,
+            )
+            canary_attestation_sha256 = _validate_canary_attestation(
+                review_dir, ledger
+            )
+            campaign = target_index.inspection_result.manifest.campaign
+            configured_judges = [
+                item
+                for item in campaign.judges
+                if item.identifier == judge_identifier
+            ]
+            if len(configured_judges) != 1:
+                raise ReviewError("qualitative review judge is not configured")
+            case = _load_bound_case(
+                matrix_dir,
+                review_dir,
+                target_index,
+                ledger,
+                work_item_id,
+                judge_identifier,
+            )
+            retained_judgments = judge._retained_judgments(  # noqa: SLF001
+                matrix_dir, target_index
+            )
+            matching_files = _matching_judgment_files(
+                _retained_judgment_files(matrix_dir, retained_judgments),
+                target=case["target"],
+                judge_identifier=judge_identifier,
+            )
+            operation_path = _operation_path(
+                review_dir, "judgment", work_item_id, judge_identifier
+            )
+
+            # The operation embeds everything needed to finish an interrupted
+            # import, so a retry never depends on the disposable source files.
+            if _node_exists(operation_path):
+                operation = _read_json(
+                    operation_path, require_private=True, require_canonical=True
+                )
+                if operation.get("schema") != _DURATION_LOSS_OPERATION_SCHEMA:
+                    raise ReviewError(
+                        "qualitative review duration-loss recovery is ineligible"
+                    )
+                document, effective_duration = _effective_judgment_operation(
+                    operation,
+                    case=case,
+                    judge_identifier=judge_identifier,
+                    canary_attestation_sha256=canary_attestation_sha256,
+                    measurement_amendment=measurement_amendment,
+                )
+                if (
+                    operation["attempt_count"] != attempt_count
+                    or operation["isolation_attestation"] != isolation_attestation
+                ):
+                    raise ReviewError(
+                        "qualitative review operational measurement does not match "
+                        "operation"
+                    )
+                judge._validate_judgment_document(  # noqa: SLF001
+                    target_index, document
+                )
+                digest = operation["artifact_sha256"]
+                if len(matching_files) > 1:
+                    raise ReviewError("qualitative judgment roster is ambiguous")
+                if matching_files:
+                    path, retained_digest, retained_document = matching_files[0]
+                    if retained_digest != digest or retained_document != document:
+                        raise ReviewError(
+                            "retained judgment does not match review operation"
+                        )
+                    retained = _retained_target(
+                        path, document, digest, kind="judgment"
+                    )
+                    if (
+                        path.name != f"{document['judgment_id']}.json"
+                        or retained is None
+                    ):
+                        raise ReviewError("retained judgment is unavailable")
+                else:
+                    target = (
+                        matrix_dir
+                        / "judgments"
+                        / f"{document['judgment_id']}.json"
+                    )
+                    retained = _retained_target(
+                        target, document, digest, kind="judgment"
+                    )
+                    if retained is None:
+                        retained = _import_document_locked(
+                            matrix_dir, "judgment", document
+                        )
+                return {
+                    "path": retained[0].name,
+                    "sha256": retained[1],
+                    "duration": effective_duration,
+                }
+
+            if matching_files or _amendment_targets_slot(
+                measurement_amendment, case, judge_identifier
+            ):
+                raise ReviewError(
+                    "qualitative review duration-loss recovery is ineligible"
+                )
+            # The matrix registry binds exactly one resolved review_dir, so a
+            # complete scan of this operation ledger is matrix-scoped; copied
+            # review roots fail registry validation above.
+            for path in sorted((review_dir / "operations").iterdir()):
+                operation = _read_json(
+                    path, require_private=True, require_canonical=True
+                )
+                if operation.get("schema") == _DURATION_LOSS_OPERATION_SCHEMA:
+                    raise ReviewError(
+                        "qualitative review duration-loss operation exceeds limit"
+                    )
+
+            ordered_verdicts, bounded_evidence = _validated_verdict_evidence(
+                Path(verdicts_path), Path(events_path), case
+            )
+            document = {
+                "schema": "steam-agent-eval-judgment/0.1",
+                "judgment_id": f"judgment-{work_item_id}-{judge_identifier}",
+                "target": case["target"],
+                "judge": configured_judges[0].to_dict(),
+                "prompt": {
+                    "version": campaign.prompt_version,
+                    "sha256": campaign.prompt_sha256,
+                },
+                "parser": {
+                    "version": campaign.parser_version,
+                    "sha256": campaign.parser_sha256,
+                },
+                "presentation": case["presentation"],
+                "verdicts": ordered_verdicts,
+                "created_at": _now(),
+            }
+            judge._validate_judgment_document(  # noqa: SLF001
+                target_index, document
+            )
+            target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
+            _reject_existing_target(target, kind="judgment")
+            invocation_evidence = {
+                "validator": _EVENT_VALIDATOR,
+                **bounded_evidence,
+            }
+            invocation_evidence["binding_sha256"] = _invocation_evidence_binding(
+                case, document, invocation_evidence
+            )
+            operation = {
+                "schema": _DURATION_LOSS_OPERATION_SCHEMA,
+                "package_id": ledger["package_id"],
+                "kind": "judgment_import",
+                "matrix_id": case["target"]["matrix_id"],
+                "work_item_id": work_item_id,
+                "judge_identifier": judge_identifier,
+                "attempt_count": attempt_count,
+                "duration": {
+                    "state": "unavailable",
+                    "reason": _DURATION_LOSS_REASON,
+                },
+                "usage": {"state": "unavailable"},
+                "isolation_attestation": isolation_attestation,
+                "invocation_evidence": invocation_evidence,
+                "canary_attestation_sha256": canary_attestation_sha256,
+                "case_sha256": _sha256(case),
+                "artifact_sha256": _sha256(document),
+                "artifact": document,
+                "recorded_at": _now(),
+            }
+            _publish_operation(operation_path, operation)
+            _validate_review_root(
+                matrix_dir,
+                review_dir,
+                target_index,
+                measurement_amendment,
+            )
+            path, digest = _import_document_locked(matrix_dir, "judgment", document)
+            return {
+                "path": path.name,
+                "sha256": digest,
+                "duration": operation["duration"],
+            }
+
+
 def _case_entry(
     ledger: dict[str, Any], work_item_id: str, judge_identifier: str
 ) -> dict[str, Any]:
@@ -3033,6 +3309,33 @@ def _validate_unavailable_judgment_operation(
     )
 
 
+def _validate_duration_loss_judgment_operation(
+    operation: dict[str, Any],
+    *,
+    case: dict[str, Any],
+    judge_identifier: str,
+    canary_attestation_sha256: str,
+) -> dict[str, Any]:
+    if (
+        operation.get("schema") != _DURATION_LOSS_OPERATION_SCHEMA
+        or operation.get("attempt_count") != 1
+        or operation.get("duration")
+        != {"state": "unavailable", "reason": _DURATION_LOSS_REASON}
+        or "duration_ms" in operation
+    ):
+        raise ReviewError("qualitative review operation is invalid")
+    shadow = dict(operation)
+    shadow["schema"] = _OPERATION_SCHEMA
+    shadow["duration_ms"] = 0
+    shadow.pop("duration")
+    return _validate_judgment_operation(
+        shadow,
+        case=case,
+        judge_identifier=judge_identifier,
+        canary_attestation_sha256=canary_attestation_sha256,
+    )
+
+
 def _amendment_targets_slot(
     measurement_amendment: tuple[dict[str, Any], str] | None,
     case: dict[str, Any],
@@ -3056,11 +3359,7 @@ def _effective_judgment_operation(
     canary_attestation_sha256: str,
     measurement_amendment: tuple[dict[str, Any], str] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    targeted = _amendment_targets_slot(
-        measurement_amendment,
-        case,
-        judge_identifier,
-    )
+    targeted = _amendment_targets_slot(measurement_amendment, case, judge_identifier)
     amendment_class = (
         measurement_amendment[0].get("amendment_class")
         if targeted and measurement_amendment is not None
@@ -3080,6 +3379,16 @@ def _effective_judgment_operation(
             "state": "unavailable",
             "amendment_sha256": measurement_amendment[1],
         }
+    if operation.get("schema") == _DURATION_LOSS_OPERATION_SCHEMA:
+        if targeted:
+            raise ReviewError("qualitative review operation is invalid")
+        artifact = _validate_duration_loss_judgment_operation(
+            operation,
+            case=case,
+            judge_identifier=judge_identifier,
+            canary_attestation_sha256=canary_attestation_sha256,
+        )
+        return artifact, operation["duration"]
     if amendment_class == "interrupted_attempt_duration_unavailable":
         raise ReviewError("qualitative review operation is invalid")
     artifact = _validate_judgment_operation(
@@ -3586,42 +3895,9 @@ def assemble_judgment(
                 raise ReviewError(
                     "qualitative review operational measurement is invalid"
                 )
-            verdict_document, verdict_content = _read_json_with_content(
-                Path(verdicts_path),
-                schema_name="review-verdicts-0.2.json",
-                require_private=True,
+            ordered_verdicts, bounded_evidence = _validated_verdict_evidence(
+                Path(verdicts_path), events_path, case
             )
-            expected_response_target = {
-                "work_item_id": case["target"]["work_item_id"],
-                "projection_sha256": case["target"]["projection_sha256"],
-            }
-            if verdict_document["target"] != expected_response_target:
-                raise ReviewError("qualitative verdicts target a different case")
-            if verdict_document["invocation"] != case["execution"]["invocation"]:
-                raise ReviewError("qualitative verdicts target a different invocation")
-            criteria = [item["id"] for item in case["projection"]["criteria"]]
-            verdict_map = judge._criterion_map(  # noqa: SLF001
-                verdict_document["verdicts"], field="verdict"
-            )
-            if set(verdict_map) != set(criteria):
-                raise ReviewError("qualitative verdicts do not cover the exact rubric")
-            ordered_verdicts = sorted(
-                verdict_document["verdicts"],
-                key=lambda item: criteria.index(item["criterion_id"]),
-            )
-            if events_path is None:
-                raise ReviewError(
-                    "qualitative review invocation evidence is unavailable"
-                )
-            event_count, event_log_sha256 = _bound_event_log(
-                Path(events_path), verdict_content
-            )
-            bound_verdict = {
-                "schema": _VERDICTS_SCHEMA,
-                "target": expected_response_target,
-                "invocation": case["execution"]["invocation"],
-                "verdicts": ordered_verdicts,
-            }
             document = {
                 "schema": "steam-agent-eval-judgment/0.1",
                 "judgment_id": f"judgment-{work_item_id}-{judge_identifier}",
@@ -3647,10 +3923,7 @@ def assemble_judgment(
             _reject_existing_target(target, kind="judgment")
             invocation_evidence = {
                 "validator": _EVENT_VALIDATOR,
-                "event_log_sha256": event_log_sha256,
-                "event_count": event_count,
-                "verdict_bytes_sha256": hashlib.sha256(verdict_content).hexdigest(),
-                "verdict_document_sha256": _sha256(bound_verdict),
+                **bounded_evidence,
             }
             invocation_evidence["binding_sha256"] = _invocation_evidence_binding(
                 case, document, invocation_evidence
@@ -3945,6 +4218,21 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
         required=True,
         choices=tuple(sorted(_MEASUREMENT_AMENDMENT_CLASSES)),
     )
+    duration_loss_parser = subparsers.add_parser("recover-duration-loss")
+    duration_loss_parser.add_argument("matrix_dir", type=Path)
+    duration_loss_parser.add_argument("review_dir", type=Path)
+    duration_loss_parser.add_argument("work_item_id")
+    duration_loss_parser.add_argument("verdicts", type=Path)
+    duration_loss_parser.add_argument("--events", required=True, type=Path)
+    duration_loss_parser.add_argument("--judge", required=True)
+    duration_loss_parser.add_argument(
+        "--attempt-count", required=True, type=int
+    )
+    duration_loss_parser.add_argument(
+        "--isolation-attestation",
+        required=True,
+        choices=(_ISOLATION_ATTESTATION,),
+    )
     events_parser = subparsers.add_parser("check-events")
     events_parser.add_argument("events", type=Path)
     codex_parser = subparsers.add_parser("preflight-codex")
@@ -4017,6 +4305,17 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
                 args.work_item_id,
                 judge_identifier=args.judge,
                 amendment_class=args.amendment_class,
+            )
+        elif args.command == "recover-duration-loss":
+            result = recover_duration_loss_judgment(
+                args.matrix_dir,
+                args.review_dir,
+                args.work_item_id,
+                args.verdicts,
+                events_path=args.events,
+                judge_identifier=args.judge,
+                attempt_count=args.attempt_count,
+                isolation_attestation=args.isolation_attestation,
             )
         elif args.command == "check-events":
             result = check_event_log(args.events)

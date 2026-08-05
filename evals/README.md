@@ -438,6 +438,41 @@ only a same-attempt resume; it cannot reroll the verdict. Amended duration is
 non-authoritative and never changes scoring. See
 [ADR 0025](../docs/adr/0025-qualitative-review-measurement-amendments.md).
 
+If the exact valid verdict and event-log bytes survived but their externally
+measured duration was lost before any operation or judgment was persisted,
+retain both private files and invoke the dedicated recovery command:
+
+```text
+uv run python -m evals.runner review recover-duration-loss \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
+  "$VERDICT_PATH" --events "$STDOUT_LOG" --judge JUDGE_ID \
+  --attempt-count 1 \
+  --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1
+```
+
+`--attempt-count` must be exactly `1`: the surviving event log proves one valid
+invocation, but no durable event or attempt ledger proves any retry history.
+Initial publication requires a slot with no operation or judgment. The command
+revalidates the exact verdict and event bytes against the case, judge, review
+package, canary, privacy boundary, and isolation attestation, then publishes
+the already observed attempt under the distinct
+`steam-agent-eval-review-duration-loss-operation/0.1` schema and imports its
+judgment. Its duration is recorded as `state=unavailable` with reason
+`attempt_duration_lost_before_persist`; it is non-authoritative and
+scoring-independent.
+
+The operation is the only durable recovery artifact; no duration-loss
+amendment file is created. At most one duration-loss operation may exist per
+matrix. A second operation, an occupied slot, changed evidence, or invalid
+preserved files fails closed. Ordinary `review assemble` cannot create this
+operation or accept the missing duration. If recovery stops after operation
+publication, repeat `recover-duration-loss`: it resumes the missing import
+from the bound operation before consulting the disposable inputs. Never rerun
+a valid verdict merely to recover timing, and never infer, estimate, or
+substitute a duration. ADR 0025 and its single measurement-amendment artifact
+remain unchanged. See
+[ADR 0026](../docs/adr/0026-qualitative-review-duration-loss-recovery.md).
+
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:
 
