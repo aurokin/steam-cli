@@ -1,6 +1,6 @@
 # ADR 0021: diagnostic product benchmark campaigns
 
-Status: accepted 2026-08-04
+Status: accepted 2026-08-04; unavailable-capture clarification 2026-08-04
 
 ## Context
 
@@ -32,6 +32,17 @@ three-judge agreement policy. Projections and imported artifacts remain strict,
 route-blind, privacy-scanned, and hash-bound to the exact retained report and
 rubric. The repository validates imported judgments and adjudications only; it
 does not automate model-judge calls or invent missing outcomes.
+
+A completed benchmark observation remains in the diagnostic denominator when
+tool use, capture, or the selected must-mention path is unavailable. Its
+privacy-cleared answer remains eligible for review, with each affected
+must-mention criterion carrying a bounded explicit zero `capture_unavailable`
+or `path_unavailable` state. The projection never substitutes oracle, fixture,
+claims-sidecar, or other-replicate data. If one valid CLI document exists, the
+projection preserves the strict selected value and its exact cardinality.
+Multiple documents, private material, malformed values, and size violations
+remain fatal. This applies to every benchmark track and changes neither the
+deterministic failure vector nor screen and qualification policy.
 
 The `report` command is available only for benchmark matrices and emits schema
 `steam-agent-eval-benchmark-report/0.1`. It preserves detailed deterministic

@@ -505,6 +505,132 @@ def _conditional_selected_evidence(
     return _bounded_selected_evidence(evidence)
 
 
+def _benchmark_selected_evidence(
+    observation: inspection.Observation, path: str
+) -> tuple[dict[str, Any], int]:
+    """Preserve exact evidence when present, with bounded diagnostic absence."""
+
+    try:
+        document = _captured_cli_document(observation)
+    except JudgmentError as error:
+        if str(error) != "qualitative selected evidence is unavailable":
+            raise
+        if not _coherent_benchmark_capture(observation, captured=False):
+            raise
+        return _bounded_selected_evidence(
+            {"cardinality": "zero", "state": "capture_unavailable"}
+        )
+    if not _coherent_benchmark_capture(observation, captured=True):
+        raise JudgmentError("qualitative selected evidence is unavailable")
+    try:
+        return _selected_evidence(document, path)
+    except JudgmentError as error:
+        if str(error) != "qualitative selected evidence is unavailable":
+            raise
+        return _bounded_selected_evidence(
+            {"cardinality": "zero", "state": "path_unavailable"}
+        )
+
+
+def _coherent_benchmark_capture(
+    observation: inspection.Observation, *, captured: bool
+) -> bool:
+    documents = observation.report.get("required_cli_documents")
+    diagnostics = observation.report.get("diagnostics")
+    capture = (
+        diagnostics.get("evidence_capture")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    keys = {
+        "state",
+        "source",
+        "matching_attempts",
+        "successful_candidates",
+        "turn",
+        "completion_sequence",
+    }
+    if (
+        not isinstance(documents, list)
+        or not isinstance(capture, dict)
+        or set(capture) != keys
+    ):
+        return False
+    matching = capture["matching_attempts"]
+    successful = capture["successful_candidates"]
+    turn = capture["turn"]
+    sequence = capture["completion_sequence"]
+    if (
+        not isinstance(matching, int)
+        or isinstance(matching, bool)
+        or matching < 0
+        or not isinstance(successful, int)
+        or isinstance(successful, bool)
+        or successful < 0
+        or (
+            turn is not None
+            and (
+                not isinstance(turn, int) or isinstance(turn, bool) or turn < 0
+            )
+        )
+        or (
+            sequence is not None
+            and (
+                not isinstance(sequence, int)
+                or isinstance(sequence, bool)
+                or sequence < 0
+            )
+        )
+    ):
+        return False
+    state = capture["state"]
+    source = capture["source"]
+    if captured:
+        return (
+            state == "captured"
+            and source in {"aggregate", "deltas", "unknown"}
+            and matching >= 1
+            and successful == 1
+            and turn is not None
+            and len(documents) == 1
+        )
+    if documents:
+        return False
+    if state == "command_missing":
+        return (
+            source is None
+            and matching == 0
+            and successful == 0
+            and turn is None
+            and sequence is None
+        )
+    if state == "command_failed":
+        return (
+            source is None
+            and matching >= 1
+            and successful == 0
+            and turn is None
+            and sequence is None
+        )
+    if state == "multiple_candidates":
+        # The runner retains zero documents here; multiple retained documents
+        # are the distinct ambiguous case rejected by _captured_cli_document.
+        return (
+            source is None
+            and successful >= 2
+            and matching >= successful
+            and turn is None
+            and sequence is None
+        )
+    return (
+        state in {"output_absent", "invalid_json"}
+        and source in {"aggregate", "deltas", "unknown"}
+        and matching >= 1
+        and successful == 1
+        and turn is not None
+    )
+
+
 def _contains_private_material(value: Any) -> bool:
     """Scan parsed strings for canaries and private paths within fixed bounds."""
 
@@ -607,14 +733,20 @@ def _qualitative_projection(
         for item in scenario.qualitative_criteria
         if item.source == "fact_rubric.must_mention"
     )
-    allow_unavailable_must_mention = (
+    benchmark_must_mention = (
+        campaign is not None and campaign.campaign_kind == "benchmark"
+    )
+    screen_answer_must_mention = (
         campaign is not None
         and campaign.campaign_kind == "screen"
         and observation.work_item.track == "answer"
     )
     requires_exact_must_mention = bool(must_mention) and (
-        not allow_unavailable_must_mention
-        or any(item.screen_safety_gate for item in must_mention)
+        not benchmark_must_mention
+        and (
+            not screen_answer_must_mention
+            or any(item.screen_safety_gate for item in must_mention)
+        )
     )
     captured_document = (
         _captured_cli_document(observation)
@@ -627,7 +759,12 @@ def _qualitative_projection(
         projected = criterion.to_dict()
         if criterion.source == "fact_rubric.must_mention":
             assert criterion.evidence_path is not None
-            if allow_unavailable_must_mention and not criterion.screen_safety_gate:
+            # Valid manifests reserve screen_safety_gate for hard-fact criteria.
+            if benchmark_must_mention:
+                evidence, evidence_size = _benchmark_selected_evidence(
+                    observation, criterion.evidence_path
+                )
+            elif screen_answer_must_mention and not criterion.screen_safety_gate:
                 evidence, evidence_size = _conditional_selected_evidence(
                     observation, criterion.evidence_path
                 )

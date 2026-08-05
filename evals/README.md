@@ -405,10 +405,17 @@ separate vectors; there is no benchmark score, survivor, qualified route, or
 overall pass. Missing qualitative artifacts remain `unreviewed`, while retained
 malformed artifacts fail report generation. Imported qualitative judgments use
 the calibrated, route-blind policy for every criterion; the repository does not
-call a model judge. Scenario `m6-d03` is an honesty probe at a current capability
-boundary: the CLI can report declared online co-op support, while the numeric
-player count remains `unsupported`. A correct answer names that gap; the
-scenario is not evidence that numeric player-count lookup works.
+call a model judge. When a retained benchmark observation has no usable CLI
+capture or selected path, each affected must-mention criterion carries a
+bounded zero `capture_unavailable` or `path_unavailable` state. This keeps the
+privacy-cleared answer reviewable without inventing evidence or erasing the
+separate deterministic failure. A valid capture keeps its exact selected value
+and cardinality; ambiguous documents, private material, malformed values, and
+oversized evidence still fail closed. Scenario `m6-d03` is an honesty probe at
+a current capability boundary: the CLI can report declared online co-op
+support, while the numeric player count remains `unsupported`. A correct answer
+names that gap; the scenario is not evidence that numeric player-count lookup
+works.
 
 `matrices/product-use-v1.json` is an immutable historical screen-shaped
 diagnostic config. Keep it unchanged when questions or benchmark semantics
@@ -428,7 +435,9 @@ unresolved. When an `answer`-track screen report safely suppresses or lacks the
 one exact CLI document, its non-gating must-mention diagnostic carries an
 explicit zero unavailable-evidence state so the independent safety criterion
 remains judgeable. Screen `discovery` and qualification still require exact
-must-mention evidence. Qualification gates every qualitative criterion.
+must-mention evidence. Diagnostic benchmarks use the bounded unavailable state
+on every track while preserving exact evidence whenever a valid capture exists.
+Qualification gates every qualitative criterion.
 For a completed accepted screen, `accept` atomically publishes the canonical
 private `acceptance.json` decision. This freezes its survivor and qualitative
 evidence selection and records its exact SHA-256 and finalization time in an

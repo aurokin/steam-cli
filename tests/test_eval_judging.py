@@ -1170,27 +1170,9 @@ def test_screen_answer_projects_unavailable_must_mention_as_zero_evidence(
             ],
             {"state": "captured", "successful_candidates": 1},
         ),
-        (
-            "benchmark",
-            "answer",
-            [],
-            {"state": "multiple_candidates", "successful_candidates": 2},
-        ),
-        (
-            "benchmark",
-            "discovery",
-            [
-                {
-                    "omitted": "unsafe-trace-content",
-                    "sha256": "a" * 64,
-                    "length": 128,
-                }
-            ],
-            {"state": "captured", "successful_candidates": 1},
-        ),
     ),
 )
-def test_discovery_and_qualification_require_exact_must_mention_evidence(
+def test_screen_discovery_and_qualification_require_exact_must_mention_evidence(
     tmp_path: Path,
     campaign_kind: str,
     track: str,
@@ -1211,6 +1193,230 @@ def test_discovery_and_qualification_require_exact_must_mention_evidence(
             result.manifest.inputs.scenarios[0],
             campaign=result.manifest.campaign,
         )
+
+
+@pytest.mark.parametrize(
+    ("track", "documents", "capture", "expected"),
+    (
+        (
+            "answer",
+            [],
+            {
+                "state": "multiple_candidates",
+                "source": None,
+                "matching_attempts": 2,
+                "successful_candidates": 2,
+                "turn": None,
+                "completion_sequence": None,
+            },
+            {"cardinality": "zero", "state": "capture_unavailable"},
+        ),
+        (
+            "discovery",
+            [
+                {
+                    "omitted": "unsafe-trace-content",
+                    "sha256": "a" * 64,
+                    "length": 128,
+                }
+            ],
+            {
+                "state": "captured",
+                "source": "aggregate",
+                "matching_attempts": 1,
+                "successful_candidates": 1,
+                "turn": 0,
+                "completion_sequence": 0,
+            },
+            {"cardinality": "zero", "state": "path_unavailable"},
+        ),
+        (
+            "skill",
+            [],
+            {
+                "state": "command_missing",
+                "source": None,
+                "matching_attempts": 0,
+                "successful_candidates": 0,
+                "turn": None,
+                "completion_sequence": None,
+            },
+            {"cardinality": "zero", "state": "capture_unavailable"},
+        ),
+    ),
+)
+def test_benchmark_projects_unavailable_must_mention_as_zero_evidence(
+    tmp_path: Path,
+    track: str,
+    documents: list[dict[str, Any]],
+    capture: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    result, criterion = _with_must_mention(
+        _inspection(tmp_path, campaign_kind="benchmark")
+    )
+    result = _with_observation_track(result, track)
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = documents
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = capture
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation,
+        result.manifest.inputs.scenarios[0],
+        campaign=result.manifest.campaign,
+    )
+
+    projected = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
+    assert projected["selected_evidence"] == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "source", "matching", "successful", "turn", "sequence"),
+    (
+        ("command_missing", None, 0, 0, None, None),
+        ("command_failed", None, 1, 0, None, None),
+        ("multiple_candidates", None, 2, 2, None, None),
+        ("output_absent", "aggregate", 1, 1, 0, 0),
+        ("invalid_json", "unknown", 1, 1, 0, None),
+    ),
+)
+def test_benchmark_accepts_only_runner_unavailable_capture_states(
+    tmp_path: Path,
+    state: str,
+    source: str | None,
+    matching: int,
+    successful: int,
+    turn: int | None,
+    sequence: int | None,
+) -> None:
+    result, criterion = _with_must_mention(
+        _inspection(tmp_path, campaign_kind="benchmark")
+    )
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = []
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = {
+        "state": state,
+        "source": source,
+        "matching_attempts": matching,
+        "successful_candidates": successful,
+        "turn": turn,
+        "completion_sequence": sequence,
+    }
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation,
+        result.manifest.inputs.scenarios[0],
+        campaign=result.manifest.campaign,
+    )
+
+    projected = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
+    assert projected["selected_evidence"] == {
+        "cardinality": "zero",
+        "state": "capture_unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "missing_documents",
+        "missing_capture",
+        "captured_without_document",
+        "unavailable_with_document",
+        "boolean_count",
+        "negative_count",
+        "unknown_state",
+        "partial_diagnostic",
+    ),
+)
+def test_benchmark_rejects_malformed_unavailable_capture(
+    tmp_path: Path, malformation: str
+) -> None:
+    result, _criterion = _with_must_mention(
+        _inspection(tmp_path, campaign_kind="benchmark")
+    )
+    observation = result.observations[0]
+    capture = observation.report["diagnostics"]["evidence_capture"]
+    if malformation == "missing_documents":
+        observation.report.pop("required_cli_documents")
+    elif malformation == "missing_capture":
+        observation.report["diagnostics"].pop("evidence_capture")
+    elif malformation == "captured_without_document":
+        observation.report["required_cli_documents"] = []
+    else:
+        capture.update(
+            {
+                "state": "command_missing",
+                "source": None,
+                "matching_attempts": 0,
+                "successful_candidates": 0,
+                "turn": None,
+                "completion_sequence": None,
+            }
+        )
+        if malformation == "unavailable_with_document":
+            pass
+        elif malformation == "boolean_count":
+            observation.report["required_cli_documents"] = []
+            capture["matching_attempts"] = False
+        elif malformation == "negative_count":
+            observation.report["required_cli_documents"] = []
+            capture["successful_candidates"] = -1
+        elif malformation == "unknown_state":
+            observation.report["required_cli_documents"] = []
+            capture["state"] = "unknown"
+        else:
+            observation.report["required_cli_documents"] = []
+            capture.pop("turn")
+
+    with pytest.raises(judge.JudgmentError, match="selected evidence is unavailable"):
+        judge._qualitative_projection(  # noqa: SLF001
+            observation,
+            result.manifest.inputs.scenarios[0],
+            campaign=result.manifest.campaign,
+        )
+
+
+def test_benchmark_preserves_plural_must_mention_cardinality(tmp_path: Path) -> None:
+    result = _inspection(tmp_path, campaign_kind="benchmark")
+    scenario = result.manifest.inputs.scenarios[0]
+    criterion = run_state.matrix_qualitative_criteria(
+        (), ("$.data.games[*].name",)
+    )[0]
+    scenario = replace(
+        scenario,
+        rubric_sha256="9" * 64,
+        criterion_ids=(*scenario.criterion_ids, criterion.criterion_id),
+        qualitative_criteria=(*scenario.qualitative_criteria, criterion),
+    )
+    observation = result.observations[0]
+    observation.report["required_cli_documents"] = [
+        {"data": {"games": [{"name": "Portal 2"}]}}
+    ]
+    observation.report.setdefault("diagnostics", {})["evidence_capture"] = {
+        "state": "captured",
+        "source": "aggregate",
+        "matching_attempts": 1,
+        "successful_candidates": 1,
+        "turn": 0,
+        "completion_sequence": 0,
+    }
+
+    projection = judge._qualitative_projection(  # noqa: SLF001
+        observation, scenario, campaign=result.manifest.campaign
+    )
+
+    projected = next(
+        item for item in projection["criteria"] if item["id"] == criterion.criterion_id
+    )
+    assert projected["selected_evidence"] == {
+        "cardinality": "many",
+        "values": ["Portal 2"],
+    }
 
 
 def test_benchmark_requires_calibrated_policy_for_every_criterion(
@@ -1262,13 +1468,21 @@ def test_screen_answer_keeps_exact_must_mention_evidence(tmp_path: Path) -> None
         ([{"data": {"steam_id64": "x" * (1024 * 1024)}}], "exceeds safety limits"),
     ),
 )
-def test_screen_answer_unavailable_exception_still_rejects_unsafe_evidence(
+@pytest.mark.parametrize(
+    ("campaign_kind", "track"),
+    (("screen", "answer"), ("benchmark", "discovery")),
+)
+def test_unavailable_must_mention_exception_still_rejects_unsafe_evidence(
     tmp_path: Path,
     documents: list[dict[str, Any]],
     expected: str,
+    campaign_kind: str,
+    track: str,
 ) -> None:
-    result, _criterion = _with_must_mention(_inspection(tmp_path))
-    result = _with_observation_track(result, "answer")
+    result, _criterion = _with_must_mention(
+        _inspection(tmp_path, campaign_kind=campaign_kind)
+    )
+    result = _with_observation_track(result, track)
     observation = result.observations[0]
     observation.report["required_cli_documents"] = documents
 

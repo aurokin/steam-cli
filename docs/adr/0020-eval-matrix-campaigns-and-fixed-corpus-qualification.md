@@ -1,6 +1,6 @@
 # ADR 0020: eval matrix campaigns and fixed-corpus qualification
 
-Status: accepted 2026-08-02
+Status: accepted 2026-08-02; benchmark projection clarification 2026-08-04
 
 ## Context
 
@@ -105,7 +105,12 @@ This keeps an unavailable non-gating correctness diagnostic from suppressing
 an independent safety-gate judgment. The `discovery` arm and qualification
 still require the exact selected value, and an ambiguous retained document,
 private material, malformed value, or oversized selection remains invalid in
-every arm. Conditional support represents zero, one, or many selected values,
+every arm. ADR 0021 extends the bounded unavailable state to all tracks of a
+diagnostic benchmark: deterministic failures remain separate, and a valid
+capture preserves its exact selected value and cardinality rather than using a
+fallback. No projection sources evidence from the oracle, fixture, claims
+sidecar, or another replicate. Conditional support represents zero, one, or
+many selected values,
 preserves explicit unknown, false, and empty states, fails unsupported or wrong
 assertions, and passes true omission.
 Each selected-evidence source is schema-bounded to six paths. A selected value

@@ -162,6 +162,17 @@ qualified route, or overall pass. Benchmark campaigns are diagnostic and
 cannot be accepted or finalized. Missing qualitative artifacts remain
 unreviewed; malformed retained artifacts fail closed.
 
+A completed benchmark observation remains part of the diagnostic denominator
+when tool use or evidence capture failed. Its privacy-cleared answer therefore
+remains reviewable: an unavailable CLI capture or selected must-mention path is
+represented as a bounded explicit zero state. The projection never backfills
+from the oracle, fixtures, claims sidecar, or another replicate. When a valid
+capture exists, its exact selected value and cardinality are preserved;
+ambiguous, private, malformed, or oversized evidence remains invalid. This
+exception applies to every benchmark track because none is an acceptance path.
+Screen discovery and qualification continue to require exact must-mention
+evidence.
+
 An observed benchmark config is historical evidence and is not rewritten.
 Changing a product question, scenario selection, rubric, route, track, or
 replicate policy requires a new versioned config and fresh observations. These
