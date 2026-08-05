@@ -36,17 +36,22 @@ response-schema digest, and an explicit policy that usage accounting is
 unavailable. Import requires the operator to attest to that exact versioned
 isolation profile because the runner cannot observe an external process.
 Prepared cases must remain their exact canonical bytes, and external verdict
-outputs must be private mode-`0600` regular files.
+outputs and Codex JSONL event logs must be private mode-`0600` regular files.
 
 The assembler accepts one exact-rubric verdict response whose work-item and
 projection hashes must match the prepared case, creates the existing
 `steam-agent-eval-judgment/0.1` envelope, and imports it through the existing
 privacy and policy validator. Its append-only private operation records the
 case and artifact digests, externally measured duration, unavailable usage
-state, and an attempt count of one through three. Three means the initial call
-plus at most two retries, and retries are permitted only for transport failure
-or structurally invalid output. A valid `uncertain` verdict or disagreement is
-never retryable.
+state, and an attempt count of one through three. Private operation schema
+`0.2` also binds the successful invocation: the sole completed, tool-free
+Codex `agent_message.text` UTF-8 bytes must exactly equal the raw verdict-file
+bytes. The operation retains only the validator identity, bounded event count,
+event-log and verdict-byte SHA-256 values, a normalized verdict-document
+SHA-256, and their case-and-artifact binding; event and reasoning text are
+never retained. Three attempts means the initial call plus at most two retries,
+and retries are permitted only for transport failure or structurally invalid
+output. A valid `uncertain` verdict or disagreement is never retryable.
 
 After one configured judgment per judge identity exists for every case, the
 resolver derives agreement outcomes without a model call. Unanimous `pass` or
@@ -54,7 +59,10 @@ resolver derives agreement outcomes without a model call. Unanimous `pass` or
 `unresolved`. It imports the existing adjudication schema and records another
 append-only operation. The review lock is always acquired before the matrix
 lock, and the matrix conflict check, operation publication, and target import
-occur under both. An interrupted import resumes from the bound operation
+occur under both. Before any append, every existing canonical operation name is
+bound back to its exact prepared case and validated with its kind-specific
+operation and embedded-artifact validators. This preflight never imports a
+missing target, preserving operation-first recovery. An interrupted import resumes from the bound operation
 before consulting any disposable response file, without regenerating model
 output. Judgment uniqueness is semantic rather than filename-based: one target
 and configured judge can have at most one retained artifact, and resume accepts

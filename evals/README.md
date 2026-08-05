@@ -320,7 +320,7 @@ externally measured total attempts and duration:
 ```text
 uv run python -m evals.runner review assemble \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review WORK_ITEM_ID \
-  "$VERDICT_PATH" --judge judge-1 \
+  "$VERDICT_PATH" --events "$STDOUT_LOG" --judge judge-1 \
   --attempt-count 1 --duration-ms 12345 \
   --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1
 ```
@@ -337,7 +337,13 @@ infer that fact from an external process. Configuration readback proves the
 settings were accepted, not the effective model-visible inventory; the residual
 inventory described above was established separately from source and wire
 evidence. Any CLI, model catalog, or profile change invalidates this
-attestation. `check-events` privately parses the `--json` log and requires one
+attestation. `check-events` is a standalone preflight, while `assemble`
+independently enforces the same checks on the required `--events` file and
+requires its sole completed `agent_message.text` UTF-8 bytes to equal the raw
+verdict-file bytes exactly. The private operation `0.2` evidence records only
+bounded counts and SHA-256 bindings for the event log, raw verdict bytes, and
+normalized verdict document; it never records event, reasoning, or message
+text. `check-events` privately parses the `--json` log and requires one
 `thread.started`, then one `turn.started`, only stable-ID reasoning or
 `agent_message` item lifecycles that all complete, exactly one completed
 `agent_message`, and finally one `turn.completed` with nothing after it. A
@@ -347,10 +353,11 @@ completion invalidates that attempt. Treat it like a transport or structural
 failure: discard that invocation root and retry from a new root, counting it
 toward the initial-plus-two limit. Never retry a valid `uncertain` verdict. The
 `umask 077`, precreated output, and post-call checks are also required: the
-assembler rejects a verdict output unless it is a mode-`0600` regular file no
-larger than 16 MiB. Import the result before the `EXIT` trap removes its fresh
-root. Operation timestamps use the existing matrix invariant: a non-empty,
-parseable, timezone-aware timestamp.
+assembler rejects either input unless it is a mode-`0600` regular file no
+larger than 16 MiB. Initial import must finish before the `EXIT` trap removes
+both disposable files. An operation-first crash may resume from the bound
+private operation after both files are gone. Operation timestamps use the
+existing matrix invariant: a non-empty, parseable, timezone-aware timestamp.
 
 Once all three judgments exist for every case, resolve agreement mechanically
 and render the updated benchmark report:

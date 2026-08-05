@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -168,6 +169,46 @@ def _write_event_log(path: Path, events: list[dict[str, object]]) -> None:
         )
     )
     path.chmod(0o600)
+
+
+def _write_bound_event_log(path: Path, verdicts_path: Path) -> Path:
+    events = _valid_event_log()
+    message = events[-2]["item"]
+    assert isinstance(message, dict)
+    message["text"] = verdicts_path.read_bytes().decode("utf-8")
+    _write_event_log(path, events)
+    return path
+
+
+def _invocation_evidence(
+    artifact: dict[str, object],
+    *,
+    case: dict[str, object] | None = None,
+) -> dict[str, object]:
+    bound_case = _case() if case is None else case
+    target = bound_case["target"]
+    execution = bound_case["execution"]
+    assert isinstance(target, dict) and isinstance(execution, dict)
+    bound_verdict = {
+        "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+        "target": {
+            "work_item_id": target["work_item_id"],
+            "projection_sha256": target["projection_sha256"],
+        },
+        "invocation": execution["invocation"],
+        "verdicts": artifact.get("verdicts"),
+    }
+    evidence = {
+        "validator": review._EVENT_VALIDATOR,  # noqa: SLF001
+        "event_log_sha256": "e" * 64,
+        "event_count": 5,
+        "verdict_bytes_sha256": "f" * 64,
+        "verdict_document_sha256": review._sha256(bound_verdict),  # noqa: SLF001
+    }
+    evidence["binding_sha256"] = review._invocation_evidence_binding(  # noqa: SLF001
+        bound_case, artifact, evidence
+    )
+    return evidence
 
 
 def _valid_event_log() -> list[dict[str, object]]:
@@ -530,7 +571,9 @@ def test_review_root_rejects_non_string_work_item_without_type_error(
     ledger_path.write_bytes(review._canonical_bytes(ledger))  # noqa: SLF001
 
     with pytest.raises(review.ReviewError, match="ledger is invalid"):
-        review._validate_review_root(review_dir, result)  # noqa: SLF001
+        review._validate_review_root(  # noqa: SLF001
+            matrix_dir, review_dir, index
+        )
 
 
 def test_bound_case_rejects_semantically_equal_noncanonical_bytes(
@@ -927,6 +970,7 @@ def test_judgment_operation_rejects_non_object_judge() -> None:
         "duration_ms": 1,
         "usage": {"state": "unavailable"},
         "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "invocation_evidence": _invocation_evidence(artifact),
         "case_sha256": review._sha256(_case()),  # noqa: SLF001
         "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
         "artifact": artifact,
@@ -955,6 +999,7 @@ def test_judgment_operation_requires_deterministic_judgment_id() -> None:
         "duration_ms": 1,
         "usage": {"state": "unavailable"},
         "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "invocation_evidence": _invocation_evidence(artifact),
         "case_sha256": review._sha256(_case()),  # noqa: SLF001
         "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
         "artifact": artifact,
@@ -986,6 +1031,7 @@ def test_operation_validators_reject_invalid_recorded_at(recorded_at: object) ->
         "duration_ms": 1,
         "usage": {"state": "unavailable"},
         "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "invocation_evidence": _invocation_evidence(judgment_artifact),
         "case_sha256": review._sha256(_case()),  # noqa: SLF001
         "artifact_sha256": review._sha256(judgment_artifact),  # noqa: SLF001
         "artifact": judgment_artifact,
@@ -1108,6 +1154,8 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     )
     assert 'exec --json --ephemeral' in documentation
     assert 'review check-events "$STDOUT_LOG"' in documentation
+    assert '"$VERDICT_PATH" --events "$STDOUT_LOG" --judge judge-1' in documentation
+    assert "operation `0.2` evidence" in documentation
     assert "tool-free" not in documentation
     invocation = documentation.split(
         "Then invoke the judge with the isolated environment:", maxsplit=1
@@ -1310,12 +1358,14 @@ def test_assemble_wraps_external_verdicts_and_records_operation(
     monkeypatch.setattr(review, "_import_document_locked", fake_import)
     verdicts = tmp_path / "verdicts.json"
     review._write_json(verdicts, _verdict_document())  # noqa: SLF001
+    events = _write_bound_event_log(tmp_path / "events.jsonl", verdicts)
 
     output = review.assemble_judgment(
         matrix_dir,
         review_dir,
         WORK_ITEM_ID,
         verdicts,
+        events_path=events,
         judge_identifier="judge-1",
         attempt_count=2,
         duration_ms=1234,
@@ -1335,7 +1385,179 @@ def test_assemble_wraps_external_verdicts_and_records_operation(
     assert operation["duration_ms"] == 1234
     assert operation["usage"] == {"state": "unavailable"}
     assert operation["isolation_attestation"] == review._ISOLATION_ATTESTATION  # noqa: SLF001
+    assert operation["invocation_evidence"]["event_log_sha256"] == hashlib.sha256(
+        events.read_bytes()
+    ).hexdigest()
+    assert operation["invocation_evidence"]["verdict_bytes_sha256"] == (
+        hashlib.sha256(verdicts.read_bytes()).hexdigest()
+    )
     assert operation["case_sha256"] == review._sha256(_case())  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "malformed",
+        "foreign",
+        "embedded",
+        "noncanonical",
+        "retained_mismatch",
+        "malformed_adjudication",
+        "embedded_adjudication",
+    ],
+)
+def test_assemble_preflights_every_retained_operation_before_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    result = _result()
+    index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(
+        review,
+        "_case_document",
+        lambda _matrix, _index, _work_item, judge_identifier: _case(
+            judge_identifier
+        ),
+    )
+    monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
+
+    def full_validate(_index: object, artifact: dict[str, object]) -> None:
+        if "schema" not in artifact:
+            raise review.judge.JudgmentError("embedded judgment is invalid")
+
+    monkeypatch.setattr(review.judge, "_validate_judgment_document", full_validate)
+
+    def full_adjudication_validate(
+        *_args: object, **_kwargs: object
+    ) -> None:
+        artifact = _args[2]
+        assert isinstance(artifact, dict)
+        if "schema" not in artifact:
+            raise review.judge.JudgmentError("embedded adjudication is invalid")
+
+    monkeypatch.setattr(
+        review.judge,
+        "_validate_adjudication_document",
+        full_adjudication_validate,
+    )
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    review_dir = tmp_path / "prepared"
+    review.prepare(matrix_dir, review_dir)
+    is_adjudication = mutation.endswith("adjudication")
+    retained_path = review_dir / "operations" / (
+        f"adjudication-{WORK_ITEM_ID}-agreement.json"
+        if is_adjudication
+        else f"judgment-{WORK_ITEM_ID}-judge-2.json"
+    )
+    if mutation in {"malformed", "noncanonical", "malformed_adjudication"}:
+        operation: dict[str, object] = {}
+    elif mutation == "embedded_adjudication":
+        artifact = {
+            "adjudication_id": f"adjudication-{WORK_ITEM_ID}",
+            "target": TARGET,
+        }
+        operation = {
+            "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "kind": "adjudication_import",
+            "matrix_id": TARGET["matrix_id"],
+            "work_item_id": WORK_ITEM_ID,
+            "case_sha256": review._sha256(_case()),  # noqa: SLF001
+            "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
+            "artifact": artifact,
+            "recorded_at": "2026-08-04T12:00:00Z",
+        }
+    else:
+        bound_judge = "judge-1" if mutation == "foreign" else "judge-2"
+        case = _case(bound_judge)
+        artifact = {
+            "judgment_id": f"judgment-{WORK_ITEM_ID}-{bound_judge}",
+            "target": TARGET,
+            "judge": run_state.CALIBRATED_JUDGE_CONFIGURATIONS[
+                int(bound_judge[-1]) - 1
+            ].to_dict(),
+            "verdicts": [
+                {
+                    "criterion_id": "clear",
+                    "verdict": "pass",
+                    "rationale": "Clear verdict.",
+                },
+                {
+                    "criterion_id": "aligned",
+                    "verdict": "pass",
+                    "rationale": "Claims align.",
+                },
+            ],
+        }
+        if mutation == "retained_mismatch":
+            artifact["schema"] = "steam-agent-eval-judgment/0.1"
+            artifact["created_at"] = "2026-08-04T12:00:00Z"
+        operation = {
+            "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "kind": "judgment_import",
+            "matrix_id": TARGET["matrix_id"],
+            "work_item_id": WORK_ITEM_ID,
+            "judge_identifier": bound_judge,
+            "attempt_count": 1,
+            "duration_ms": 1,
+            "usage": {"state": "unavailable"},
+            "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            "invocation_evidence": _invocation_evidence(artifact, case=case),
+            "case_sha256": review._sha256(case),  # noqa: SLF001
+            "artifact_sha256": review._sha256(artifact),  # noqa: SLF001
+            "artifact": artifact,
+            "recorded_at": "2026-08-04T12:00:00Z",
+        }
+    if mutation == "noncanonical":
+        retained_path.write_text("{ }\n")
+        retained_path.chmod(0o600)
+    else:
+        review._write_json(retained_path, operation)  # noqa: SLF001
+    if mutation == "retained_mismatch":
+        retained_artifact = json.loads(json.dumps(operation["artifact"]))
+        retained_artifact["created_at"] = "2026-08-04T13:00:00Z"
+        retained_digest = review._sha256(retained_artifact)  # noqa: SLF001
+        target_root = matrix_dir / "judgments"
+        target_root.mkdir(mode=0o700)
+        target_path = target_root / f"judgment-{WORK_ITEM_ID}-judge-2.json"
+        review._write_json(target_path, retained_artifact)  # noqa: SLF001
+        monkeypatch.setattr(
+            review.judge,
+            "_retained_judgments",
+            lambda *_args: {retained_digest: retained_artifact},
+        )
+    monkeypatch.setattr(
+        review,
+        "_publish_operation",
+        lambda *_args: pytest.fail("global preflight must precede operation append"),
+    )
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda *_args: pytest.fail("global preflight must precede artifact import"),
+    )
+
+    with pytest.raises(review.ReviewError, match="operation|canonical"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            tmp_path / "missing-verdicts.json",
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    assert retained_path.is_file()
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+    if mutation == "retained_mismatch":
+        assert [item.name for item in (matrix_dir / "judgments").iterdir()] == [
+            f"judgment-{WORK_ITEM_ID}-judge-2.json"
+        ]
+    else:
+        assert not (matrix_dir / "judgments").exists()
 
 
 def _mock_assembly(
@@ -1358,6 +1580,75 @@ def _mock_assembly(
         review.judge, "_validate_judgment_document", lambda *_args: None
     )
     return matrix_dir, review_dir
+
+
+@pytest.mark.parametrize(
+    "event_state",
+    ["missing", "mismatch", "reformatted", "tool", "malformed", "public"],
+)
+def test_assemble_requires_bound_successful_event_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_state: str
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path: Path | None = None
+    if event_state in {"mismatch", "reformatted"}:
+        other = _verdict_document()
+        other_path = tmp_path / "other-verdicts.json"
+        if event_state == "mismatch":
+            other["verdicts"][0]["rationale"] = "Different valid rationale."
+            review._write_json(other_path, other)  # noqa: SLF001
+        else:
+            other_path.write_text(json.dumps(other, indent=2))
+            other_path.chmod(0o600)
+        events_path = _write_bound_event_log(tmp_path / "events.jsonl", other_path)
+    elif event_state == "tool":
+        events = _valid_event_log()
+        message = events[-2]["item"]
+        assert isinstance(message, dict)
+        message["text"] = verdicts_path.read_bytes().decode("utf-8")
+        events.insert(
+            -1,
+            {
+                "type": "item.completed",
+                "item": {"id": "tool-1", "type": "command_execution"},
+            },
+        )
+        events_path = tmp_path / "events.jsonl"
+        _write_event_log(events_path, events)
+    elif event_state == "malformed":
+        events_path = tmp_path / "events.jsonl"
+        events_path.write_bytes(b'{"type":"thread.started"}\n{"type":')
+        events_path.chmod(0o600)
+    elif event_state == "public":
+        events_path = _write_bound_event_log(
+            tmp_path / "events.jsonl", verdicts_path
+        )
+        events_path.chmod(0o644)
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda *_args: pytest.fail("invalid event evidence must not import"),
+    )
+
+    with pytest.raises(review.ReviewError, match="event|invocation evidence|input"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    assert not (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    ).exists()
+    assert not (matrix_dir / "judgments").exists()
 
 
 def test_assemble_rejects_verdicts_bound_to_another_case(
@@ -1440,6 +1731,7 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
     matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
     calls = 0
 
     def interrupted_import(
@@ -1458,6 +1750,7 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
             review_dir,
             WORK_ITEM_ID,
             verdicts_path,
+            events_path=events_path,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=10,
@@ -1466,6 +1759,7 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
     operation_path = review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
     assert operation_path.is_file()
     verdicts_path.unlink()
+    events_path.unlink()
 
     output = review.assemble_judgment(
         matrix_dir,
@@ -1481,19 +1775,13 @@ def test_assemble_resumes_from_operation_after_verdict_is_deleted(
     assert calls == 2
 
 
-@pytest.mark.parametrize(
-    ("attempt_count", "duration_ms"),
-    [(2, 10), (1, 11)],
-)
-def test_assemble_resume_rejects_different_operational_measurements(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    attempt_count: int,
-    duration_ms: int,
+def test_assemble_resume_rejects_tampered_invocation_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
     calls = 0
 
     def interrupted_import(*_args: object) -> tuple[Path, str]:
@@ -1508,6 +1796,69 @@ def test_assemble_resume_rejects_different_operational_measurements(
             review_dir,
             WORK_ITEM_ID,
             verdicts_path,
+            events_path=events_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+    operation_path = (
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json"
+    )
+    operation = review._read_json(  # noqa: SLF001
+        operation_path, require_private=True
+    )
+    operation["invocation_evidence"]["event_log_sha256"] = "0" * 64
+    operation_path.write_bytes(review._canonical_bytes(operation))  # noqa: SLF001
+    operation_path.chmod(0o600)
+    verdicts_path.unlink()
+    events_path.unlink()
+
+    with pytest.raises(review.ReviewError, match="operation is invalid"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=10,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+    assert calls == 1
+    assert not (matrix_dir / "judgments").exists()
+
+
+@pytest.mark.parametrize(
+    ("attempt_count", "duration_ms"),
+    [(2, 10), (1, 11)],
+)
+def test_assemble_resume_rejects_different_operational_measurements(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempt_count: int,
+    duration_ms: int,
+) -> None:
+    matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
+    verdicts_path = tmp_path / "verdicts.json"
+    review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
+    calls = 0
+
+    def interrupted_import(*_args: object) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            verdicts_path,
+            events_path=events_path,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=10,
@@ -1536,6 +1887,7 @@ def test_assemble_resume_never_emits_noncanonical_retained_filename(
     matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
     monkeypatch.setattr(
         review,
         "_import_document_locked",
@@ -1547,6 +1899,7 @@ def test_assemble_resume_never_emits_noncanonical_retained_filename(
             review_dir,
             WORK_ITEM_ID,
             verdicts_path,
+            events_path=events_path,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=10,
@@ -1593,6 +1946,7 @@ def test_assemble_resume_requires_one_exact_semantic_judgment(
     matrix_dir, review_dir = _mock_assembly(tmp_path, monkeypatch)
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
     monkeypatch.setattr(
         review,
         "_import_document_locked",
@@ -1604,6 +1958,7 @@ def test_assemble_resume_requires_one_exact_semantic_judgment(
             review_dir,
             WORK_ITEM_ID,
             verdicts_path,
+            events_path=events_path,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=10,
@@ -1656,6 +2011,7 @@ def test_assemble_detects_target_conflict_before_publishing_operation(
     monkeypatch.setattr(review, "_retained_judgment_files", lambda *_args: [])
     verdicts_path = tmp_path / "verdicts.json"
     review._write_json(verdicts_path, _verdict_document())  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdicts_path)
     judgments = matrix_dir / "judgments"
     judgments.mkdir(mode=0o700)
     target = judgments / f"judgment-{WORK_ITEM_ID}-judge-1.json"
@@ -1668,6 +2024,7 @@ def test_assemble_detects_target_conflict_before_publishing_operation(
             review_dir,
             WORK_ITEM_ID,
             verdicts_path,
+            events_path=events_path,
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=1,
@@ -1806,6 +2163,7 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
     )
     invalid = tmp_path / "invalid.json"
     corrected = tmp_path / "corrected.json"
+    event_paths: dict[Path, Path] = {}
     for path, rationale in (
         (invalid, "Found /Users/private-account/Steam"),
         (corrected, "Answer is clear."),
@@ -1835,6 +2193,9 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
                 ],
             },
         )
+        event_paths[path] = _write_bound_event_log(
+            path.with_suffix(".jsonl"), path
+        )
 
     with pytest.raises(review.judge.JudgmentError, match="private material"):
         review.assemble_judgment(
@@ -1842,6 +2203,7 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
             review_dir,
             WORK_ITEM_ID,
             invalid,
+            events_path=event_paths[invalid],
             judge_identifier="judge-1",
             attempt_count=1,
             duration_ms=100,
@@ -1858,6 +2220,7 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
         review_dir,
         WORK_ITEM_ID,
         corrected,
+        events_path=event_paths[corrected],
         judge_identifier="judge-1",
         attempt_count=2,
         duration_ms=200,
@@ -1914,6 +2277,9 @@ def _mock_resolution(
             "duration_ms": 100,
             "usage": {"state": "unavailable"},
             "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            "invocation_evidence": _invocation_evidence(
+                document, case=_case(configured.identifier)
+            ),
             "case_sha256": review._sha256(  # noqa: SLF001
                 _case(configured.identifier)
             ),
@@ -2367,6 +2733,9 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
             "duration_ms": 100,
             "usage": {"state": "unavailable"},
             "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            "invocation_evidence": _invocation_evidence(
+                document, case=_case(configured.identifier)
+            ),
             "case_sha256": review._sha256(  # noqa: SLF001
                 _case(configured.identifier)
             ),

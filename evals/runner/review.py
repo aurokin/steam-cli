@@ -27,7 +27,8 @@ from evals.runner import codex_driver, inspection, judge, matrix, run_state
 _CASE_SCHEMA = "steam-agent-eval-review-case/0.1"
 _VERDICTS_SCHEMA = "steam-agent-eval-review-verdicts/0.1"
 _LEDGER_SCHEMA = "steam-agent-eval-review-ledger/0.1"
-_OPERATION_SCHEMA = "steam-agent-eval-review-operation/0.1"
+_OPERATION_SCHEMA = "steam-agent-eval-review-operation/0.2"
+_EVENT_VALIDATOR = "codex-jsonl-verdict-binding/0.1"
 _MAX_CASES = 1024
 _MAX_ATTEMPTS = 3
 _MAX_DURATION_MS = 24 * 60 * 60 * 1000
@@ -53,6 +54,7 @@ _HOST_ISOLATION_DISABLED_FEATURES = (
 _ISOLATION_ATTESTATION = "codex-0.146-no-shell-host-isolated-profile-v1"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _SAFE_WORK_ITEM = re.compile(r"w-[0-9]{6}-[0-9a-f]{16}\Z", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _CODEX_ITEM_EVENTS = frozenset(
     {"item.started", "item.updated", "item.completed"}
 )
@@ -130,15 +132,13 @@ def _read_bytes(path: Path, *, require_private: bool = False) -> bytes:
             os.close(descriptor)
 
 
-def _read_json(
-    path: Path,
+def _decode_json_document(
+    content: bytes,
     *,
     schema_name: str | None = None,
-    require_private: bool = False,
     require_canonical: bool = False,
 ) -> dict[str, Any]:
     try:
-        content = _read_bytes(path, require_private=require_private)
         document = matrix._strict_json_loads(  # noqa: SLF001
             content.decode("utf-8")
         )
@@ -156,11 +156,45 @@ def _read_json(
     return document
 
 
-def check_event_log(path: Path) -> dict[str, int]:
-    """Reject malformed, failed, or tool-using Codex JSONL judge events."""
+def _read_json_with_content(
+    path: Path,
+    *,
+    schema_name: str | None = None,
+    require_private: bool = False,
+    require_canonical: bool = False,
+) -> tuple[dict[str, Any], bytes]:
+    content = _read_bytes(path, require_private=require_private)
+    return (
+        _decode_json_document(
+            content,
+            schema_name=schema_name,
+            require_canonical=require_canonical,
+        ),
+        content,
+    )
+
+
+def _read_json(
+    path: Path,
+    *,
+    schema_name: str | None = None,
+    require_private: bool = False,
+    require_canonical: bool = False,
+) -> dict[str, Any]:
+    return _read_json_with_content(
+        path,
+        schema_name=schema_name,
+        require_private=require_private,
+        require_canonical=require_canonical,
+    )[0]
+
+
+def _inspect_event_log(path: Path) -> tuple[dict[str, int], str, str]:
+    """Return bounded evidence from one successful, tool-free Codex invocation."""
 
     try:
-        text = _read_bytes(Path(path), require_private=True).decode("utf-8")
+        content = _read_bytes(Path(path), require_private=True)
+        text = content.decode("utf-8")
         lines = text.splitlines()
     except UnicodeError:
         raise ReviewError("qualitative review event log is invalid") from None
@@ -184,6 +218,7 @@ def check_event_log(path: Path) -> dict[str, int]:
     ):
         raise ReviewError("qualitative review event log is invalid")
     agent_messages = 0
+    agent_message = ""
     item_states: dict[str, tuple[str, str]] = {}
     for event in events[2:-1]:
         event_type = event["type"]
@@ -209,14 +244,39 @@ def check_event_log(path: Path) -> dict[str, int]:
                 raise ReviewError("qualitative review event log is invalid")
             item_states[item_id] = (item_type, "completed")
             if item_type == "agent_message":
+                message = item.get("text")
+                if not isinstance(message, str):
+                    raise ReviewError("qualitative review event log is invalid")
                 agent_messages += 1
+                agent_message = message
     if (
         agent_messages != 1
         or not item_states
         or any(state != "completed" for _item_type, state in item_states.values())
     ):
         raise ReviewError("qualitative review event log is invalid")
-    return {"events": len(lines), "agent_messages": agent_messages}
+    return (
+        {"events": len(lines), "agent_messages": agent_messages},
+        agent_message,
+        hashlib.sha256(content).hexdigest(),
+    )
+
+
+def check_event_log(path: Path) -> dict[str, int]:
+    """Reject malformed, failed, or tool-using Codex JSONL judge events."""
+
+    return _inspect_event_log(path)[0]
+
+
+def _bound_event_log(path: Path, verdict_content: bytes) -> tuple[int, str]:
+    summary, agent_message, digest = _inspect_event_log(path)
+    try:
+        message_content = agent_message.encode("utf-8")
+    except UnicodeError:
+        raise ReviewError("qualitative review event log is invalid") from None
+    if message_content != verdict_content:
+        raise ReviewError("qualitative review event log does not match verdict")
+    return summary["events"], digest
 
 
 def preflight_native_codex(path: Path) -> dict[str, str]:
@@ -443,8 +503,11 @@ def _case_document(
 
 
 def _validate_review_root(
-    review_dir: Path, result: inspection.MatrixInspection
+    matrix_dir: Path,
+    review_dir: Path,
+    target_index: judge._TargetIndex,  # noqa: SLF001
 ) -> dict[str, Any]:
+    result = target_index.inspection_result
     try:
         item_stat = review_dir.lstat()
     except OSError:
@@ -560,21 +623,137 @@ def _validate_review_root(
     operation_names = {item.name for item in (review_dir / "operations").iterdir()}
     if len(operation_names) > len(cases) + len(expected_work_items):
         raise ReviewError("qualitative review operation ledger exceeds limits")
-    valid_operation_names = {
-        f"judgment-{work_item_id}-{judge_config.identifier}.json"
+    judgment_operations = {
+        f"judgment-{work_item_id}-{judge_config.identifier}.json": (
+            work_item_id,
+            judge_config.identifier,
+        )
         for work_item_id in expected_work_items
         for judge_config in result.manifest.campaign.judges
-    } | {
-        f"adjudication-{work_item_id}-agreement.json"
+    }
+    adjudication_operations = {
+        f"adjudication-{work_item_id}-agreement.json": work_item_id
         for work_item_id in expected_work_items
     }
+    valid_operation_names = set(judgment_operations) | set(adjudication_operations)
     if not operation_names <= valid_operation_names:
         raise ReviewError("qualitative review operation ledger is invalid")
-    for name in operation_names:
-        _read_json(
+    retained_judgments: dict[str, dict[str, Any]] | None = None
+    retained_judgment_files: list[tuple[Path, str, dict[str, Any]]] | None = None
+    retained_adjudication_files: list[
+        tuple[Path, str, dict[str, Any]]
+    ] | None = None
+    first_judge = result.manifest.campaign.judges[0].identifier
+    for name in sorted(operation_names):
+        operation = _read_json(
             review_dir / "operations" / name,
             require_private=True,
+            require_canonical=True,
         )
+        try:
+            if name in judgment_operations:
+                work_item_id, judge_identifier = judgment_operations[name]
+                case = _load_bound_case(
+                    matrix_dir,
+                    review_dir,
+                    target_index,
+                    ledger,
+                    work_item_id,
+                    judge_identifier,
+                )
+                artifact = _validate_judgment_operation(
+                    operation,
+                    case=case,
+                    judge_identifier=judge_identifier,
+                )
+                judge._validate_judgment_document(  # noqa: SLF001
+                    target_index, artifact
+                )
+                if retained_judgments is None:
+                    retained_judgments = judge._retained_judgments(  # noqa: SLF001
+                        matrix_dir, target_index
+                    )
+                if retained_judgment_files is None:
+                    retained_judgment_files = _retained_judgment_files(
+                        matrix_dir, retained_judgments
+                    )
+                matching_files = _matching_judgment_files(
+                    retained_judgment_files,
+                    target=case["target"],
+                    judge_identifier=judge_identifier,
+                )
+                if len(matching_files) > 1:
+                    raise ReviewError("qualitative judgment roster is ambiguous")
+                if matching_files:
+                    path, digest, retained_artifact = matching_files[0]
+                    if (
+                        digest != operation["artifact_sha256"]
+                        or retained_artifact != artifact
+                    ):
+                        raise ReviewError(
+                            "retained judgment does not match review operation"
+                        )
+                    if path.name != f"{artifact['judgment_id']}.json":
+                        raise ReviewError("retained judgment filename is invalid")
+                    if _retained_target(
+                        path,
+                        artifact,
+                        digest,
+                        kind="judgment",
+                    ) is None:
+                        raise ReviewError("retained judgment is unavailable")
+            else:
+                work_item_id = adjudication_operations[name]
+                case = _load_bound_case(
+                    matrix_dir,
+                    review_dir,
+                    target_index,
+                    ledger,
+                    work_item_id,
+                    first_judge,
+                )
+                artifact = _validate_adjudication_operation(operation, case=case)
+                if retained_judgments is None:
+                    retained_judgments = judge._retained_judgments(  # noqa: SLF001
+                        matrix_dir, target_index
+                    )
+                judge._validate_adjudication_document(  # noqa: SLF001
+                    matrix_dir,
+                    target_index,
+                    artifact,
+                    retained=retained_judgments,
+                )
+                if retained_adjudication_files is None:
+                    retained_adjudication_files = _retained_adjudication_files(
+                        matrix_dir, target_index, retained_judgments
+                    )
+                matching_files = [
+                    item
+                    for item in retained_adjudication_files
+                    if item[2]["target"] == case["target"]
+                ]
+                if len(matching_files) > 1:
+                    raise ReviewError("qualitative adjudication roster is ambiguous")
+                if matching_files:
+                    path, digest, retained_artifact = matching_files[0]
+                    if (
+                        digest != operation["artifact_sha256"]
+                        or retained_artifact != artifact
+                    ):
+                        raise ReviewError(
+                            "retained adjudication does not match review operation"
+                        )
+                    if path.name != f"{artifact['adjudication_id']}.json":
+                        raise ReviewError("retained adjudication filename is invalid")
+                    if _retained_target(
+                        path,
+                        artifact,
+                        digest,
+                        kind="adjudication",
+                    ) is None:
+                        raise ReviewError("retained adjudication is unavailable")
+        except judge.JudgmentError:
+            raise ReviewError("qualitative review operation ledger is invalid") from None
     return ledger
 
 
@@ -723,6 +902,20 @@ def _publish_operation(path: Path, document: dict[str, Any]) -> None:
     _write_json(path, document)
 
 
+def _invocation_evidence_binding(
+    case: dict[str, Any], artifact: dict[str, Any], evidence: dict[str, Any]
+) -> str:
+    return _sha256(
+        {
+            "case_sha256": _sha256(case),
+            "artifact_sha256": _sha256(artifact),
+            "invocation_evidence": {
+                key: value for key, value in evidence.items() if key != "binding_sha256"
+            },
+        }
+    )
+
+
 def _validate_judgment_operation(
     operation: dict[str, Any],
     *,
@@ -739,6 +932,7 @@ def _validate_judgment_operation(
         "duration_ms",
         "usage",
         "isolation_attestation",
+        "invocation_evidence",
         "case_sha256",
         "artifact_sha256",
         "artifact",
@@ -746,6 +940,20 @@ def _validate_judgment_operation(
     }
     artifact = operation.get("artifact")
     artifact_judge = artifact.get("judge") if isinstance(artifact, dict) else None
+    evidence = operation.get("invocation_evidence")
+    bound_verdict = (
+        {
+            "schema": _VERDICTS_SCHEMA,
+            "target": {
+                "work_item_id": case["target"]["work_item_id"],
+                "projection_sha256": case["target"]["projection_sha256"],
+            },
+            "invocation": case["execution"]["invocation"],
+            "verdicts": artifact.get("verdicts"),
+        }
+        if isinstance(artifact, dict)
+        else None
+    )
     if (
         set(operation) != required
         or operation.get("schema") != _OPERATION_SCHEMA
@@ -761,6 +969,31 @@ def _validate_judgment_operation(
         or not 0 <= operation["duration_ms"] <= _MAX_DURATION_MS
         or operation.get("usage") != {"state": "unavailable"}
         or operation.get("isolation_attestation") != _ISOLATION_ATTESTATION
+        or not isinstance(evidence, dict)
+        or set(evidence)
+        != {
+            "validator",
+            "event_log_sha256",
+            "event_count",
+            "verdict_bytes_sha256",
+            "verdict_document_sha256",
+            "binding_sha256",
+        }
+        or evidence.get("validator") != _EVENT_VALIDATOR
+        or not isinstance(evidence.get("event_log_sha256"), str)
+        or _SHA256.fullmatch(evidence["event_log_sha256"]) is None
+        or not isinstance(evidence.get("event_count"), int)
+        or isinstance(evidence.get("event_count"), bool)
+        or not 4 <= evidence["event_count"] <= _MAX_DOCUMENT_BYTES
+        or not isinstance(evidence.get("verdict_bytes_sha256"), str)
+        or _SHA256.fullmatch(evidence["verdict_bytes_sha256"]) is None
+        or not isinstance(evidence.get("verdict_document_sha256"), str)
+        or _SHA256.fullmatch(evidence["verdict_document_sha256"]) is None
+        or bound_verdict is None
+        or evidence["verdict_document_sha256"] != _sha256(bound_verdict)
+        or not isinstance(evidence.get("binding_sha256"), str)
+        or evidence["binding_sha256"]
+        != _invocation_evidence_binding(case, artifact, evidence)
         or operation.get("case_sha256") != _sha256(case)
         or not isinstance(artifact, dict)
         or artifact.get("target") != case["target"]
@@ -976,6 +1209,7 @@ def assemble_judgment(
     work_item_id: str,
     verdicts_path: Path,
     *,
+    events_path: Path | None = None,
     judge_identifier: str,
     attempt_count: int,
     duration_ms: int,
@@ -1001,7 +1235,9 @@ def assemble_judgment(
                 target_index = judge._target_index(matrix_dir)  # noqa: SLF001
             except judge.JudgmentError as error:
                 raise ReviewError(str(error)) from None
-            ledger = _validate_review_root(review_dir, target_index.inspection_result)
+            ledger = _validate_review_root(
+                matrix_dir, review_dir, target_index
+            )
             campaign = target_index.inspection_result.manifest.campaign
             judges = [
                 item for item in campaign.judges if item.identifier == judge_identifier
@@ -1073,7 +1309,7 @@ def assemble_judgment(
 
             if matching_files:
                 raise ReviewError("qualitative judgment already exists for judge")
-            verdict_document = _read_json(
+            verdict_document, verdict_content = _read_json_with_content(
                 Path(verdicts_path),
                 schema_name="review-verdicts-0.1.json",
                 require_private=True,
@@ -1096,6 +1332,19 @@ def assemble_judgment(
                 verdict_document["verdicts"],
                 key=lambda item: criteria.index(item["criterion_id"]),
             )
+            if events_path is None:
+                raise ReviewError(
+                    "qualitative review invocation evidence is unavailable"
+                )
+            event_count, event_log_sha256 = _bound_event_log(
+                Path(events_path), verdict_content
+            )
+            bound_verdict = {
+                "schema": _VERDICTS_SCHEMA,
+                "target": expected_response_target,
+                "invocation": case["execution"]["invocation"],
+                "verdicts": ordered_verdicts,
+            }
             document = {
                 "schema": "steam-agent-eval-judgment/0.1",
                 "judgment_id": f"judgment-{work_item_id}-{judge_identifier}",
@@ -1119,6 +1368,16 @@ def assemble_judgment(
             artifact_sha256 = _sha256(document)
             target = matrix_dir / "judgments" / f"{document['judgment_id']}.json"
             _reject_existing_target(target, kind="judgment")
+            invocation_evidence = {
+                "validator": _EVENT_VALIDATOR,
+                "event_log_sha256": event_log_sha256,
+                "event_count": event_count,
+                "verdict_bytes_sha256": hashlib.sha256(verdict_content).hexdigest(),
+                "verdict_document_sha256": _sha256(bound_verdict),
+            }
+            invocation_evidence["binding_sha256"] = _invocation_evidence_binding(
+                case, document, invocation_evidence
+            )
             operation = {
                 "schema": _OPERATION_SCHEMA,
                 "kind": "judgment_import",
@@ -1129,6 +1388,7 @@ def assemble_judgment(
                 "duration_ms": duration_ms,
                 "usage": {"state": "unavailable"},
                 "isolation_attestation": isolation_attestation,
+                "invocation_evidence": invocation_evidence,
                 "case_sha256": _sha256(case),
                 "artifact_sha256": artifact_sha256,
                 "artifact": document,
@@ -1190,7 +1450,9 @@ def resolve_agreement(matrix_dir: Path, review_dir: Path) -> dict[str, Any]:
                 target_index = judge._target_index(matrix_dir)  # noqa: SLF001
             except judge.JudgmentError as error:
                 raise ReviewError(str(error)) from None
-            ledger = _validate_review_root(review_dir, target_index.inspection_result)
+            ledger = _validate_review_root(
+                matrix_dir, review_dir, target_index
+            )
             retained = judge._retained_judgments(  # noqa: SLF001
                 matrix_dir, target_index
             )
@@ -1325,6 +1587,7 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
     assemble_parser.add_argument("review_dir", type=Path)
     assemble_parser.add_argument("work_item_id")
     assemble_parser.add_argument("verdicts", type=Path)
+    assemble_parser.add_argument("--events", required=True, type=Path)
     assemble_parser.add_argument("--judge", required=True)
     assemble_parser.add_argument("--attempt-count", required=True, type=int)
     assemble_parser.add_argument("--duration-ms", required=True, type=int)
@@ -1350,6 +1613,7 @@ def review_cli(argv: Sequence[str] | None = None) -> int:
                 args.review_dir,
                 args.work_item_id,
                 args.verdicts,
+                events_path=args.events,
                 judge_identifier=args.judge,
                 attempt_count=args.attempt_count,
                 duration_ms=args.duration_ms,
