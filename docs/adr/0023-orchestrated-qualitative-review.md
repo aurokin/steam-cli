@@ -87,3 +87,7 @@ number.
 The workflow deliberately does not resolve genuine judge disagreement. A
 future human-adjudication policy would require separate calibration and a new
 accepted contract rather than retries against the same model policy.
+
+Provider rejection before inference may supersede an otherwise terminal review
+package only through the narrow, append-only contract in
+[ADR 0024](0024-qualitative-review-package-supersession.md).

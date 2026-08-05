@@ -644,6 +644,19 @@ def test_inspection_exposes_the_hash_bound_attempt_start(tmp_path: Path) -> None
     ).hexdigest()
 
 
+def test_inspection_allows_private_operational_review_registry(
+    tmp_path: Path,
+) -> None:
+    matrix_dir = _completed_matrix(tmp_path, name="one", model="model-a")
+    run_state.atomic_publish_private_json(
+        matrix_dir / "review-package.json", {"operational": True}
+    )
+
+    result = inspection.inspect_matrix(matrix_dir)
+
+    assert result.manifest.matrix_id == matrix_dir.name
+
+
 def test_attempt_validator_accepts_canonical_published_bytes(tmp_path: Path) -> None:
     matrix_dir = _completed_matrix(tmp_path, name="one", model="model-a")
     manifest = matrix.load_manifest(matrix_dir)

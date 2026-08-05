@@ -2908,6 +2908,9 @@ def test_matrix_layout_allows_private_qualitative_artifact_directories(
         root = matrix_dir / directory
         root.mkdir(mode=0o700)
         run_state.atomic_publish_private_json(root / filename, {})
+    run_state.atomic_publish_private_json(
+        matrix_dir / "review-package.json", {"operational": True}
+    )
 
     completed = matrix.execute_matrix(
         config,

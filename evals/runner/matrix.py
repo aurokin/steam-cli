@@ -2721,6 +2721,7 @@ def _verify_matrix_layout(matrix_dir: Path, manifest: run_state.MatrixManifest) 
         "config.json",
         "manifest.json",
         "matrix.lock",
+        "review-package.json",
         "work",
         "calibration",
         "preflight",

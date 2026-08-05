@@ -201,6 +201,24 @@ uv run python -m evals.runner review prepare \
   evals/results/MATRIX_ID /private/path/MATRIX_ID-review
 ```
 
+Preparation validates the response schema against Draft 2020-12 and the pinned
+Codex structured-output subset before it publishes the private package. In
+particular, every `const` or `enum` property has an explicit type, objects are
+strict and require every declared property, keywords and types are supported,
+and values retain their declared bounds. A schema that fails this check is a
+package defect, not a judge-slot attempt.
+
+Before invoking any judge case, run the package's one non-slot live canary with the
+exact response-schema bytes, copied native Codex version, model and effort, and
+host-isolated profile used below. The canary contains no subject/candidate
+evidence or projection, only fixed synthetic transport scaffolding. It must end
+in one tool-free agent message whose JSON validates
+against the response schema, and its private attestation must bind those exact
+identities and digests. The operator attests to the external process identity
+that the runner cannot observe. A canary is package-specific and is never reused.
+A pass or bounded failure is terminal; a failed or missing canary stops the
+package before judging and consumes no slot attempt.
+
 Each `cases/WORK_ITEM_ID-JUDGE_ID.json` file is the complete prompt for exactly
 one judge slot. Pipe it verbatim; do not add a wrapper prompt. Every invocation,
 including a retry, uses a newly created private root with a fresh `CODEX_HOME`
@@ -226,7 +244,9 @@ The structured response must echo `target.work_item_id`,
 The assembler requires all three exact matches, so a response copied from
 another replicate or judge slot cannot be imported.
 
-One setup pattern is:
+The accepted judge attestation below is macOS-only. The deterministic runner
+and test suite also support Linux, but no Linux judge-isolation recipe currently
+satisfies this exact attestation. One setup pattern is:
 
 ```text
 set -eu
@@ -314,6 +334,38 @@ test "$(stat -f '%Lp' "$VERDICT_PATH")" = 600
 uv run python -m evals.runner review check-events "$STDOUT_LOG"
 ```
 
+Run that exact setup and isolated invocation first with the package's
+`canary-case.json` copied to `CASE_PATH`. On success, record
+and validate the package canary before creating any judge invocation root:
+
+```text
+uv run python -m evals.runner review record-canary \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review \
+  "$VERDICT_PATH" --events "$STDOUT_LOG" --duration-ms 12345 \
+  --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1 \
+  --operator-invocation-attestation \
+  operator-attested-codex-0.146-gpt-5.6-sol-xhigh-no-shell-host-isolated-profile-v1
+uv run python -m evals.runner review validate-canary \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review
+```
+
+If transport or provider rejection prevents a verdict/event pair, record the
+terminal failure instead, selecting the matching failure class:
+
+```text
+uv run python -m evals.runner review record-canary-failure \
+  evals/results/MATRIX_ID /private/path/MATRIX_ID-review \
+  --failure-class transport_failure --duration-ms 12345 \
+  --isolation-attestation codex-0.146-no-shell-host-isolated-profile-v1 \
+  --operator-invocation-attestation \
+  operator-attested-codex-0.146-gpt-5.6-sol-xhigh-no-shell-host-isolated-profile-v1
+```
+
+`record-canary` itself records a terminal structural failure when supplied
+artifacts are malformed, tool-using, or incorrectly bound. Never rerun a failed
+canary. After a pass, discard its invocation root and create a fresh root for
+each judge slot.
+
 Import the result for each of `judge-1`, `judge-2`, and `judge-3`, recording the
 externally measured total attempts and duration:
 
@@ -340,7 +392,7 @@ evidence. Any CLI, model catalog, or profile change invalidates this
 attestation. `check-events` is a standalone preflight, while `assemble`
 independently enforces the same checks on the required `--events` file and
 requires its sole completed `agent_message.text` UTF-8 bytes to equal the raw
-verdict-file bytes exactly. The private operation `0.2` evidence records only
+verdict-file bytes exactly. The private operation `0.3` evidence records only
 bounded counts and SHA-256 bindings for the event log, raw verdict bytes, and
 normalized verdict document; it never records event, reasoning, or message
 text. `check-events` privately parses the `--json` log and requires one
@@ -372,6 +424,117 @@ The resolver preserves every disagreement or `uncertain` verdict as
 `unresolved`; it never calls a model or retries for agreement. The exact-input
 and append-only operation contract is recorded in
 [ADR 0023](../docs/adr/0023-orchestrated-qualitative-review.md).
+
+### Recovering a provider-rejected review package
+
+A legacy review-package `0.1` response-schema or invocation-protocol defect may
+be recovered to package protocol `0.2` only through the whole-package
+supersession contract in
+[ADR 0024](../docs/adr/0024-qualitative-review-package-supersession.md). Do not
+edit, replace, or resume the defective package. It is terminal, and all of its
+requests retain their original package-local attempt counts even when the
+provider rejected them before inference.
+
+Supersession is permitted only when the defect is package-wide, every attempted
+request was rejected before inference, and the package contains no valid model
+output, judgment operation, imported judgment, adjudication, or observed
+review outcome. A valid `uncertain` verdict, disagreement, post-inference
+failure, published operation, or import makes supersession ineligible. It is
+never a way to seek a different result or more retries.
+
+Retain every existing old-package file byte-for-byte. Under the old-package and
+matrix locks, successful preparation reserves one private canonical mode-`0600`
+`review-package.json` registry in the matrix and adds one private append-only
+`supersession.json` tombstone to the old package; it never rewrites an old asset.
+The registry binds the manifest, package, canonical destination hash, and
+tombstone without retaining a private path. A copied root, different destination,
+or second package fails closed, while an interrupted exact publication resumes.
+The registry is operational state and is ignored by subject scoring/reporting.
+
+First obtain the privacy-safe legacy identity needed by the incident record:
+
+```text
+uv run python -m evals.runner review supersession-identity \
+  evals/results/MATRIX_ID /private/path/OLD-REVIEW-ROOT
+```
+
+Create a canonical private mode-`0600` incident JSON document with this exact
+shape. Copy `matrix_id`, `manifest_sha256`, `source_revision`, and the complete
+`legacy` object from that command; list every configured judge in `by_judge`,
+and list only attempted slots in `slots`. Counts and `unattempted_slots` must
+reconcile with the full configured roster. Use `{"state":"unavailable"}` when
+a duration or diagnostic digest was not retained rather than inventing one.
+
+```json
+{
+  "schema": "steam-agent-eval-review-incident/0.1",
+  "incident_id": "response-schema-rejection-20260805",
+  "matrix_id": "MATRIX_ID",
+  "manifest_sha256": "COPY_FROM_IDENTITY_COMMAND",
+  "source_revision": "COPY_FROM_IDENTITY_COMMAND",
+  "superseded": {"ledger_schema":"steam-agent-eval-review-ledger/0.1","tree_sha256":"COPY","ledger_sha256":"COPY","response_schema_sha256":"COPY"},
+  "reason": "provider_rejected_response_schema",
+  "provider_error": {"class":"invalid_request_error","code":"invalid_json_schema","message":"Response schema rejected before inference."},
+  "codex": {"version":"codex-cli 0.146.0","isolation_attestation":"codex-0.146-no-shell-host-isolated-profile-v1"},
+  "attempt_summary": {
+    "total_requests": 1,
+    "by_judge": [
+      {"judge_identifier":"judge-1","request_count":1},
+      {"judge_identifier":"judge-2","request_count":0},
+      {"judge_identifier":"judge-3","request_count":0}
+    ],
+    "slots": [
+      {"work_item_id":"w-000000-0123456789abcdef","judge_identifier":"judge-1","attempt_count":1,"duration":{"state":"unavailable"}}
+    ],
+    "unattempted_slots": 116
+  },
+  "states": {"inference":"absent","model_output":"absent","operations":"absent","imports":"absent","adjudications":"absent"},
+  "diagnostic_evidence": {"state":"unavailable"},
+  "recorded_at": "2026-08-05T00:00:00Z"
+}
+```
+
+The incident input must use the same compact, sorted, newline-terminated
+canonical JSON bytes as other review artifacts. Canonicalize an ASCII or Unicode
+draft through a private temporary regular file, then rename it atomically:
+
+```text
+set -eu
+umask 077
+INCIDENT_TMP="$(mktemp /private/path/.steam-agent-incident.XXXXXX)"
+chmod 600 "$INCIDENT_TMP"
+uv run python -c 'import json,sys; value=json.load(open(sys.argv[1])); sys.stdout.write(json.dumps(value,allow_nan=False,ensure_ascii=True,separators=(",",":"),sort_keys=True)+"\n")' \
+  /private/path/incident-draft.json > "$INCIDENT_TMP"
+test -f "$INCIDENT_TMP" && test ! -L "$INCIDENT_TMP"
+test "$(stat -f '%Lp' "$INCIDENT_TMP")" = 600
+mv "$INCIDENT_TMP" /private/path/incident.json
+```
+
+Then prepare the one replacement package:
+
+```text
+uv run python -m evals.runner review prepare \
+  evals/results/MATRIX_ID /private/path/NEW-REVIEW-ROOT \
+  --supersede-review-dir /private/path/OLD-REVIEW-ROOT \
+  --incident-record /private/path/incident.json
+```
+
+The package identity binds the complete incident, old tree/ledger/schema,
+operation and canary protocol versions, and exact Codex/model/effort/isolation
+identities. Do not retain or disclose raw provider bodies, reasoning or event
+text, credentials, account or thread identifiers, or private paths.
+
+Every configured slot moves to the replacement package together. Never combine
+old and new cases, operations, judgments, or attempt accounting. The replacement
+gets its own initial-plus-two limit because it is a new version of the review
+instrument; that does not erase the old calls. Run the static schema checks and
+the exact-profile live canary before its first slot.
+
+Do not rerun the subject matrix for a response-schema-only supersession. Its
+candidate inputs, outputs, reports, projections, prompts, parsers, rubrics, and
+route settings remain immutable. Run every qualitative judge slot under the
+replacement package, then rerun only mechanical agreement resolution and the
+benchmark report.
 
 The immutable edge confirmation in
 `matrices/product-use-discovery-edge-v1.json` isolates the compatibility

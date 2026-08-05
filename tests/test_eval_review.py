@@ -15,10 +15,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from evals.runner import codex_driver, review, run_state  # noqa: E402
+from evals.runner import codex_driver, matrix, review, run_state  # noqa: E402
 
 
 WORK_ITEM_ID = "w-000000-0123456789abcdef"
+PACKAGE_ID = "package-" + "6" * 64
 PROMPT_VERSION = "matrix-judge/0.1"
 PROMPT_SHA256 = "671449c1329475b3753ffe30a017ad60152603efe6def833872eff8c428deec7"
 PARSER_VERSION = "matrix-parser/0.1"
@@ -70,6 +71,7 @@ def _campaign() -> SimpleNamespace:
 def _result() -> SimpleNamespace:
     manifest = SimpleNamespace(
         matrix_id="matrix-test",
+        revision="2985282f7f2da3377796403b90f41fd709eef6cf",
         campaign=_campaign(),
         work_items=(SimpleNamespace(work_item_id=WORK_ITEM_ID),),
     )
@@ -80,9 +82,12 @@ def _result() -> SimpleNamespace:
     )
 
 
-def _case(judge_identifier: str = "judge-1") -> dict[str, object]:
+def _case(
+    judge_identifier: str = "judge-1", package_id: str = PACKAGE_ID
+) -> dict[str, object]:
     return {
         "schema": review._CASE_SCHEMA,  # noqa: SLF001
+        "package_id": package_id,
         "execution": {
             "model_input": "this_document_verbatim",
             "criterion_coverage": "every_projection_criterion_exactly_once",
@@ -90,9 +95,10 @@ def _case(judge_identifier: str = "judge-1") -> dict[str, object]:
             "response_schema": {
                 "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
                 "sha256": "5" * 64,
+                "validator": review._STRUCTURED_OUTPUT_VALIDATOR,  # noqa: SLF001
             },
             "invocation": review._invocation_binding(  # noqa: SLF001
-                TARGET, judge_identifier
+                TARGET, judge_identifier, package_id
             ),
         },
         "target": TARGET,
@@ -111,11 +117,72 @@ def _case(judge_identifier: str = "judge-1") -> dict[str, object]:
     }
 
 
+def _mock_canary_documents() -> tuple[dict[str, object], dict[str, object]]:
+    canary = review._canary_case(  # noqa: SLF001
+        matrix_id="matrix-test",
+        package_id=PACKAGE_ID,
+        response_schema_sha256="5" * 64,
+    )
+    evidence = {
+        "validator": review._EVENT_VALIDATOR,  # noqa: SLF001
+        "event_log_sha256": "a" * 64,
+        "event_count": 5,
+        "verdict_bytes_sha256": "b" * 64,
+        "verdict_document_sha256": "d" * 64,
+    }
+    evidence["binding_sha256"] = review._canary_evidence_binding(  # noqa: SLF001
+        canary, evidence
+    )
+    attestation = {
+        "schema": review._CANARY_ATTESTATION_SCHEMA,  # noqa: SLF001
+        "status": "passed",
+        "package_id": PACKAGE_ID,
+        "matrix_id": "matrix-test",
+        "response_schema_sha256": "5" * 64,
+        "case_sha256": review._sha256(canary),  # noqa: SLF001
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "codex_version": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+        "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "operator_invocation_attestation": (
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+        "duration_ms": 1,
+        "invocation_evidence": evidence,
+        "recorded_at": "2026-08-04T12:00:00Z",
+    }
+    return canary, attestation
+
+
+def _mock_canary_sha256() -> str:
+    return hashlib.sha256(
+        review._canonical_bytes(_mock_canary_documents()[1])  # noqa: SLF001
+    ).hexdigest()
+
+
 def _review_root(path: Path) -> dict[str, object]:
     path.mkdir(mode=0o700)
     path.chmod(0o700)
     (path / "operations").mkdir(mode=0o700)
+    canary, attestation = _mock_canary_documents()
+    review._write_json(path / "canary-case.json", canary)  # noqa: SLF001
+    review._write_json(path / "canary-attestation.json", attestation)  # noqa: SLF001
     ledger = {
+        "package_id": PACKAGE_ID,
+        "matrix_id": "matrix-test",
+        "response_schema": {"sha256": "5" * 64},
+        "canary": {
+            "case_path": "canary-case.json",
+            "case_sha256": review._sha256(canary),  # noqa: SLF001
+            "attestation_path": "canary-attestation.json",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "codex_version": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+            "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            "operator_invocation_attestation": (
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        },
         "cases": [
             {
                 "work_item_id": WORK_ITEM_ID,
@@ -137,6 +204,127 @@ def _matrix_root(path: Path) -> Path:
     return path
 
 
+def _install_calibration(matrix_dir: Path) -> None:
+    calibration = matrix_dir / "calibration"
+    calibration.mkdir(mode=0o700)
+    source = ROOT / "evals" / "calibration"
+    for name in ("matrix-judge-prompt-0.1.md", "matrix-parser-0.1.json"):
+        target = calibration / name
+        target.write_bytes((source / name).read_bytes())
+        target.chmod(0o600)
+
+
+def _legacy_review_package(
+    matrix_dir: Path,
+    review_dir: Path,
+    target_index: SimpleNamespace,
+) -> dict[str, object]:
+    review_dir.mkdir(mode=0o700)
+    cases_dir = review_dir / "cases"
+    operations_dir = review_dir / "operations"
+    cases_dir.mkdir(mode=0o700)
+    operations_dir.mkdir(mode=0o700)
+    response_schema = review._read_json(  # noqa: SLF001
+        ROOT / "evals" / "schema" / "review-verdicts-0.1.json"
+    )
+    review._write_json(review_dir / "response-schema.json", response_schema)  # noqa: SLF001
+    entries: list[dict[str, object]] = []
+    for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS:
+        case = review._legacy_case_document(  # noqa: SLF001
+            matrix_dir,
+            target_index,
+            WORK_ITEM_ID,
+            configured.identifier,
+        )
+        filename = f"{WORK_ITEM_ID}-{configured.identifier}.json"
+        review._write_json(cases_dir / filename, case)  # noqa: SLF001
+        entries.append(
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "judge_identifier": configured.identifier,
+                "path": f"cases/{filename}",
+                "sha256": review._sha256(case),  # noqa: SLF001
+            }
+        )
+    ledger = {
+        "schema": review._LEGACY_LEDGER_SCHEMA,  # noqa: SLF001
+        "matrix_id": "matrix-test",
+        "manifest_sha256": "a" * 64,
+        "prepared_at": "2026-08-04T11:00:00Z",
+        "policy": {
+            "maximum_attempts_per_judgment": 3,
+            "model_invocation": "external",
+            "usage_accounting": "unavailable",
+        },
+        "response_schema": {
+            "path": "response-schema.json",
+            "sha256": review._sha256(response_schema),  # noqa: SLF001
+        },
+        "cases": entries,
+    }
+    review._write_json(review_dir / "ledger.json", ledger)  # noqa: SLF001
+    return ledger
+
+
+def _prepare_v2_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, SimpleNamespace, dict[str, object]]:
+    result = _result()
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    review_dir = tmp_path / "review-v2"
+    output = review.prepare(matrix_dir, review_dir)
+    return matrix_dir, review_dir, target_index, output
+
+
+def _supersession_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, Path, SimpleNamespace]:
+    target_index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    legacy_dir = tmp_path / "legacy-review"
+    _legacy_review_package(matrix_dir, legacy_dir, target_index)
+    legacy = review._legacy_root_identity(  # noqa: SLF001
+        matrix_dir, legacy_dir, target_index
+    )
+    incident_path = tmp_path / "incident.json"
+    review._write_json(  # noqa: SLF001
+        incident_path, _incident_document(legacy=legacy)
+    )
+    return matrix_dir, legacy_dir, incident_path, target_index
+
+
+def _write_canary_result(review_dir: Path, tmp_path: Path) -> tuple[Path, Path]:
+    case = review._read_json(  # noqa: SLF001
+        review_dir / "canary-case.json", require_private=True
+    )
+    verdict = {
+        "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+        "target": {
+            "work_item_id": case["target"]["work_item_id"],
+            "projection_sha256": case["target"]["projection_sha256"],
+        },
+        "invocation": case["execution"]["invocation"],
+        "verdicts": [
+            {
+                "criterion_id": "schema-compatible",
+                "verdict": "pass",
+                "rationale": "Structured output is accepted.",
+            }
+        ],
+    }
+    verdict_path = tmp_path / "canary-verdict.json"
+    review._write_json(verdict_path, verdict)  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "canary-events.jsonl", verdict_path)
+    return verdict_path, events_path
+
+
 def _verdict_document(judge_identifier: str = "judge-1") -> dict[str, object]:
     return {
         "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
@@ -145,7 +333,7 @@ def _verdict_document(judge_identifier: str = "judge-1") -> dict[str, object]:
             "projection_sha256": TARGET["projection_sha256"],
         },
         "invocation": review._invocation_binding(  # noqa: SLF001
-            TARGET, judge_identifier
+            TARGET, judge_identifier, PACKAGE_ID
         ),
         "verdicts": [
             {
@@ -231,6 +419,1110 @@ def _valid_event_log() -> list[dict[str, object]]:
     ]
 
 
+def _legacy_identity() -> dict[str, str]:
+    return {
+        "ledger_schema": review._LEGACY_LEDGER_SCHEMA,  # noqa: SLF001
+        "tree_sha256": "7" * 64,
+        "ledger_sha256": "8" * 64,
+        "response_schema_sha256": "9" * 64,
+    }
+
+
+def _incident_document(
+    *, legacy: dict[str, str] | None = None
+) -> dict[str, object]:
+    return {
+        "schema": review._INCIDENT_SCHEMA,  # noqa: SLF001
+        "incident_id": "provider-schema-rejection-2026-08-04",
+        "matrix_id": "matrix-test",
+        "manifest_sha256": "a" * 64,
+        "source_revision": "2985282f7f2da3377796403b90f41fd709eef6cf",
+        "superseded": _legacy_identity() if legacy is None else legacy,
+        "reason": "provider_rejected_response_schema",
+        "provider_error": {
+            "class": "invalid_request_error",
+            "code": "invalid_json_schema",
+            "message": "Root schema property requires an explicit type.",
+        },
+        "codex": {
+            "version": codex_driver._REQUIRED_CODEX_VERSION,  # noqa: SLF001
+            "isolation_attestation": review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        },
+        "attempt_summary": {
+            "total_requests": 1,
+            "by_judge": [
+                {"judge_identifier": "judge-1", "request_count": 1},
+                {"judge_identifier": "judge-2", "request_count": 0},
+                {"judge_identifier": "judge-3", "request_count": 0},
+            ],
+            "slots": [
+                {
+                    "work_item_id": WORK_ITEM_ID,
+                    "judge_identifier": "judge-1",
+                    "attempt_count": 1,
+                    "duration": {"state": "measured", "duration_ms": 1200},
+                }
+            ],
+            "unattempted_slots": 2,
+        },
+        "states": {
+            "inference": "absent",
+            "model_output": "absent",
+            "operations": "absent",
+            "imports": "absent",
+            "adjudications": "absent",
+        },
+        "diagnostic_evidence": {"state": "unavailable"},
+        "recorded_at": "2026-08-04T12:00:00Z",
+    }
+
+
+def test_review_v2_schema_pins_provider_const_and_local_enum_types() -> None:
+    schema = json.loads(
+        (ROOT / "evals" / "schema" / "review-verdicts-0.2.json").read_text()
+    )
+
+    assert schema["properties"]["schema"] == {
+        "type": "string",
+        "const": "steam-agent-eval-review-verdicts/0.2",
+    }
+    assert schema["properties"]["verdicts"]["items"]["properties"]["verdict"] == {
+        "type": "string",
+        "enum": ["pass", "fail", "uncertain"],
+    }
+    review._validate_structured_output_schema(schema)  # noqa: SLF001
+
+
+def test_review_v2_case_and_runtime_contract_ids_advance_together() -> None:
+    case_schema = json.loads(
+        (ROOT / "evals" / "schema" / "review-case-0.2.json").read_text()
+    )
+
+    assert review._CASE_SCHEMA == "steam-agent-eval-review-case/0.2"  # noqa: SLF001
+    assert (  # noqa: SLF001
+        review._VERDICTS_SCHEMA == "steam-agent-eval-review-verdicts/0.2"
+    )
+    assert review._LEDGER_SCHEMA == "steam-agent-eval-review-ledger/0.2"  # noqa: SLF001
+    assert review._OPERATION_SCHEMA == "steam-agent-eval-review-operation/0.3"  # noqa: SLF001
+    assert case_schema["properties"]["schema"] == {
+        "type": "string",
+        "const": review._CASE_SCHEMA,  # noqa: SLF001
+    }
+    response_identity = case_schema["properties"]["execution"]["properties"][
+        "response_schema"
+    ]["properties"]["schema"]
+    assert response_identity == {
+        "type": "string",
+        "const": review._VERDICTS_SCHEMA,  # noqa: SLF001
+    }
+
+
+def test_package_identity_binds_operation_and_canary_protocols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_schema = review._read_json(  # noqa: SLF001
+        ROOT / "evals" / "schema" / "review-verdicts-0.2.json"
+    )
+    baseline = review._package_id(  # noqa: SLF001
+        _result(), response_schema, [], None
+    )
+
+    monkeypatch.setattr(
+        review,
+        "_OPERATION_SCHEMA",
+        "steam-agent-eval-review-operation/changed",
+    )
+    assert (
+        review._package_id(_result(), response_schema, [], None)  # noqa: SLF001
+        != baseline
+    )
+
+
+@pytest.mark.parametrize("property_name", ["schema", "verdict"])
+def test_structured_output_subset_rejects_implicit_const_or_enum_type(
+    property_name: str,
+) -> None:
+    schema = json.loads(
+        (ROOT / "evals" / "schema" / "review-verdicts-0.2.json").read_text()
+    )
+    if property_name == "schema":
+        constrained = schema["properties"]["schema"]
+    else:
+        constrained = schema["properties"]["verdicts"]["items"]["properties"][
+            "verdict"
+        ]
+    del constrained["type"]
+
+    with pytest.raises(review.ReviewError):
+        review._validate_structured_output_schema(schema)  # noqa: SLF001
+
+
+def test_review_v1_schema_assets_remain_byte_identical() -> None:
+    expected = {
+        "review-case-0.1.json": (
+            "3a7ad6ec4e85326bdf1aebb39511eee39c87035f11943ea9633d6050b84d307c"
+        ),
+        "review-verdicts-0.1.json": (
+            "87dfa18210d4c72df30fb8fa60cb7619f1d4394ce4b328d621e74ec02ed93aca"
+        ),
+    }
+
+    for name, digest in expected.items():
+        content = (ROOT / "evals" / "schema" / name).read_bytes()
+        assert hashlib.sha256(content).hexdigest() == digest
+
+
+@pytest.mark.parametrize(
+    "state_name",
+    ["inference", "model_output", "operations", "imports", "adjudications"],
+)
+def test_supersession_incident_rejects_any_observed_state(state_name: str) -> None:
+    incident = _incident_document()
+    incident["states"][state_name] = "present"
+
+    with pytest.raises(review.ReviewError, match="incident record is invalid"):
+        review._validate_incident(  # noqa: SLF001
+            incident,
+            result=_result(),
+            legacy=_legacy_identity(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("matrix_id", "matrix-other"),
+        ("superseded", {"ledger_schema": "wrong"}),
+        ("source_revision", "0" * 40),
+    ],
+)
+def test_supersession_incident_rejects_inconsistent_binding(
+    mutation: str, value: object
+) -> None:
+    incident = _incident_document()
+    incident[mutation] = value
+
+    with pytest.raises(review.ReviewError, match="incident record is invalid"):
+        review._validate_incident(  # noqa: SLF001
+            incident,
+            result=_result(),
+            legacy=_legacy_identity(),
+        )
+
+
+@pytest.mark.parametrize("incident_id", [[], {}])
+def test_supersession_incident_rejects_non_string_ids(
+    incident_id: object,
+) -> None:
+    incident = _incident_document()
+    incident["incident_id"] = incident_id
+
+    with pytest.raises(review.ReviewError, match="incident record is invalid"):
+        review._validate_incident(  # noqa: SLF001
+            incident,
+            result=_result(),
+            legacy=_legacy_identity(),
+        )
+
+
+@pytest.mark.parametrize("mutation", ["judge", "work_item"])
+def test_supersession_incident_rejects_unhashable_nested_identifiers(
+    mutation: str,
+) -> None:
+    incident = _incident_document()
+    summary = incident["attempt_summary"]
+    assert isinstance(summary, dict)
+    if mutation == "judge":
+        by_judge = summary["by_judge"]
+        assert isinstance(by_judge, list)
+        by_judge[0]["judge_identifier"] = []
+    else:
+        slots = summary["slots"]
+        assert isinstance(slots, list)
+        slots[0]["work_item_id"] = {}
+
+    with pytest.raises(review.ReviewError, match="incident record is invalid"):
+        review._validate_incident(  # noqa: SLF001
+            incident,
+            result=_result(),
+            legacy=_legacy_identity(),
+        )
+
+
+def test_prepare_rejects_invalid_provider_subset_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: index)
+    monkeypatch.setattr(
+        review,
+        "_case_document",
+        lambda _matrix, _index, _work_item, judge_identifier, package_id: _case(
+            judge_identifier, package_id
+        ),
+    )
+    monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
+    calls: list[dict[str, object]] = []
+
+    def reject_schema(document: dict[str, object]) -> None:
+        calls.append(document)
+        raise review.ReviewError("qualitative response schema is unsupported")
+
+    monkeypatch.setattr(review, "_validate_structured_output_schema", reject_schema)
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    review_dir = tmp_path / "prepared"
+
+    with pytest.raises(review.ReviewError, match="response schema is unsupported"):
+        review.prepare(matrix_dir, review_dir)
+
+    assert len(calls) == 1
+    assert not review_dir.exists()
+
+
+def test_ordinary_prepare_is_sequentially_idempotent_and_destination_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, first = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+
+    assert review.prepare(matrix_dir, review_dir) == first
+    with pytest.raises(review.ReviewError, match="package registry is invalid"):
+        review.prepare(matrix_dir, tmp_path / "different-review")
+
+
+def test_ordinary_prepare_lock_contention_cannot_publish_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    review_dir = tmp_path / "review-v2"
+
+    with matrix.MatrixLock(matrix_dir):
+        with pytest.raises(matrix.MatrixError, match="already running"):
+            review.prepare(matrix_dir, review_dir)
+
+    assert not (matrix_dir / review._REGISTRY_FILENAME).exists()  # noqa: SLF001
+    assert not review_dir.exists()
+
+
+def test_ordinary_prepare_recovers_after_registry_first_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_index = SimpleNamespace(inspection_result=_result())
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    review_dir = tmp_path / "review-v2"
+    publish = review._publish_review_package  # noqa: SLF001
+
+    def crash(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("simulated crash after registry")
+
+    monkeypatch.setattr(review, "_publish_review_package", crash)
+    with pytest.raises(RuntimeError, match="after registry"):
+        review.prepare(matrix_dir, review_dir)
+    assert (matrix_dir / review._REGISTRY_FILENAME).is_file()  # noqa: SLF001
+    assert not review_dir.exists()
+
+    monkeypatch.setattr(review, "_publish_review_package", publish)
+    recovered = review.prepare(matrix_dir, review_dir)
+    assert recovered["package_id"].startswith("package-")
+    assert review_dir.is_dir()
+
+
+def test_whole_package_v1_supersession_binds_immutable_inputs_and_reuses_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result()
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    legacy_dir = tmp_path / "legacy-review"
+    _legacy_review_package(matrix_dir, legacy_dir, target_index)
+    legacy = review._legacy_root_identity(  # noqa: SLF001
+        matrix_dir, legacy_dir, target_index
+    )
+    response_schema = review._read_json(  # noqa: SLF001
+        ROOT / "evals" / "schema" / "review-verdicts-0.2.json"
+    )
+    preliminary_cases = [
+        review._preliminary_case_document(  # noqa: SLF001
+            matrix_dir, target_index, WORK_ITEM_ID, configured.identifier
+        )
+        for configured in run_state.CALIBRATED_JUDGE_CONFIGURATIONS
+    ]
+    incident_path = tmp_path / "incident.json"
+    incident = _incident_document(legacy=legacy)
+    review._write_json(incident_path, incident)  # noqa: SLF001
+    incident_sha256 = hashlib.sha256(incident_path.read_bytes()).hexdigest()
+    package_id = review._package_id(  # noqa: SLF001
+        result,
+        response_schema,
+        preliminary_cases,
+        {
+            "reason": "provider_rejected_response_schema",
+            "legacy": legacy,
+            "incident_sha256": incident_sha256,
+        },
+    )
+
+    before = {
+        path.relative_to(legacy_dir).as_posix(): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in legacy_dir.rglob("*")
+    }
+    replacement_dir = tmp_path / "replacement-review"
+
+    output = review.prepare(
+        matrix_dir,
+        replacement_dir,
+        supersede_review_dir=legacy_dir,
+        incident_record=incident_path,
+    )
+
+    after = {
+        path.relative_to(legacy_dir).as_posix(): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in legacy_dir.rglob("*")
+    }
+    assert {name: after[name] for name in before} == before
+    assert set(after) == set(before) | {"matrix.lock", "supersession.json"}
+    assert output["package_id"] == package_id
+    ledger = review._read_json(  # noqa: SLF001
+        replacement_dir / "ledger.json", require_private=True
+    )
+    assert ledger["schema"] == "steam-agent-eval-review-ledger/0.2"
+    assert ledger["supersedes"]["legacy"] == legacy
+    assert ledger["supersedes"]["incident"] == {
+        "path": "incident.json",
+        "sha256": hashlib.sha256(incident_path.read_bytes()).hexdigest(),
+    }
+    legacy_case = review._read_json(  # noqa: SLF001
+        legacy_dir / "cases" / f"{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    replacement_case = review._read_json(  # noqa: SLF001
+        replacement_dir / "cases" / f"{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    assert replacement_case["target"] == legacy_case["target"]
+    assert replacement_case["projection"] == legacy_case["projection"]
+
+    retained = review.prepare(
+        matrix_dir,
+        replacement_dir,
+        supersede_review_dir=legacy_dir,
+    )
+    assert retained == output
+
+    with pytest.raises(review.ReviewError, match="tombstone is invalid"):
+        review.prepare(
+            matrix_dir,
+            tmp_path / "different-replacement",
+            supersede_review_dir=legacy_dir,
+        )
+
+    incident["provider_error"]["message"] = "Different safe incident."
+    incident_path.write_bytes(review._canonical_bytes(incident))  # noqa: SLF001
+    incident_path.chmod(0o600)
+    with pytest.raises(review.ReviewError, match="does not match tombstone"):
+        review.prepare(
+            matrix_dir,
+            replacement_dir,
+            supersede_review_dir=legacy_dir,
+            incident_record=incident_path,
+        )
+
+
+def test_supersession_recovers_after_tombstone_first_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, legacy_dir, incident_path, _target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+    replacement_dir = tmp_path / "replacement-review"
+    publish = review._publish_review_package  # noqa: SLF001
+
+    def crash(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("simulated crash after tombstone")
+
+    monkeypatch.setattr(review, "_publish_review_package", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        review.prepare(
+            matrix_dir,
+            replacement_dir,
+            supersede_review_dir=legacy_dir,
+            incident_record=incident_path,
+        )
+    assert (legacy_dir / "supersession.json").is_file()
+    assert not replacement_dir.exists()
+    (matrix_dir / review._REGISTRY_FILENAME).unlink()  # noqa: SLF001
+
+    monkeypatch.setattr(review, "_publish_review_package", publish)
+    recovered = review.prepare(
+        matrix_dir,
+        replacement_dir,
+        supersede_review_dir=legacy_dir,
+    )
+    assert recovered["package_id"].startswith("package-")
+    assert replacement_dir.is_dir()
+
+
+def test_supersession_recovers_after_registry_before_tombstone_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, legacy_dir, incident_path, _target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+    replacement_dir = tmp_path / "replacement-review"
+    write_json = review._write_json  # noqa: SLF001
+
+    def crash_tombstone(path: Path, value: object) -> None:
+        if path.name == review._SUPERSESSION_FILENAME:  # noqa: SLF001
+            raise RuntimeError("simulated crash before tombstone")
+        write_json(path, value)
+
+    monkeypatch.setattr(review, "_write_json", crash_tombstone)
+    with pytest.raises(RuntimeError, match="before tombstone"):
+        review.prepare(
+            matrix_dir,
+            replacement_dir,
+            supersede_review_dir=legacy_dir,
+            incident_record=incident_path,
+        )
+    assert (matrix_dir / review._REGISTRY_FILENAME).is_file()  # noqa: SLF001
+    assert not (legacy_dir / review._SUPERSESSION_FILENAME).exists()  # noqa: SLF001
+    assert not replacement_dir.exists()
+
+    monkeypatch.setattr(review, "_write_json", write_json)
+    recovered = review.prepare(
+        matrix_dir,
+        replacement_dir,
+        supersede_review_dir=legacy_dir,
+        incident_record=incident_path,
+    )
+    assert recovered["package_id"].startswith("package-")
+    assert (legacy_dir / review._SUPERSESSION_FILENAME).is_file()  # noqa: SLF001
+
+
+def test_supersession_registry_and_tombstone_tamper_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, legacy_dir, incident_path, _target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+    replacement_dir = tmp_path / "replacement-review"
+    review.prepare(
+        matrix_dir,
+        replacement_dir,
+        supersede_review_dir=legacy_dir,
+        incident_record=incident_path,
+    )
+    tombstone_path = legacy_dir / review._SUPERSESSION_FILENAME  # noqa: SLF001
+    tombstone = review._read_json(tombstone_path, require_private=True)  # noqa: SLF001
+    tombstone["destination_path_sha256"] = "0" * 64
+    tombstone_path.write_bytes(review._canonical_bytes(tombstone))  # noqa: SLF001
+    tombstone_path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="tombstone is invalid"):
+        review.prepare(
+            matrix_dir,
+            replacement_dir,
+            supersede_review_dir=legacy_dir,
+        )
+
+    registry_path = matrix_dir / review._REGISTRY_FILENAME  # noqa: SLF001
+    registry = review._read_json(registry_path, require_private=True)  # noqa: SLF001
+    registry["destination_path_sha256"] = "0" * 64
+    registry_path.write_bytes(review._canonical_bytes(registry))  # noqa: SLF001
+    registry_path.chmod(0o600)
+    with pytest.raises(review.ReviewError, match="package registry is invalid"):
+        review.validate_canary(matrix_dir, replacement_dir)
+
+
+def test_supersession_lock_contention_precedes_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, legacy_dir, incident_path, _target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+    replacement_dir = tmp_path / "replacement-review"
+
+    with matrix.MatrixLock(legacy_dir):
+        with pytest.raises(matrix.MatrixError, match="already running"):
+            review.prepare(
+                matrix_dir,
+                replacement_dir,
+                supersede_review_dir=legacy_dir,
+                incident_record=incident_path,
+            )
+
+    assert not (legacy_dir / "supersession.json").exists()
+    assert not replacement_dir.exists()
+
+
+def test_supersession_identity_cli_is_read_only_and_path_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix_dir, legacy_dir, _incident_path, _target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+
+    assert (
+        review.review_cli(
+            ["supersession-identity", str(matrix_dir), str(legacy_dir)]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert set(output) == {
+        "matrix_id",
+        "manifest_sha256",
+        "source_revision",
+        "legacy",
+    }
+    assert str(matrix_dir) not in json.dumps(output)
+    assert str(legacy_dir) not in json.dumps(output)
+    assert not (legacy_dir / "supersession.json").exists()
+
+
+def test_supersession_rejects_any_legacy_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result()
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    legacy_dir = tmp_path / "legacy-review"
+    _legacy_review_package(matrix_dir, legacy_dir, target_index)
+    review._write_json(legacy_dir / "operations" / "attempt.json", {"attempt": 1})  # noqa: SLF001
+
+    with pytest.raises(review.ReviewError, match="has operations"):
+        review._legacy_root_identity(  # noqa: SLF001
+            matrix_dir, legacy_dir, target_index
+        )
+
+
+@pytest.mark.parametrize("identifier", [[], {}])
+def test_supersession_rejects_unhashable_legacy_case_identifiers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identifier: object,
+) -> None:
+    matrix_dir, legacy_dir, _incident_path, target_index = (
+        _supersession_fixture(tmp_path, monkeypatch)
+    )
+    ledger_path = legacy_dir / "ledger.json"
+    ledger = review._read_json(ledger_path, require_private=True)  # noqa: SLF001
+    ledger["cases"][0]["work_item_id"] = identifier
+    ledger_path.write_bytes(review._canonical_bytes(ledger))  # noqa: SLF001
+    ledger_path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="superseded cases are invalid"):
+        review._legacy_root_identity(  # noqa: SLF001
+            matrix_dir, legacy_dir, target_index
+        )
+
+
+@pytest.mark.parametrize("artifact_root", ["judgments", "adjudications"])
+def test_supersession_rejects_any_imported_matrix_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_root: str,
+) -> None:
+    result = _result()
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    legacy_dir = tmp_path / "legacy-review"
+    _legacy_review_package(matrix_dir, legacy_dir, target_index)
+    imported = matrix_dir / artifact_root
+    imported.mkdir(mode=0o700)
+    review._write_json(imported / "observed.json", {"observed": True})  # noqa: SLF001
+
+    with pytest.raises(review.ReviewError, match="retained outcomes"):
+        review.prepare(
+            matrix_dir,
+            tmp_path / "replacement-review",
+            supersede_review_dir=legacy_dir,
+            incident_record=tmp_path / "unused-incident.json",
+        )
+
+
+def test_supersession_rejects_v2_replacement_as_legacy_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _result()
+    target_index = SimpleNamespace(inspection_result=result)
+    monkeypatch.setattr(review.judge, "_target_index", lambda _path: target_index)
+    monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
+    matrix_dir = _matrix_root(tmp_path / "matrix")
+    _install_calibration(matrix_dir)
+    first_replacement = tmp_path / "replacement-v2"
+    review.prepare(matrix_dir, first_replacement)
+
+    with pytest.raises(review.ReviewError, match="superseded .* is invalid"):
+        review._legacy_root_identity(  # noqa: SLF001
+            matrix_dir, first_replacement, target_index
+        )
+
+
+def test_canary_attestation_exactly_binds_package_schema_profile_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+
+    recorded = review.record_canary(
+        matrix_dir,
+        review_dir,
+        verdict_path,
+        events_path=events_path,
+        duration_ms=4321,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+
+    attestation_path = review_dir / "canary-attestation.json"
+    attestation = review._read_json(  # noqa: SLF001
+        attestation_path, require_private=True, require_canonical=True
+    )
+    ledger = review._read_json(  # noqa: SLF001
+        review_dir / "ledger.json", require_private=True
+    )
+    assert recorded["status"] == "passed"
+    assert attestation["schema"] == review._CANARY_ATTESTATION_SCHEMA  # noqa: SLF001
+    assert attestation["package_id"] == output["package_id"]
+    assert attestation["matrix_id"] == "matrix-test"
+    assert attestation["response_schema_sha256"] == ledger["response_schema"][
+        "sha256"
+    ]
+    assert attestation["case_sha256"] == ledger["canary"]["case_sha256"]
+    assert attestation["model"] == ledger["canary"]["model"]
+    assert attestation["reasoning_effort"] == ledger["canary"]["reasoning_effort"]
+    assert attestation["codex_version"] == ledger["canary"]["codex_version"]
+    assert attestation["isolation_attestation"] == ledger["canary"][
+        "isolation_attestation"
+    ]
+    assert attestation["operator_invocation_attestation"] == ledger["canary"][
+        "operator_invocation_attestation"
+    ]
+    assert attestation["invocation_evidence"]["event_log_sha256"] == (
+        hashlib.sha256(events_path.read_bytes()).hexdigest()
+    )
+    assert attestation["invocation_evidence"]["verdict_bytes_sha256"] == (
+        hashlib.sha256(verdict_path.read_bytes()).hexdigest()
+    )
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("package_id", "package-" + "0" * 64),
+        ("matrix_id", "matrix-other"),
+        ("response_schema_sha256", "0" * 64),
+        ("case_sha256", "0" * 64),
+        ("model", "gpt-5.6-terra"),
+        ("reasoning_effort", "high"),
+        ("codex_version", "codex-cli 0.999.0"),
+        ("isolation_attestation", "different-profile"),
+        ("operator_invocation_attestation", "unattested-invocation"),
+    ],
+)
+def test_canary_attestation_rejects_any_changed_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+    review.record_canary(
+        matrix_dir,
+        review_dir,
+        verdict_path,
+        events_path=events_path,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+    path = review_dir / "canary-attestation.json"
+    attestation = review._read_json(path, require_private=True)  # noqa: SLF001
+    attestation[field] = replacement
+    path.write_bytes(review._canonical_bytes(attestation))  # noqa: SLF001
+    path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="canary attestation is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+@pytest.mark.parametrize(
+    "evidence_field",
+    [
+        "event_log_sha256",
+        "verdict_bytes_sha256",
+        "verdict_document_sha256",
+        "binding_sha256",
+    ],
+)
+def test_canary_attestation_rejects_changed_event_or_verdict_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_field: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+    review.record_canary(
+        matrix_dir,
+        review_dir,
+        verdict_path,
+        events_path=events_path,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+    path = review_dir / "canary-attestation.json"
+    attestation = review._read_json(path, require_private=True)  # noqa: SLF001
+    attestation["invocation_evidence"][evidence_field] = "0" * 64
+    path.write_bytes(review._canonical_bytes(attestation))  # noqa: SLF001
+    path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="canary attestation is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+def test_canary_structural_failure_is_terminal_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+    valid_content = verdict_path.read_bytes()
+    verdict = review._read_json(verdict_path, require_private=True)  # noqa: SLF001
+    verdict["target"]["work_item_id"] = WORK_ITEM_ID
+    verdict_path.write_bytes(review._canonical_bytes(verdict))  # noqa: SLF001
+    verdict_path.chmod(0o600)
+
+    with pytest.raises(review.ReviewError, match="canary verdict is invalid"):
+        review.record_canary(
+            matrix_dir,
+            review_dir,
+            verdict_path,
+            events_path=events_path,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+    terminal = review._read_json(  # noqa: SLF001
+        review_dir / "canary-attestation.json", require_private=True
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["failure_class"] == "structural_failure"
+
+    verdict_path.write_bytes(valid_content)
+    verdict_path.chmod(0o600)
+    with pytest.raises(review.ReviewError, match="terminally failed"):
+        review.record_canary(
+            matrix_dir,
+            review_dir,
+            verdict_path,
+            events_path=events_path,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+
+
+def test_canary_transport_failure_cli_is_terminal_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+    args = [
+        "record-canary-failure",
+        str(matrix_dir),
+        str(review_dir),
+        "--failure-class",
+        "transport_failure",
+        "--duration-ms",
+        "7",
+        "--isolation-attestation",
+        review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        "--operator-invocation-attestation",
+        review._CANARY_OPERATOR_ATTESTATION,  # noqa: SLF001
+    ]
+
+    assert review.review_cli(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["status"] == "failed"
+    assert review.review_cli(args) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second == first
+    assert review.validate_canary(matrix_dir, review_dir)["status"] == "failed"
+
+    with pytest.raises(review.ReviewError, match="terminally failed"):
+        review.record_canary(
+            matrix_dir,
+            review_dir,
+            verdict_path,
+            events_path=events_path,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+
+
+def test_canary_rejects_wrong_operator_attestation_without_terminalizing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+
+    with pytest.raises(review.ReviewError, match="measurement is invalid"):
+        review.record_canary(
+            matrix_dir,
+            review_dir,
+            verdict_path,
+            events_path=events_path,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation="unattested-invocation",
+        )
+    assert not (review_dir / "canary-attestation.json").exists()
+
+
+def test_canary_dangling_attestation_symlink_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    (review_dir / "canary-attestation.json").symlink_to(
+        tmp_path / "missing-attestation.json"
+    )
+
+    with pytest.raises(review.ReviewError, match="input is invalid"):
+        review.validate_canary(matrix_dir, review_dir)
+
+
+@pytest.mark.parametrize("terminal_status", ["passed", "failed"])
+def test_canary_validation_rejects_copied_review_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    if terminal_status == "passed":
+        verdict_path, events_path = _write_canary_result(review_dir, tmp_path)
+        review.record_canary(
+            matrix_dir,
+            review_dir,
+            verdict_path,
+            events_path=events_path,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+    else:
+        review.record_canary_failure(
+            matrix_dir,
+            review_dir,
+            failure_class="transport_failure",
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+    copied = tmp_path / "copied-review"
+    shutil.copytree(review_dir, copied)
+
+    with pytest.raises(review.ReviewError, match="package registry is invalid"):
+        review.validate_canary(matrix_dir, copied)
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "duration_ms"),
+    [("provider_rejection", 7), ("transport_failure", 8)],
+)
+def test_canary_failure_replay_rejects_contradictory_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_class: str,
+    duration_ms: int,
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    review.record_canary_failure(
+        matrix_dir,
+        review_dir,
+        failure_class="transport_failure",
+        duration_ms=7,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+
+    with pytest.raises(review.ReviewError, match="replay is contradictory"):
+        review.record_canary_failure(
+            matrix_dir,
+            review_dir,
+            failure_class=failure_class,
+            duration_ms=duration_ms,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+            operator_invocation_attestation=(
+                review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+            ),
+        )
+
+
+@pytest.mark.parametrize("attestation_state", ["missing", "invalid"])
+def test_assemble_refuses_missing_or_invalid_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attestation_state: str,
+) -> None:
+    matrix_dir, review_dir, _target_index, _output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    if attestation_state == "invalid":
+        review._write_json(  # noqa: SLF001
+            review_dir / "canary-attestation.json", {"schema": "invalid"}
+        )
+
+    with pytest.raises(review.ReviewError, match="canary attestation"):
+        review.assemble_judgment(
+            matrix_dir,
+            review_dir,
+            WORK_ITEM_ID,
+            tmp_path / "missing-verdict.json",
+            events_path=tmp_path / "missing-events.jsonl",
+            judge_identifier="judge-1",
+            attempt_count=1,
+            duration_ms=1,
+            isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        )
+
+
+def test_operation_v03_binds_package_and_canary_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir, _target_index, output = _prepare_v2_review(
+        tmp_path, monkeypatch
+    )
+    canary_verdict, canary_events = _write_canary_result(review_dir, tmp_path)
+    review.record_canary(
+        matrix_dir,
+        review_dir,
+        canary_verdict,
+        events_path=canary_events,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+        operator_invocation_attestation=(
+            review._CANARY_OPERATOR_ATTESTATION  # noqa: SLF001
+        ),
+    )
+    case = review._read_json(  # noqa: SLF001
+        review_dir / "cases" / f"{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    verdict = {
+        "schema": review._VERDICTS_SCHEMA,  # noqa: SLF001
+        "target": {
+            "work_item_id": WORK_ITEM_ID,
+            "projection_sha256": TARGET["projection_sha256"],
+        },
+        "invocation": case["execution"]["invocation"],
+        "verdicts": _verdict_document()["verdicts"],
+    }
+    verdict_path = tmp_path / "verdict.json"
+    review._write_json(verdict_path, verdict)  # noqa: SLF001
+    events_path = _write_bound_event_log(tmp_path / "events.jsonl", verdict_path)
+    monkeypatch.setattr(
+        review.judge, "_validate_judgment_document", lambda *_args: None
+    )
+    monkeypatch.setattr(review.judge, "_retained_judgments", lambda *_args: {})
+    monkeypatch.setattr(review, "_retained_judgment_files", lambda *_args: [])
+    monkeypatch.setattr(
+        review,
+        "_import_document_locked",
+        lambda _matrix, kind, document: (
+            Path(f"{kind}-retained.json"),
+            review._sha256(document),  # noqa: SLF001
+        ),
+    )
+
+    review.assemble_judgment(
+        matrix_dir,
+        review_dir,
+        WORK_ITEM_ID,
+        verdict_path,
+        events_path=events_path,
+        judge_identifier="judge-1",
+        attempt_count=1,
+        duration_ms=1,
+        isolation_attestation=review._ISOLATION_ATTESTATION,  # noqa: SLF001
+    )
+
+    operation = review._read_json(  # noqa: SLF001
+        review_dir / "operations" / f"judgment-{WORK_ITEM_ID}-judge-1.json",
+        require_private=True,
+    )
+    assert operation["schema"] == "steam-agent-eval-review-operation/0.3"
+    assert operation["package_id"] == output["package_id"]
+    assert operation["canary_attestation_sha256"] == hashlib.sha256(
+        (review_dir / "canary-attestation.json").read_bytes()
+    ).hexdigest()
+
+
 def test_case_document_is_the_exact_route_blind_model_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,18 +1539,18 @@ def test_case_document_is_the_exact_route_blind_model_input(
     monkeypatch.setattr(review, "_target_for", lambda *_args: (TARGET, PROJECTION))
 
     document = review._case_document(  # noqa: SLF001
-        tmp_path, index, WORK_ITEM_ID, "judge-1"
+        tmp_path, index, WORK_ITEM_ID, "judge-1", PACKAGE_ID
     )
 
     encoded = review._canonical_bytes(document)  # noqa: SLF001
-    assert review.judge._validate_schema(document, "review-case-0.1.json") == document  # noqa: SLF001
+    assert review.judge._validate_schema(document, "review-case-0.2.json") == document  # noqa: SLF001
     assert b"gpt-5.6-sol" not in encoded
     assert b'"route"' not in encoded
     assert b'"metrics"' not in encoded
     assert document["projection"] == PROJECTION
     assert document["execution"]["model_input"] == "this_document_verbatim"
     assert document["execution"]["invocation"] == review._invocation_binding(  # noqa: SLF001
-        TARGET, "judge-1"
+        TARGET, "judge-1", PACKAGE_ID
     )
     assert document["prompt"]["text"].startswith("# Matrix qualitative judge")
 
@@ -333,32 +1625,49 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
     monkeypatch.setattr(
         review,
         "_case_document",
-        lambda _matrix, _index, _work_item, judge_identifier: _case(
-            judge_identifier
+        lambda _matrix, _index, _work_item, judge_identifier, package_id: _case(
+            judge_identifier, package_id
         ),
     )
     monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
-    matrix_dir = tmp_path / "matrix"
-    matrix_dir.mkdir()
+    matrix_dir = _matrix_root(tmp_path / "matrix")
     review_dir = tmp_path / "prepared"
 
     output = review.prepare(matrix_dir, review_dir)
 
-    assert output == {"matrix_id": "matrix-test", "cases": 3}
+    assert output == {
+        "matrix_id": "matrix-test",
+        "package_id": output["package_id"],
+        "cases": 3,
+        "canary": "canary-case.json",
+    }
+    assert output["package_id"].startswith("package-")
+    assert len(output["package_id"]) == len("package-") + 64
     assert str(review_dir) not in review._canonical_bytes(output).decode()  # noqa: SLF001
     assert stat.S_IMODE(review_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "cases").stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "operations").stat().st_mode) == 0o700
     assert stat.S_IMODE((review_dir / "ledger.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((review_dir / "response-schema.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((review_dir / "canary-case.json").stat().st_mode) == 0o600
     ledger = review._read_json(  # noqa: SLF001
         review_dir / "ledger.json", require_private=True
     )
+    assert ledger["schema"] == "steam-agent-eval-review-ledger/0.2"
+    assert ledger["package_id"] == output["package_id"]
     assert ledger["policy"] == {
         "maximum_attempts_per_judgment": 3,
         "model_invocation": "external",
         "usage_accounting": "unavailable",
+        "package_protocol": "qualitative-review-package/0.2",
+        "operation_schema": "steam-agent-eval-review-operation/0.3",
+        "canary_required": True,
     }
+    assert ledger["supersedes"] is None
+    assert ledger["response_schema"]["validator"] == (
+        "codex-structured-output-subset/0.1"
+    )
+    assert ledger["canary"]["attestation_path"] == "canary-attestation.json"
     assert {
         (item["judge_identifier"], item["path"])
         for item in ledger["cases"]
@@ -377,6 +1686,13 @@ def test_prepare_publishes_private_cases_schema_and_bounded_ledger(
             for item in ledger["cases"]
         }
     ) == 3
+    for item in ledger["cases"]:
+        case = review._read_json(  # noqa: SLF001
+            review_dir / item["path"], require_private=True
+        )
+        assert case["schema"] == "steam-agent-eval-review-case/0.2"
+        assert case["package_id"] == output["package_id"]
+        assert case["execution"]["invocation"]["package_id"] == output["package_id"]
 
 
 def test_review_cli_redacts_filesystem_error_paths(
@@ -962,6 +2278,8 @@ def test_judgment_operation_rejects_non_object_judge() -> None:
     artifact = {"target": TARGET, "judge": []}
     operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "package_id": PACKAGE_ID,
+        "canary_attestation_sha256": _mock_canary_sha256(),
         "kind": "judgment_import",
         "matrix_id": TARGET["matrix_id"],
         "work_item_id": WORK_ITEM_ID,
@@ -991,6 +2309,8 @@ def test_judgment_operation_requires_deterministic_judgment_id() -> None:
     }
     operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "package_id": PACKAGE_ID,
+        "canary_attestation_sha256": _mock_canary_sha256(),
         "kind": "judgment_import",
         "matrix_id": TARGET["matrix_id"],
         "work_item_id": WORK_ITEM_ID,
@@ -1023,6 +2343,8 @@ def test_operation_validators_reject_invalid_recorded_at(recorded_at: object) ->
     }
     judgment_operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "package_id": PACKAGE_ID,
+        "canary_attestation_sha256": _mock_canary_sha256(),
         "kind": "judgment_import",
         "matrix_id": TARGET["matrix_id"],
         "work_item_id": WORK_ITEM_ID,
@@ -1040,6 +2362,8 @@ def test_operation_validators_reject_invalid_recorded_at(recorded_at: object) ->
     adjudication_artifact = {"target": TARGET}
     adjudication_operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "package_id": PACKAGE_ID,
+        "canary_attestation_sha256": _mock_canary_sha256(),
         "kind": "adjudication_import",
         "matrix_id": TARGET["matrix_id"],
         "work_item_id": WORK_ITEM_ID,
@@ -1066,6 +2390,8 @@ def test_operation_validators_accept_timezone_aware_recorded_at() -> None:
     }
     operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+        "package_id": PACKAGE_ID,
+        "canary_attestation_sha256": _mock_canary_sha256(),
         "kind": "adjudication_import",
         "matrix_id": TARGET["matrix_id"],
         "work_item_id": WORK_ITEM_ID,
@@ -1155,8 +2481,8 @@ def test_documented_judge_profile_matches_runner_configuration() -> None:
     assert 'exec --json --ephemeral' in documentation
     assert 'review check-events "$STDOUT_LOG"' in documentation
     assert '"$VERDICT_PATH" --events "$STDOUT_LOG" --judge judge-1' in documentation
-    assert "operation `0.2` evidence" in documentation
-    assert "tool-free" not in documentation
+    assert "operation `0.3` evidence" in documentation
+    assert "one tool-free agent message" in documentation
     invocation = documentation.split(
         "Then invoke the judge with the isolated environment:", maxsplit=1
     )[1].split("Import the result", maxsplit=1)[0]
@@ -1415,8 +2741,8 @@ def test_assemble_preflights_every_retained_operation_before_append(
     monkeypatch.setattr(
         review,
         "_case_document",
-        lambda _matrix, _index, _work_item, judge_identifier: _case(
-            judge_identifier
+        lambda _matrix, _index, _work_item, judge_identifier, package_id: _case(
+            judge_identifier, package_id
         ),
     )
     monkeypatch.setattr(review.judge, "_validate_schema", lambda value, _name: value)
@@ -1443,6 +2769,17 @@ def test_assemble_preflights_every_retained_operation_before_append(
     matrix_dir = _matrix_root(tmp_path / "matrix")
     review_dir = tmp_path / "prepared"
     review.prepare(matrix_dir, review_dir)
+    review._write_json(  # noqa: SLF001
+        review_dir / "canary-attestation.json", {"mock": True}
+    )
+    monkeypatch.setattr(
+        review,
+        "_validate_canary_terminal",
+        lambda *_args: (
+            {"status": "passed"},
+            _mock_canary_sha256(),
+        ),
+    )
     is_adjudication = mutation.endswith("adjudication")
     retained_path = review_dir / "operations" / (
         f"adjudication-{WORK_ITEM_ID}-agreement.json"
@@ -1458,6 +2795,8 @@ def test_assemble_preflights_every_retained_operation_before_append(
         }
         operation = {
             "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "package_id": PACKAGE_ID,
+            "canary_attestation_sha256": _mock_canary_sha256(),
             "kind": "adjudication_import",
             "matrix_id": TARGET["matrix_id"],
             "work_item_id": WORK_ITEM_ID,
@@ -1493,6 +2832,8 @@ def test_assemble_preflights_every_retained_operation_before_append(
             artifact["created_at"] = "2026-08-04T12:00:00Z"
         operation = {
             "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "package_id": PACKAGE_ID,
+            "canary_attestation_sha256": _mock_canary_sha256(),
             "kind": "judgment_import",
             "matrix_id": TARGET["matrix_id"],
             "work_item_id": WORK_ITEM_ID,
@@ -2177,7 +3518,7 @@ def test_privacy_invalid_response_does_not_poison_corrected_retry(
                     "projection_sha256": TARGET["projection_sha256"],
                 },
                 "invocation": review._invocation_binding(  # noqa: SLF001
-                    TARGET, "judge-1"
+                    TARGET, "judge-1", PACKAGE_ID
                 ),
                 "verdicts": [
                     {
@@ -2269,6 +3610,8 @@ def _mock_resolution(
         judgments[digest] = document
         operation = {
             "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "package_id": PACKAGE_ID,
+            "canary_attestation_sha256": _mock_canary_sha256(),
             "kind": "judgment_import",
             "matrix_id": TARGET["matrix_id"],
             "work_item_id": WORK_ITEM_ID,
@@ -2360,7 +3703,7 @@ def test_resolve_preflights_every_roster_before_first_append(
         target = dict(TARGET, work_item_id=work_item_id)
         case["target"] = target
         case["execution"]["invocation"] = review._invocation_binding(  # noqa: SLF001
-            target, judge_identifier
+            target, judge_identifier, PACKAGE_ID
         )
         return case
 
@@ -2375,8 +3718,9 @@ def test_resolve_preflights_every_roster_before_first_append(
         cases_by_judge: dict[str, dict[str, object]],
         campaign: object,
         files: object,
+        canary_attestation_sha256: str,
     ) -> dict[str, tuple[str, dict[str, object]]]:
-        del files
+        del files, canary_attestation_sha256
         case = next(iter(cases_by_judge.values()))
         if case["target"]["work_item_id"] == second_work_item:
             raise review.ReviewError("later qualitative roster is invalid")
@@ -2559,7 +3903,7 @@ def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(
         target = dict(TARGET, work_item_id=work_item_id)
         case["target"] = target
         case["execution"]["invocation"] = review._invocation_binding(  # noqa: SLF001
-            target, judge_identifier
+            target, judge_identifier, PACKAGE_ID
         )
         return case
 
@@ -2580,8 +3924,9 @@ def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(
         cases_by_judge: dict[str, dict[str, object]],
         campaign: object,
         files: object,
+        canary_attestation_sha256: str,
     ) -> dict[str, tuple[str, dict[str, object]]]:
-        del files
+        del files, canary_attestation_sha256
         case = next(iter(cases_by_judge.values()))
         roster_calls.append(case["target"]["work_item_id"])
         return {
@@ -2725,6 +4070,8 @@ def test_resolve_mechanically_preserves_disagreement_as_unresolved(
         judgments[digest] = document
         operation = {
             "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
+            "package_id": PACKAGE_ID,
+            "canary_attestation_sha256": _mock_canary_sha256(),
             "kind": "judgment_import",
             "matrix_id": TARGET["matrix_id"],
             "work_item_id": WORK_ITEM_ID,
