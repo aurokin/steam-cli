@@ -1014,7 +1014,10 @@ def test_operation_validators_reject_invalid_recorded_at(recorded_at: object) ->
 
 
 def test_operation_validators_accept_timezone_aware_recorded_at() -> None:
-    artifact = {"target": TARGET}
+    artifact = {
+        "adjudication_id": f"adjudication-{WORK_ITEM_ID}",
+        "target": TARGET,
+    }
     operation = {
         "schema": review._OPERATION_SCHEMA,  # noqa: SLF001
         "kind": "adjudication_import",
@@ -2079,6 +2082,81 @@ def test_resolve_resumes_adjudication_from_operation_after_interruption(
         "retained": 1,
     }
     assert calls == 2
+
+
+def test_adjudication_resume_rejects_edited_id_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    calls = 0
+
+    def interrupted_import(*_args: object) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    operation_path = (
+        review_dir / "operations" / f"adjudication-{WORK_ITEM_ID}-agreement.json"
+    )
+    operation = review._read_json(  # noqa: SLF001
+        operation_path, require_private=True
+    )
+    private_id = "adjudication-private-account-name"
+    operation["artifact"]["adjudication_id"] = private_id
+    operation["artifact_sha256"] = review._sha256(operation["artifact"])  # noqa: SLF001
+    operation_path.write_bytes(review._canonical_bytes(operation))  # noqa: SLF001
+    operation_path.chmod(0o600)
+    mutated_bytes = operation_path.read_bytes()
+
+    with pytest.raises(review.ReviewError, match="operation is invalid") as raised:
+        review.resolve_agreement(matrix_dir, review_dir)
+
+    assert private_id not in str(raised.value)
+    assert operation_path.read_bytes() == mutated_bytes
+    assert calls == 1
+    assert not (matrix_dir / "adjudications").exists()
+
+
+def test_adjudication_resume_rejects_renamed_retained_file_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matrix_dir, review_dir = _mock_resolution(tmp_path, monkeypatch)
+    calls = 0
+
+    def interrupted_import(*_args: object) -> tuple[Path, str]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(review, "_import_document_locked", interrupted_import)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        review.resolve_agreement(matrix_dir, review_dir)
+    operation_path = (
+        review_dir / "operations" / f"adjudication-{WORK_ITEM_ID}-agreement.json"
+    )
+    operation_bytes = operation_path.read_bytes()
+    operation = review._read_json(  # noqa: SLF001
+        operation_path, require_private=True
+    )
+    artifact = operation["artifact"]
+    digest = operation["artifact_sha256"]
+    private_name = "private-account-name.json"
+    monkeypatch.setattr(
+        review,
+        "_retained_adjudication_files",
+        lambda *_args: [(Path(private_name), digest, artifact)],
+    )
+
+    with pytest.raises(review.ReviewError, match="filename is invalid") as raised:
+        review.resolve_agreement(matrix_dir, review_dir)
+
+    assert private_name not in str(raised.value)
+    assert operation_path.read_bytes() == operation_bytes
+    assert calls == 1
+    assert not (matrix_dir / "adjudications").exists()
 
 
 def test_resolve_repreflights_all_rosters_before_partial_phase_two_resume(

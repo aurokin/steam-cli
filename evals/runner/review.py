@@ -798,6 +798,8 @@ def _validate_adjudication_operation(
         or operation.get("case_sha256") != _sha256(case)
         or not isinstance(artifact, dict)
         or artifact.get("target") != case["target"]
+        or artifact.get("adjudication_id")
+        != f"adjudication-{case['target']['work_item_id']}"
         or operation.get("artifact_sha256") != _sha256(artifact)
         or not _valid_timestamp(operation.get("recorded_at"))
     ):
@@ -1160,6 +1162,8 @@ def _existing_operation_plan(
         target, retained_digest, retained_artifact = matching_files[0]
         if retained_digest != digest or retained_artifact != artifact:
             raise ReviewError("retained adjudication does not match review operation")
+        if target.name != f"{artifact['adjudication_id']}.json":
+            raise ReviewError("retained adjudication filename is invalid")
         retained_target = _retained_target(
             target, artifact, digest, kind="adjudication"
         )
