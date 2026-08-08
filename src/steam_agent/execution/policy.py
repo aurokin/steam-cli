@@ -52,6 +52,11 @@ def load_policy(path: Path) -> ExecutionPolicy:
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise PolicyError("policy file is not valid TOML") from error
 
+    unsupported_keys = set(document) - {"grants"}
+    if unsupported_keys:
+        raise PolicyError(
+            f"unsupported policy key {sorted(unsupported_keys)[0]!r}"
+        )
     grants_table = document.get("grants", {})
     if not isinstance(grants_table, dict):
         raise PolicyError("[grants] must be a table")

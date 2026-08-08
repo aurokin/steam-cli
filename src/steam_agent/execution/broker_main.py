@@ -146,17 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"initialized": True, "policy": "deny-all template written"})
         return 0
 
-    # Policy gates intake and execution only.  reconcile and status must
-    # work with a broken policy file: recovery (client restoration, journal
-    # repair) can never be blocked behind policy repair.
-    policy = None
-    if arguments.command in {"request", "confirm", "run"}:
+    # Policy gates intake and execution only, and is re-read at each
+    # decision point so file edits take effect immediately.  reconcile and
+    # status never load it: recovery (client restoration, journal repair)
+    # can never be blocked behind policy repair.
+    if arguments.command == "request":
         try:
             policy = load_policy(state_dir / "policy.toml")
         except PolicyError as error:
             return _fail(str(error))
-
-    if arguments.command == "request":
         try:
             plan = json.load(sys.stdin)
         except json.JSONDecodeError:
@@ -228,9 +226,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         except ConfirmationRejected as error:
             return _fail(str(error))
-        # Re-check the live policy: revoking a grant must dead-end a nonce
-        # minted while the grant was still active.
+        # Re-check the policy, read at this decision point: revoking a grant
+        # must dead-end a nonce minted while the grant was still active.
         operation = ledger.get(operation_id)
+        try:
+            policy = load_policy(state_dir / "policy.toml")
+        except PolicyError as error:
+            ledger.transition(
+                operation_id, "aborted", detail="policy unreadable at confirmation"
+            )
+            return _fail(str(error))
         if policy.grant_for(operation.operation) != "confirm":
             ledger.transition(
                 operation_id, "aborted", detail="policy revoked before confirmation"
@@ -249,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             operation = ledger.get(operation_id)
         except LedgerError as error:
+            return _fail(str(error))
+        try:
+            policy = load_policy(state_dir / "policy.toml")
+        except PolicyError as error:
             return _fail(str(error))
         if (
             operation.state in {"authorized", "interrupted"}

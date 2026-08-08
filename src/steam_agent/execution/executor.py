@@ -458,7 +458,13 @@ class Executor:
             return actions
         if state == "adopting":
             # Steam may have been restarted since the crash; adoption repair
-            # rewrites the live manifest, so never race a running client.
+            # rewrites the live manifest, so re-check the full lease and
+            # never race a running client or newly active user work.
+            if not self._session.gates().all_clear():
+                actions.append(
+                    f"{operation_id}: lease gates not clear; adoption reconcile deferred"
+                )
+                return actions
             if self._session.client_possibly_running() and not self._session.stop_client():
                 actions.append(
                     f"{operation_id}: client running; adoption reconcile deferred"

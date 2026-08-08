@@ -48,6 +48,15 @@ def test_policy_unattended_value_fails_closed(tmp_path: Path) -> None:
         )
 
 
+def test_policy_unknown_top_level_key_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError):
+        load_policy(
+            _write_policy(
+                tmp_path, 'allow_unattended = true\n[grants]\ninstall = "confirm"\n'
+            )
+        )
+
+
 def test_policy_composite_value_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(PolicyError):
         load_policy(_write_policy(tmp_path, '[grants]\ninstall = ["confirm"]\n'))
