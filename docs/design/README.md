@@ -15,7 +15,7 @@ Use this page to find the canonical design source. The broader
 | Provider support, terms, and limitations | [Evidence matrix](evidence-matrix.md) | Working, time-sensitive |
 | Data privacy, retention, acknowledgment, and deletion | [Steam data lifecycle](steam-data-lifecycle.md) | Accepted M2–M4 policy; index to M5–M6 ADRs |
 | Steam actions and confirmation classes | [Actions](actions.md) | M7 boundary accepted; future classes proposed |
-| Provisioned execution (broker install/update; uninstall human-only) | [Execution plan](execution-plan.md) and [Linux session model](execution-linux-session-model.md) | [ADR 0027](../adr/0027-provisioned-execution.md) accepted 2026-08-08; Phase 1 broker implemented (`steam-agent-broker`), later phases proposed |
+| Broker execution (install/update; uninstall human-only) | [Execution plan](execution-plan.md) and [Linux session model](execution-linux-session-model.md) | [ADR 0027](../adr/0027-provisioned-execution.md) accepted 2026-08-08, re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md) (trusted-manager model, standing grants implemented); Phase 1 broker implemented (`steam-agent-broker`), later phases proposed |
 | Historical pricing providers and fallback | [Pricing strategy](pricing-strategy.md) | M3 boundary accepted; providers time-sensitive |
 | Evaluation and acceptance | [Evaluation strategy](evaluation-strategy.md), [corpus and runner](../../evals/README.md), and [testing](../testing.md) | Working strategy; deterministic gate accepted |
 

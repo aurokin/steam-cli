@@ -1,11 +1,12 @@
-"""``steam-agent-broker``: the provisioned execution entry point (ADR 0027).
+"""``steam-agent-broker``: the execution entry point (ADR 0027/0028).
 
-Installing and invoking this command under a dedicated OS identity IS the
-provisioning act.  The inert planner (``steam-agent``) never imports this
-module.  Subcommands:
+The broker runs as the desktop user and is driven directly by the trusted
+manager agent (single-identity model, ADR 0028).  The inert planner
+(``steam-agent``) never imports this module.  Subcommands:
 
 - ``init``       scaffold the state directory and a deny-all policy template
-- ``request``    accept one operation-plan JSON on stdin, mint a nonce
+- ``request``    accept one operation-plan JSON on stdin; under an
+                 ``allow`` grant the request may auto-authorize in-process
 - ``confirm``    consume a nonce with an actor identity
 - ``run``        execute the single authorized (or resumable) operation
 - ``reconcile``  map any non-terminal operation to its one recovery action
@@ -22,6 +23,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 from steam_agent.execution.content_plane import SteamcmdAdapter
@@ -71,7 +73,7 @@ def _state_lock(state_dir: Path):
 
     # Owner-only from the first moment it exists: mkdir's mode is masked by
     # the umask (never widened), so 0o700 closes the pre-chmod window a
-    # permissive umask would otherwise open for another identity to
+    # permissive umask would otherwise open for another local user to
     # pre-create policy/state.  The chmod still repairs a pre-existing dir.
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_dir.chmod(0o700)
@@ -83,10 +85,28 @@ def _state_lock(state_dir: Path):
         handle.close()
 
 
+def _floor_denial(library: Path, min_free_gb: int | None) -> str | None:
+    """Reason the disk floor blocks auto-confirmation, or None if it passes.
+
+    ``load_policy`` guarantees a floor exists whenever any grant is
+    ``allow``, so a missing floor here is a defect, not a passing check.
+    """
+
+    if min_free_gb is None:
+        return "no disk floor configured"
+    try:
+        free = shutil.disk_usage(library / "steamapps").free
+    except OSError:
+        return "free disk space could not be measured"
+    if free < min_free_gb * 10**9:
+        return f"free disk {free // 10**9} GB below the {min_free_gb} GB floor"
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="steam-agent-broker",
-        description="Provisioned execution broker (ADR 0027, Phase 1).",
+        description="Execution broker (ADR 0027/0028).",
     )
     parser.add_argument("--state-dir", type=Path, default=None)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -109,7 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--operation-id", type=int, default=None)
 
     commands.add_parser("reconcile", help="Recover non-terminal operations.")
-    commands.add_parser("status", help="Show active operation and events.")
+    status = commands.add_parser(
+        "status", help="Show active operation, events, and recent outcomes."
+    )
+    status.add_argument("--limit", type=int, default=5)
+    commands.add_parser("policy", help="Show the effective execution policy.")
     return parser
 
 
@@ -171,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
                         "an operation is active; refusing to reconfigure the broker"
                     )
             # Ledger, policy, logs, and the steamcmd credential cache live
-            # here; never trust the umask to keep other identities out.
+            # here; never trust the umask to keep other local users out.
             state_dir.chmod(0o700)
             # An omitted --machine-id preserves the configured identity;
             # re-init must never silently retarget the single-active key.
@@ -237,9 +261,9 @@ def main(argv: list[str] | None = None) -> int:
             policy = load_policy(state_dir / "policy.toml")
         except PolicyError as error:
             return _fail(str(error))
-        # Bounded read across the trust boundary: the whole plan (unknown
-        # fields included) is later persisted into the ledger, so an
-        # unbounded stream could exhaust memory or state-disk space.
+        # Bounded read: the whole plan (unknown fields included) is later
+        # persisted into the ledger, so an unbounded stream could exhaust
+        # memory or state-disk space.
         raw_plan = sys.stdin.read(_PLAN_BYTE_LIMIT + 1)
         if len(raw_plan) > _PLAN_BYTE_LIMIT:
             return _fail("operation plan exceeds the size limit")
@@ -253,8 +277,8 @@ def main(argv: list[str] | None = None) -> int:
             return _fail("unsupported plan schema")
         operation = str(plan.get("operation", ""))
         if operation not in _SUPPORTED_OPERATIONS:
-            return _fail(f"operation {operation!r} is not executable in Phase 1")
-        if policy.grant_for(operation) != "confirm":
+            return _fail(f"operation {operation!r} is not executable")
+        if policy.grant_for(operation) not in {"confirm", "allow"}:
             return _fail(f"policy denies {operation!r}")
         target = plan.get("target", {})
         if not isinstance(target, dict):
@@ -312,11 +336,54 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except LedgerError as error:
                 return _fail(str(error))
-        _emit(
-            {
+            payload: dict[str, object] = {
                 "operation_id": operation_id,
                 "nonce": nonce,
                 "state": "pending_confirmation",
+            }
+            # Auto-confirmation (ADR 0028): re-read the policy under the
+            # state lock so the grant and version recorded as the
+            # authorizing actor are the ones in effect now, not the
+            # pre-lock intake read.  An unreadable re-read degrades to the
+            # ordinary pending flow; the confirm verb governs from there.
+            try:
+                current = load_policy(state_dir / "policy.toml")
+            except PolicyError:
+                current = None
+            if current is not None and current.grant_for(operation) == "allow":
+                denied = _floor_denial(
+                    Path(config["library"]), current.min_free_gb
+                )
+                if denied is not None:
+                    # Degraded, not dead: the emitted nonce stays
+                    # explicitly confirmable until it expires.
+                    payload["auto_confirm_denied"] = denied
+                else:
+                    try:
+                        ledger.confirm(
+                            nonce=nonce, actor=f"policy:{current.version}"
+                        )
+                    except ConfirmationRejected as error:
+                        return _fail(str(error))
+                    payload = {
+                        "operation_id": operation_id,
+                        "state": "authorized",
+                    }
+        _emit(payload)
+        return 0
+
+    if arguments.command == "policy":
+        # Read-only visibility for the manager agent; an unreadable policy
+        # is itself information (execution is denied until repaired).
+        try:
+            policy = load_policy(state_dir / "policy.toml")
+        except PolicyError as error:
+            return _fail(str(error))
+        _emit(
+            {
+                "version": policy.version,
+                "grants": policy.grants,
+                "limits": {"min_free_gb": policy.min_free_gb},
             }
         )
         return 0
@@ -353,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             except InvalidTransition:
                 pass  # already executing; run enforces policy from here
             return _fail(str(error))
-        if policy.grant_for(operation.operation) != "confirm":
+        if policy.grant_for(operation.operation) not in {"confirm", "allow"}:
             try:
                 ledger.transition(
                     operation_id,
@@ -390,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
             denial = str(error)
             denial_detail = "policy unreadable before execution"
         else:
-            if policy.grant_for(operation.operation) != "confirm":
+            if policy.grant_for(operation.operation) not in {"confirm", "allow"}:
                 denial = f"policy now denies {operation.operation!r}"
                 denial_detail = "policy revoked before execution"
         if denial is not None and operation.state not in {
@@ -442,10 +509,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if arguments.command == "status":
+        # SQLite reads LIMIT -1 as unbounded; keep the recent list bounded.
+        if arguments.limit < 0:
+            return _fail("--limit must be non-negative")
         ledger.expire_lapsed()
         active = ledger.active()
+        recent = [
+            {
+                "operation_id": row[0],
+                "operation": row[1],
+                "appid": row[2],
+                "state": row[3],
+                "detail": row[4],
+                "updated_at": row[5],
+            }
+            for row in ledger.recent(arguments.limit)
+        ]
         if active is None:
-            _emit({"active": None})
+            _emit({"active": None, "recent": recent})
             return 0
         _emit(
             {
@@ -454,8 +535,13 @@ def main(argv: list[str] | None = None) -> int:
                     "operation": active.operation,
                     "appid": active.appid,
                     "state": active.state,
+                    "detail": active.detail,
+                    "execution_window_expires_at": (
+                        active.execution_window_expires_at
+                    ),
                     "events": ledger.events(active.operation_id),
-                }
+                },
+                "recent": recent,
             }
         )
         return 0

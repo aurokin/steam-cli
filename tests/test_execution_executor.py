@@ -145,7 +145,7 @@ def _authorized(
         operation="install",
         appid=480,
         account_alias="owner",
-        machine_id="herb",
+        machine_id="machine-a",
         policy_version="v",
     )
     return ledger.confirm(nonce=nonce, actor="discord:owner")

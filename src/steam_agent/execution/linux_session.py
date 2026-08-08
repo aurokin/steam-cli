@@ -70,10 +70,8 @@ class LinuxSession:
 
     This class must execute inside the desktop user's own session: pgrep,
     ``steam -shutdown``, and ``systemd-run --user`` all target the invoking
-    user.  Phase 1 deploys the broker as that user (as spiked on the target
-    machine); the three-identity deployment of the session-model document
-    moves these calls behind the desktop user's session helper rather than
-    ever invoking them from the broker identity.
+    user.  The broker runs as that user permanently (single-identity
+    model, ADR 0028).
     """
 
     def __init__(
@@ -92,10 +90,9 @@ class LinuxSession:
     @staticmethod
     def _pgrep(*arguments: str) -> list[str]:
         # Scope to the invoking user.  LinuxSession always executes inside
-        # the desktop user's session (class docstring) — Phase 1 as that
-        # user directly, later behind their session helper — so the
-        # invoking UID IS the Steam-owning UID; another user's processes
-        # are neither stoppable nor relevant here.
+        # the desktop user's session (class docstring), so the invoking
+        # UID IS the Steam-owning UID; another user's processes are
+        # neither stoppable nor relevant here.
         return ["pgrep", "-U", str(os.getuid()), *arguments]
 
     def _absent(self, pattern: list[str]) -> GateState:
@@ -110,8 +107,8 @@ class LinuxSession:
         # Stopping the client interrupts downloads in every configured
         # library.  libraryfolders.vdf normally lives only in the primary
         # library, so also consult the standard config locations in case the
-        # broker targets a secondary one.  (The session helper runs in the
-        # desktop user's session, so its HOME is the right root here.)
+        # broker targets a secondary one.  (The broker runs in the desktop
+        # user's session, so its HOME is the right root here.)
         # Returns None when a configuration file exists but is unreadable:
         # the library list is then unknown and the gate must not pass.
         dirs = [self._library / "steamapps" / "downloading"]

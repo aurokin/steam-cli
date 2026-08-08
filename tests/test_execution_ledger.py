@@ -23,7 +23,7 @@ def ledger(tmp_path: Path) -> ExecutionLedger:
 
 def _request(
     ledger: ExecutionLedger,
-    machine: str = "herb",
+    machine: str = "machine-a",
     ttl: int = 900,
     key: str = "k" * 8,
 ) -> tuple[int, str]:
@@ -84,7 +84,7 @@ def test_expired_nonce_rejected(ledger: ExecutionLedger) -> None:
         operation="install",
         appid=480,
         account_alias="owner",
-        machine_id="herb",
+        machine_id="machine-a",
         policy_version="v",
         nonce_ttl_seconds=0,
     )

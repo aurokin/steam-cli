@@ -9,11 +9,13 @@ M1–M7 are accepted. Preserve their schema `0.1` contracts and safety boundarie
   human-open plans. It never launches, installs, uninstalls, mutates Steam
   state, or executes a generated plan, and never imports
   `steam_agent.execution`.
-- Execution exists ONLY behind the provisioned `steam-agent-broker` entry
-  point per [ADR 0027](docs/adr/0027-provisioned-execution.md): install
-  plans, explicit confirmation nonces, ledger-first state transitions,
-  fail-closed gates. Uninstall stays human-in-Steam; store/market/wallet/
-  credential operations are hard-denied forever.
+- Execution exists ONLY behind the `steam-agent-broker` entry point per
+  [ADR 0027](docs/adr/0027-provisioned-execution.md) as re-scoped by
+  [ADR 0028](docs/adr/0028-trusted-manager-execution.md): install/update
+  plans, policy-gated authorization (grants `deny | confirm | allow` within
+  limits), ledger-first state transitions, fail-closed gates. Uninstall
+  stays human-in-Steam; store/market/wallet/credential operations are
+  hard-denied forever.
 - Preserve the M1 last-good rule: partial or failed scans do not replace a
   complete installed projection.
 - Keep `unknown`, `false`, empty, inaccessible, and stale distinct. Separate

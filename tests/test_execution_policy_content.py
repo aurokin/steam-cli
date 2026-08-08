@@ -67,6 +67,45 @@ def test_policy_missing_grant_is_deny(tmp_path: Path) -> None:
     assert policy.grant_for("install") == "deny"
 
 
+def test_policy_allow_with_floor_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write_policy(
+            tmp_path,
+            '[grants]\ninstall = "allow"\n[limits]\nmin_free_gb = 25\n',
+        )
+    )
+    assert policy.grant_for("install") == "allow"
+    assert policy.min_free_gb == 25
+
+
+def test_policy_allow_without_floor_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError):
+        load_policy(_write_policy(tmp_path, '[grants]\ninstall = "allow"\n'))
+
+
+@pytest.mark.parametrize(
+    "value", ["true", "-1", '"25"', "25.5"], ids=["bool", "negative", "str", "float"]
+)
+def test_policy_bad_limit_type_fails_closed(tmp_path: Path, value: str) -> None:
+    with pytest.raises(PolicyError):
+        load_policy(
+            _write_policy(
+                tmp_path,
+                f'[grants]\ninstall = "allow"\n[limits]\nmin_free_gb = {value}\n',
+            )
+        )
+
+
+def test_policy_unknown_limit_key_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError):
+        load_policy(
+            _write_policy(
+                tmp_path,
+                '[grants]\ninstall = "confirm"\n[limits]\nmax_daily_gb = 10\n',
+            )
+        )
+
+
 def _library(tmp_path: Path) -> Path:
     library = tmp_path / "library"
     (library / "steamapps").mkdir(parents=True)

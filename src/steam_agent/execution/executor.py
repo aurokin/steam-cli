@@ -202,7 +202,7 @@ class Executor:
         install_dir_name = raw_name or ""
         # The directory the client already uses for this AppID always wins:
         # any other directory would re-download and orphan the install, and
-        # move is not an executable operation in Phase 1.  Reusing the live
+        # move is not an executable operation.  Reusing the live
         # directory in place is the accepted recoverable-update contract
         # (ADR 0027 clause 5): steamcmd validates and repairs content on
         # retry, and failure cost is bounded at temporary unplayability.
@@ -518,7 +518,7 @@ class Executor:
                 message=f"steamcmd failed; see {result.log_path.name}",
             )
 
-        # The human's confirmation bounds the WHOLE operation: a download
+        # The confirmation bounds the WHOLE operation: a download
         # that consumed the rest of the authorization window must not adopt
         # after it, matching reconciliation's lapsed-mid-download semantics.
         if not ledger.window_valid(operation_id):

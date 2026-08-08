@@ -1,10 +1,14 @@
 # Provisioned execution plan
 
-Status: proposed working plan for [ADR 0027](../adr/0027-provisioned-execution.md); drafted 2026-08-07 after a five-angle mechanism brainstorm and three adversarial review rounds. Supersedes nothing until the ADR is accepted.
+Status: working plan under [ADR 0027](../adr/0027-provisioned-execution.md)
+as re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md)
+(trusted-manager model, single identity); Phase 1 implemented
+(`steam-agent-broker`).
 
-Goal: extend steam-agent (Python CLI, read-only today by ADR 0013) so an AI
-agent, commanded from Discord, can keep a gaming PC's Steam library installed,
-updated, and curated — unattended where granted, confirmed where not.
+Goal: extend steam-agent (Python CLI, read-only today by ADR 0013) so the
+owner's trusted manager agent, driving the broker CLI directly over SSH, can
+keep a gaming PC's Steam library installed, updated, and curated — unattended
+where granted, confirmed where not.
 
 Scope discipline: v1 targets ONE OS — **Linux** (owner decision, resolved) —
 specified completely, with named portability seams (executor adapters,
@@ -16,32 +20,26 @@ Non-goals (v1): fine-grained download-queue control, CEF/SteamClient.* injection
 surgery (future ADR at most), any store/market/wallet/credential/
 account-settings operation (hard-deny forever).
 
-## 1. Threat model and trust boundary
+## 1. Trust model (re-scoped by ADR 0028)
 
-The Discord-facing agent process is untrusted-by-default (prompt-injectable).
-Execution is not a code path it can call; it is a capability held by a
-different OS identity.
+The agent is a **trusted manager** of this machine's Steam library, not an
+untrusted submitter. It reaches `steam-agent-broker` directly over SSH as
+the desktop user; the broker runs as that same user (single identity). The
+agent remains an LLM and therefore injectable — that risk is accepted, and
+bounded by the broker surface rather than by an identity boundary:
 
-- A small **executor broker** runs as its own restricted OS user. It
-  exclusively owns: the policy file, the operation ledger, the steamcmd
-  installation + cached credentials, and the right to invoke steamcmd and
-  client lifecycle commands. The agent reaches it only via a local
-  authenticated socket carrying structured plan documents.
-- **Topology (resolved)**: the LLM agent is a Hermes agent running on another
-  host; it reaches the gaming PC over SSH. The CLI and broker operate on
-  localhost only. The permissions circle resolves as three identities on the
-  PC: desktop user (owns Steam + library + a small session helper for client
-  lifecycle/launch), broker user (systemd service; owns policy, ledger,
-  steamcmd root + credentials, Discord bot token; library write via
-  group/ACL), and a restricted SSH login user for the agent (owns neither;
-  its only capability is the broker's local socket). The Hermes agent's SSH
-  key lands in that restricted user's authorized_keys — never the desktop
-  user's. Concrete ACL layout is the Item 0 doc (§12), validated in Phase 0.
-- The ledger is an operational log; it is tamper-evident against the agent
-  identity only via these OS permissions. (Optional later: hash-chained
-  records to a remote sink.)
-- Proportionality: personal machine, not a bank — but the identity boundary is
-  cheap now and impossible to retrofit later.
+- **Hard-denied classes are absent code, not policy entries**: store,
+  market, wallet, credentials, account settings, content deletion. Within
+  the broker surface the worst case is wasted bandwidth and disk plus
+  temporary unplayability — never deleted saves, commerce, or credential
+  operations.
+- **The policy file is the owner's recorded intent**, an accident brake,
+  and the kill switch (`install = "deny"`, re-read at every decision point,
+  fails closed when unreadable). It is not an enforcement boundary against
+  the agent, which shares the broker's UID.
+- **The ledger is an audit trail** for the owner, not tamper-proof against
+  the agent. Human interaction, when wanted, flows through the owner's
+  existing conversation with the agent.
 
 ## 2. Execution planes and verb matrix
 
@@ -184,25 +182,22 @@ The adoption journal records the new manifest's checksum before placement, so
 Crash/reboot/disk-full/network-loss at each transition is a required Phase 0
 test, not an afterthought.
 
-## 6. Remote confirmation (Discord)
+## 6. Authorization (re-scoped by ADR 0028)
 
-- Plan hashes identify WHAT; authorization is a **random single-use nonce**,
-  minted broker-side, bound to: full plan hash, machine id, operation+appid,
-  expected data impact, policy version, confirmer's immutable Discord user id
-  and channel, and expiry. Consumed atomically in the ledger.
-- **Deferred-execution rule**: the nonce carries an execution window shown at
-  confirmation time ("will run within N hours / at tonight's window"). If the
-  lease isn't acquired within that window, the operation expires and requires
-  fresh confirmation — a "now" confirm never silently becomes a
+- Authorization is a policy outcome per operation class:
+  `allow | confirm | deny`. Under `allow` the broker auto-authorizes at
+  request time within the policy's limits (measured free-disk floor;
+  degrade to pending when it fails or cannot be measured). Under `confirm`
+  the agent relays the owner's conversational approval by running the
+  `confirm` verb; the actor string is provenance, not authentication.
+- The **nonce** is a broker-minted single-use token binding one request row
+  to exactly one authorization event — consumed in-process under `allow`,
+  via the CLI verb under `confirm`. It is mistake-guarding and audit, not a
+  security boundary against the agent. Consumed atomically in the ledger.
+- **Deferred-execution rule**: authorization carries an execution window.
+  If the lease isn't acquired within that window, the operation expires and
+  requires fresh authorization — a "now" approval never silently becomes a
   next-day execution.
-- Confirmation is a **Discord slash-command/button interaction** (structured,
-  identity-carrying). The agent relays and explains plans; it never decides
-  that prose was a confirmation.
-- Transport (resolved): the Hermes agent reaches the PC over SSH as the
-  restricted user; agent↔broker is a localhost socket behind that. The broker
-  holds the Discord bot token and maintains its own outbound gateway
-  connection, so confirmations (slash-command/button) flow Discord → broker
-  directly — they never pass through the LLM agent or the SSH channel.
 
 ## 7. Postconditions: semantic, per verb, honest about first-run
 
@@ -230,8 +225,9 @@ test, not an afterthought.
 steamcmd auth is a renewable state (`authenticated | auth_required |
 unknown`) owned by the broker. Fail-fast noninteractive settings; any Guard
 challenge or token invalidation → `auth_required` + owner alert, never a retry
-loop. The cached token IS a credential and lives in the broker identity's
-profile, unreadable by the agent user. Onboarding expects one interactive
+loop. The cached token IS a credential and lives in the broker's private
+steamcmd HOME (a `HOME` override under the state directory); Guard alerts
+surface through broker output into the owner conversation. Onboarding expects one interactive
 login per machine; token longevity is measured in Phase 0 and the design
 assumes re-auth interrupts happen.
 
@@ -292,7 +288,7 @@ large titles.
 ## 10a. Uninstall mechanism (DECIDED 2026-08-08: human-in-Steam only)
 
 `app_uninstall` is dead: 4/4 silent no-ops on the current steamcmd with valid
-auth (Phase 0, herb). Owner decision: **uninstall stays human-present,
+auth (Phase 0, target machine). Owner decision: **uninstall stays human-present,
 executed inside Steam** (the plan carries the `steam://uninstall/<appid>`
 reference and UI instructions; the agent never deletes game content).
 
@@ -309,34 +305,28 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
 
 ## 11. ADR and eval changes
 
-- New ADR supersedes 0013: "read-only by default; execution by explicit
-  provisioned grant." Preserves 0013's observation/ranking/inert-plan clauses;
-  adds: broker trust boundary + three-identity model, two-plane mechanism
-  decision, maintenance lease, fresh-vs-update mutation policy,
-  single-manifest adoption rule, first-run honesty, VSA posture
-  (human-declared intent, agent-executed steps, no credential/commerce
-  automation, rate limits), the move-by-reinstall composite and its
-  one-complete-copy invariant, and explicit deferral of cold-surgery/CEF.
-- Boundary evals become a matrix: refuse when (broker not provisioned | no
-  grant | nonce missing/consumed/expired | plan hash mismatch | gate failed |
-  execution window lapsed | hard-deny class | capability unknown | non-default
-  install), execute-and-verify when granted. Regression eval: the planner
-  surface alone still never executes. New evals: mid-game request defers;
-  nonce replay rejected; crash reconciliation per table row; agent never
-  claims `ready_to_play` unattended; uninstall never touches residual user
-  content; move never leaves fewer than one complete copy (kill-at-every-
-  sub-state), never two adopted manifests, and source cleanup only targets
-  the pinned source path.
+- ADR 0027 (accepted) supersedes 0013's execution prohibition for the broker
+  surface; ADR 0028 (accepted) re-scopes 0027 to the trusted-manager
+  single-identity model with policy-gated authorization.
+- The boundary-eval refusal matrix remains future work under the 0028 model:
+  refuse when (no grant | nonce missing/consumed/expired | gate failed |
+  execution window lapsed | hard-deny class | capability unknown |
+  non-default install), plus auto-grant-within-limits, degrade-on-limit, and
+  revocation rows; no confirmation-transport rows. The existing regression
+  eval — the planner surface alone still never executes — is retained.
+  Future evals: mid-game request defers; nonce replay rejected; crash
+  reconciliation per table row; agent never claims `ready_to_play`
+  unattended; uninstall never touches residual user content; move never
+  leaves fewer than one complete copy (kill-at-every-sub-state), never two
+  adopted manifests, and source cleanup only targets the pinned source path.
 
 ## 12. Delivery phases
 
-- **Item 0 (before Phase 0 code): Linux session model.** One document: the
-  three identities and their ACLs; broker as a systemd system service; the
-  desktop-user session helper (systemd user service) the broker commands for
-  client start/stop/launch (the Steam client needs the graphical session;
-  steamcmd does not); presence/idle gates via logind + process observation;
-  autologin posture for unattended windows; SSH restricted-user setup.
-  Phase 0 validates it.
+- **Item 0 (before Phase 0 code): Linux session model.** One document (now
+  single-identity per ADR 0028): the broker CLI runs in the desktop user's
+  session; client lifecycle via `-shutdown`/`systemd-run --user`;
+  presence/idle gates via process observation; autologin posture for
+  unattended windows. Phase 0 validated it.
 - **Phase 0 — spike**, safe boundaries: disposable secondary library + full
   metadata backup, free/small titles first then owner account against the
   disposable library, pass/fail thresholds defined before testing,
@@ -345,27 +335,33 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
   both directions), (2) app_uninstall reliability, (3) coverage % across the
   owner's real library incl. DLC/Family/third-party-launcher titles,
   (4) Guard token longevity, (5) `-shutdown` + process-tree-exit detection,
-  (6) steamcmd stdout parse stability, (7) the identity/ACL model works.
-- **Phase 1 — broker + ledger + install/update only.** Explicit confirmation
-  for everything, all work serialized, every other verb denied. Smallest
-  thing that delivers the use case (library kept current from Discord).
+  (6) steamcmd stdout parse stability, (7) the identity/ACL model works
+  (retired by ADR 0028: single identity is the permanent design).
+- **Phase 1 — broker + ledger + install/update only. IMPLEMENTED**
+  (`steam-agent-broker`), all work serialized, every other verb denied.
+  Originally "explicit confirmation for everything"; superseded by ADR
+  0028's policy grants (`allow` within limits auto-authorizes).
 - **Phases 2a/2b/2c/2d — independent verb additions**, each gated on its own
   spike line and shippable alone: 2a uninstall-as-inert-plan (candidate
   ranking + inventory + in-Steam instructions; human executes, per §10a),
   2b repair, 2c launch allowlist (dispatched-terminal), 2d move-by-reinstall
   (composite of §10; terminates `confirmed_with_residue`, human source
   cleanup).
-- **Phase 3 — standing grants + scheduler**: allow_unattended grants scoped by
-  appid set/rule, maintenance windows, overnight cycles, budgets (max GB
-  downloaded/deleted per day), kill switch. Then second-OS port behind its own
-  gate.
+- **Phase 3 — scheduler**: maintenance windows, overnight cycles, per-day
+  byte budgets, per-appid grant scoping. (Standing grants shipped early as
+  ADR 0028's `allow`; the kill switch already exists as
+  `install = "deny"`.) Then second-OS port behind its own gate.
 - **Phase last (ideally never)** — move / cold-file surgery ADR.
 
-## Owner decisions (all resolved 2026-08-07)
-1. Target OS: **Linux**.
-2. Spike posture: owner account against a disposable library with backups —
-   host is not the owner's primary gaming machine, disruption acceptable.
-3. Topology: CLI/broker are localhost-only on the PC; the LLM agent is a
-   Hermes agent with SSH access, logging in as the restricted user. Broker
-   holds the Discord bot token; confirmations bypass the agent entirely.
-4. Launch ships as Phase 2c with dispatched-only honesty.
+## Owner decisions
+1. (2026-08-07) Target OS: **Linux**.
+2. (2026-08-07) Spike posture: owner account against a disposable library
+   with backups — host is not the owner's primary gaming machine,
+   disruption acceptable.
+3. (2026-08-07) Topology: CLI/broker are localhost-only on the PC; the LLM
+   agent reaches it over SSH. (Restricted-user/Discord-transport clauses
+   superseded by decision 5.)
+4. (2026-08-07) Launch ships as Phase 2c with dispatched-only honesty.
+5. (2026-08-08) Trusted-manager re-scope: the agent drives the broker CLI
+   directly as the desktop user; confirmation demoted to policy grants.
+   See [ADR 0028](../adr/0028-trusted-manager-execution.md).

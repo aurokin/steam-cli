@@ -99,7 +99,7 @@ def _stamp(value: datetime) -> str:
 
 
 class ExecutionLedger:
-    """SQLite-backed operation ledger owned by the broker identity."""
+    """SQLite-backed operation ledger under the broker CLI's state dir."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -202,9 +202,11 @@ class ExecutionLedger:
     ) -> tuple[int, str]:
         """Record a requested operation and mint its single-use nonce.
 
-        Returns ``(operation_id, nonce)``.  The nonce is the human-facing
-        confirmation secret; the OS identity boundary, not nonce secrecy,
-        is what keeps the requesting agent from confirming its own plans.
+        Returns ``(operation_id, nonce)``.  The nonce is the single-use
+        token binding this request to exactly one authorization event —
+        consumed in-process under an ``allow`` grant, or via the confirm
+        verb (ADR 0028); it is provenance and mistake-guarding, not a
+        security boundary against the agent.
         """
 
         # token_hex, not token_urlsafe: a nonce is retyped as a CLI argument
@@ -406,6 +408,20 @@ class ExecutionLedger:
             "'expired') LIMIT 1"
         ).fetchone()
         return None if row is None else self.get(int(row[0]))
+
+    def recent(
+        self, limit: int
+    ) -> list[tuple[int, str, int, str, str | None, str]]:
+        """Most recently created terminal operations, newest first."""
+
+        rows = self._connection.execute(
+            "SELECT operation_id, operation, appid, state, detail, updated_at"
+            " FROM operations WHERE state IN"
+            " ('confirmed','unconfirmed','contradicted','aborted','failed',"
+            "'expired') ORDER BY operation_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [tuple(row) for row in rows]
 
     def window_valid(self, operation_id: int) -> bool:
         operation = self.get(operation_id)
