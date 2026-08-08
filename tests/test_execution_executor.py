@@ -40,6 +40,7 @@ class FakeSession:
         self.start_ok = True
         self.stop_ok = True
         self.steamcmd_alive = False
+        self.client_probe_unknown = False
 
     def gates(self) -> LeaseGates:
         state = "pass" if self.clear else "fail"
@@ -47,7 +48,11 @@ class FakeSession:
             game_running=state,
             remote_play="pass",
             download_in_flight="pass",
-            client_running="fail" if self.running else "pass",
+            client_running=(
+                "unknown"
+                if self.client_probe_unknown
+                else ("fail" if self.running else "pass")
+            ),
         )
 
     def client_running(self) -> bool:
@@ -167,6 +172,17 @@ def test_auth_required_fails_fast_and_restores_client(harness) -> None:
     assert report.outcome == "auth_required"
     assert ledger.get(operation_id).state == "failed"
     assert session.starts == 1
+
+
+def test_unknown_client_probe_defers_fresh_execution(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.client_probe_unknown = True
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "presence unknown" in report.detail
+    assert ledger.get(operation_id).state == "authorized"  # retryable
+    assert session.stops == 0 and session.starts == 0
 
 
 def test_client_not_running_is_not_restarted(harness) -> None:

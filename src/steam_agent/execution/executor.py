@@ -357,7 +357,18 @@ class Executor:
                     operation_id, "aborted", "client would not exit for resume"
                 )
         else:
-            prior_running = self._session.client_possibly_running()
+            # prior_client_running drives a later start_client(); recording
+            # it from an errored probe could launch Steam the user never had
+            # running.  Unlike the stop-side checks (where unknown must read
+            # as "possibly running", fail closed), this value needs definite
+            # evidence — defer with the state untouched otherwise.
+            if gates.client_running == "unknown":
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "client presence unknown (probe error); deferred",
+                )
+            prior_running = gates.client_running == "fail"
             ledger.transition(
                 operation_id,
                 "lease_acquired",
