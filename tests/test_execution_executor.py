@@ -425,6 +425,60 @@ def test_unowned_existing_target_directory_aborts(harness) -> None:
     assert "not owned" in report.detail
 
 
+def test_failed_partial_install_stays_retryable(harness) -> None:
+    ledger, _, content, executor, library = harness
+    content.outcome = "failed"
+    first = _authorized(ledger)
+    original_install = content.install
+
+    def install_with_partial(**kwargs):
+        partial = kwargs["install_dir"] / "steamapps" / "downloading"
+        partial.mkdir(parents=True, exist_ok=True)
+        (partial / "chunk.bin").write_text("x", encoding="utf-8")
+        return original_install(**kwargs)
+
+    content.install = install_with_partial
+    assert executor.execute(first).outcome == "failed"
+    assert (library / "steamapps" / "common" / "Spacewar" / "steamapps").exists()
+
+    # A fresh retry (not a resume) must reuse the partial directory.
+    content.outcome = "installed"
+    retry = _authorized(ledger)
+    report = executor.execute(retry)
+    assert report.outcome == "confirmed"
+    # Marker retired once the steamcmd manifest proves ownership itself.
+    assert not executor._owned_marker(480).exists()
+
+
+def test_resume_stop_failure_attempts_client_restore(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "interrupted"):
+        ledger.transition(operation_id, state)
+    session.stop_ok = False
+
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "would not exit for resume" in report.detail
+    assert session.starts == 1  # prior run-state restoration attempted
+    assert ledger.get(operation_id).state == "interrupted"  # still resumable
+
+
+def test_reconcile_adopting_stop_failure_attempts_restore(harness) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "adopting"):
+        ledger.transition(operation_id, state)
+    session.stop_ok = False
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "adopting"  # deferred, retryable
+    assert any("deferred" in action for action in actions)
+    assert session.starts == 1  # prior run-state restoration attempted
+
+
 def test_plan_name_conflicting_with_existing_install_aborts(harness) -> None:
     ledger, _, _, executor, library = harness
     (library / "steamapps" / "appmanifest_480.acf").write_text(

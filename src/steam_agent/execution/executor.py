@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Literal
@@ -19,6 +20,7 @@ from typing import Literal
 from steam_agent.execution.content_plane import (
     AdoptionError,
     SteamcmdAdapter,
+    _durable_write,
     adopt_manifest,
     clear_adoption_journal,
     locate_manifest,
@@ -291,6 +293,14 @@ class Executor:
                         own_library_dir is not None
                         and own_library_dir.casefold() == install_dir_name.casefold()
                     )
+                    # A prior broker operation for this AppID recorded the
+                    # directory before its steamcmd ran: a failed partial
+                    # install stays retryable without manual cleanup.
+                    or (
+                        (claim := self._owned_dir_claim(operation.appid))
+                        is not None
+                        and claim.casefold() == install_dir_name.casefold()
+                    )
                     or not any(target.iterdir())
                 )
             except OSError:
@@ -333,6 +343,12 @@ class Executor:
         if resuming:
             prior_running = operation.prior_client_running or False
             if self._session.client_possibly_running() and not self._session.stop_client():
+                # The failed stop may still have taken down the main process
+                # (helper lingering, probe error); restore the recorded prior
+                # state rather than leave the client half stopped.  Best
+                # effort: the row stays interrupted either way, so
+                # reconciliation retries.
+                self._restore_client(prior_running)
                 return ExecutionReport(
                     operation_id, "aborted", "client would not exit for resume"
                 )
@@ -377,6 +393,11 @@ class Executor:
             "content_running",
             detail="resume" if resuming else None,
         )
+        # Durable ownership evidence BEFORE steamcmd can write anything: a
+        # run that fails after a partial download leaves no nested manifest,
+        # and without this record every fresh retry would fail the
+        # not-owned check above until the directory was removed by hand.
+        self._record_owned_dir(operation.appid, install_dir_name)
         result = self._content.install(
             account=operation.account_alias,
             appid=operation.appid,
@@ -476,6 +497,8 @@ class Executor:
         # read as an unproven adoption after the manifest was already swapped).
         ledger.transition(operation_id, "client_restart_pending")
         clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
+        # The steamcmd-written manifest now proves ownership on its own.
+        self._owned_marker(operation.appid).unlink(missing_ok=True)
         if not self._restore_client(prior_running):
             # Never terminalize while restoration is failing: the state
             # stays at client_restart_pending so reconciliation retries.
@@ -528,6 +551,35 @@ class Executor:
             operation_id,
             "unconfirmed",
             f"adoption not confirmed (StateFlags={flags})",
+        )
+
+    # -- partial-install ownership markers --------------------------------
+    # Written durably before steamcmd starts; they let a later fresh
+    # operation reuse a partial directory a failed run left behind (no
+    # nested manifest exists yet to prove ownership).  Retired once a
+    # steamcmd-written manifest provides real evidence.
+
+    def _owned_marker(self, appid: int) -> Path:
+        return self._state_dir / "owned" / f"{appid}.json"
+
+    def _owned_dir_claim(self, appid: int) -> str | None:
+        try:
+            record = json.loads(
+                self._owned_marker(appid).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        name = record.get("install_dir_name")
+        return name if isinstance(name, str) else None
+
+    def _record_owned_dir(self, appid: int, install_dir_name: str) -> None:
+        marker = self._owned_marker(appid)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        _durable_write(
+            marker,
+            json.dumps({"install_dir_name": install_dir_name}).encode("utf-8"),
         )
 
     def _restore_client(self, prior_running: bool | None) -> bool:
@@ -668,6 +720,11 @@ class Executor:
                 return actions
             if self._session.client_possibly_running():
                 if not self._session.stop_client():
+                    # The failed stop may still have taken down the main
+                    # process (helper lingering, probe error); restore the
+                    # prior run-state rather than leave the client half
+                    # stopped across repeated deferrals.
+                    restore()
                     actions.append(
                         f"{operation_id}: client running; adoption reconcile deferred"
                     )
@@ -706,6 +763,7 @@ class Executor:
                 operation_id, "client_restart_pending", detail=f"adoption {verdict}"
             )
             clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
+            self._owned_marker(active.appid).unlink(missing_ok=True)
             if not restore():
                 return actions  # retried from client_restart_pending
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
@@ -717,6 +775,7 @@ class Executor:
             # The swap completed before these states; any journal left behind
             # is a crash remnant and must not outlive the operation.
             clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
+            self._owned_marker(active.appid).unlink(missing_ok=True)
             if not restore():
                 return actions
             if state != "verifying":
