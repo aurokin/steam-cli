@@ -320,6 +320,38 @@ def test_null_plan_name_treated_as_unspecified(harness) -> None:
     assert '"installdir"\t\t"OldDir"' in adopted  # not literal "None"
 
 
+def test_symlinked_lock_file_is_rejected(harness) -> None:
+    import hashlib
+
+    ledger, _, _, executor, library = harness
+    key = hashlib.sha256(str(library.resolve()).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path("/tmp") / f"steam-broker-{key}.lock"
+    decoy = library.parent / "decoy"
+    decoy.write_text("", encoding="utf-8")
+    lock_path.symlink_to(decoy)
+    try:
+        with pytest.raises(ExecutorLockedError):
+            executor._lock()
+    finally:
+        lock_path.unlink()
+
+
+def test_client_reappearing_during_stop_aborts(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    original_stop = session.stop_client
+
+    def stop_then_relaunch() -> bool:
+        result = original_stop()
+        session.running = True  # user or autostart relaunched Steam
+        return result
+
+    session.stop_client = stop_then_relaunch
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "regressed during client stop" in report.detail
+
+
 def test_lock_scoped_to_library_not_state_dir(harness, tmp_path: Path) -> None:
     ledger, session, content, executor, library = harness
     other = Executor(

@@ -17,6 +17,8 @@ Diagnostics go to stderr; stdout is deterministic JSON.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -58,6 +60,19 @@ def _emit(payload: dict[str, object]) -> None:
 def _fail(message: str) -> int:
     print(f"steam-agent-broker: {message}", file=sys.stderr)
     return 2
+
+
+@contextmanager
+def _state_lock(state_dir: Path):
+    """Serialize reconfiguration with intake (broker-owned dir; blocking)."""
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    handle = (state_dir / "state.lock").open("a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,41 +138,42 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = arguments.state_dir or _default_state_dir()
 
     if arguments.command == "init":
-        # Reconfiguring while an operation is active could point a
-        # confirmed plan at a different library, script, or machine key.
-        if (state_dir / "ledger.sqlite3").exists():
-            ledger = ExecutionLedger(state_dir / "ledger.sqlite3")
-            active = ledger.active()
-            ledger.close()
-            if active is not None:
-                return _fail(
-                    "an operation is active; refusing to reconfigure the broker"
-                )
-        state_dir.mkdir(parents=True, exist_ok=True)
-        # Ledger, policy, logs, and the steamcmd credential cache live here;
-        # never trust the umask to keep other identities out.
-        state_dir.chmod(0o700)
-        # Idempotent re-init: keep an existing (possibly owner-edited)
-        # policy rather than failing, so a partial first init is repairable.
-        wrote_template = False
-        if not (state_dir / "policy.toml").exists():
-            try:
-                write_policy_template(state_dir / "policy.toml")
-            except PolicyError as error:
-                return _fail(str(error))
-            wrote_template = True
-        (state_dir / "broker.json").write_text(
-            json.dumps(
-                {
-                    # Absolute paths: later commands may run from any cwd.
-                    "library": str(arguments.library.resolve()),
-                    "steamcmd": str(arguments.steamcmd.resolve()),
-                    "machine_id": str(arguments.machine_id),
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+        with _state_lock(state_dir):
+            # Reconfiguring while an operation is active could point a
+            # confirmed plan at a different library, script, or machine key.
+            # The state lock serializes this check-and-write with intake.
+            if (state_dir / "ledger.sqlite3").exists():
+                ledger = ExecutionLedger(state_dir / "ledger.sqlite3")
+                active = ledger.active()
+                ledger.close()
+                if active is not None:
+                    return _fail(
+                        "an operation is active; refusing to reconfigure the broker"
+                    )
+            # Ledger, policy, logs, and the steamcmd credential cache live
+            # here; never trust the umask to keep other identities out.
+            state_dir.chmod(0o700)
+            # Idempotent re-init: keep an existing (possibly owner-edited)
+            # policy rather than failing, so a partial init is repairable.
+            wrote_template = False
+            if not (state_dir / "policy.toml").exists():
+                try:
+                    write_policy_template(state_dir / "policy.toml")
+                except PolicyError as error:
+                    return _fail(str(error))
+                wrote_template = True
+            (state_dir / "broker.json").write_text(
+                json.dumps(
+                    {
+                        # Absolute paths: later commands run from any cwd.
+                        "library": str(arguments.library.resolve()),
+                        "steamcmd": str(arguments.steamcmd.resolve()),
+                        "machine_id": str(arguments.machine_id),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
         _emit(
             {
                 "initialized": True,
@@ -206,29 +222,30 @@ def main(argv: list[str] | None = None) -> int:
         # into a different AppID than the plan the human confirms.
         if not isinstance(appid, int) or isinstance(appid, bool) or appid <= 0:
             return _fail("plan target appid is malformed")
-        try:
-            config = _load_config(state_dir)
-        except PolicyError as error:
-            return _fail(str(error))
-        # The single-active constraint is keyed by machine_id; it must come
-        # from broker configuration, never the submitted plan.
-        machine_id = str(config.get("machine_id", "local"))
-        plan_machine = target.get("machine_id")
-        if plan_machine is not None and str(plan_machine) != machine_id:
-            return _fail("plan targets a different machine than this broker")
-        ledger, _ = _components(state_dir)
-        try:
-            operation_id, nonce = ledger.request(
-                plan_key=str(plan.get("idempotency_key", "")),
-                plan_document=json.dumps(plan, sort_keys=True),
-                operation=operation,
-                appid=appid,
-                account_alias=str(arguments.account),
-                machine_id=machine_id,
-                policy_version=policy.version,
-            )
-        except LedgerError as error:
-            return _fail(str(error))
+        with _state_lock(state_dir):
+            try:
+                config = _load_config(state_dir)
+            except PolicyError as error:
+                return _fail(str(error))
+            # The single-active constraint is keyed by machine_id; it must
+            # come from broker configuration, never the submitted plan.
+            machine_id = str(config.get("machine_id", "local"))
+            plan_machine = target.get("machine_id")
+            if plan_machine is not None and str(plan_machine) != machine_id:
+                return _fail("plan targets a different machine than this broker")
+            ledger, _ = _components(state_dir)
+            try:
+                operation_id, nonce = ledger.request(
+                    plan_key=str(plan.get("idempotency_key", "")),
+                    plan_document=json.dumps(plan, sort_keys=True),
+                    operation=operation,
+                    appid=appid,
+                    account_alias=str(arguments.account),
+                    machine_id=machine_id,
+                    policy_version=policy.version,
+                )
+            except LedgerError as error:
+                return _fail(str(error))
         _emit(
             {
                 "operation_id": operation_id,

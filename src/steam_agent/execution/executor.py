@@ -90,17 +90,24 @@ class Executor:
         # Fixed /tmp, not tempfile.gettempdir(): TMPDIR is caller-controlled
         # and a per-process value would defeat cross-broker serialization.
         lock_path = Path("/tmp") / f"steam-broker-{library_key}.lock"
-        handle = lock_path.open("a")
+        # /tmp is shared: O_NOFOLLOW refuses a planted symlink outright,
+        # ownership is checked on the opened inode, and the directory entry
+        # is re-lstat'ed after locking so an unlink/replace cannot yield two
+        # holders.  All failures are fail-closed (no execution), never
+        # fail-open.  The sticky bit stops others unlinking our own file.
         try:
-            # /tmp is shared: refuse a lock file another identity planted
-            # (fail closed, never corrupt), and verify the path still names
-            # the inode we opened so an unlink/replace cannot yield two
-            # holders.  The sticky bit stops others unlinking ours.
-            opened = os.fstat(handle.fileno())
+            descriptor = os.open(
+                lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+            )
+        except OSError as error:
+            raise ExecutorLockedError("cannot open the lock file safely") from error
+        handle = os.fdopen(descriptor, "r+")
+        try:
+            opened = os.fstat(descriptor)
             if opened.st_uid not in (os.geteuid(), 0):
                 raise ExecutorLockedError("lock file owned by another user")
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            current = os.stat(lock_path)
+            current = os.lstat(lock_path)
             if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
                 raise ExecutorLockedError("lock file was replaced concurrently")
         except OSError as error:
@@ -270,9 +277,10 @@ class Executor:
 
         # Shutdown can take up to a minute; re-check the lease between the
         # client stopping and steamcmd starting so freshly begun user work
-        # is never mutated under.
+        # is never mutated under.  Unlike the pre-stop check, the client
+        # must now be provably absent as well.
         post_stop_gates = self._session.gates()
-        if not post_stop_gates.all_clear():
+        if not post_stop_gates.all_clear() or post_stop_gates.client_running != "pass":
             note = self._restore_note(prior_running)
             ledger.transition(
                 operation_id,
