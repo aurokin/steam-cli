@@ -21,6 +21,7 @@ from steam_agent.execution.content_plane import (
     AdoptionError,
     SteamcmdAdapter,
     _durable_write,
+    _fsync_dir,
     adopt_manifest,
     clear_adoption_journal,
     locate_manifest,
@@ -189,6 +190,20 @@ class Executor:
             self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
         )
         if own_manifest.exists():
+            # The filename is not proof: a stale/misnamed file could carry
+            # another title's body and point at that title's directory,
+            # which the collision scan below skips by filename.
+            if manifest_appid(own_manifest) != operation.appid:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="existing manifest appid mismatch",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "existing manifest for this title has a mismatched appid",
+                )
             existing = manifest_install_dir(own_manifest)
             if existing is None:
                 # An install exists but its directory is unknowable; any
@@ -670,6 +685,11 @@ class Executor:
         # a symlink planted at common/ (or the target) in that window would
         # be followed by mkdir.  Checked again after creation so a racing
         # replacement cannot slip between the check and the mkdir.
+        # Replacement DURING the steamcmd run itself is out of scope: any
+        # process that can rewrite common/ shares the broker's UID and could
+        # equally rewrite the library or broker state directly — no
+        # privilege boundary is crossed, and POSIX offers no portable way to
+        # pin the path for a 30-minute run.
         if not self._target_contained(target):
             raise _TargetEscapedError(target.name)
         # Create the directory ourselves (steamcmd accepts an existing one)
@@ -680,6 +700,10 @@ class Executor:
         identity = os.lstat(target)
         marker = self._owned_marker(appid)
         marker.parent.mkdir(parents=True, exist_ok=True)
+        # The owned/ directory entry must itself survive a power loss, or
+        # the marker written below vanishes with it and a resume aborts on
+        # the surviving nonempty partial target.
+        _fsync_dir(marker.parent.parent)
         _durable_write(
             marker,
             json.dumps(
@@ -734,7 +758,9 @@ class Executor:
         finally:
             lock.close()  # type: ignore[attr-defined]
 
-    def _verified_outcome(self, appid: int) -> tuple[str, str]:
+    def _verified_outcome(
+        self, appid: int, prior_running: bool | None
+    ) -> tuple[str, str]:
         """Manifest-evidence verdict shared by execution and reconciliation."""
 
         flags = manifest_state_flags(
@@ -744,7 +770,14 @@ class Executor:
             return "unconfirmed", f"manifest StateFlags={flags}"
         if (self._library / "steamapps" / "downloading" / str(appid)).exists():
             return "contradicted", "client re-downloading after adoption"
-        return "confirmed", "client_adopted"
+        # A client that was never running has had no chance to observe the
+        # adoption; the recorded evidence must not claim it did.
+        if prior_running:
+            return "confirmed", "client_adopted"
+        return (
+            "confirmed",
+            "content_present; client validation deferred to next client start",
+        )
 
     # -- reconciliation ---------------------------------------------------
 
@@ -880,7 +913,9 @@ class Executor:
             if not restore():
                 return actions  # retried from client_restart_pending
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
-            outcome, why = self._verified_outcome(active.appid)
+            outcome, why = self._verified_outcome(
+                active.appid, active.prior_client_running
+            )
             ledger.transition(operation_id, outcome, detail=f"reconciled: {why}")
             actions.append(f"{operation_id}: adoption {verdict} -> {outcome}")
             return actions
@@ -893,7 +928,9 @@ class Executor:
                 return actions
             if state != "verifying":
                 ledger.transition(operation_id, "verifying", detail="reconciled")
-            outcome, why = self._verified_outcome(active.appid)
+            outcome, why = self._verified_outcome(
+                active.appid, active.prior_client_running
+            )
             ledger.transition(operation_id, outcome, detail=f"reconciled: {why}")
             actions.append(f"{operation_id}: {state} -> {outcome}")
             return actions

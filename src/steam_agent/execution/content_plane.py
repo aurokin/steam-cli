@@ -312,7 +312,10 @@ def clear_adoption_journal(*, appid: int, journal_dir: Path) -> None:
     """Retire the journal once its swap is durably complete."""
 
     (journal_dir / f"adoption-{appid}.json").unlink(missing_ok=True)
-    _fsync_dir(journal_dir)
+    # The dir may not exist (an operation that never adopted anything);
+    # reconciliation must not crash clearing a journal that was never born.
+    if journal_dir.is_dir():
+        _fsync_dir(journal_dir)
 
 
 def reconcile_adoption(

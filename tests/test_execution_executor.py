@@ -650,6 +650,40 @@ def test_unreadable_own_manifest_blocks_fallback(harness) -> None:
     assert "unreadable" in report.detail
 
 
+def test_misnamed_existing_manifest_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    # File named for 480 but carrying another title's body and directory.
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"999"\n\t"installdir"\t\t"OtherGame"\n'
+        '\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger, install_dir_name="")
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "mismatched appid" in report.detail
+
+
+def test_reconcile_records_deferred_validation_for_stopped_client(harness) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=False)
+    for state in ("client_stopping", "content_running", "adopting",
+                  "client_restart_pending"):
+        ledger.transition(operation_id, state)
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    session.running = False
+
+    executor.reconcile()
+    operation = ledger.get(operation_id)
+    assert operation.state == "confirmed"
+    # The client never ran: the evidence must not claim it observed the
+    # adoption.
+    assert "deferred" in operation.detail
+
+
 def test_stop_failure_attempts_client_restore(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.stop_ok = False
