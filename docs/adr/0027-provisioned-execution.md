@@ -1,8 +1,10 @@
 # ADR 0027: Provisioned execution behind a broker trust boundary
 
-Status: proposed 2026-08-07 (supersedes the execution prohibition of
-[ADR 0013](0013-m7-read-only-operation-plans.md) if accepted; preserves its
-observation, ranking, and inert-plan clauses)
+Status: accepted 2026-08-08 (owner acceptance with Phase 0 evidence below;
+supersedes the execution prohibition of
+[ADR 0013](0013-m7-read-only-operation-plans.md) for the provisioned broker
+surface only; ADR 0013's observation, ranking, and inert-plan clauses
+continue to govern the planner surface)
 
 ## Context
 
