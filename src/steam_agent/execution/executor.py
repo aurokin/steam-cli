@@ -669,6 +669,18 @@ class Executor:
         # its own schedule, so the outcome wording below distinguishes whether
         # a running client has had any chance to observe the adoption.
         ledger.transition(operation_id, "verifying")
+        # Same rule as reconciled verification: the restarted client (or
+        # another process) may have replaced the file, and a misnamed body
+        # must never confirm the wrong title.
+        if manifest_appid(adopted) != operation.appid:
+            ledger.transition(
+                operation_id, "unconfirmed", detail="manifest appid mismatch"
+            )
+            return ExecutionReport(
+                operation_id,
+                "unconfirmed",
+                "adopted manifest no longer matches the requested appid",
+            )
         flags = manifest_state_flags(adopted)
         if flags == _STATE_FULLY_INSTALLED:
             downloading = (

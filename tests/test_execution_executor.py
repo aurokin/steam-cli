@@ -764,6 +764,26 @@ def test_reconcile_records_deferred_validation_for_stopped_client(harness) -> No
     assert "deferred" in operation.detail
 
 
+def test_verify_rejects_manifest_rewritten_to_wrong_appid(harness) -> None:
+    ledger, session, _, executor, library = harness
+    original_start = session.start_client
+
+    def start_and_rewrite() -> bool:
+        # The restarting client replaces the adopted manifest with a
+        # misnamed body before verification runs.
+        (library / "steamapps" / "appmanifest_480.acf").write_text(
+            _MANIFEST.replace('"appid"\t\t"480"', '"appid"\t\t"999"'),
+            encoding="utf-8",
+        )
+        return original_start()
+
+    session.start_client = start_and_rewrite
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "unconfirmed"
+    assert "appid" in report.detail
+
+
 def test_reconcile_verify_rejects_misnamed_manifest(harness) -> None:
     ledger, session, _, executor, library = harness
     operation_id = _authorized(ledger)

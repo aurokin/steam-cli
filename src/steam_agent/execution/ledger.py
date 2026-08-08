@@ -304,8 +304,17 @@ class ExecutionLedger:
         *,
         detail: str | None = None,
         prior_client_running: bool | None = None,
+        expected_from: str | None = None,
     ) -> None:
         current = self.get(operation_id)
+        # expected_from pins the source state: a revocation abort must
+        # dead-end only a not-yet-started operation, never terminalize one
+        # a concurrent run has already advanced (the CAS below closes the
+        # read-to-write window).
+        if expected_from is not None and current.state != expected_from:
+            raise InvalidTransition(
+                f"expected {expected_from!r}, found {current.state!r}"
+            )
         allowed = _TRANSITIONS.get(current.state, frozenset())
         if to_state not in allowed:
             raise InvalidTransition(

@@ -33,6 +33,7 @@ from steam_agent.execution.executor import (
 from steam_agent.execution.ledger import (
     ConfirmationRejected,
     ExecutionLedger,
+    InvalidTransition,
     LedgerError,
 )
 from steam_agent.execution.linux_session import LinuxSession
@@ -335,17 +336,33 @@ def main(argv: list[str] | None = None) -> int:
         # Re-check the policy, read at this decision point: revoking a grant
         # must dead-end a nonce minted while the grant was still active.
         operation = ledger.get(operation_id)
+        # expected_from: a concurrent run may already have advanced this
+        # row past authorized; terminalizing an in-flight execution would
+        # strand its stopped client (terminal rows are invisible to
+        # reconciliation).  The run path re-checks policy itself.
         try:
             policy = load_policy(state_dir / "policy.toml")
         except PolicyError as error:
-            ledger.transition(
-                operation_id, "aborted", detail="policy unreadable at confirmation"
-            )
+            try:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="policy unreadable at confirmation",
+                    expected_from="authorized",
+                )
+            except InvalidTransition:
+                pass  # already executing; run enforces policy from here
             return _fail(str(error))
         if policy.grant_for(operation.operation) != "confirm":
-            ledger.transition(
-                operation_id, "aborted", detail="policy revoked before confirmation"
-            )
+            try:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="policy revoked before confirmation",
+                    expected_from="authorized",
+                )
+            except InvalidTransition:
+                pass  # already executing; run enforces policy from here
             return _fail(f"policy now denies {operation.operation!r}")
         _emit({"operation_id": operation_id, "state": "authorized"})
         return 0
@@ -394,7 +411,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"{denial};"
                     " client restore failed; operation left for reconcile"
                 )
-            ledger.transition(operation_id, "aborted", detail=denial_detail)
+            try:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail=denial_detail,
+                    expected_from=operation.state,
+                )
+            except InvalidTransition:
+                return _fail(f"{denial}; operation state changed; not aborted")
             return _fail(denial)
         try:
             report = executor.execute(operation_id)

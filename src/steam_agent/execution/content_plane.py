@@ -473,8 +473,14 @@ def reconcile_adoption(
     # The restored manifest must be durable before the journal disappears:
     # losing the journal while the restore is still in the page cache would
     # leave no recovery record for the next pass.
-    if backup_value is not None and Path(str(backup_value)).is_file():
-        _durable_write(destination, Path(str(backup_value)).read_bytes())
+    if backup_value is not None:
+        backup_path = Path(str(backup_value))
+        if not backup_path.is_file():
+            # The journal promises a backup that is gone: evidence is
+            # incomplete, and the fresh-install deletion path below would
+            # orphan an existing installation.  Defer, never guess.
+            raise AdoptionError("adoption backup missing; recovery deferred")
+        _durable_write(destination, backup_path.read_bytes())
         journal_path.unlink()
         _fsync_dir(journal_dir)
         return "restored"

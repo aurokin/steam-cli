@@ -127,6 +127,19 @@ def test_transition_table_enforced(ledger: ExecutionLedger) -> None:
         ledger.transition(operation_id, "verifying")
 
 
+def test_transition_expected_from_guards_concurrent_advance(
+    ledger: ExecutionLedger,
+) -> None:
+    operation_id, nonce = _request(ledger)
+    ledger.confirm(nonce=nonce, actor="a")
+    ledger.transition(operation_id, "lease_acquired")  # a run advanced it
+    # A revocation abort pinned to authorized must not terminalize the
+    # in-flight execution.
+    with pytest.raises(InvalidTransition):
+        ledger.transition(operation_id, "aborted", expected_from="authorized")
+    assert ledger.get(operation_id).state == "lease_acquired"
+
+
 def test_events_are_recorded_in_order(ledger: ExecutionLedger) -> None:
     operation_id, nonce = _request(ledger)
     ledger.confirm(nonce=nonce, actor="a")

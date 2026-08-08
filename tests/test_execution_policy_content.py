@@ -219,6 +219,34 @@ def test_reconcile_foreign_destination_journal_rejected(tmp_path: Path) -> None:
     assert victim.read_text(encoding="utf-8") == "do not touch"
 
 
+def test_reconcile_missing_backup_defers_instead_of_unlinking(
+    tmp_path: Path,
+) -> None:
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    prior = library / "steamapps" / "appmanifest_1902490.acf"
+    prior.write_text("old", encoding="utf-8")
+    target = _target_with_manifest(tmp_path)
+    journal_dir = tmp_path / "journal"
+    adopted = adopt_manifest(
+        source=locate_manifest(install_dir=target, appid=1902490),
+        library=library,
+        appid=1902490,
+        install_dir_name="Desk Job",
+        journal_dir=journal_dir,
+        operation_id=7,
+    )
+    adopted.write_text('"AppState" { torn', encoding="utf-8")  # crash mid-swap
+    # The promised backup vanished: recovery must defer, not take the
+    # fresh-install unlink path over an update's manifest.
+    (journal_dir / "appmanifest_1902490.acf.backup").unlink()
+
+    with pytest.raises(AdoptionError):
+        reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
+    assert adopted.exists()  # nothing unlinked on incomplete evidence
+
+
 def test_reconcile_mount_changed_journal_defers(tmp_path: Path) -> None:
     import json as json_module
 
