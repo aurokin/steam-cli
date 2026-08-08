@@ -67,6 +67,9 @@ def _state_lock(state_dir: Path):
     """Serialize reconfiguration with intake (broker-owned dir; blocking)."""
 
     state_dir.mkdir(parents=True, exist_ok=True)
+    # Owner-only from the first moment it exists: a permissive umask must
+    # never open a window for another identity to pre-create policy/state.
+    state_dir.chmod(0o700)
     handle = (state_dir / "state.lock").open("a")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -155,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             # The state lock serializes this check-and-write with intake.
             if (state_dir / "ledger.sqlite3").exists():
                 ledger = ExecutionLedger(state_dir / "ledger.sqlite3")
+                ledger.expire_lapsed()  # a lapsed row must not block re-init
                 active = ledger.active()
                 ledger.close()
                 if active is not None:
@@ -317,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "run":
         operation_id = arguments.operation_id
         if operation_id is None:
+            ledger.expire_lapsed()
             active = ledger.active()
             if active is None or active.state not in {"authorized", "interrupted"}:
                 return _fail("no authorized operation to run")
@@ -336,7 +341,11 @@ def main(argv: list[str] | None = None) -> int:
             # An interrupted operation may have left the client stopped;
             # restore before terminalizing (terminal rows are invisible to
             # reconciliation) and leave the state for retry if that fails.
-            if not executor.release_client(operation_id):
+            try:
+                released = executor.release_client(operation_id)
+            except ExecutorLockedError as error:
+                return _fail(str(error))
+            if not released:
                 return _fail(
                     f"policy now denies {operation.operation!r};"
                     " client restore failed; operation left for reconcile"
@@ -366,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if arguments.command == "status":
+        ledger.expire_lapsed()
         active = ledger.active()
         if active is None:
             _emit({"active": None})

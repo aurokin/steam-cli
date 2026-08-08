@@ -560,10 +560,18 @@ class Executor:
         return ExecutionReport(operation_id, outcome, message)
 
     def release_client(self, operation_id: int) -> bool:
-        """Best-effort prior-client restoration for out-of-band aborts."""
+        """Best-effort prior-client restoration for out-of-band aborts.
 
-        operation = self._ledger.get(operation_id)
-        return self._restore_client(operation.prior_client_running)
+        Takes the per-library lock: restarting Steam while another executor
+        holds it would race that executor's stopped-client invariant.
+        """
+
+        lock = self._lock()
+        try:
+            operation = self._ledger.get(operation_id)
+            return self._restore_client(operation.prior_client_running)
+        finally:
+            lock.close()  # type: ignore[attr-defined]
 
     def _verified_outcome(self, appid: int) -> tuple[str, str]:
         """Manifest-evidence verdict shared by execution and reconciliation."""

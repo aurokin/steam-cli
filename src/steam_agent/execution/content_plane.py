@@ -178,11 +178,14 @@ class SteamcmdAdapter:
             if not _LOG_LINE_RECOGNIZED.search(line):
                 dropped += 1
                 continue
+            # Paths before the account alias: replacing the alias first
+            # could mangle a path that contains it and leave the remainder
+            # of that private path in the log.
             for value, label in (
-                (account, "<account>"),
                 (str(self._home), "<steamcmd-home>"),
                 (str(install_dir), "<install-dir>"),
                 (str(self._script), "<steamcmd>"),
+                (account, "<account>"),
             ):
                 if value:
                     line = line.replace(value, label)
