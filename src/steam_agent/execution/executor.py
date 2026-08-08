@@ -182,9 +182,8 @@ class Executor:
         # replaced) later would make the lexical containment checks pass
         # against a different volume.  Revalidated before content starts,
         # in the steamcmd abort poll, and before adoption.
-        try:
-            library_device = os.lstat(self._library / "steamapps").st_dev
-        except OSError:
+        library_identity = self._library_identity()
+        if library_identity is None:
             return ExecutionReport(
                 operation_id,
                 "aborted",
@@ -442,7 +441,7 @@ class Executor:
                 outcome="aborted",
                 to_state="aborted",
             )
-        if not self._library_on_device(library_device):
+        if self._library_identity() != library_identity:
             return self._finish_failure(
                 operation_id,
                 prior_running,
@@ -476,7 +475,7 @@ class Executor:
                 abort_when=lambda: (
                     self._session.client_possibly_running()
                     or not ledger.window_valid(operation_id)
-                    or not self._library_on_device(library_device)
+                    or self._library_identity() != library_identity
                 ),
             )
         except _TargetEscapedError:
@@ -552,7 +551,7 @@ class Executor:
         # steamcmd can run for up to 30 minutes; re-check the full lease and
         # re-assert the stopped client before touching steamapps/ — never
         # adopt under a live client or a lease that regressed.
-        if not self._library_on_device(library_device):
+        if self._library_identity() != library_identity:
             return self._finish_failure(
                 operation_id,
                 prior_running,
@@ -748,11 +747,14 @@ class Executor:
             record.get("ino"),
         )
 
-    def _library_on_device(self, device: int) -> bool:
+    def _library_identity(self) -> tuple[int, int] | None:
+        # Device AND inode: st_dev alone misses a bind-mount unmount or a
+        # replacement directory on the same filesystem.
         try:
-            return os.lstat(self._library / "steamapps").st_dev == device
+            stat = os.lstat(self._library / "steamapps")
         except OSError:
-            return False
+            return None
+        return (stat.st_dev, stat.st_ino)
 
     def _target_contained(self, target: Path) -> bool:
         try:

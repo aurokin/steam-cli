@@ -219,6 +219,34 @@ def test_reconcile_foreign_destination_journal_rejected(tmp_path: Path) -> None:
     assert victim.read_text(encoding="utf-8") == "do not touch"
 
 
+def test_reconcile_mount_changed_journal_defers(tmp_path: Path) -> None:
+    import json as json_module
+
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    target = _target_with_manifest(tmp_path)
+    journal_dir = tmp_path / "journal"
+    adopted = adopt_manifest(
+        source=locate_manifest(install_dir=target, appid=1902490),
+        library=library,
+        appid=1902490,
+        install_dir_name="Desk Job",
+        journal_dir=journal_dir,
+        operation_id=7,
+    )
+    # Simulate a different volume exposed at the library path: the journaled
+    # identity no longer matches the live directory.
+    journal = journal_dir / "adoption-1902490.json"
+    record = json_module.loads(journal.read_text(encoding="utf-8"))
+    record["library_ino"] += 1
+    journal.write_text(json_module.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AdoptionError):
+        reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
+    assert adopted.is_file()  # nothing destroyed on the mismatched volume
+
+
 def test_reconcile_corrupt_journal_raises_adoption_error(tmp_path: Path) -> None:
     from steam_agent.execution.content_plane import AdoptionError
 

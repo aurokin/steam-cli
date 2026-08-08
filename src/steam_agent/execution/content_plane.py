@@ -345,6 +345,13 @@ def adopt_manifest(
     """
 
     destination = library / "steamapps" / f"appmanifest_{appid}.acf"
+    # Capture the library's mount identity for the journal: recovery must
+    # never restore/unlink against a different volume exposed at the same
+    # path after an unmount while the broker was down.
+    try:
+        library_stat = os.lstat(library / "steamapps")
+    except OSError as error:
+        raise AdoptionError("library steamapps unavailable") from error
     journal_dir.mkdir(parents=True, exist_ok=True)
     # The journal directory's own entry must be durable before anything is
     # journaled into it: a power loss could otherwise persist the swapped
@@ -367,6 +374,8 @@ def adopt_manifest(
             "destination": str(destination),
             "checksum": checksum,
             "backup": None if backup is None else str(backup),
+            "library_dev": library_stat.st_dev,
+            "library_ino": library_stat.st_ino,
             "at": datetime.now(timezone.utc).isoformat(),
         },
         sort_keys=True,
@@ -422,6 +431,18 @@ def reconcile_adoption(
         str(record["backup"])
     ) != journal_dir / f"appmanifest_{appid}.acf.backup":
         raise AdoptionError("adoption journal names an unexpected backup")
+    # The journaled mount identity must still be present: recovery against
+    # a different volume exposed at the library path (unmount/replacement
+    # while the broker was down) would mutate the wrong filesystem.
+    try:
+        current = os.lstat(library / "steamapps")
+    except OSError as error:
+        raise AdoptionError("library steamapps unavailable for recovery") from error
+    if (current.st_dev, current.st_ino) != (
+        record.get("library_dev"),
+        record.get("library_ino"),
+    ):
+        raise AdoptionError("library mount changed; adoption recovery deferred")
     if operation_id is not None and record.get("operation_id") != operation_id:
         # A prior operation's journal that survived only because its swap
         # already completed; discard it rather than let it vouch for this one.

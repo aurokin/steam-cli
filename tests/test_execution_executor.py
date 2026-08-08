@@ -906,7 +906,7 @@ def test_library_mount_change_during_download_skips_adoption(
     def install_and_remount(**kwargs):
         result = original_install(**kwargs)
         # The external library was unmounted/replaced during the download.
-        monkeypatch.setattr(executor, "_library_on_device", lambda _d: False)
+        monkeypatch.setattr(executor, "_library_identity", lambda: ("gone", 0))
         return result
 
     content.install = install_and_remount
