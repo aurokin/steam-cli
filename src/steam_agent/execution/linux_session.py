@@ -66,7 +66,15 @@ class LeaseGates:
 
 
 class LinuxSession:
-    """Probes and client lifecycle for the Linux session model."""
+    """Probes and client lifecycle for the Linux session model.
+
+    This class must execute inside the desktop user's own session: pgrep,
+    ``steam -shutdown``, and ``systemd-run --user`` all target the invoking
+    user.  Phase 1 deploys the broker as that user (as spiked on the target
+    machine); the three-identity deployment of the session-model document
+    moves these calls behind the desktop user's session helper rather than
+    ever invoking them from the broker identity.
+    """
 
     def __init__(
         self,

@@ -92,8 +92,12 @@ class SteamcmdAdapter:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         # Per-attempt filename (an operation can retry after interruption):
         # every attempt keeps its own evidence instead of the last one's.
+        # The pid disambiguates a quick crash-restart within one second.
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        log_path = self._log_dir / f"install-{appid}-op{operation_id}-{stamp}.log"
+        log_path = (
+            self._log_dir
+            / f"install-{appid}-op{operation_id}-{stamp}-p{os.getpid()}.log"
+        )
         argv = [
             str(self._script),
             "+@NoPromptForPassword",
@@ -107,6 +111,8 @@ class SteamcmdAdapter:
             "+quit",
         ]
         environment = dict(os.environ, HOME=str(self._home))
+        timed_out = False
+        returncode: int | None = None
         try:
             process = subprocess.Popen(
                 argv,
@@ -126,17 +132,21 @@ class SteamcmdAdapter:
                 # Kill the whole session group: the configured script wraps
                 # the real steamcmd binary, and killing only the leader
                 # would leave a live writer in the install directory.
+                timed_out = True
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     process.kill()
                 out, err = process.communicate()
+            returncode = process.returncode
             output = _captured_text(out) + _captured_text(err)
         # Classify on the raw output first: redaction could mangle a marker
         # (an account alias like "all" is a substring of "fully installed").
+        # Success additionally requires a clean exit: output text alone must
+        # never outrank a nonzero exit or a killed/timed-out process.
         if _AUTH_FAILURE.search(output):
             outcome: ContentOutcome = "auth_required"
-        elif _SUCCESS.search(output):
+        elif not timed_out and returncode == 0 and _SUCCESS.search(output):
             outcome = "installed"
         else:
             outcome = "failed"

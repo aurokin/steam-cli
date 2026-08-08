@@ -435,6 +435,13 @@ class Executor:
                 actions.append(f"{operation_id}: failed (window lapsed before resume)")
             return actions
         if state == "adopting":
+            # Steam may have been restarted since the crash; adoption repair
+            # rewrites the live manifest, so never race a running client.
+            if self._session.client_possibly_running() and not self._session.stop_client():
+                actions.append(
+                    f"{operation_id}: client running; adoption reconcile deferred"
+                )
+                return actions
             verdict = reconcile_adoption(
                 library=self._library,
                 appid=active.appid,

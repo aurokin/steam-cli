@@ -182,6 +182,7 @@ def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
 class _FakeProcess:
     def __init__(self, stdout: str) -> None:
         self.pid = 4242
+        self.returncode = 0
         self._stdout = stdout
 
     def communicate(self, timeout=None):
