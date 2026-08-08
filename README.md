@@ -64,8 +64,11 @@ operation plans, data locations, and deletion.
 Agents working from this checkout can use the
 [repository-owned `steam-agent` project skill](.agents/skills/steam-agent/SKILL.md).
 It maps common library questions to cache-only commands and carries the same
-evidence, privacy, and read-only Steam boundaries as the CLI. It is
-checkout-local; installing the CLI does not install a global agent skill.
+evidence, privacy, and read-only Steam boundaries as the CLI. Execution has its
+own [`steam-agent-broker` skill](.agents/skills/steam-agent-broker/SKILL.md),
+kept separate so the planner skill stays provably inert; it is never invoked
+implicitly. Both are checkout-local; installing the CLI does not install a
+global agent skill.
 
 ## Develop
 
@@ -106,3 +109,13 @@ Queries that claim to be cache-only do not access providers or resolve secrets.
 The durable boundary is evidence and planning: `steam-agent` may read approved
 local/provider sources and mutate its own cache or explicit preferences, but it
 does not mutate Steam or execute generated plans.
+
+Execution is a separate, separately provisioned executable,
+`steam-agent-broker`, accepted by
+[ADR 0027](docs/adr/0027-provisioned-execution.md) as re-scoped by
+[ADR 0028](docs/adr/0028-trusted-manager-execution.md). It installs and updates
+owned titles on the machine it runs on, behind a policy grant, an operation
+ledger, and fail-closed session gates. Uninstall remains a human step inside
+Steam, and store, market, wallet, credential, and account-settings operations
+are not implemented at all. Installing the planner does not provision it; see
+the [user guide](docs/user-guide.md).

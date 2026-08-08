@@ -53,6 +53,7 @@ def test_maintained_documentation_is_reachable_from_entry_points() -> None:
         REPO_ROOT / "README.md",
         REPO_ROOT / "steam-library-agent-research-handoff.md",
         REPO_ROOT / ".agents" / "skills" / "steam-agent" / "SKILL.md",
+        REPO_ROOT / ".agents" / "skills" / "steam-agent-broker" / "SKILL.md",
         *(REPO_ROOT / "docs").rglob("*.md"),
         *(
             path

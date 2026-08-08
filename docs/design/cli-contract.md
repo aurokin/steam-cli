@@ -2,11 +2,19 @@
 
 Status: canonical implemented M1–M7 process contract.
 
-The selected executable is `steam-agent`. This document describes shared
-process behavior and the implemented command contracts that require detailed
-machine semantics; it is not an exhaustive command synopsis. `steam-agent
-COMMAND --help` is canonical for all executable syntax. Proposed commands and
-envelopes do not belong in this contract.
+The project ships two executables with different powers. `steam-agent` is the
+planner: it observes, ranks, and emits inert plans, and never mutates Steam
+(ADR 0013). `steam-agent-broker` is the execution surface added by
+[ADR 0027](../adr/0027-provisioned-execution.md) as re-scoped by
+[ADR 0028](../adr/0028-trusted-manager-execution.md); it is the only code in
+this project that may change Steam state, and it is documented under
+"Implemented broker execution commands" below. The planner never imports it.
+
+This document describes shared process behavior and the implemented command
+contracts that require detailed machine semantics; it is not an exhaustive
+command synopsis. `steam-agent COMMAND --help` and
+`steam-agent-broker COMMAND --help` are canonical for all executable syntax.
+Proposed commands and envelopes do not belong in this contract.
 
 ## Implemented M1 commands
 
@@ -644,3 +652,74 @@ HTTPS references, rollback guidance, and unknown postconditions. Move requires
 exactly one destination ordinal from 1 through 1024; every other operation
 rejects that option. The command does not open a URL or Steam URI, spawn a
 process, access a client, modify files, or claim completion.
+
+## Implemented broker execution commands
+
+`steam-agent-broker` is the provisioned execution surface. It runs as the
+desktop user on the target machine and is driven directly by the owner's
+trusted manager agent (ADR 0028). Installing the planner does not provision
+it: execution requires an initialized state directory and a policy grant.
+
+```text
+steam-agent-broker [--state-dir PATH] init --library PATH --steamcmd PATH [--machine-id ID]
+steam-agent-broker [--state-dir PATH] request --account ALIAS        # operation-plan/0.1 JSON on stdin
+steam-agent-broker [--state-dir PATH] confirm NONCE --actor ACTOR
+steam-agent-broker [--state-dir PATH] run [--operation-id N]
+steam-agent-broker [--state-dir PATH] reconcile
+steam-agent-broker [--state-dir PATH] status [--limit N]
+steam-agent-broker [--state-dir PATH] policy
+```
+
+`--state-dir` defaults to `~/.local/state/steam-broker`; the environment
+equivalent is `STEAM_BROKER_STATE`. The directory is created mode 0700 and
+holds the policy file, the ledger, the adoption journal, logs, and steamcmd's
+private HOME with its cached credentials. Stdout is deterministic JSON;
+diagnostics go to stderr. Exit 0 is success, 1 is a completed run whose
+outcome was not `confirmed`, and 2 is a refusal or error.
+
+`install` is the only executable operation class; every other class is denied
+regardless of policy content. Uninstall remains human-in-Steam, and store,
+market, wallet, credential, and account-settings operations are absent code
+paths rather than policy entries.
+
+### Authorization
+
+Policy lives in `policy.toml` under the state directory and is re-read at
+every decision point, failing closed when unreadable.
+
+```toml
+[grants]
+install = "allow"   # or "confirm" (two-step) or "deny" (kill switch)
+
+[limits]
+min_free_gb = 25    # required whenever any grant is "allow"
+```
+
+Under `confirm`, `request` emits `{"operation_id", "nonce", "state":
+"pending_confirmation"}` and the operation runs only after `confirm` consumes
+that nonce. Under `allow`, `request` measures free space on the library
+filesystem and, when the floor passes, authorizes in process and emits
+`{"operation_id", "state": "authorized"}` with no nonce; the recorded actor is
+`policy:<policy-version>`. When the floor fails or cannot be measured, the
+request degrades to `pending_confirmation` with an `auto_confirm_denied`
+reason and stays explicitly confirmable. Authorization carries a four-hour
+execution window; one operation per machine is active at a time; a plan's
+`idempotency_key` may be recorded only once.
+
+### Run outcomes
+
+`run` reports one of:
+
+| Outcome | Meaning | Ledger row |
+| --- | --- | --- |
+| `confirmed` | content present and adopted by the client | terminal |
+| `unconfirmed` / `contradicted` | ran, but verification did not prove the expected end state | terminal |
+| `deferred` | no content work completed. Usually refused before any side effect (lease gate not clear, steamcmd already running, client presence unknown); the client-restore-failure case instead reports that state was left for reconcile and may leave the client stopped | left retryable |
+| `aborted` | terminated without completing (window lapsed, policy revoked, gates regressed) | terminal |
+| `failed` | content work started and did not succeed | terminal |
+| `auth_required` | steamcmd needs an interactive Steam Guard login | terminal |
+
+A `deferred` outcome is not a failure and must not be resubmitted under a new
+idempotency key: the same operation is still authorized and a later `run`
+retries it in place. `reconcile` maps any non-terminal operation to exactly
+one recovery action and never depends on the policy file.

@@ -194,7 +194,60 @@ is safe to uninstall, backed up, current, or downloadable on time. Plans are
 inert: they return official references and instructions but never open Steam,
 launch a process, change a file, or claim completion.
 
+## Execute an install or update with the broker
+
+`steam-agent` never changes Steam. Execution lives in a second executable,
+`steam-agent-broker`, which runs on the machine it manages and is provisioned
+separately: installing the planner does not enable it. The full contract is in
+the [CLI contract](design/cli-contract.md); the decisions behind it are
+[ADR 0027](adr/0027-provisioned-execution.md) as re-scoped by
+[ADR 0028](adr/0028-trusted-manager-execution.md).
+
+Provision it once, then grant an operation class:
+
+```bash
+steam-agent-broker init --library ~/.local/share/Steam --steamcmd /path/to/steamcmd.sh
+# edit ~/.local/state/steam-broker/policy.toml: install = "confirm"
+steam-agent-broker policy
+```
+
+Submit a plan on stdin, then run it. Under `install = "confirm"` the request
+returns a nonce that must be consumed before the operation may run:
+
+```bash
+steam-agent-broker request --account ALIAS < plan.json
+steam-agent-broker confirm NONCE --actor owner
+steam-agent-broker run
+steam-agent-broker status --limit 5
+```
+
+Setting `install = "allow"` with a `[limits] min_free_gb` floor authorizes
+qualifying requests automatically, so the loop shortens to `request` then
+`run`. Setting `install = "deny"` is the kill switch: it refuses new requests
+and stops any authorized operation that has not started.
+
+Three behaviors matter when scripting against it. A `deferred` outcome means
+no content work completed and the same operation is still authorized, so retry
+it later rather than resubmitting a new plan. Most deferrals happen before any
+side effect — a game was running, a download was in flight, or the client's
+state could not be determined — but one does not: when the broker could not
+restart a client it had stopped, it defers with a detail saying the state was
+left for reconcile, and Steam may still be stopped. Always read the detail, and
+run `reconcile` when it says so. Every plan carries an `idempotency_key` that
+may be recorded only once. And a successful install ends at `client_adopted`
+with first run still
+required: Steam install scripts, EULAs, and anti-cheat setup run on a
+human-present first launch, so the broker never claims a game is ready to
+play.
+
+If a run is interrupted, `steam-agent-broker reconcile` maps whatever it finds
+to exactly one recovery action. It works even when the policy file is broken,
+so recovery is never blocked behind repairing configuration.
+
 ## Network, persistence, and Steam effects
+
+The table below covers `steam-agent`. The separate `steam-agent-broker`
+executable does change Steam, under the authorization rules above.
 
 | Command family | Network | Writes Steam Agent state | Changes Steam |
 | --- | --- | --- | --- |

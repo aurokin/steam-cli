@@ -12,7 +12,7 @@ Use `steam-agent` as the evidence source. Prefer its cache-only reads and keep t
 1. Start with `steam-agent --help` when the intent-to-command mapping is unclear. Use `<family> <leaf> --help` for exact options.
 2. Put global `--data-dir` before the command. Request `--format json` and inspect the returned context, completeness, warnings, and evidence fields before answering.
 3. Run only the smallest read that answers the question. Do not sync, authenticate, probe a provider, or change Steam Agent's local state unless the user explicitly asks to acquire or change that evidence. Never do those things in a read-only evaluation.
-4. Never launch, install, uninstall, move, or otherwise change Steam. `operations plan` emits instructions for a human; it does not authorize execution.
+4. Never launch, install, uninstall, move, or otherwise change Steam from this skill. `steam-agent` cannot do it, and `operations plan` emits instructions for a human rather than authorizing execution. Execution exists only in a separate, separately provisioned CLI with its own skill; it is out of scope here and must not be invoked from this one.
 5. State what the evidence supports and what remains unknown, stale, partial, inaccessible, or unsupported. Do not collapse any of those states into `false` or an empty result.
 
 ## Choose the command

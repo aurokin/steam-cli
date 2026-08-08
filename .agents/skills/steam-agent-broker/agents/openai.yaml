@@ -1,0 +1,6 @@
+interface:
+  display_name: "Steam Agent Broker"
+  short_description: "Install or update owned Steam titles on this machine"
+  default_prompt: "Use $steam-agent-broker to install or update an owned Steam title on this machine."
+policy:
+  allow_implicit_invocation: false
