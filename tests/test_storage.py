@@ -274,6 +274,7 @@ def test_migration_resource_is_packaged_and_applied_once(tmp_path: Path) -> None
         (23,),
         (24,),
         (25,),
+        (26,),
     ]
     assert {"machines", "steam_apps", "sync_runs", "evidence"} <= tables
     assert {"installed_observations", "installed_current", "accounts"} <= tables
@@ -555,6 +556,7 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
                 23,
                 24,
                 25,
+                26,
             )
         ]
         * workers
@@ -588,6 +590,7 @@ def test_concurrent_first_open_applies_migration_once(tmp_path: Path) -> None:
             (23,),
             (24,),
             (25,),
+            (26,),
         ]
 
 

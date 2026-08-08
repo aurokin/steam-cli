@@ -306,7 +306,7 @@ def test_owned_migration_and_secure_delete_are_enabled(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (25,)
+        ).fetchone() == (26,)
 
 
 def test_populated_v5_upgrade_backfills_steam_application_identities(
@@ -347,7 +347,7 @@ def test_populated_v5_upgrade_backfills_steam_application_identities(
             storage._connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-            == 25
+            == 26
         )
 
 
@@ -539,7 +539,7 @@ def test_original_populated_v6_upgrade_preserves_only_proven_legacy_facts(
             storage._connection.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-            == 25
+            == 26
         )
 
 

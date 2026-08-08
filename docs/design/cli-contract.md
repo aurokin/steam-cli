@@ -653,6 +653,18 @@ references, rollback guidance, and unknown postconditions.
 `human_open_references` stay exactly what schema `0.1` fixed: official HTTPS
 pages under the closed `product_page | support_page` purposes, inert to open.
 
+`uninstall` plans carry one extra risk describing content Steam's own
+uninstall leaves in place — the Proton compatibility prefix, the shader
+cache, and subscribed Workshop items — measured during the installed scan.
+`residual_content_remains` names the directories and their total size,
+`residual_content_absent` records that all three were looked for and found
+empty, and a projection promoted before residual measurement existed carries
+neither, because unmeasured is not the same claim as empty. A truncated or
+partly unreadable measurement reports its total as a floor ("at least N GB").
+Sizes only; the risk text never names a path. Steam Cloud and `userdata` are
+outside the measurement: locating them means enumerating account directories,
+which the scanner does not do, so `local_data_state_unknown` still applies.
+
 `uninstall` plans add one `ui_instructions` step offering the Steam client
 shortcut `steam://uninstall/<appid>`, because uninstall is the one operation
 this project will never execute (Phase 0 proved steamcmd cannot uninstall

@@ -14,6 +14,7 @@ from steam_agent.operation_plans import (
     MAX_APPID,
     HumanOpenReference,
     PlanPrecondition,
+    ResidualSummary,
     build_operation_plan,
 )
 
@@ -283,3 +284,119 @@ def test_output_is_deterministic_and_contains_no_callable_values() -> None:
                 walk(item)
 
     walk(first)
+
+
+def test_measured_residual_content_becomes_an_uninstall_risk() -> None:
+    plan = build(
+        "uninstall",
+        residual=ResidualSummary("measured", 12_400_000_000, ("compatdata", "shadercache")),
+    )
+
+    risk = next(item for item in plan.risks if item.code == "residual_content_remains")
+    assert risk.severity == "medium"
+    assert "Proton compatibility prefix" in risk.message
+    assert "shader cache" in risk.message
+    assert "12.4 GB" in risk.message
+    assert "at least" not in risk.message
+    # The unmeasured-state risk stays: directory sizes are not save or cloud state.
+    assert any(item.code == "local_data_state_unknown" for item in plan.risks)
+
+
+def test_truncated_residual_measurement_is_reported_as_a_floor() -> None:
+    plan = build(
+        "uninstall", residual=ResidualSummary("partial", 3_000_000_000, ("workshop",))
+    )
+
+    risk = next(item for item in plan.risks if item.code == "residual_content_remains")
+    assert "at least 3.0 GB" in risk.message
+
+
+def test_measured_empty_residual_says_so_rather_than_staying_silent() -> None:
+    plan = build("uninstall", residual=ResidualSummary("measured", 0, ()))
+
+    codes = {item.code for item in plan.risks}
+    assert "residual_content_absent" in codes
+    assert "residual_content_remains" not in codes
+
+
+def test_unmeasured_residual_adds_no_claim_either_way() -> None:
+    codes = {item.code for item in build("uninstall").risks}
+
+    assert "residual_content_absent" not in codes
+    assert "residual_content_remains" not in codes
+
+
+def test_residual_is_rejected_for_operations_that_leave_nothing_behind() -> None:
+    with pytest.raises(ValueError):
+        build("install", residual=ResidualSummary("measured", 1, ("compatdata",)))
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        ("measured", -1, ()),
+        ("measured", 1, ("unknown_kind",)),
+        ("measured", 1, ("compatdata", "compatdata")),
+        ("unknown", 1, ("compatdata",)),
+    ],
+)
+def test_residual_summary_rejects_invalid_input(summary: tuple[object, ...]) -> None:
+    with pytest.raises(ValueError):
+        ResidualSummary(*summary)  # type: ignore[arg-type]
+
+
+def test_residual_risk_carries_counts_but_never_a_path() -> None:
+    plan = build(
+        "uninstall", residual=ResidualSummary("measured", 900_000_000, ("compatdata",))
+    )
+
+    rendered = json.dumps(asdict(plan))
+    assert "/" not in next(
+        item.message for item in plan.risks if item.code == "residual_content_remains"
+    )
+    assert "steamapps" not in rendered
+
+
+def test_a_partial_measurement_that_found_nothing_claims_nothing() -> None:
+    codes = {
+        item.code
+        for item in build("uninstall", residual=ResidualSummary("partial", 0, ())).risks
+    }
+
+    assert "residual_content_absent" not in codes
+    assert "residual_content_remains" not in codes
+
+
+@pytest.mark.parametrize(
+    ("total", "expected"),
+    [(12_400_000_000, "12.4 GB"), (42_000_000, "42 MB"), (900, "900 bytes")],
+)
+def test_small_residuals_stay_visibly_nonzero(total: int, expected: str) -> None:
+    plan = build(
+        "uninstall", residual=ResidualSummary("measured", total, ("compatdata",))
+    )
+
+    risk = next(item for item in plan.risks if item.code == "residual_content_remains")
+    assert expected in risk.message
+
+
+@pytest.mark.parametrize("summary", [("measured", 1, ()), ("measured", 0, ("compatdata",))])
+def test_residual_summary_rejects_a_total_its_kinds_contradict(
+    summary: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        ResidualSummary(*summary)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("total", "expected"), [(1_600_000, "at least 1 MB"), (12_490_000_000, "at least 12.4 GB")]
+)
+def test_a_partial_total_is_never_rounded_above_what_was_counted(
+    total: int, expected: str
+) -> None:
+    plan = build(
+        "uninstall", residual=ResidualSummary("partial", total, ("shadercache",))
+    )
+
+    risk = next(item for item in plan.risks if item.code == "residual_content_remains")
+    assert expected in risk.message

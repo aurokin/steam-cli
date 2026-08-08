@@ -10,7 +10,7 @@ import platform
 import sys
 from typing import Callable
 
-from steam_agent.local_steam import LocalSteamScan, scan_local_steam
+from steam_agent.local_steam import LocalSteamScan, ResidualContent, scan_local_steam
 from steam_agent.storage import (
     EvidenceInput,
     InstalledObservation,
@@ -184,6 +184,7 @@ def sync_installed(
                 )
             except OSError:
                 manifest_mtime = None
+            residual = app.residual or ResidualContent(None, None, None, "unknown")
             payload = {
                 "appid": app.appid,
                 "name": app.name,
@@ -194,6 +195,10 @@ def sync_installed(
                 "size_on_disk_bytes": app.size_on_disk_bytes,
                 "state_flags": app.state_flags,
                 "parser_version": scan.parser_version,
+                "residual_state": residual.state,
+                "residual_compatdata_bytes": residual.compatdata_bytes,
+                "residual_shadercache_bytes": residual.shadercache_bytes,
+                "residual_workshop_bytes": residual.workshop_bytes,
             }
             storage.record_installed_observation(
                 run.id,
@@ -209,6 +214,10 @@ def sync_installed(
                     manifest_path=str(app.manifest_path),
                     manifest_mtime=manifest_mtime,
                     observed_at=started_at,
+                    residual_state=residual.state,
+                    residual_compatdata_bytes=residual.compatdata_bytes,
+                    residual_shadercache_bytes=residual.shadercache_bytes,
+                    residual_workshop_bytes=residual.workshop_bytes,
                 ),
                 EvidenceInput(
                     provider="local_steam",

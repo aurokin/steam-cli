@@ -12,7 +12,8 @@ from enum import StrEnum
 import os
 from pathlib import Path
 import re
-from typing import Final, Mapping
+import stat
+from typing import Final, Literal, Mapping
 
 
 KEYVALUES_PARSER_VERSION: Final = "steam-keyvalues-minimal-v1"
@@ -37,6 +38,13 @@ _APP_STATE_PLAUSIBLE_UPDATE: Final = (
     | (1 << 21) | (1 << 22) | (1 << 23)
 )
 _SQLITE_INT_MAX: Final = (1 << 63) - 1
+
+# Residual content: the per-app directories Steam's uninstall does not
+# remove.  Measuring them is the only recursive walk this scanner performs,
+# so it is bounded per app — a Proton prefix is an entire Windows filesystem
+# and a shader cache can hold six figures of files.  Exceeding the budget
+# yields a truncated count marked ``partial``, never a wrong-looking total.
+MAX_RESIDUAL_ENTRIES: Final = 60_000
 
 
 class KeyValuesError(ValueError):
@@ -67,6 +75,26 @@ class SteamLibrary:
 
 
 @dataclass(frozen=True, slots=True)
+class ResidualContent:
+    """Bytes Steam's own uninstall leaves behind for one app.
+
+    A byte count of ``0`` means the directory was looked for and is absent;
+    ``None`` means it could not be measured.  ``state`` is ``measured`` only
+    when all three counts are trustworthy, ``partial`` when the walk was
+    truncated or a subtree was unreadable, and ``unknown`` when measurement
+    did not run.
+
+    Steam Cloud and ``userdata`` are deliberately excluded: locating them
+    requires enumerating account directories, which this scanner does not do.
+    """
+
+    compatdata_bytes: int | None
+    shadercache_bytes: int | None
+    workshop_bytes: int | None
+    state: Literal["measured", "partial", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
 class InstalledSteamApp:
     appid: int
     name: str | None
@@ -76,6 +104,7 @@ class InstalledSteamApp:
     state_flags: int | None
     library_path: Path
     manifest_path: Path
+    residual: ResidualContent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,6 +687,7 @@ def _read_manifest(
         state_flags=state_flags,
         library_path=library_path,
         manifest_path=manifest,
+        residual=_measure_residual_content(manifest.parent, appid),
     )
 
 
@@ -799,6 +829,83 @@ def _bounded_optional_manifest_integer(
     return None
 
 
+def _measure_residual_content(steamapps: Path, appid: int) -> ResidualContent:
+    """Size the per-app directories a Steam uninstall leaves in place."""
+
+    budget = [MAX_RESIDUAL_ENTRIES]
+    counts: list[int | None] = []
+    truncated = False
+    for root in (
+        steamapps / "compatdata" / str(appid),
+        steamapps / "shadercache" / str(appid),
+        steamapps / "workshop" / "content" / str(appid),
+    ):
+        total, complete = _measure_tree(root, budget)
+        counts.append(total)
+        truncated = truncated or not complete
+    compatdata, shadercache, workshop = counts
+    return ResidualContent(
+        compatdata_bytes=compatdata,
+        shadercache_bytes=shadercache,
+        workshop_bytes=workshop,
+        state="partial" if truncated else "measured",
+    )
+
+
+def _measure_tree(root: Path, budget: list[int]) -> tuple[int | None, bool]:
+    """Sum regular-file bytes under ``root``; never follow directory links.
+
+    Returns ``(bytes, complete)``.  An absent tree is ``(0, True)``: looked
+    for and not there.  Anything else that yields no bytes — an unreadable
+    tree, a truncated walk, or a symlinked root, which is a pointer to
+    content living somewhere else rather than content in this library — is
+    incomplete, so a zero it produces is never read as an absence.
+    """
+
+    try:
+        status = root.lstat()
+    except FileNotFoundError:
+        return 0, True
+    except OSError:
+        # Denied or otherwise unreadable: not the same claim as missing.
+        return 0, False
+    # A junction has directory mode rather than S_IFLNK, so it needs its own
+    # check; both mean the content lives outside this tree.
+    if stat.S_ISLNK(status.st_mode) or root.is_junction():
+        return 0, False
+    total = 0
+    complete = True
+    stack = [root]
+    while stack:
+        if budget[0] <= 0:
+            return total, False
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if budget[0] <= 0:
+                        return total, False
+                    budget[0] -= 1
+                    try:
+                        # is_junction() is os.DirEntry API from Python
+                        # 3.12, which this project requires.
+                        if entry.is_symlink() or entry.is_junction():
+                            # The link stays behind an uninstall, but its
+                            # target lives elsewhere and is not this tree's
+                            # bytes to count.  Unmeasured, so not complete.
+                            # NTFS junctions are not symlinks and would
+                            # otherwise be walked into.
+                            complete = False
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        complete = False
+        except OSError:
+            complete = False
+    return total, complete
+
+
 def _is_readable_directory(path: Path) -> bool:
     try:
         return path.is_dir()
@@ -841,6 +948,7 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 __all__ = [
     "InstalledSteamApp",
     "KEYVALUES_PARSER_VERSION",
+    "ResidualContent",
     "KeyValuesError",
     "LocalSteamScan",
     "LocalSteamWarning",

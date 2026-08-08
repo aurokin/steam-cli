@@ -54,6 +54,7 @@ def test_account_migration_is_packaged_and_applied(tmp_path: Path) -> None:
             (23,),
             (24,),
             (25,),
+            (26,),
         ]
 
 

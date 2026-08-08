@@ -108,6 +108,17 @@ _RISKS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
 }
 
+# Directories a Steam uninstall leaves in place, in the order a human reads
+# them.  Sizing them is the CLI's job; this module only formats what it is
+# handed, because plan building performs no I/O.
+_RESIDUAL_KINDS: tuple[str, ...] = ("compatdata", "shadercache", "workshop")
+_RESIDUAL_LABELS: dict[str, str] = {
+    "compatdata": "the Proton compatibility prefix",
+    "shadercache": "the shader cache",
+    "workshop": "subscribed Workshop content",
+}
+MAX_RESIDUAL_BYTES = (1 << 63) - 1
+
 _LOCAL_DATA_UNKNOWN_RISK = (
     "local_data_state_unknown",
     "high",
@@ -191,6 +202,38 @@ class PlanPrecondition:
         if self.state not in {"pass", "fail", "unknown"}:
             raise ValueError("precondition state is invalid")
         _code(self.detail_code, name="precondition detail_code")
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualSummary:
+    """Measured on-disk content a Steam uninstall leaves behind.
+
+    ``kinds`` names only the directories observed to hold bytes, and
+    ``total_bytes`` sums them.  Paths are deliberately absent: the builder
+    receives counts, never locations.
+    """
+
+    state: Literal["measured", "partial"]
+    total_bytes: int
+    kinds: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.state not in {"measured", "partial"}:
+            raise ValueError("residual state is invalid")
+        if isinstance(self.total_bytes, bool) or not isinstance(self.total_bytes, int):
+            raise ValueError("residual total_bytes must be an integer")
+        if not 0 <= self.total_bytes <= MAX_RESIDUAL_BYTES:
+            raise ValueError("residual total_bytes is out of range")
+        if not isinstance(self.kinds, tuple) or len(self.kinds) > len(_RESIDUAL_KINDS):
+            raise ValueError("residual kinds must be a bounded tuple")
+        if any(kind not in _RESIDUAL_KINDS for kind in self.kinds):
+            raise ValueError("residual kinds are invalid")
+        if len(set(self.kinds)) != len(self.kinds):
+            raise ValueError("residual kinds must be unique")
+        # kinds names the directories holding bytes, so the two agree or the
+        # summary is describing two different measurements.
+        if bool(self.kinds) != (self.total_bytes > 0):
+            raise ValueError("residual kinds and total_bytes disagree")
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +321,7 @@ def build_operation_plan(
     generated_at: datetime,
     preconditions: tuple[PlanPrecondition, ...] = (),
     destination_library_ordinal: int | None = None,
+    residual: ResidualSummary | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> OperationPlan:
     """Build an auditable, non-executable plan from already-normalized inputs."""
@@ -305,6 +349,12 @@ def build_operation_plan(
     else:
         destination = None
 
+    if residual is not None:
+        if operation != "uninstall":
+            raise ValueError("residual is only valid for uninstall plans")
+        if not isinstance(residual, ResidualSummary):
+            raise ValueError("residual must be a ResidualSummary")
+
     normalized_preconditions = _normalize_preconditions(operation, preconditions)
     summary = _summarize(normalized_preconditions)
     target = OperationTarget(
@@ -317,7 +367,14 @@ def build_operation_plan(
         ttl_seconds=ttl,
     )
     expires_at = timestamp + timedelta(seconds=ttl)
-    risks = tuple(PlanRisk(*risk) for risk in (*_RISKS[operation], _LOCAL_DATA_UNKNOWN_RISK))
+    risks = tuple(
+        PlanRisk(*risk)
+        for risk in (
+            *_RISKS[operation],
+            *_residual_risks(residual),
+            _LOCAL_DATA_UNKNOWN_RISK,
+        )
+    )
     postconditions = tuple(
         PlanPostcondition(code) for code in _POSTCONDITIONS[operation]
     )
@@ -348,6 +405,55 @@ def build_operation_plan(
         rollback=_ROLLBACK[operation],
         postconditions=postconditions,
     )
+
+
+def _residual_risks(residual: ResidualSummary | None) -> tuple[tuple[str, str, str], ...]:
+    """State what an uninstall will leave on disk, when it has been measured."""
+
+    if residual is None:
+        return ()
+    if not residual.kinds:
+        if residual.state != "measured":
+            # A truncated walk that counted nothing proves nothing.
+            return ()
+        return (
+            (
+                "residual_content_absent",
+                "low",
+                (
+                    "No compatibility prefix, shader cache, or Workshop content"
+                    " was found for this game; uninstalling should not strand"
+                    " those directories."
+                ),
+            ),
+        )
+    named = ", ".join(_RESIDUAL_LABELS[kind] for kind in residual.kinds)
+    floor = "at least " if residual.state == "partial" else ""
+    return (
+        (
+            "residual_content_remains",
+            "medium",
+            (
+                f"Uninstalling does not remove {named}, holding {floor}"
+                f"{_size(residual.total_bytes)}. Removing that is a separate"
+                " manual step."
+            ),
+        ),
+    )
+
+
+def _size(value: int) -> str:
+    """Render bytes in a unit that keeps a small residual visibly nonzero.
+
+    Always rounds down: a partial measurement is presented as a floor, and a
+    floor that rounds up is not one.
+    """
+
+    if value >= 10**9:
+        return f"{value // 10**8 / 10:.1f} GB"
+    if value >= 10**6:
+        return f"{value // 10**6} MB"
+    return f"{value} bytes"
 
 
 def _ui_instructions(operation: str, appid: int) -> tuple[str, ...]:

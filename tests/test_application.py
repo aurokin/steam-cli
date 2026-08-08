@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 import pytest
@@ -528,3 +529,35 @@ def test_finalization_failure_does_not_replace_original_cancellation(
                 machine_id="fixture-machine",
                 clock=Clock(),
             )
+
+
+def test_residual_measurements_survive_promotion_and_stay_pathless(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    steamapps = root / "steamapps"
+    (steamapps / "common" / "Eight").mkdir(parents=True)
+    (steamapps / "libraryfolders.vdf").write_text(
+        '"libraryfolders" { "0" { "path" "." "apps" { "8" "1" } } }',
+        encoding="utf-8",
+    )
+    (steamapps / "appmanifest_8.acf").write_text(
+        '"AppState" { "appid" "8" "name" "Eight" "installdir" "Eight"'
+        ' "StateFlags" "4" }',
+        encoding="utf-8",
+    )
+    cache = steamapps / "shadercache" / "8"
+    cache.mkdir(parents=True)
+    (cache / "fozpipelinesv6").write_bytes(b"y" * 700)
+
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        sync_installed(
+            storage, steam_root=root, machine_id="fixture-machine", clock=Clock()
+        )
+        game = storage.list_installed("fixture-machine")[0]
+
+    assert game.residual_state == "measured"
+    assert game.residual_shadercache_bytes == 700
+    assert game.residual_compatdata_bytes == 0
+    assert game.residual_workshop_bytes == 0
+    assert str(tmp_path) not in json.dumps(installed_item(game))

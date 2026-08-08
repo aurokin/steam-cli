@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from steam_agent import local_steam
 from steam_agent.local_steam import (
     KEYVALUES_PARSER_VERSION,
     MAX_KEYVALUES_BYTES,
@@ -651,3 +653,162 @@ def test_manifest_symlink_is_rejected(tmp_path: Path) -> None:
 
     assert result.apps == ()
     assert "unsafe_manifest_entry" in {warning.code for warning in result.warnings}
+
+
+def _root_with_app(base: Path, appid: int = 8) -> Path:
+    steamapps = base / "steamapps"
+    (steamapps / "common" / "Eight").mkdir(parents=True)
+    (steamapps / f"appmanifest_{appid}.acf").write_text(
+        '"AppState" { "appid" "%d" "name" "Eight" "installdir" "Eight"'
+        ' "StateFlags" "4" }' % appid,
+        encoding="utf-8",
+    )
+    return steamapps
+
+
+def test_residual_content_is_measured_per_directory(tmp_path: Path) -> None:
+    steamapps = _root_with_app(tmp_path)
+    prefix = steamapps / "compatdata" / "8" / "pfx" / "drive_c"
+    prefix.mkdir(parents=True)
+    (prefix / "user.reg").write_bytes(b"x" * 1200)
+    cache = steamapps / "shadercache" / "8"
+    cache.mkdir(parents=True)
+    (cache / "fozpipelinesv6").write_bytes(b"y" * 800)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "measured"
+    assert residual.compatdata_bytes == 1200
+    assert residual.shadercache_bytes == 800
+    # Looked for and absent is zero, which is a different claim from unknown.
+    assert residual.workshop_bytes == 0
+
+
+def test_residual_measurement_never_follows_directory_symlinks(tmp_path: Path) -> None:
+    steamapps = _root_with_app(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "huge").write_bytes(b"z" * 5000)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    (compatdata / "escape").symlink_to(outside, target_is_directory=True)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.compatdata_bytes == 0
+
+
+def test_unreadable_residual_subtree_reports_partial_not_a_smaller_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steamapps = _root_with_app(tmp_path)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    (compatdata / "readable").write_bytes(b"a" * 500)
+    denied = compatdata / "denied"
+    denied.mkdir()
+    original_scandir = os.scandir
+
+    def deny(path: object, *args: object, **kwargs: object):
+        if Path(path) == denied:
+            raise PermissionError("denied")
+        return original_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", deny)
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "partial"
+    assert residual.compatdata_bytes == 500
+
+
+def test_residual_walk_stops_at_the_entry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_steam, "MAX_RESIDUAL_ENTRIES", 3)
+    steamapps = _root_with_app(tmp_path)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    for index in range(10):
+        (compatdata / f"file{index}").write_bytes(b"b" * 100)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "partial"
+    assert 0 <= (residual.compatdata_bytes or 0) < 1000
+
+
+def test_symlinked_residual_root_is_incomplete_rather_than_absent(
+    tmp_path: Path,
+) -> None:
+    steamapps = _root_with_app(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "big").write_bytes(b"c" * 4000)
+    (steamapps / "compatdata").mkdir()
+    (steamapps / "compatdata" / "8").symlink_to(outside, target_is_directory=True)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "partial"
+    assert residual.compatdata_bytes == 0
+
+
+def test_unreadable_residual_root_is_not_reported_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steamapps = _root_with_app(tmp_path)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    original_lstat = Path.lstat
+
+    def deny(path: Path, *args: object, **kwargs: object):
+        if path == compatdata:
+            raise PermissionError("denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny)
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "partial"
+    assert residual.compatdata_bytes == 0
+
+
+def test_a_residual_tree_holding_only_a_symlink_is_not_measured_as_empty(
+    tmp_path: Path,
+) -> None:
+    steamapps = _root_with_app(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "big").write_bytes(b"d" * 3000)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    (compatdata / "link").symlink_to(outside, target_is_directory=True)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "partial"
+    assert residual.compatdata_bytes == 0
+
+
+def test_a_tree_that_exactly_fits_the_budget_is_measured_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_steam, "MAX_RESIDUAL_ENTRIES", 4)
+    steamapps = _root_with_app(tmp_path)
+    compatdata = steamapps / "compatdata" / "8"
+    compatdata.mkdir(parents=True)
+    for index in range(4):
+        (compatdata / f"file{index}").write_bytes(b"e" * 250)
+
+    residual = scan_local_steam(tmp_path).apps[0].residual
+
+    assert residual is not None
+    assert residual.state == "measured"
+    assert residual.compatdata_bytes == 1000

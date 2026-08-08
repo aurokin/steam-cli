@@ -58,6 +58,7 @@ from steam_agent.storage import (
     GROUP_PROFILE_DISCLOSURE_VERSION,
     MAX_DECLARED_APP_DEMAND,
     AccountConflict,
+    InstalledGame,
     Storage,
     StorageError,
 )
@@ -161,7 +162,11 @@ from steam_agent.groups import (
     score_preferences,
     summarize_ownership,
 )
-from steam_agent.operation_plans import PlanPrecondition, build_operation_plan
+from steam_agent.operation_plans import (
+    PlanPrecondition,
+    ResidualSummary,
+    build_operation_plan,
+)
 from steam_agent.operations_observe import (
     InstalledAttempt,
     PromotedInstalledFact,
@@ -4735,6 +4740,36 @@ def _dispatch_travel_rank(args: argparse.Namespace, database_path: Path) -> int:
     )
 
 
+_RESIDUAL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("compatdata", "residual_compatdata_bytes"),
+    ("shadercache", "residual_shadercache_bytes"),
+    ("workshop", "residual_workshop_bytes"),
+)
+
+
+def _residual_summary(game: InstalledGame | None) -> ResidualSummary | None:
+    """Summarize measured leave-behind content, or None when unmeasured.
+
+    A projection promoted before residual measurement existed carries a NULL
+    state, which stays unmeasured rather than being reported as empty.
+    """
+
+    if game is None or game.residual_state not in {"measured", "partial"}:
+        return None
+    total = 0
+    kinds: list[str] = []
+    for kind, field in _RESIDUAL_FIELDS:
+        value = getattr(game, field)
+        if not isinstance(value, int) or value <= 0:
+            continue
+        total += value
+        kinds.append(kind)
+    try:
+        return ResidualSummary(game.residual_state, total, tuple(kinds))
+    except ValueError:
+        return None
+
+
 def _dispatch_operation_plan(args: argparse.Namespace, database_path: Path) -> int:
     command = "operations.plan"
     now = _utc_now()
@@ -4790,6 +4825,20 @@ def _dispatch_operation_plan(args: argparse.Namespace, database_path: Path) -> i
         installation = _operation_batch(
             snapshot.installed, appids=(args.appid,), now=now
         ).items[0].installed
+        residual = (
+            _residual_summary(
+                next(
+                    (
+                        game
+                        for game in snapshot.installed.games
+                        if game.appid == args.appid
+                    ),
+                    None,
+                )
+            )
+            if args.operation == "uninstall"
+            else None
+        )
         _, _, owned_authoritative = _owned_scope_state(snapshot.owned, now=now)
         owned_item = next(
             (
@@ -4897,6 +4946,7 @@ def _dispatch_operation_plan(args: argparse.Namespace, database_path: Path) -> i
             generated_at=now,
             preconditions=tuple(available[name] for name in required),
             destination_library_ordinal=args.destination_library_ordinal,
+            residual=residual,
             ttl_seconds=args.expires_minutes * 60,
         )
     except ValueError:

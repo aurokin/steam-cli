@@ -208,6 +208,10 @@ class InstalledObservation:
     size_bytes: int | None = None
     manifest_path: str | None = None
     manifest_mtime: str | datetime | None = None
+    residual_state: str | None = None
+    residual_compatdata_bytes: int | None = None
+    residual_shadercache_bytes: int | None = None
+    residual_workshop_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +230,10 @@ class InstalledGame:
     observed_at: str
     evidence_id: int
     promoted_sync_run_id: int
+    residual_state: str | None = None
+    residual_compatdata_bytes: int | None = None
+    residual_shadercache_bytes: int | None = None
+    residual_workshop_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -6361,8 +6369,10 @@ class Storage:
                 INSERT INTO installed_observations(
                     sync_run_id, evidence_id, machine_id, appid, name, app_type,
                     library_root, install_dir, state, build_id, size_bytes,
-                    manifest_path, manifest_mtime, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    manifest_path, manifest_mtime, observed_at,
+                    residual_state, residual_compatdata_bytes,
+                    residual_shadercache_bytes, residual_workshop_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sync_run_id, appid) DO UPDATE SET
                     evidence_id = excluded.evidence_id,
                     name = excluded.name,
@@ -6374,7 +6384,11 @@ class Storage:
                     size_bytes = excluded.size_bytes,
                     manifest_path = excluded.manifest_path,
                     manifest_mtime = excluded.manifest_mtime,
-                    observed_at = excluded.observed_at
+                    observed_at = excluded.observed_at,
+                    residual_state = excluded.residual_state,
+                    residual_compatdata_bytes = excluded.residual_compatdata_bytes,
+                    residual_shadercache_bytes = excluded.residual_shadercache_bytes,
+                    residual_workshop_bytes = excluded.residual_workshop_bytes
                 """,
                 (
                     sync_run_id,
@@ -6391,6 +6405,10 @@ class Storage:
                     observation.manifest_path,
                     manifest_mtime,
                     observed_at,
+                    observation.residual_state,
+                    observation.residual_compatdata_bytes,
+                    observation.residual_shadercache_bytes,
+                    observation.residual_workshop_bytes,
                 ),
             )
             self._connection.execute(
@@ -8607,7 +8625,11 @@ class Storage:
                 current.manifest_mtime,
                 current.observed_at,
                 current.evidence_id,
-                current.promoted_sync_run_id
+                current.promoted_sync_run_id,
+                current.residual_state,
+                current.residual_compatdata_bytes,
+                current.residual_shadercache_bytes,
+                current.residual_workshop_bytes
             FROM installed_current AS current
             JOIN installed_observations AS promoted
               ON promoted.sync_run_id = current.promoted_sync_run_id
@@ -9783,12 +9805,16 @@ class Storage:
             INSERT INTO installed_current(
                 machine_id, appid, evidence_id, promoted_sync_run_id, library_root,
                 install_dir, state, build_id, size_bytes, manifest_path,
-                manifest_mtime, observed_at
+                manifest_mtime, observed_at, residual_state,
+                residual_compatdata_bytes, residual_shadercache_bytes,
+                residual_workshop_bytes
             )
             SELECT
                 machine_id, appid, evidence_id, sync_run_id, library_root,
                 install_dir, state, build_id, size_bytes, manifest_path,
-                manifest_mtime, observed_at
+                manifest_mtime, observed_at, residual_state,
+                residual_compatdata_bytes, residual_shadercache_bytes,
+                residual_workshop_bytes
             FROM installed_observations
             WHERE sync_run_id = ?
             ON CONFLICT(machine_id, appid) DO UPDATE SET
@@ -9801,7 +9827,11 @@ class Storage:
                 size_bytes = excluded.size_bytes,
                 manifest_path = excluded.manifest_path,
                 manifest_mtime = excluded.manifest_mtime,
-                observed_at = excluded.observed_at
+                observed_at = excluded.observed_at,
+                residual_state = excluded.residual_state,
+                residual_compatdata_bytes = excluded.residual_compatdata_bytes,
+                residual_shadercache_bytes = excluded.residual_shadercache_bytes,
+                residual_workshop_bytes = excluded.residual_workshop_bytes
             """,
             (sync_run_id,),
         )

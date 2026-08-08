@@ -131,6 +131,10 @@ def seed(tmp_path: Path) -> None:
                 size_bytes=2_000_000_000,
                 manifest_path="/private/library/steamapps/appmanifest_10.acf",
                 manifest_mtime=NOW,
+                residual_state="measured",
+                residual_compatdata_bytes=8_000_000_000,
+                residual_shadercache_bytes=0,
+                residual_workshop_bytes=0,
             ),
             EvidenceInput(
                 provider="local_steam",
@@ -700,3 +704,55 @@ def test_invalid_move_ordinal_is_invalid_argument(
     )
     assert code == 2
     assert value["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_uninstall_plan_reports_measured_leave_behind_content_without_paths(
+    tmp_path: Path, capsys: object
+) -> None:
+    seed(tmp_path)
+    code, value, stderr = invoke(
+        tmp_path,
+        capsys,
+        "operations",
+        "plan",
+        "uninstall",
+        "10",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    risk = next(
+        item
+        for item in value["data"]["plan"]["risks"]
+        if item["code"] == "residual_content_remains"
+    )
+    assert "Proton compatibility prefix" in risk["message"]
+    assert "8.0 GB" in risk["message"]
+    assert "shader cache" not in risk["message"]
+    assert "/private" not in json.dumps(value)
+
+
+def test_plans_other_than_uninstall_carry_no_residual_claim(
+    tmp_path: Path, capsys: object
+) -> None:
+    seed(tmp_path)
+    code, value, _ = invoke(
+        tmp_path,
+        capsys,
+        "operations",
+        "plan",
+        "verify",
+        "10",
+        "--account",
+        "primary",
+        "--machine",
+        "local",
+    )
+
+    assert code == 0
+    codes = {item["code"] for item in value["data"]["plan"]["risks"]}
+    assert not any(item.startswith("residual_content") for item in codes)
