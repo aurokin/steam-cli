@@ -610,9 +610,21 @@ class Executor:
         # consult the journal, never as adopting-with-no-journal (which would
         # read as an unproven adoption after the manifest was already swapped).
         ledger.transition(operation_id, "client_restart_pending")
-        clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
-        # The steamcmd-written manifest now proves ownership on its own.
-        self._owned_marker(operation.appid).unlink(missing_ok=True)
+        try:
+            clear_adoption_journal(
+                appid=operation.appid, journal_dir=self._journal_dir
+            )
+            # The steamcmd-written manifest now proves ownership on its own.
+            self._owned_marker(operation.appid).unlink(missing_ok=True)
+        except OSError:
+            # A failing state filesystem must not leave the client stopped:
+            # restore first, stay non-terminal so reconciliation retries.
+            self._restore_client(prior_running)
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "journal cleanup failed; state left for reconcile retry",
+            )
         if not self._restore_client(prior_running):
             # Never terminalize while restoration is failing: the state
             # stays at client_restart_pending so reconciliation retries.
@@ -801,9 +813,12 @@ class Executor:
     ) -> tuple[str, str]:
         """Manifest-evidence verdict shared by execution and reconciliation."""
 
-        flags = manifest_state_flags(
-            self._library / "steamapps" / f"appmanifest_{appid}.acf"
-        )
+        manifest = self._library / "steamapps" / f"appmanifest_{appid}.acf"
+        # Filename-only evidence is rejected everywhere else; recovery must
+        # not confirm a stale/misnamed body swapped in after a crash.
+        if manifest_appid(manifest) != appid:
+            return "unconfirmed", "manifest appid mismatch"
+        flags = manifest_state_flags(manifest)
         if flags != _STATE_FULLY_INSTALLED:
             return "unconfirmed", f"manifest StateFlags={flags}"
         if (self._library / "steamapps" / "downloading" / str(appid)).exists():
@@ -946,8 +961,17 @@ class Executor:
             ledger.transition(
                 operation_id, "client_restart_pending", detail=f"adoption {verdict}"
             )
-            clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
-            self._owned_marker(active.appid).unlink(missing_ok=True)
+            try:
+                clear_adoption_journal(
+                    appid=active.appid, journal_dir=self._journal_dir
+                )
+                self._owned_marker(active.appid).unlink(missing_ok=True)
+            except OSError:
+                # A failing state filesystem must not leave the client
+                # stopped across retries; restore and defer.
+                restore()
+                actions.append(f"{operation_id}: journal cleanup failed; deferred")
+                return actions
             if not restore():
                 return actions  # retried from client_restart_pending
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
@@ -960,8 +984,17 @@ class Executor:
         if state in {"client_restart_pending", "verifying"}:
             # The swap completed before these states; any journal left behind
             # is a crash remnant and must not outlive the operation.
-            clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
-            self._owned_marker(active.appid).unlink(missing_ok=True)
+            try:
+                clear_adoption_journal(
+                    appid=active.appid, journal_dir=self._journal_dir
+                )
+                self._owned_marker(active.appid).unlink(missing_ok=True)
+            except OSError:
+                # A failing state filesystem must not leave the client
+                # stopped across retries; restore and defer.
+                restore()
+                actions.append(f"{operation_id}: journal cleanup failed; deferred")
+                return actions
             if not restore():
                 return actions
             if state != "verifying":

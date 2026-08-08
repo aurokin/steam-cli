@@ -717,6 +717,43 @@ def test_reconcile_records_deferred_validation_for_stopped_client(harness) -> No
     assert "deferred" in operation.detail
 
 
+def test_reconcile_verify_rejects_misnamed_manifest(harness) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=False)
+    for state in ("client_stopping", "content_running", "adopting",
+                  "client_restart_pending"):
+        ledger.transition(operation_id, state)
+    # Fully-installed flags, but the body belongs to another title.
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST.replace('"appid"\t\t"480"', '"appid"\t\t"999"'),
+        encoding="utf-8",
+    )
+    session.running = False
+
+    executor.reconcile()
+    operation = ledger.get(operation_id)
+    assert operation.state == "unconfirmed"
+    assert "mismatch" in operation.detail
+
+
+def test_reconcile_restores_client_when_journal_cleanup_fails(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "adopting",
+                  "client_restart_pending"):
+        ledger.transition(operation_id, state)
+    executor._journal_dir.parent.mkdir(parents=True, exist_ok=True)
+    executor._journal_dir.write_text("", encoding="utf-8")  # cleanup will fail
+    session.running = False
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "client_restart_pending"  # retryable
+    assert session.starts == 1  # client restored despite the failure
+    assert any("cleanup failed" in action for action in actions)
+
+
 def test_stop_failure_attempts_client_restore(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.stop_ok = False
