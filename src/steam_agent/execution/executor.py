@@ -19,6 +19,7 @@ from steam_agent.execution.content_plane import (
     adopt_manifest,
     clear_adoption_journal,
     locate_manifest,
+    manifest_install_dir,
     manifest_state_flags,
     reconcile_adoption,
 )
@@ -142,6 +143,20 @@ class Executor:
                 "aborted",
                 "install target resolves outside the library",
             )
+        for manifest in sorted((self._library / "steamapps").glob("appmanifest_*.acf")):
+            if manifest.name == f"appmanifest_{operation.appid}.acf":
+                continue
+            if manifest_install_dir(manifest) == install_dir_name:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="install_dir_name claimed by another title",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "install_dir_name belongs to another installed title",
+                )
 
         gates = self._session.gates()
         if not gates.all_clear():
@@ -168,11 +183,16 @@ class Executor:
             )
             ledger.transition(operation_id, "client_stopping")
             if prior_running and not self._session.stop_client():
+                # The main process may already be gone with a helper (or a
+                # probe error) lingering; try to restore the prior state
+                # before going terminal.  A second -silent start is safe:
+                # Steam is single-instance.
+                note = self._restore_note(prior_running)
                 ledger.transition(
                     operation_id, "aborted", detail="client would not exit cleanly"
                 )
                 return ExecutionReport(
-                    operation_id, "aborted", "client would not exit cleanly"
+                    operation_id, "aborted", f"client would not exit cleanly{note}"
                 )
 
         ledger.transition(
@@ -184,6 +204,7 @@ class Executor:
             account=operation.account_alias,
             appid=operation.appid,
             install_dir=target,
+            operation_id=operation_id,
         )
         # Restore the client before recording a terminal state: a crash in
         # between then leaves a non-terminal row that reconciliation still

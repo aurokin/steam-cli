@@ -51,6 +51,10 @@ def _grant_install(state_dir: Path) -> None:
     )
 
 
+def test_init_makes_state_dir_owner_only(state_dir: Path) -> None:
+    assert (state_dir.stat().st_mode & 0o777) == 0o700
+
+
 def test_init_writes_deny_all_policy(state_dir: Path) -> None:
     assert 'install = "deny"' in (state_dir / "policy.toml").read_text(
         encoding="utf-8"

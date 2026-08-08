@@ -124,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.command == "init":
         state_dir.mkdir(parents=True, exist_ok=True)
+        # Ledger, policy, logs, and the steamcmd credential cache live here;
+        # never trust the umask to keep other identities out.
+        state_dir.chmod(0o700)
         try:
             write_policy_template(state_dir / "policy.toml")
         except PolicyError as error:
@@ -263,7 +266,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.outcome == "confirmed" else 1
 
     if arguments.command == "reconcile":
-        _emit({"actions": executor.reconcile()})
+        try:
+            _emit({"actions": executor.reconcile()})
+        except ExecutorLockedError as error:
+            return _fail(str(error))
         return 0
 
     if arguments.command == "status":

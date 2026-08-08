@@ -200,7 +200,9 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
         private_home=home,
         log_dir=tmp_path / "logs",
     )
-    result = adapter.install(account="ownername", appid=480, install_dir=install_dir)
+    result = adapter.install(
+        account="ownername", appid=480, install_dir=install_dir, operation_id=1
+    )
     log = result.log_path.read_text(encoding="utf-8")
     assert "ownername" not in log
     assert str(install_dir) not in log and str(home) not in log
@@ -226,7 +228,9 @@ def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) 
     )
     # "all" is a substring of "fully installed"; classification must see
     # the raw output, not the redacted copy.
-    result = adapter.install(account="all", appid=480, install_dir=tmp_path / "i")
+    result = adapter.install(
+        account="all", appid=480, install_dir=tmp_path / "i", operation_id=1
+    )
     assert result.outcome == "installed"
     assert "all" not in result.log_path.read_text(encoding="utf-8").replace(
         "<install-dir>", ""
@@ -249,6 +253,8 @@ def test_steamcmd_timeout_bytes_output_is_decoded(tmp_path: Path, monkeypatch) -
         private_home=tmp_path / "home",
         log_dir=tmp_path / "logs",
     )
-    result = adapter.install(account="o", appid=480, install_dir=tmp_path / "i")
+    result = adapter.install(
+        account="o", appid=480, install_dir=tmp_path / "i", operation_id=1
+    )
     assert result.outcome == "failed"
     assert "partial" in result.log_path.read_text(encoding="utf-8")

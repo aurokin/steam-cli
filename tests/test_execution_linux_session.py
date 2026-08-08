@@ -30,3 +30,23 @@ def test_stop_client_confirms_exit_on_explicit_no_match(tmp_path: Path) -> None:
 
     session = LinuxSession(library=tmp_path, runner=runner, sleep=lambda _: None)
     assert session.stop_client() is True
+
+
+def test_download_gate_covers_all_configured_libraries(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    (library / "steamapps").mkdir(parents=True)
+    other = tmp_path / "other-library"
+    downloading = other / "steamapps" / "downloading"
+    downloading.mkdir(parents=True)
+    (downloading / "999").mkdir()
+    (library / "steamapps" / "libraryfolders.vdf").write_text(
+        f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{library}"\n\t}}\n'
+        f'\t"1"\n\t{{\n\t\t"path"\t\t"{other}"\n\t}}\n}}\n',
+        encoding="utf-8",
+    )
+
+    def runner(argv: list[str]) -> CommandResult:
+        return CommandResult(returncode=1, stdout="")
+
+    session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
+    assert session.gates().download_in_flight == "fail"

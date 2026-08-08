@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 from typing import Callable, Literal
@@ -88,16 +89,32 @@ class LinuxSession:
             return "pass"  # pgrep: no match
         return "unknown"
 
-    def gates(self) -> LeaseGates:
-        downloading = self._library / "steamapps" / "downloading"
+    def _download_dirs(self) -> list[Path]:
+        # Stopping the client interrupts downloads in every configured
+        # library, not just the broker's target one.
+        dirs = [self._library / "steamapps" / "downloading"]
+        vdf = self._library / "steamapps" / "libraryfolders.vdf"
         try:
-            download_state: GateState = (
-                "fail" if any(downloading.iterdir()) else "pass"
-            )
-        except FileNotFoundError:
-            download_state = "pass"
+            text = vdf.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            download_state = "unknown"
+            return dirs
+        for match in re.finditer(r'"path"\s+"([^"]*)"', text):
+            candidate = Path(match.group(1)) / "steamapps" / "downloading"
+            if candidate not in dirs:
+                dirs.append(candidate)
+        return dirs
+
+    def gates(self) -> LeaseGates:
+        download_state: GateState = "pass"
+        for downloading in self._download_dirs():
+            try:
+                if any(downloading.iterdir()):
+                    download_state = "fail"
+                    break
+            except FileNotFoundError:
+                continue
+            except OSError:
+                download_state = "unknown"
 
         client = self._run(["pgrep", "-x", "steam"])
         client_state: GateState

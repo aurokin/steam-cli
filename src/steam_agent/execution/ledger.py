@@ -198,6 +198,9 @@ class ExecutionLedger:
         # token_hex, not token_urlsafe: a nonce is retyped as a CLI argument
         # and must never begin with "-" or argparse consumes it as a flag.
         nonce = secrets.token_hex(16)
+        # A pending row whose nonce lapsed would otherwise hold the
+        # single-active slot forever and block every new request.
+        self.expire_lapsed()
         now = _utcnow()
         expires = now + timedelta(seconds=nonce_ttl_seconds)
         try:
@@ -304,7 +307,7 @@ class ExecutionLedger:
         """Expire pending confirmations and authorized-but-lapsed windows."""
 
         now = _stamp(_utcnow())
-        expired: list[int] = []
+        expired: list[tuple[int, str]] = []
         with self._transaction():
             for state, column in (
                 ("pending_confirmation", "nonce_expires_at"),
@@ -319,10 +322,10 @@ class ExecutionLedger:
                     (now, state, now),
                 )
                 for row in cursor.fetchall():
-                    expired.append(int(row[0]))
-            for operation_id in expired:
-                self._event(operation_id, "lapsed", "expired", None)
-        return expired
+                    expired.append((int(row[0]), state))
+            for operation_id, from_state in expired:
+                self._event(operation_id, from_state, "expired", None)
+        return [operation_id for operation_id, _ in expired]
 
     # -- reads ------------------------------------------------------------
 

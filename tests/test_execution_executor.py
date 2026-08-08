@@ -33,6 +33,7 @@ class FakeSession:
         self.stops = 0
         self.starts = 0
         self.start_ok = True
+        self.stop_ok = True
         self.steamcmd_alive = False
 
     def gates(self) -> LeaseGates:
@@ -55,6 +56,8 @@ class FakeSession:
 
     def stop_client(self) -> bool:
         self.stops += 1
+        if not self.stop_ok:
+            return False
         self.running = False
         return True
 
@@ -72,7 +75,9 @@ class FakeContent:
     log_dir: Path = field(default_factory=Path)
     write_manifest: bool = True
 
-    def install(self, *, account: str, appid: int, install_dir: Path) -> ContentResult:
+    def install(
+        self, *, account: str, appid: int, install_dir: Path, operation_id: int
+    ) -> ContentResult:
         log_path = self.log_dir / f"install-{appid}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("log", encoding="utf-8")
@@ -260,6 +265,29 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "confirmed"
     assert any("completed" in action for action in actions)
+
+
+def test_install_dir_claimed_by_other_title_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_999.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"999"\n\t"installdir"\t\t"Spacewar"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "another installed title" in report.detail
+
+
+def test_stop_failure_attempts_client_restore(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.stop_ok = False
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "would not exit" in report.detail
+    assert session.starts == 1  # prior run-state restoration attempted
+    assert ledger.get(operation_id).state == "aborted"
 
 
 def test_gate_regression_during_download_skips_adoption(harness) -> None:

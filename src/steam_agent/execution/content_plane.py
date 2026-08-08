@@ -65,11 +65,13 @@ class SteamcmdAdapter:
         self._timeout = timeout_seconds
 
     def install(
-        self, *, account: str, appid: int, install_dir: Path
+        self, *, account: str, appid: int, install_dir: Path, operation_id: int
     ) -> ContentResult:
         self._home.mkdir(parents=True, exist_ok=True)
         self._log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self._log_dir / f"install-{appid}.log"
+        # Per-attempt filename: ledger records keep pointing at the evidence
+        # for their own attempt instead of whatever ran last.
+        log_path = self._log_dir / f"install-{appid}-op{operation_id}.log"
         argv = [
             str(self._script),
             "+@NoPromptForPassword",
@@ -130,6 +132,15 @@ def locate_manifest(*, install_dir: Path, appid: int) -> Path | None:
 
     candidate = install_dir / "steamapps" / f"appmanifest_{appid}.acf"
     return candidate if candidate.is_file() else None
+
+
+def manifest_install_dir(manifest: Path) -> str | None:
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r'"installdir"\s+"([^"]*)"', text)
+    return None if match is None else match.group(1)
 
 
 def manifest_state_flags(manifest: Path) -> int | None:

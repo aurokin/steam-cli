@@ -21,7 +21,9 @@ def ledger(tmp_path: Path) -> ExecutionLedger:
     instance.close()
 
 
-def _request(ledger: ExecutionLedger, machine: str = "herb") -> tuple[int, str]:
+def _request(
+    ledger: ExecutionLedger, machine: str = "herb", ttl: int = 900
+) -> tuple[int, str]:
     return ledger.request(
         plan_key="k" * 8,
         plan_document='{"schema": "operation-plan/0.1"}',
@@ -30,7 +32,21 @@ def _request(ledger: ExecutionLedger, machine: str = "herb") -> tuple[int, str]:
         account_alias="owner",
         machine_id=machine,
         policy_version="deadbeef",
+        nonce_ttl_seconds=ttl,
     )
+
+
+def test_expired_pending_does_not_block_new_request(
+    ledger: ExecutionLedger,
+) -> None:
+    stale_id, _ = _request(ledger, ttl=0)  # lapses immediately
+    fresh_id, _ = _request(ledger)  # intake expires the stale row first
+    assert fresh_id != stale_id
+    assert ledger.get(stale_id).state == "expired"
+    # The audit event records the real prior state, not a pseudo-state.
+    events = ledger.events(stale_id)
+    assert events[-1][1] == "pending_confirmation"
+    assert events[-1][2] == "expired"
 
 
 def test_request_confirm_flow(ledger: ExecutionLedger) -> None:
