@@ -33,6 +33,22 @@ class AdoptionError(RuntimeError):
     """Manifest adoption could not be completed or rolled back cleanly."""
 
 
+def _durable_write(path: Path, data: bytes) -> None:
+    """Atomic and power-loss durable: fsync the file, rename, fsync the dir."""
+
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _captured_text(captured: str | bytes | None) -> str:
     # TimeoutExpired carries bytes even when the run used text=True.
     if captured is None:
@@ -69,9 +85,10 @@ class SteamcmdAdapter:
     ) -> ContentResult:
         self._home.mkdir(parents=True, exist_ok=True)
         self._log_dir.mkdir(parents=True, exist_ok=True)
-        # Per-attempt filename: ledger records keep pointing at the evidence
-        # for their own attempt instead of whatever ran last.
-        log_path = self._log_dir / f"install-{appid}-op{operation_id}.log"
+        # Per-attempt filename (an operation can retry after interruption):
+        # every attempt keeps its own evidence instead of the last one's.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = self._log_dir / f"install-{appid}-op{operation_id}-{stamp}.log"
         argv = [
             str(self._script),
             "+@NoPromptForPassword",
@@ -185,30 +202,27 @@ def adopt_manifest(
     backup: Path | None = None
     if destination.exists():
         backup = journal_dir / f"appmanifest_{appid}.acf.backup"
-        backup.write_bytes(destination.read_bytes())
+        _durable_write(backup, destination.read_bytes())
 
     journal = journal_dir / f"adoption-{appid}.json"
-    journal_temporary = journal_dir / f"adoption-{appid}.json.tmp"
-    journal_temporary.write_text(
-        json.dumps(
-            {
-                "appid": appid,
-                "operation_id": operation_id,
-                "destination": str(destination),
-                "checksum": checksum,
-                "backup": None if backup is None else str(backup),
-                "at": datetime.now(timezone.utc).isoformat(),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    record = json.dumps(
+        {
+            "appid": appid,
+            "operation_id": operation_id,
+            "destination": str(destination),
+            "checksum": checksum,
+            "backup": None if backup is None else str(backup),
+            "at": datetime.now(timezone.utc).isoformat(),
+        },
+        sort_keys=True,
     )
-    journal_temporary.replace(journal)  # never leave partial journal JSON
+    # Durability order is the contract: backup, then journal, then manifest.
+    # A power loss can never persist the swapped manifest without the
+    # journal (and backup) that reconciliation needs to judge it.
+    _durable_write(journal, record.encode("utf-8"))
 
-    temporary = destination.with_suffix(".acf.adopting")
     try:
-        temporary.write_text(patched, encoding="utf-8")
-        temporary.replace(destination)
+        _durable_write(destination, patched.encode("utf-8"))
     except OSError as error:
         raise AdoptionError("manifest adoption failed mid-write") from error
     return destination

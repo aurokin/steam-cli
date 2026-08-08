@@ -115,6 +115,13 @@ def test_unsafe_install_dir_name_rejected(
     assert "path component" in capsys.readouterr().err
 
 
+def test_reconcile_works_despite_broken_policy(state_dir: Path, capsys) -> None:
+    # Recovery must never be blocked behind policy repair.
+    (state_dir / "policy.toml").write_text("not valid [ toml", encoding="utf-8")
+    assert main(["--state-dir", str(state_dir), "reconcile"]) == 0
+    assert "actions" in capsys.readouterr().out
+
+
 def test_non_object_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     monkeypatch.setattr("sys.stdin", io.StringIO('"just a string"'))

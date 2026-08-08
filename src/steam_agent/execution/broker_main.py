@@ -146,10 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"initialized": True, "policy": "deny-all template written"})
         return 0
 
-    try:
-        policy = load_policy(state_dir / "policy.toml")
-    except PolicyError as error:
-        return _fail(str(error))
+    # Policy gates intake and execution only.  reconcile and status must
+    # work with a broken policy file: recovery (client restoration, journal
+    # repair) can never be blocked behind policy repair.
+    policy = None
+    if arguments.command in {"request", "confirm", "run"}:
+        try:
+            policy = load_policy(state_dir / "policy.toml")
+        except PolicyError as error:
+            return _fail(str(error))
 
     if arguments.command == "request":
         try:

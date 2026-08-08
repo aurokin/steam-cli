@@ -116,7 +116,12 @@ class Executor:
         plan = ledger.plan_document(operation_id)
         install_dir_name = str(plan.get("install_dir_name", ""))
         if not install_dir_name:
-            install_dir_name = f"app_{operation.appid}"
+            # Prefer the directory the client already uses for this AppID:
+            # inventing a new one would re-download and orphan the install.
+            existing = manifest_install_dir(
+                self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
+            )
+            install_dir_name = existing or f"app_{operation.appid}"
         if not safe_install_dir_name(install_dir_name):
             ledger.transition(
                 operation_id, "aborted", detail="unsafe install_dir_name"
@@ -374,16 +379,24 @@ class Executor:
         state = active.state
         operation_id = active.operation_id
 
-        def restore() -> None:
-            if not self._restore_client(active.prior_client_running):
-                actions.append(f"{operation_id}: client restore failed")
+        def restore() -> bool:
+            # Restore BEFORE terminal transitions: while restoration keeps
+            # failing, the operation stays non-terminal so a later reconcile
+            # retries it instead of orphaning a stopped client.
+            if self._restore_client(active.prior_client_running):
+                return True
+            actions.append(
+                f"{operation_id}: client restore failed; state left for retry"
+            )
+            return False
 
         if state in {"pending_confirmation", "authorized"}:
             return actions  # no side effects yet; expiry alone governs
         if state in {"lease_acquired", "client_stopping"}:
+            if not restore():
+                return actions
             ledger.transition(operation_id, "aborted", detail="reconciled: no side effects")
             actions.append(f"{operation_id}: aborted (died before content ran)")
-            restore()
             return actions
         if state == "content_running":
             if self._session.steamcmd_running():
@@ -397,11 +410,12 @@ class Executor:
                 actions.append(f"{operation_id}: resume via execute()")
                 ledger.transition(operation_id, "interrupted", detail="resume candidate")
             else:
+                if not restore():
+                    return actions
                 ledger.transition(
                     operation_id, "failed", detail="window lapsed mid-download"
                 )
                 actions.append(f"{operation_id}: failed (window lapsed; partial dir invisible)")
-                restore()
             return actions
         if state == "interrupted":
             # Already a resume candidate: leave it resumable while the window
@@ -409,11 +423,12 @@ class Executor:
             if ledger.window_valid(operation_id):
                 actions.append(f"{operation_id}: resume via execute()")
             else:
+                if not restore():
+                    return actions
                 ledger.transition(
                     operation_id, "failed", detail="window lapsed before resume"
                 )
                 actions.append(f"{operation_id}: failed (window lapsed before resume)")
-                restore()
             return actions
         if state == "adopting":
             verdict = reconcile_adoption(
@@ -427,16 +442,18 @@ class Executor:
                 # clean/stale: this operation never journaled its adoption
                 # (or only a prior operation's journal survived), so a
                 # StateFlags=4 manifest proves nothing about this operation.
+                if not restore():
+                    return actions
                 ledger.transition(
                     operation_id, "failed", detail=f"reconciled: adoption {verdict}"
                 )
                 actions.append(f"{operation_id}: adoption {verdict} -> failed")
-                restore()
                 return actions
             ledger.transition(
                 operation_id, "client_restart_pending", detail=f"adoption {verdict}"
             )
-            restore()
+            if not restore():
+                return actions  # retried from client_restart_pending
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
             outcome, why = self._verified_outcome(active.appid)
             ledger.transition(operation_id, outcome, detail=f"reconciled: {why}")
@@ -446,7 +463,8 @@ class Executor:
             # The swap completed before these states; any journal left behind
             # is a crash remnant and must not outlive the operation.
             clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
-            restore()
+            if not restore():
+                return actions
             if state != "verifying":
                 ledger.transition(operation_id, "verifying", detail="reconciled")
             outcome, why = self._verified_outcome(active.appid)

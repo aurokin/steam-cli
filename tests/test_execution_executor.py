@@ -267,6 +267,38 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     assert any("completed" in action for action in actions)
 
 
+def test_reconcile_leaves_state_while_restore_fails(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    session.running = False
+    session.start_ok = False
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "lease_acquired"  # retryable
+    assert any("retry" in action for action in actions)
+
+    session.start_ok = True
+    executor.reconcile()
+    assert ledger.get(operation_id).state == "aborted"
+
+
+def test_missing_plan_name_reuses_existing_installdir(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"480"\n\t"installdir"\t\t"OldDir"\n'
+        '\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger, install_dir_name="")
+    report = executor.execute(operation_id)
+    assert report.outcome == "confirmed"
+    adopted = (library / "steamapps" / "appmanifest_480.acf").read_text(
+        encoding="utf-8"
+    )
+    assert '"installdir"\t\t"OldDir"' in adopted  # not app_480
+
+
 def test_install_dir_claimed_by_other_title_aborts(harness) -> None:
     ledger, _, _, executor, library = harness
     (library / "steamapps" / "appmanifest_999.acf").write_text(

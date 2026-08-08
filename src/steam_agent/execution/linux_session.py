@@ -91,17 +91,25 @@ class LinuxSession:
 
     def _download_dirs(self) -> list[Path]:
         # Stopping the client interrupts downloads in every configured
-        # library, not just the broker's target one.
+        # library.  libraryfolders.vdf normally lives only in the primary
+        # library, so also consult the standard config locations in case the
+        # broker targets a secondary one.  (The session helper runs in the
+        # desktop user's session, so its HOME is the right root here.)
         dirs = [self._library / "steamapps" / "downloading"]
-        vdf = self._library / "steamapps" / "libraryfolders.vdf"
-        try:
-            text = vdf.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return dirs
-        for match in re.finditer(r'"path"\s+"([^"]*)"', text):
-            candidate = Path(match.group(1)) / "steamapps" / "downloading"
-            if candidate not in dirs:
-                dirs.append(candidate)
+        vdf_candidates = [
+            self._library / "steamapps" / "libraryfolders.vdf",
+            Path.home() / ".steam" / "steam" / "steamapps" / "libraryfolders.vdf",
+            Path.home() / ".local" / "share" / "Steam" / "steamapps" / "libraryfolders.vdf",
+        ]
+        for vdf in vdf_candidates:
+            try:
+                text = vdf.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in re.finditer(r'"path"\s+"([^"]*)"', text):
+                candidate = Path(match.group(1)) / "steamapps" / "downloading"
+                if candidate not in dirs:
+                    dirs.append(candidate)
         return dirs
 
     def gates(self) -> LeaseGates:
