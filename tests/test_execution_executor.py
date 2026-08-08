@@ -13,7 +13,7 @@ from steam_agent.execution.content_plane import (
     adopt_manifest,
     locate_manifest,
 )
-from steam_agent.execution.executor import Executor
+from steam_agent.execution.executor import Executor, safe_install_dir_name
 from steam_agent.execution.ledger import ExecutionLedger
 from steam_agent.execution.linux_session import LeaseGates
 
@@ -253,6 +253,22 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "confirmed"
     assert any("completed" in action for action in actions)
+
+
+def test_safe_install_dir_name_rejects_acf_breaking_characters() -> None:
+    assert not safe_install_dir_name('Bad"Name')
+    assert not safe_install_dir_name("two\nlines")
+    assert not safe_install_dir_name("../../outside")
+    assert safe_install_dir_name("Desk Job")
+
+
+def test_reconcile_detects_client_redownload_as_contradicted(harness) -> None:
+    ledger, _, _, executor, library = harness
+    operation_id = _adopting_operation(ledger, executor, library)
+    (library / "steamapps" / "downloading" / "480").mkdir(parents=True)
+
+    executor.reconcile()
+    assert ledger.get(operation_id).state == "contradicted"
 
 
 def test_symlinked_install_target_aborts(harness) -> None:

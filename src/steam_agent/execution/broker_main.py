@@ -169,11 +169,10 @@ def main(argv: list[str] | None = None) -> int:
             str(install_dir_name)
         ):
             return _fail("install_dir_name must be a single path component")
-        try:
-            appid = int(target.get("appid", 0))
-        except (TypeError, ValueError):
-            return _fail("plan target appid is malformed")
-        if appid <= 0:
+        appid = target.get("appid")
+        # A JSON integer only: int() would silently coerce 480.9 or true
+        # into a different AppID than the plan the human confirms.
+        if not isinstance(appid, int) or isinstance(appid, bool) or appid <= 0:
             return _fail("plan target appid is malformed")
         try:
             config = _load_config(state_dir)
@@ -237,7 +236,10 @@ def main(argv: list[str] | None = None) -> int:
             if active is None or active.state not in {"authorized", "interrupted"}:
                 return _fail("no authorized operation to run")
             operation_id = active.operation_id
-        operation = ledger.get(operation_id)
+        try:
+            operation = ledger.get(operation_id)
+        except LedgerError as error:
+            return _fail(str(error))
         if (
             operation.state in {"authorized", "interrupted"}
             and policy.grant_for(operation.operation) != "confirm"

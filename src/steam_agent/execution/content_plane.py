@@ -98,6 +98,15 @@ class SteamcmdAdapter:
             output = _captured_text(error.stdout) + _captured_text(error.stderr)
         except OSError as error:
             output = f"steamcmd unavailable: {error}"
+        # Classify on the raw output first: redaction could mangle a marker
+        # (an account alias like "all" is a substring of "fully installed").
+        if _AUTH_FAILURE.search(output):
+            outcome: ContentOutcome = "auth_required"
+        elif _SUCCESS.search(output):
+            outcome = "installed"
+        else:
+            outcome = "failed"
+
         # Raw steamcmd output carries the account name and private absolute
         # paths; the repository boundary keeps both out of persisted logs.
         for value, label in (
@@ -108,12 +117,7 @@ class SteamcmdAdapter:
             if value:
                 output = output.replace(value, label)
         log_path.write_text(output, encoding="utf-8", errors="replace")
-
-        if _AUTH_FAILURE.search(output):
-            return ContentResult(outcome="auth_required", log_path=log_path)
-        if _SUCCESS.search(output):
-            return ContentResult(outcome="installed", log_path=log_path)
-        return ContentResult(outcome="failed", log_path=log_path)
+        return ContentResult(outcome=outcome, log_path=log_path)
 
 
 def locate_manifest(*, install_dir: Path, appid: int) -> Path | None:

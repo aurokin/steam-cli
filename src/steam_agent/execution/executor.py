@@ -38,11 +38,14 @@ _STATE_FULLY_INSTALLED = 4
 
 
 def safe_install_dir_name(name: str) -> bool:
-    """True only for a single path component: adoption never leaves the library."""
+    """True only for one path component that can be quoted into an ACF value."""
 
     if not name or name in {".", ".."}:
         return False
-    return not any(character in name for character in ("/", "\\", "\0"))
+    if any(character in name for character in ("/", "\\", '"')):
+        return False
+    # Control characters (newlines especially) could inject VDF fields.
+    return not any(ord(character) < 32 for character in name)
 
 
 class ExecutorLockedError(RuntimeError):
@@ -240,11 +243,12 @@ class Executor:
             journal_dir=self._journal_dir,
             operation_id=operation_id,
         )
-        # The swap is durably complete once adopt_manifest returns; retire
-        # the journal now so it can never vouch for a later operation.
-        clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
-
+        # Leave the ledger's adopting state before retiring the journal: a
+        # crash in between then reconciles from a state whose branch does not
+        # consult the journal, never as adopting-with-no-journal (which would
+        # read as an unproven adoption after the manifest was already swapped).
         ledger.transition(operation_id, "client_restart_pending")
+        clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
         client_restored = self._restore_client(prior_running)
         note = "" if client_restored else "; client restore failed"
 
@@ -302,6 +306,18 @@ class Executor:
 
     def _restore_note(self, prior_running: bool | None) -> str:
         return "" if self._restore_client(prior_running) else "; client restore failed"
+
+    def _verified_outcome(self, appid: int) -> tuple[str, str]:
+        """Manifest-evidence verdict shared by execution and reconciliation."""
+
+        flags = manifest_state_flags(
+            self._library / "steamapps" / f"appmanifest_{appid}.acf"
+        )
+        if flags != _STATE_FULLY_INSTALLED:
+            return "unconfirmed", f"manifest StateFlags={flags}"
+        if (self._library / "steamapps" / "downloading" / str(appid)).exists():
+            return "contradicted", "client re-downloading after adoption"
+        return "confirmed", "client_adopted"
 
     # -- reconciliation ---------------------------------------------------
 
@@ -381,22 +397,19 @@ class Executor:
             )
             restore()
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
-            flags = manifest_state_flags(
-                self._library / "steamapps" / f"appmanifest_{active.appid}.acf"
-            )
-            outcome = "confirmed" if flags == _STATE_FULLY_INSTALLED else "unconfirmed"
-            ledger.transition(operation_id, outcome, detail=f"reconciled: {verdict}")
+            outcome, why = self._verified_outcome(active.appid)
+            ledger.transition(operation_id, outcome, detail=f"reconciled: {why}")
             actions.append(f"{operation_id}: adoption {verdict} -> {outcome}")
             return actions
         if state in {"client_restart_pending", "verifying"}:
+            # The swap completed before these states; any journal left behind
+            # is a crash remnant and must not outlive the operation.
+            clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
             restore()
             if state != "verifying":
                 ledger.transition(operation_id, "verifying", detail="reconciled")
-            flags = manifest_state_flags(
-                self._library / "steamapps" / f"appmanifest_{active.appid}.acf"
-            )
-            outcome = "confirmed" if flags == _STATE_FULLY_INSTALLED else "unconfirmed"
-            ledger.transition(operation_id, outcome, detail="reconciled")
+            outcome, why = self._verified_outcome(active.appid)
+            ledger.transition(operation_id, outcome, detail=f"reconciled: {why}")
             actions.append(f"{operation_id}: {state} -> {outcome}")
             return actions
         return actions

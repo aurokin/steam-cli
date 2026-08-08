@@ -207,6 +207,32 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     assert "<account>" in log
 
 
+def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    def _run(*args, **kwargs):
+        return SimpleNamespace(
+            stdout="Success! App '480' fully installed.", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+    )
+    # "all" is a substring of "fully installed"; classification must see
+    # the raw output, not the redacted copy.
+    result = adapter.install(account="all", appid=480, install_dir=tmp_path / "i")
+    assert result.outcome == "installed"
+    assert "all" not in result.log_path.read_text(encoding="utf-8").replace(
+        "<install-dir>", ""
+    )
+
+
 def test_steamcmd_timeout_bytes_output_is_decoded(tmp_path: Path, monkeypatch) -> None:
     import subprocess
 
