@@ -127,10 +127,13 @@ def main(argv: list[str] | None = None) -> int:
         # Ledger, policy, logs, and the steamcmd credential cache live here;
         # never trust the umask to keep other identities out.
         state_dir.chmod(0o700)
-        try:
-            write_policy_template(state_dir / "policy.toml")
-        except PolicyError as error:
-            return _fail(str(error))
+        # Idempotent re-init: keep an existing (possibly owner-edited)
+        # policy rather than failing, so a partial first init is repairable.
+        if not (state_dir / "policy.toml").exists():
+            try:
+                write_policy_template(state_dir / "policy.toml")
+            except PolicyError as error:
+                return _fail(str(error))
         (state_dir / "broker.json").write_text(
             json.dumps(
                 {

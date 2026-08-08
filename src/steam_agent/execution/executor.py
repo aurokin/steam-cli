@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -89,13 +90,25 @@ class Executor:
         # Fixed /tmp, not tempfile.gettempdir(): TMPDIR is caller-controlled
         # and a per-process value would defeat cross-broker serialization.
         lock_path = Path("/tmp") / f"steam-broker-{library_key}.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("w")
+        handle = lock_path.open("a")
         try:
+            # /tmp is shared: refuse a lock file another identity planted
+            # (fail closed, never corrupt), and verify the path still names
+            # the inode we opened so an unlink/replace cannot yield two
+            # holders.  The sticky bit stops others unlinking ours.
+            opened = os.fstat(handle.fileno())
+            if opened.st_uid not in (os.geteuid(), 0):
+                raise ExecutorLockedError("lock file owned by another user")
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = os.stat(lock_path)
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ExecutorLockedError("lock file was replaced concurrently")
         except OSError as error:
             handle.close()
             raise ExecutorLockedError("another execution holds the lock") from error
+        except ExecutorLockedError:
+            handle.close()
+            raise
         return handle
 
     def execute(self, operation_id: int) -> ExecutionReport:
@@ -156,9 +169,11 @@ class Executor:
         common = self._library / "steamapps" / "common"
         target = common / install_dir_name
         try:
-            # A pre-existing symlink at the target would let a safe-looking
-            # name write outside the library; resolve before trusting it.
-            escapes = not target.resolve().is_relative_to(common.resolve())
+            # A pre-existing symlink at the target (or at common/ itself)
+            # would let a safe-looking name write outside the library;
+            # anchor the check to the configured library, never to common's
+            # own resolution.
+            escapes = not target.resolve().is_relative_to(self._library.resolve())
         except OSError:
             escapes = True
         if escapes:
@@ -221,6 +236,23 @@ class Executor:
                 return ExecutionReport(
                     operation_id, "aborted", f"client would not exit cleanly{note}"
                 )
+
+        # Shutdown can take up to a minute; re-check the lease between the
+        # client stopping and steamcmd starting so freshly begun user work
+        # is never mutated under.
+        post_stop_gates = self._session.gates()
+        if not post_stop_gates.all_clear():
+            note = self._restore_note(prior_running)
+            ledger.transition(
+                operation_id,
+                "aborted",
+                detail="lease gates regressed during client stop",
+            )
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                f"lease gates regressed during client stop{note}",
+            )
 
         ledger.transition(
             operation_id,

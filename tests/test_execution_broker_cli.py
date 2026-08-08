@@ -51,6 +51,24 @@ def _grant_install(state_dir: Path) -> None:
     )
 
 
+def test_init_is_idempotent_after_partial_state(state_dir: Path, tmp_path: Path, capsys) -> None:
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "--state-dir",
+                str(state_dir),
+                "init",
+                "--library",
+                str(tmp_path / "library"),
+                "--steamcmd",
+                str(tmp_path / "steamcmd.sh"),
+            ]
+        )
+        == 0
+    )
+
+
 def test_init_makes_state_dir_owner_only(state_dir: Path) -> None:
     assert (state_dir.stat().st_mode & 0o777) == 0o700
 

@@ -215,7 +215,8 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
         subprocess,
         "Popen",
         lambda *args, **kwargs: _FakeProcess(
-            f"Logging in user 'ownername' ... dir {install_dir} home {home}"
+            f"Logging in user 'ownername' (76561199000000001)"
+            f" ... dir {install_dir} home {home}"
         ),
     )
     adapter = SteamcmdAdapter(
@@ -229,7 +230,8 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     log = result.log_path.read_text(encoding="utf-8")
     assert "ownername" not in log
     assert str(install_dir) not in log and str(home) not in log
-    assert "<account>" in log
+    assert "76561199000000001" not in log
+    assert "<account>" in log and "<steamid>" in log
 
 
 def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) -> None:

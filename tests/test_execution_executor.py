@@ -403,6 +403,18 @@ def test_reconcile_detects_client_redownload_as_contradicted(harness) -> None:
     assert ledger.get(operation_id).state == "contradicted"
 
 
+def test_symlinked_common_dir_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    outside = library.parent / "elsewhere"
+    outside.mkdir()
+    (library / "steamapps" / "common").symlink_to(outside)
+
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "outside the library" in report.detail
+
+
 def test_symlinked_install_target_aborts(harness) -> None:
     ledger, session, _, executor, library = harness
     common = library / "steamapps" / "common"

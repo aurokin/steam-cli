@@ -165,6 +165,7 @@ class SteamcmdAdapter:
         ):
             if value:
                 output = output.replace(value, label)
+        output = re.sub(r"\b7656119\d{10}\b", "<steamid>", output)
         log_path.write_text(output, encoding="utf-8", errors="replace")
         return ContentResult(outcome=outcome, log_path=log_path)
 
