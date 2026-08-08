@@ -248,7 +248,9 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(target, dict):
             return _fail("plan target is malformed")
         install_dir_name = plan.get("install_dir_name")
-        if install_dir_name is not None and (
+        # Empty means unspecified, same as absent: the executor falls back
+        # to the existing manifest's directory or app_<appid>.
+        if install_dir_name is not None and install_dir_name != "" and (
             not isinstance(install_dir_name, str)
             or not safe_install_dir_name(install_dir_name)
         ):

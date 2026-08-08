@@ -362,6 +362,40 @@ def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) 
     )
 
 
+def test_client_relaunch_kills_steamcmd_mid_run(tmp_path: Path) -> None:
+    import os
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "steamcmd.sh"
+    script.write_text(
+        f"#!/bin/sh\nsleep 30 &\necho $! > {pid_file}\nwait\n", encoding="utf-8"
+    )
+    script.chmod(0o755)
+    adapter = SteamcmdAdapter(
+        steamcmd_script=script,
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+        timeout_seconds=30,
+        abort_poll_seconds=0.05,
+    )
+    # abort_when reporting a live client must kill the whole tree promptly,
+    # long before the 30s timeout.  (Gated on the pid file so the script has
+    # started; also exercises repeated polls.)
+    result = adapter.install(
+        account="o",
+        appid=480,
+        install_dir=tmp_path / "i",
+        operation_id=1,
+        abort_when=pid_file.exists,
+    )
+    assert result.outcome == "failed"
+    child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
 def test_steamcmd_timeout_kills_entire_process_tree(tmp_path: Path) -> None:
     import os
 

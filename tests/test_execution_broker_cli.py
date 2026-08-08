@@ -148,6 +148,17 @@ def test_reconcile_works_despite_broken_policy(state_dir: Path, capsys) -> None:
     assert "actions" in capsys.readouterr().out
 
 
+def test_empty_install_dir_name_accepted_as_unspecified(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["install_dir_name"] = ""  # same as absent for the executor
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "pending_confirmation"
+
+
 def test_oversized_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     plan = json.loads(_plan())

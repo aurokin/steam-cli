@@ -86,7 +86,13 @@ class FakeContent:
     write_manifest: bool = True
 
     def install(
-        self, *, account: str, appid: int, install_dir: Path, operation_id: int
+        self,
+        *,
+        account: str,
+        appid: int,
+        install_dir: Path,
+        operation_id: int,
+        abort_when=None,
     ) -> ContentResult:
         log_path = self.log_dir / f"install-{appid}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,7 +593,7 @@ def test_common_replaced_during_stop_aborts(harness) -> None:
 def test_manifest_with_wrong_appid_is_not_adopted(harness) -> None:
     ledger, _, content, executor, library = harness
 
-    def install_stale_manifest(*, account, appid, install_dir, operation_id):
+    def install_stale_manifest(*, account, appid, install_dir, operation_id, **_):
         manifest_dir = install_dir / "steamapps"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         (manifest_dir / f"appmanifest_{appid}.acf").write_text(
@@ -742,6 +748,24 @@ def test_client_relaunch_surviving_late_stop_fails(harness) -> None:
     report = executor.execute(operation_id)
     assert report.outcome == "failed"
     assert "adoption skipped" in report.detail
+
+
+def test_window_lapse_during_download_fails(harness, monkeypatch) -> None:
+    ledger, session, content, executor, _ = harness
+    original_install = content.install
+
+    def install_and_lapse(**kwargs):
+        result = original_install(**kwargs)
+        # The download consumed the rest of the authorization window.
+        monkeypatch.setattr(ledger, "window_valid", lambda _oid: False)
+        return result
+
+    content.install = install_and_lapse
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "window lapsed" in report.detail
+    assert session.starts == 1  # prior run-state still restored
 
 
 def test_gate_regression_during_download_skips_adoption(harness) -> None:

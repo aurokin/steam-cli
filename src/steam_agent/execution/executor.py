@@ -463,6 +463,10 @@ class Executor:
                 appid=operation.appid,
                 install_dir=target,
                 operation_id=operation_id,
+                # A client relaunched mid-download is a concurrent writer;
+                # the adapter polls this and kills steamcmd promptly instead
+                # of leaving the overlap open until the late probe.
+                abort_when=self._session.client_possibly_running,
             )
         except _TargetEscapedError:
             return self._finish_failure(
@@ -502,6 +506,17 @@ class Executor:
                 prior_running,
                 detail=f"steamcmd failed: {result.log_path.name}",
                 message=f"steamcmd failed; see {result.log_path.name}",
+            )
+
+        # The human's confirmation bounds the WHOLE operation: a download
+        # that consumed the rest of the authorization window must not adopt
+        # after it, matching reconciliation's lapsed-mid-download semantics.
+        if not ledger.window_valid(operation_id):
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="window lapsed during content run",
+                message="execution window lapsed during download",
             )
 
         source = locate_manifest(install_dir=target, appid=operation.appid)
@@ -678,6 +693,11 @@ class Executor:
         # Bound to the recorded directory inode, not just the name: a
         # partial dir the user removed and replaced with unrelated content
         # at the same path must not inherit the marker's vouching.
+        # In-place repurposing (adding unrelated files to the still-live
+        # broker-created dir) is accepted as out of scope: without content
+        # hashing it is indistinguishable from steamcmd's own partial
+        # payload, and the directory remains dedicated to this AppID until
+        # removed.
         try:
             current = os.lstat(target)
         except OSError:

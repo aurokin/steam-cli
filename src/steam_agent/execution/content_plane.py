@@ -9,6 +9,7 @@ prompt or a retry.  Adoption writes exactly one file into the client's
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -18,6 +19,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import time
 from typing import Literal
 
 ContentOutcome = Literal["installed", "auth_required", "failed"]
@@ -28,6 +30,7 @@ _AUTH_FAILURE = re.compile(
 )
 _SUCCESS = re.compile(r"fully installed", re.IGNORECASE)
 _DEFAULT_TIMEOUT_SECONDS = 30 * 60
+_DEFAULT_ABORT_POLL_SECONDS = 15.0
 
 # Only recognized steamcmd diagnostic lines are persisted (after literal
 # redaction); everything else is dropped with a count.  The repository
@@ -96,14 +99,22 @@ class SteamcmdAdapter:
         private_home: Path,
         log_dir: Path,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+        abort_poll_seconds: float = _DEFAULT_ABORT_POLL_SECONDS,
     ) -> None:
         self._script = steamcmd_script
         self._home = private_home
         self._log_dir = log_dir
         self._timeout = timeout_seconds
+        self._abort_poll = abort_poll_seconds
 
     def install(
-        self, *, account: str, appid: int, install_dir: Path, operation_id: int
+        self,
+        *,
+        account: str,
+        appid: int,
+        install_dir: Path,
+        operation_id: int,
+        abort_when: Callable[[], bool] | None = None,
     ) -> ContentResult:
         self._home.mkdir(parents=True, exist_ok=True)
         self._log_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +140,7 @@ class SteamcmdAdapter:
         ]
         environment = dict(os.environ, HOME=str(self._home))
         timed_out = False
+        aborted = False
         returncode: int | None = None
         try:
             process = subprocess.Popen(
@@ -145,18 +157,35 @@ class SteamcmdAdapter:
         except OSError as error:
             output = f"steamcmd unavailable: {error}"
         else:
-            try:
-                out, err = process.communicate(timeout=self._timeout)
-            except subprocess.TimeoutExpired:
-                # Kill the whole session group: the configured script wraps
-                # the real steamcmd binary, and killing only the leader
-                # would leave a live writer in the install directory.
-                timed_out = True
+            # Poll while steamcmd runs: a Steam client relaunched during a
+            # 30-minute download is a concurrent writer in the same install
+            # directory, and waiting for the post-download probe would leave
+            # that overlap window open the whole time.
+            deadline = time.monotonic() + self._timeout
+            while True:
+                remaining = deadline - time.monotonic()
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    process.kill()
-                out, err = process.communicate()
+                    out, err = process.communicate(
+                        timeout=min(self._abort_poll, max(remaining, 0.0))
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if remaining <= 0:
+                        timed_out = True
+                    elif abort_when is not None and abort_when():
+                        aborted = True
+                    else:
+                        continue
+                    # Kill the whole session group: the configured script
+                    # wraps the real steamcmd binary, and killing only the
+                    # leader would leave a live writer in the install
+                    # directory.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        process.kill()
+                    out, err = process.communicate()
+                    break
             returncode = process.returncode
             # Explicit separator: without one, a stdout tail lacking its
             # newline would merge with stderr's first line, and a recognized
@@ -169,7 +198,12 @@ class SteamcmdAdapter:
         # never outrank a nonzero exit or a killed/timed-out process.
         if _AUTH_FAILURE.search(output):
             outcome: ContentOutcome = "auth_required"
-        elif not timed_out and returncode == 0 and _SUCCESS.search(output):
+        elif (
+            not timed_out
+            and not aborted
+            and returncode == 0
+            and _SUCCESS.search(output)
+        ):
             outcome = "installed"
         else:
             outcome = "failed"
