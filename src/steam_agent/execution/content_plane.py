@@ -98,6 +98,15 @@ class SteamcmdAdapter:
             output = _captured_text(error.stdout) + _captured_text(error.stderr)
         except OSError as error:
             output = f"steamcmd unavailable: {error}"
+        # Raw steamcmd output carries the account name and private absolute
+        # paths; the repository boundary keeps both out of persisted logs.
+        for value, label in (
+            (account, "<account>"),
+            (str(self._home), "<steamcmd-home>"),
+            (str(install_dir), "<install-dir>"),
+        ):
+            if value:
+                output = output.replace(value, label)
         log_path.write_text(output, encoding="utf-8", errors="replace")
 
         if _AUTH_FAILURE.search(output):
@@ -139,6 +148,7 @@ def adopt_manifest(
     appid: int,
     install_dir_name: str,
     journal_dir: Path,
+    operation_id: int,
 ) -> Path:
     """Place one manifest into the client library, journaled and backed up.
 
@@ -158,10 +168,12 @@ def adopt_manifest(
         backup.write_bytes(destination.read_bytes())
 
     journal = journal_dir / f"adoption-{appid}.json"
-    journal.write_text(
+    journal_temporary = journal_dir / f"adoption-{appid}.json.tmp"
+    journal_temporary.write_text(
         json.dumps(
             {
                 "appid": appid,
+                "operation_id": operation_id,
                 "destination": str(destination),
                 "checksum": checksum,
                 "backup": None if backup is None else str(backup),
@@ -171,6 +183,7 @@ def adopt_manifest(
         ),
         encoding="utf-8",
     )
+    journal_temporary.replace(journal)  # never leave partial journal JSON
 
     temporary = destination.with_suffix(".acf.adopting")
     try:
@@ -181,16 +194,30 @@ def adopt_manifest(
     return destination
 
 
-def reconcile_adoption(*, library: Path, appid: int, journal_dir: Path) -> str:
+def clear_adoption_journal(*, appid: int, journal_dir: Path) -> None:
+    """Retire the journal once its swap is durably complete."""
+
+    (journal_dir / f"adoption-{appid}.json").unlink(missing_ok=True)
+
+
+def reconcile_adoption(
+    *, library: Path, appid: int, journal_dir: Path, operation_id: int | None = None
+) -> str:
     """Deterministic adopting-crash recovery: complete or restore.
 
-    Returns ``completed``, ``restored``, or ``clean`` (no pending journal).
+    Returns ``completed``, ``restored``, ``clean`` (no pending journal), or
+    ``stale`` (a journal from a different operation; proves nothing here).
     """
 
     journal_path = journal_dir / f"adoption-{appid}.json"
     if not journal_path.is_file():
         return "clean"
     record = json.loads(journal_path.read_text(encoding="utf-8"))
+    if operation_id is not None and record.get("operation_id") != operation_id:
+        # A prior operation's journal that survived only because its swap
+        # already completed; discard it rather than let it vouch for this one.
+        journal_path.unlink()
+        return "stale"
     destination = Path(str(record["destination"]))
     checksum = str(record["checksum"])
 

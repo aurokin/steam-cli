@@ -195,7 +195,9 @@ class ExecutionLedger:
         is what keeps the requesting agent from confirming its own plans.
         """
 
-        nonce = secrets.token_urlsafe(24)
+        # token_hex, not token_urlsafe: a nonce is retyped as a CLI argument
+        # and must never begin with "-" or argparse consumes it as a flag.
+        nonce = secrets.token_hex(16)
         now = _utcnow()
         expires = now + timedelta(seconds=nonce_ttl_seconds)
         try:

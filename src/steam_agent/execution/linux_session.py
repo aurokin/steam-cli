@@ -129,7 +129,9 @@ class LinuxSession:
         while time.monotonic() < deadline:
             steam = self._run(["pgrep", "-x", "steam"]).returncode
             helper = self._run(["pgrep", "-x", "steamwebhelper"]).returncode
-            if steam != 0 and helper != 0:
+            # pgrep: 1 means no match; anything else nonzero is a probe
+            # error and must not count as proof the tree exited.
+            if steam == 1 and helper == 1:
                 return True
             self._sleep(1)
         return False

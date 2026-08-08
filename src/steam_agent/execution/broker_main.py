@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="Scaffold state dir and policy.")
     init.add_argument("--library", type=Path, required=True)
     init.add_argument("--steamcmd", type=Path, required=True)
+    init.add_argument("--machine-id", default="local")
 
     request = commands.add_parser(
         "request", help="Submit one operation-plan JSON on stdin."
@@ -132,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "library": str(arguments.library),
                     "steamcmd": str(arguments.steamcmd),
+                    "machine_id": str(arguments.machine_id),
                 },
                 sort_keys=True,
             ),
@@ -150,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
             plan = json.load(sys.stdin)
         except json.JSONDecodeError:
             return _fail("stdin is not a JSON operation plan")
+        if not isinstance(plan, dict):
+            return _fail("operation plan must be a JSON object")
         if plan.get("schema") != "operation-plan/0.1":
             return _fail("unsupported plan schema")
         operation = str(plan.get("operation", ""))
@@ -165,15 +169,31 @@ def main(argv: list[str] | None = None) -> int:
             str(install_dir_name)
         ):
             return _fail("install_dir_name must be a single path component")
+        try:
+            appid = int(target.get("appid", 0))
+        except (TypeError, ValueError):
+            return _fail("plan target appid is malformed")
+        if appid <= 0:
+            return _fail("plan target appid is malformed")
+        try:
+            config = _load_config(state_dir)
+        except PolicyError as error:
+            return _fail(str(error))
+        # The single-active constraint is keyed by machine_id; it must come
+        # from broker configuration, never the submitted plan.
+        machine_id = str(config.get("machine_id", "local"))
+        plan_machine = target.get("machine_id")
+        if plan_machine is not None and str(plan_machine) != machine_id:
+            return _fail("plan targets a different machine than this broker")
         ledger, _ = _components(state_dir)
         try:
             operation_id, nonce = ledger.request(
                 plan_key=str(plan.get("idempotency_key", "")),
                 plan_document=json.dumps(plan, sort_keys=True),
                 operation=operation,
-                appid=int(target.get("appid", 0)),
+                appid=appid,
                 account_alias=str(arguments.account),
-                machine_id=str(target.get("machine_id", "")),
+                machine_id=machine_id,
                 policy_version=policy.version,
             )
         except LedgerError as error:
@@ -187,7 +207,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    ledger, executor = _components(state_dir)
+    try:
+        ledger, executor = _components(state_dir)
+    except PolicyError as error:
+        return _fail(str(error))
 
     if arguments.command == "confirm":
         try:
@@ -196,6 +219,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         except ConfirmationRejected as error:
             return _fail(str(error))
+        # Re-check the live policy: revoking a grant must dead-end a nonce
+        # minted while the grant was still active.
+        operation = ledger.get(operation_id)
+        if policy.grant_for(operation.operation) != "confirm":
+            ledger.transition(
+                operation_id, "aborted", detail="policy revoked before confirmation"
+            )
+            return _fail(f"policy now denies {operation.operation!r}")
         _emit({"operation_id": operation_id, "state": "authorized"})
         return 0
 
@@ -206,6 +237,15 @@ def main(argv: list[str] | None = None) -> int:
             if active is None or active.state not in {"authorized", "interrupted"}:
                 return _fail("no authorized operation to run")
             operation_id = active.operation_id
+        operation = ledger.get(operation_id)
+        if (
+            operation.state in {"authorized", "interrupted"}
+            and policy.grant_for(operation.operation) != "confirm"
+        ):
+            ledger.transition(
+                operation_id, "aborted", detail="policy revoked before execution"
+            )
+            return _fail(f"policy now denies {operation.operation!r}")
         try:
             report = executor.execute(operation_id)
         except ExecutorLockedError as error:

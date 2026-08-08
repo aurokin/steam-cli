@@ -129,6 +129,7 @@ def test_happy_path_confirms_with_first_run_required(harness) -> None:
     adopted = library / "steamapps" / "appmanifest_480.acf"
     assert '"installdir"\t\t"Spacewar"' in adopted.read_text(encoding="utf-8")
     assert ledger.get(operation_id).state == "confirmed"
+    assert not (executor._journal_dir / "adoption-480.json").exists()  # retired
 
 
 def test_gates_block_execution(harness) -> None:
@@ -240,6 +241,7 @@ def _adopting_operation(ledger: ExecutionLedger, executor: Executor, library: Pa
         appid=480,
         install_dir_name="Spacewar",
         journal_dir=executor._journal_dir,
+        operation_id=operation_id,
     )
     return operation_id
 
@@ -251,6 +253,37 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "confirmed"
     assert any("completed" in action for action in actions)
+
+
+def test_symlinked_install_target_aborts(harness) -> None:
+    ledger, session, _, executor, library = harness
+    common = library / "steamapps" / "common"
+    common.mkdir(parents=True)
+    outside = library.parent / "outside"
+    outside.mkdir()
+    (common / "Spacewar").symlink_to(outside)
+
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "outside the library" in report.detail
+    assert session.stops == 0
+
+
+def test_reconcile_adopting_without_journal_fails(harness) -> None:
+    ledger, _, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    for state in ("lease_acquired", "client_stopping", "content_running", "adopting"):
+        ledger.transition(operation_id, state)
+    # An older fully-installed manifest exists, but this operation never
+    # journaled an adoption — it must not be credited with one.
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "failed"
+    assert any("clean" in action for action in actions)
 
 
 def test_reconcile_adopting_rolled_back_fails(harness) -> None:

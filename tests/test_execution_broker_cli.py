@@ -36,6 +36,8 @@ def state_dir(tmp_path: Path) -> Path:
                 str(tmp_path / "library"),
                 "--steamcmd",
                 str(tmp_path / "steamcmd.sh"),
+                "--machine-id",
+                "herb",
             ]
         )
         == 0
@@ -107,6 +109,51 @@ def test_unsafe_install_dir_name_rejected(
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
     assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
     assert "path component" in capsys.readouterr().err
+
+
+def test_non_object_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
+    _grant_install(state_dir)
+    monkeypatch.setattr("sys.stdin", io.StringIO('"just a string"'))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "JSON object" in capsys.readouterr().err
+
+
+def test_malformed_appid_rejected(state_dir: Path, monkeypatch, capsys) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["target"]["appid"] = "not-an-appid"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "appid" in capsys.readouterr().err
+
+
+def test_foreign_machine_id_rejected(state_dir: Path, monkeypatch, capsys) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["target"]["machine_id"] = "haste"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "different machine" in capsys.readouterr().err
+
+
+def test_policy_revocation_dead_ends_confirmation(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan()))
+    main(["--state-dir", str(state_dir), "request", "--account", "o"])
+    nonce = json.loads(capsys.readouterr().out)["nonce"]
+
+    (state_dir / "policy.toml").write_text(
+        '[grants]\ninstall = "deny"\n', encoding="utf-8"
+    )
+    assert (
+        main(["--state-dir", str(state_dir), "confirm", nonce, "--actor", "a"]) == 2
+    )
+    assert "denies" in capsys.readouterr().err
+
+    assert main(["--state-dir", str(state_dir), "status"]) == 0
+    assert json.loads(capsys.readouterr().out)["active"] is None  # aborted
 
 
 def test_replayed_nonce_rejected(state_dir: Path, monkeypatch, capsys) -> None:

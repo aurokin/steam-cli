@@ -17,6 +17,7 @@ from typing import Literal
 from steam_agent.execution.content_plane import (
     SteamcmdAdapter,
     adopt_manifest,
+    clear_adoption_journal,
     locate_manifest,
     manifest_state_flags,
     reconcile_adoption,
@@ -121,7 +122,23 @@ class Executor:
                 "aborted",
                 "install_dir_name must be a single path component",
             )
-        target = self._library / "steamapps" / "common" / install_dir_name
+        common = self._library / "steamapps" / "common"
+        target = common / install_dir_name
+        try:
+            # A pre-existing symlink at the target would let a safe-looking
+            # name write outside the library; resolve before trusting it.
+            escapes = not target.resolve().is_relative_to(common.resolve())
+        except OSError:
+            escapes = True
+        if escapes:
+            ledger.transition(
+                operation_id, "aborted", detail="install target escapes library"
+            )
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "install target resolves outside the library",
+            )
 
         gates = self._session.gates()
         if not gates.all_clear():
@@ -165,21 +182,24 @@ class Executor:
             appid=operation.appid,
             install_dir=target,
         )
+        # Restore the client before recording a terminal state: a crash in
+        # between then leaves a non-terminal row that reconciliation still
+        # owns, instead of a terminal row with the client silently stopped.
         if result.outcome == "auth_required":
+            note = self._restore_note(prior_running)
             ledger.transition(
                 operation_id, "failed", detail="auth_required: owner re-seed"
             )
-            note = self._restore_note(prior_running)
             return ExecutionReport(
                 operation_id,
                 "auth_required",
                 f"steamcmd needs re-authentication{note}",
             )
         if result.outcome != "installed":
+            note = self._restore_note(prior_running)
             ledger.transition(
                 operation_id, "failed", detail=f"steamcmd failed: {result.log_path.name}"
             )
-            note = self._restore_note(prior_running)
             return ExecutionReport(
                 operation_id,
                 "failed",
@@ -188,12 +208,27 @@ class Executor:
 
         source = locate_manifest(install_dir=target, appid=operation.appid)
         if source is None:
+            note = self._restore_note(prior_running)
             ledger.transition(
                 operation_id, "failed", detail="no steamcmd-written manifest"
             )
-            note = self._restore_note(prior_running)
             return ExecutionReport(
                 operation_id, "failed", f"steamcmd produced no manifest{note}"
+            )
+
+        # steamcmd can run for up to 30 minutes; if the client came back in
+        # the meantime (user or autostart), re-assert the stopped state
+        # before touching its steamapps/ — never adopt under a live client.
+        if self._session.client_running() and not self._session.stop_client():
+            ledger.transition(
+                operation_id,
+                "failed",
+                detail="client restarted mid-operation; adoption skipped",
+            )
+            return ExecutionReport(
+                operation_id,
+                "failed",
+                "client restarted mid-operation; adoption skipped",
             )
 
         ledger.transition(operation_id, "adopting")
@@ -203,7 +238,11 @@ class Executor:
             appid=operation.appid,
             install_dir_name=install_dir_name,
             journal_dir=self._journal_dir,
+            operation_id=operation_id,
         )
+        # The swap is durably complete once adopt_manifest returns; retire
+        # the journal now so it can never vouch for a later operation.
+        clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
 
         ledger.transition(operation_id, "client_restart_pending")
         client_restored = self._restore_client(prior_running)
@@ -324,14 +363,17 @@ class Executor:
                 library=self._library,
                 appid=active.appid,
                 journal_dir=self._journal_dir,
+                operation_id=operation_id,
             )
-            if verdict == "restored":
-                # The destination is the pre-operation backup (or absent);
-                # this operation's adoption did not survive.
+            if verdict != "completed":
+                # restored: the destination is the pre-operation backup.
+                # clean/stale: this operation never journaled its adoption
+                # (or only a prior operation's journal survived), so a
+                # StateFlags=4 manifest proves nothing about this operation.
                 ledger.transition(
-                    operation_id, "failed", detail="reconciled: adoption rolled back"
+                    operation_id, "failed", detail=f"reconciled: adoption {verdict}"
                 )
-                actions.append(f"{operation_id}: adoption restored -> failed")
+                actions.append(f"{operation_id}: adoption {verdict} -> failed")
                 restore()
                 return actions
             ledger.transition(

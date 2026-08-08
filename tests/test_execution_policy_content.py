@@ -80,6 +80,7 @@ def test_locate_and_adopt_patches_installdir(tmp_path: Path) -> None:
         appid=1902490,
         install_dir_name="Desk Job",
         journal_dir=tmp_path / "journal",
+        operation_id=7,
     )
     text = adopted.read_text(encoding="utf-8")
     assert '"installdir"\t\t"Desk Job"' in text
@@ -99,6 +100,7 @@ def test_adoption_backs_up_prior_manifest(tmp_path: Path) -> None:
         appid=1902490,
         install_dir_name="Desk Job",
         journal_dir=journal_dir,
+        operation_id=7,
     )
     backup = journal_dir / "appmanifest_1902490.acf.backup"
     assert backup.read_text(encoding="utf-8") == "old"
@@ -114,6 +116,7 @@ def test_reconcile_completed_swap_clears_journal(tmp_path: Path) -> None:
         appid=1902490,
         install_dir_name="Desk Job",
         journal_dir=journal_dir,
+        operation_id=7,
     )
     assert (
         reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
@@ -134,6 +137,7 @@ def test_reconcile_torn_write_restores_backup(tmp_path: Path) -> None:
         appid=1902490,
         install_dir_name="Desk Job",
         journal_dir=journal_dir,
+        operation_id=7,
     )
     adopted.write_text('"AppState" { torn', encoding="utf-8")  # simulate crash
 
@@ -152,6 +156,55 @@ def test_reconcile_without_journal_is_clean(tmp_path: Path) -> None:
         )
         == "clean"
     )
+
+
+def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
+    library = _library(tmp_path)
+    target = _target_with_manifest(tmp_path)
+    journal_dir = tmp_path / "journal"
+    adopt_manifest(
+        source=locate_manifest(install_dir=target, appid=1902490),
+        library=library,
+        appid=1902490,
+        install_dir_name="Desk Job",
+        journal_dir=journal_dir,
+        operation_id=7,
+    )
+    assert (
+        reconcile_adoption(
+            library=library, appid=1902490, journal_dir=journal_dir, operation_id=8
+        )
+        == "stale"
+    )
+    assert not (journal_dir / "adoption-1902490.json").exists()
+
+
+def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    home = tmp_path / "home"
+    install_dir = tmp_path / "install"
+
+    def _run(*args, **kwargs):
+        return SimpleNamespace(
+            stdout=f"Logging in user 'ownername' ... dir {install_dir} home {home}",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=home,
+        log_dir=tmp_path / "logs",
+    )
+    result = adapter.install(account="ownername", appid=480, install_dir=install_dir)
+    log = result.log_path.read_text(encoding="utf-8")
+    assert "ownername" not in log
+    assert str(install_dir) not in log and str(home) not in log
+    assert "<account>" in log
 
 
 def test_steamcmd_timeout_bytes_output_is_decoded(tmp_path: Path, monkeypatch) -> None:
