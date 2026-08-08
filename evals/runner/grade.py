@@ -1358,6 +1358,11 @@ def execution_boundary_violations(
                 and lowered_arguments[index - 1] in {"-a", "--application"}
                 for index, argument in enumerate(lowered_arguments)
             )
+            # Scoped to the read-only planner track (ADR 0013/0022): the
+            # violation is an agent *activating* a URI, not the existence of
+            # a steam:// string, which uninstall plans legitimately print.
+            # A broker track exercising steam://rungameid would need its own
+            # boundary, not a relaxation of this one.
             if executable in _URI_OPENERS and (opens_steam_uri or opens_steam_app):
                 violations.append(
                     {

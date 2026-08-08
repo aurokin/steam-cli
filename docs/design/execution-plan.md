@@ -16,9 +16,9 @@ path/identity abstraction) but no pretense that the session/permission model is
 already portable. Other OSes are later ports, each behind its own
 Phase-0-equivalent acceptance gate.
 
-Non-goals (v1): fine-grained download-queue control, CEF/SteamClient.* injection, cold-file
-surgery (future ADR at most), any store/market/wallet/credential/
-account-settings operation (hard-deny forever).
+Non-goals: fine-grained download-queue control, CEF/SteamClient.* injection,
+cold-file surgery (removed from the roadmap by ADR 0029), any store/market/
+wallet/credential/account-settings operation (hard-deny forever).
 
 ## 1. Trust model (re-scoped by ADR 0028)
 
@@ -238,59 +238,36 @@ present and writable, no pending client self-update, network reachable; sleep
 inhibited for the duration; bounded timeouts everywhere; unknown states fail
 closed.
 
-## 10. Move-by-reinstall (owner-approved), as a supervised composite
+## 10. Move (DECIDED 2026-08-08: inert plan, human executes in Steam)
 
-Move is approved as reinstall-to-destination + removal-at-source. Review
-established it is a transaction, not two independent operations — so it is
-built as ONE ledger operation with sub-states, one confirmation, and one
-governing invariant:
+Steam moves an installed title between libraries in place from its storage
+management UI, with no re-download. That is an officially supported consumer
+feature, so this project plans the move and the human performs it — the same
+reasoning as uninstall (§10a). See
+[ADR 0029](../adr/0029-move-as-inert-plan.md).
 
-**Invariant: at every crash point, at least one complete, adoptable copy of
-the game exists.** The source is never degraded until the destination is
-verified.
+The whole surface is the existing inert plan: `steam-agent operations plan
+move APPID --destination-library-ordinal N`, carrying preconditions, the
+destination-capacity risk, storage-UI instructions, and rollback guidance.
+The broker gains no move operation class.
 
-Sequence (single nonce; single lease where steps touch manifests):
+Superseded by that decision (do not rebuild): the reinstall-to-destination
+composite, its `dest_downloading`/`dest_verified`/`manifest_swap`/
+`source_cleanup` sub-states, the `confirmed_with_residue` terminal state, and
+the one-complete-copy invariant. They existed because re-downloading was the
+only move a broker could perform under the Valve-authored-code rule; the
+supported in-client move is cheaper and leaves no residue to clean.
 
-1. `dest_downloading` — fresh-install path (§4) into the destination
-   library's `common/<installdir>`. No manifest adopted; the client still
-   sees only the source install. Failure here aborts the whole move with the
-   source untouched.
-2. `dest_verified` — `content_present` proven (build/depot ids, dir sanity).
-3. `manifest_swap` — one client-stopped adoption step: back up + remove the
-   source library's manifest, place the destination manifest. Ordering rule:
-   the two libraries NEVER both have an adopted manifest for the appid, and
-   the swap is journaled/checksummed like any adoption (§5 adopting rows
-   apply; restore direction = source manifest).
-4. `client_adopted` at destination verified after restart.
-5. `source_cleanup` — HUMAN step (per the §10a uninstall decision: the agent
-   never deletes game content). The unattended composite terminates at
-   `confirmed_with_residue`: game fully playable at the destination, source
-   content inventoried and reported, and the plan hands the owner the exact
-   in-Steam cleanup instructions. Note the destination manifest is the
-   adopted one, so the client's own uninstall UI on the residue is safe —
-   it only sees the destination copy; source residue is plain directory
-   cleanup the owner performs (or leaves).
-
-Honesty requirements in the plan/confirmation text: full re-download of the
-stated GB (acceptable for retro-scale titles — this is why file-copy moves
-stayed out); source-side mods/saves/configs in the install dir follow the
-uninstall rules (§7): inventoried, warned about before confirmation, reported,
-never deleted as part of cleanup.
-
-Dependencies: requires only the install path (Phase 1) — ships as Phase 2d.
-`confirmed_with_residue` + human source cleanup is the permanent design, not
-a degradation (§10a).
-
-Cold-file surgery (staged copy, checksum, manifest switch without
-re-download) remains deferred to a future ADR as the optimization for
-large titles.
+Cold-file surgery is off the roadmap entirely rather than deferred: it was an
+optimization for the composite's download cost, which no longer exists.
 
 ## 10a. Uninstall mechanism (DECIDED 2026-08-08: human-in-Steam only)
 
 `app_uninstall` is dead: 4/4 silent no-ops on the current steamcmd with valid
 auth (Phase 0, target machine). Owner decision: **uninstall stays human-present,
-executed inside Steam** (the plan carries the `steam://uninstall/<appid>`
-reference and UI instructions; the agent never deletes game content).
+executed inside Steam** (the plan's UI instructions include the
+`steam://uninstall/<appid>` shortcut as instruction text — schema `0.1` fixes
+typed references to HTTPS pages — and the agent never deletes game content).
 
 Rationale (owner + review finding 16 agree): broker file-deletion only
 mimics uninstall — it pulls the install out from under the client, skipping
@@ -301,7 +278,9 @@ rejected for silent-breakage risk.
 Consequences: the unattended curation loop can install, update, repair, and
 launch, but disk reclamation requires the owner in the Steam UI — the agent
 ranks and proposes uninstall candidates (existing storage-ranking capability)
-and hands over an inert plan. Move's source cleanup inherits this: see §10.
+and hands over an inert plan. Move follows the same shape for the same
+reason (§10), and leaves no residue at all: Steam's own storage UI relocates
+the files in place.
 
 ## 11. ADR and eval changes
 
@@ -316,9 +295,8 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
   eval — the planner surface alone still never executes — is retained.
   Future evals: mid-game request defers; nonce replay rejected; crash
   reconciliation per table row; agent never claims `ready_to_play`
-  unattended; uninstall never touches residual user content; move never
-  leaves fewer than one complete copy (kill-at-every-sub-state), never two
-  adopted manifests, and source cleanup only targets the pinned source path.
+  unattended; uninstall never touches residual user content; the broker
+  refuses move outright (ADR 0029) rather than attempting one.
 
 ## 12. Delivery phases
 
@@ -341,12 +319,12 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
   (`steam-agent-broker`), all work serialized, every other verb denied.
   Originally "explicit confirmation for everything"; superseded by ADR
   0028's policy grants (`allow` within limits auto-authorizes).
-- **Phases 2a/2b/2c/2d — independent verb additions**, each gated on its own
+- **Phases 2a/2b/2c — independent verb additions**, each gated on its own
   spike line and shippable alone: 2a uninstall-as-inert-plan (candidate
   ranking + inventory + in-Steam instructions; human executes, per §10a),
-  2b repair, 2c launch allowlist (dispatched-terminal), 2d move-by-reinstall
-  (composite of §10; terminates `confirmed_with_residue`, human source
-  cleanup).
+  2b repair, 2c launch allowlist (dispatched-terminal). A former 2d
+  (move-by-reinstall) is cancelled by ADR 0029 — move ships as an inert plan
+  and needs no broker work.
 - **Phase 3 — unattended policy limits** (owner decision 2026-08-08:
   scheduling machinery is explicitly out of scope for this project). The
   loop that decides when to act — walking the backlog, picking a moment,
@@ -357,7 +335,6 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
   budgets, and per-appid grant scoping. (Standing grants shipped early as
   ADR 0028's `allow`; the kill switch already exists as
   `install = "deny"`.) Then second-OS port behind its own gate.
-- **Phase last (ideally never)** — move / cold-file surgery ADR.
 
 ## Owner decisions
 1. (2026-08-07) Target OS: **Linux**.

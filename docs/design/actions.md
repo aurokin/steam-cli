@@ -48,14 +48,19 @@ section is implemented and accepted.
 | Plan | Launch/install/uninstall/move/verify/update, backup, mod changes | Produce a short-lived plan with risks, size/bandwidth, target, and verification |
 | Open | Exact Steam/store/support/family/workshop UI | Return a typed official UI reference for the human; do not invoke it or claim the UI action completed |
 | Execute local reversible | Local watchlist/feedback, save snapshot | Feature-gated, auditable, idempotent where possible |
-| Execute local costly/destructive | Install, move, uninstall, delete/restore saves or mods | Install/update: broker per ADR 0027/0028, authorization per policy grant (`allow` within limits, `confirm`, `deny`); move: supervised composite (proposed Phase 2d); uninstall and save/mod deletion: interactive human only |
+| Execute local costly/destructive | Install, move, uninstall, delete/restore saves or mods | Install/update: broker per ADR 0027/0028, authorization per policy grant (`allow` within limits, `confirm`, `deny`); move: inert plan, human executes in Steam's storage UI (ADR 0029); uninstall and save/mod deletion: interactive human only |
 | Remote mutation | Wishlist, Workshop subscription, friend/invite/chat, family controls | Human UI initially |
 | Financial/security | Purchase, cart, trade, market, key redemption, refund, account/privacy | Interactive human only |
 
-The documented `steam://run/<AppID>` path is the clearest potential consumer
-launch primitive, but remains opt-in and policy-reviewed. Older install,
-uninstall, validation, client-console, and command-line mechanisms are not a
-stable supported consumer administration API.
+`steam://` URIs are supported Valve consumer entry points and this project
+names them freely: uninstall plans hand the human `steam://uninstall/<appid>`
+as instruction text. What is bounded is *activation*. The documented
+`steam://run/<AppID>` path is the clearest potential consumer launch
+primitive, but activating any URI belongs to the execution surface, so it
+stays opt-in and policy-reviewed and the planner (ADR 0013) invokes none of
+them. Coverage is the separate caveat: the older install, validation, and
+client-console routes are not a stable supported consumer administration API,
+so behavior per title is not contractual.
 
 ## Accepted M7 action boundary
 

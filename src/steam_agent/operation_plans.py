@@ -137,15 +137,18 @@ _SUPPORT_URLS: dict[str, str] = {
     "verify": "https://help.steampowered.com/en/faqs/view/0C48-FCBD-DA71-93EB",
 }
 
-# Client URI shortcuts offered to the human as instruction text, for the
-# operations this project will never execute itself.  Uninstall is the
-# deliberate case (owner decision 2026-08-08): steamcmd cannot uninstall
-# consumer titles, so the human finishes inside Steam and this saves them
-# the navigation.  These are NOT human_open_references: those are inert
-# HTTPS pages under schema 0.1, and a steam:// URI performs work when
-# activated.  Only URIs whose activation still requires the human to
-# confirm in a Steam dialog belong here — never steam://install or
-# steam://rungameid, which start work immediately.
+# Client URI shortcuts offered to the human as instruction text.  steam://
+# is a supported Valve consumer mechanism and this project is free to name
+# it; what this module cannot do is act on one, because the planner is
+# inert by ADR 0013.  Uninstall is the deliberate case (owner decision
+# 2026-08-08): steamcmd cannot uninstall consumer titles, so the human
+# finishes inside Steam and this saves them the navigation.  The shortcut
+# is instruction text rather than a human_open_reference only because
+# schema 0.1 fixes references to HTTPS pages — not because the URI is
+# off-limits.  Shortcuts are offered where they save a human real
+# navigation; install and launch are broker surfaces (implemented and
+# planned respectively), so a human shortcut for them would be answering a
+# question nobody asked.
 _CLIENT_URI_STEPS: dict[str, str] = {
     "uninstall": (
         "Shortcut: open steam://uninstall/{appid} and confirm in the dialog"
@@ -218,11 +221,11 @@ class ConfirmationRequirement:
 class HumanOpenReference:
     """A reference returned for a human to open; never invoked here.
 
-    Every reference is an official HTTPS page, inert to open.  The Steam
-    client URI that uninstall plans offer is deliberately NOT a reference:
-    activating it hands work to the local client rather than opening a page,
-    and schema ``0.1`` fixes both this shape and the ``purpose`` enum.  It
-    travels as human instruction text instead (see ``_UI_INSTRUCTIONS``).
+    Every reference is an official HTTPS page.  Schema ``0.1`` fixes both
+    this shape and the closed ``purpose`` enum, so the Steam client URI that
+    uninstall plans offer travels as human instruction text instead (see
+    ``_CLIENT_URI_STEPS``).  That is a schema-compatibility boundary, not a
+    judgment about ``steam://``.
     """
 
     purpose: Literal["product_page", "support_page"]

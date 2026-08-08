@@ -189,8 +189,8 @@ def test_references_are_official_https_and_human_only() -> None:
 def test_only_uninstall_offers_the_client_uri_and_only_as_instruction() -> None:
     # Uninstall is the one operation this project will never execute, so the
     # plan hands the human Steam's own shortcut (owner decision 2026-08-08).
-    # Activating steam://install or steam://rungameid would start work, so
-    # no other operation offers one.
+    # No other operation offers one because none of them leaves the human a
+    # navigation to save, not because steam:// is off-limits.
     for operation in ("launch", "install", "verify", "backup"):
         assert "steam://" not in json.dumps(asdict(build(operation)))
     assert "steam://" not in json.dumps(
@@ -203,8 +203,8 @@ def test_only_uninstall_offers_the_client_uri_and_only_as_instruction() -> None:
     assert "steam://uninstall/620" in shortcuts[0]
     assert "never opens it" in shortcuts[0]
 
-    # Schema 0.1 keeps references inert HTTPS pages under a closed purpose
-    # enum; the client URI must never migrate into them.
+    # Schema 0.1 fixes references to HTTPS pages under a closed purpose enum,
+    # so the client URI cannot migrate into them without breaking the schema.
     for item in plan.human_open_references:
         assert item.url.startswith("https://")
         assert item.purpose in {"product_page", "support_page"}

@@ -656,15 +656,14 @@ pages under the closed `product_page | support_page` purposes, inert to open.
 `uninstall` plans add one `ui_instructions` step offering the Steam client
 shortcut `steam://uninstall/<appid>`, because uninstall is the one operation
 this project will never execute (Phase 0 proved steamcmd cannot uninstall
-consumer titles) and the human finishes it inside Steam. It is instruction
-text for a person, deliberately not a typed reference: activating a
-`steam://` URI hands work to the local client rather than opening a page.
-Nothing here opens it, an agent that invokes it has crossed the ADR 0013
-execution boundary, and the CLI cannot confirm the client honors the URI
-because confirming it would mean invoking it — treat it as an unverified
-convenience, not a tested contract. No other operation offers one:
-`steam://install/` and `steam://rungameid/` start work immediately, whereas
-`steam://uninstall/` opens a dialog the human still confirms.
+consumer titles) and the human finishes it inside Steam. `steam://` is a
+supported Valve consumer mechanism, so naming one is unremarkable; it travels
+as instruction text rather than a typed reference only because schema `0.1`
+fixed references to HTTPS pages. What the planner cannot do is act on it —
+`steam-agent` invokes nothing at all (ADR 0013), which is also why the CLI
+cannot confirm the client honors the URI. Treat it as an unverified
+convenience, not a tested contract. No other operation offers a shortcut,
+because none of them leaves the human a navigation worth saving.
 
 Move requires
 exactly one destination ordinal from 1 through 1024; every other operation
