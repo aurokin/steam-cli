@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import time
 
 from steam_agent.execution.linux_session import CommandResult, LinuxSession
 
@@ -37,13 +39,64 @@ def test_download_gate_covers_all_configured_libraries(tmp_path: Path) -> None:
     (library / "steamapps").mkdir(parents=True)
     other = tmp_path / "other-library"
     downloading = other / "steamapps" / "downloading"
-    downloading.mkdir(parents=True)
-    (downloading / "999").mkdir()
+    (downloading / "999").mkdir(parents=True)
+    (downloading / "999" / "chunk.bin").write_bytes(b"x")
     (library / "steamapps" / "libraryfolders.vdf").write_text(
         f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{library}"\n\t}}\n'
         f'\t"1"\n\t{{\n\t\t"path"\t\t"{other}"\n\t}}\n}}\n',
         encoding="utf-8",
     )
+
+    def runner(argv: list[str]) -> CommandResult:
+        return CommandResult(returncode=1, stdout="")
+
+    session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
+    assert session.gates().download_in_flight == "fail"
+
+
+def test_stale_empty_downloading_residue_passes_the_gate(tmp_path: Path) -> None:
+    # The client leaves empty per-app subdirectories behind after finished
+    # downloads; stale residue with no file content must not wedge the gate.
+    library = tmp_path / "library"
+    residue = library / "steamapps" / "downloading" / "2996040"
+    residue.mkdir(parents=True)
+    day_ago = time.time() - 86_400
+    os.utime(residue, (day_ago, day_ago))
+
+    def runner(argv: list[str]) -> CommandResult:
+        return CommandResult(returncode=1, stdout="")
+
+    session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
+    assert session.gates().download_in_flight == "pass"
+
+
+def test_unreadable_downloading_subdir_is_unknown_not_pass(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    residue = library / "steamapps" / "downloading" / "2996040"
+    residue.mkdir(parents=True)
+    day_ago = time.time() - 86_400
+    os.utime(residue, (day_ago, day_ago))
+    residue.chmod(0o000)
+    try:
+
+        def runner(argv: list[str]) -> CommandResult:
+            return CommandResult(returncode=1, stdout="")
+
+        session = LinuxSession(
+            library=library, runner=runner, sleep=lambda _: None
+        )
+        assert session.gates().download_in_flight == "unknown"
+    finally:
+        residue.chmod(0o755)
+
+
+def test_fresh_empty_downloading_dir_fails_the_gate(tmp_path: Path) -> None:
+    # A starting download creates downloading/<appid> before its first
+    # file; an empty-but-recent directory must keep the gate fail-closed.
+    library = tmp_path / "library"
+    (library / "steamapps" / "downloading" / "480").mkdir(parents=True)
 
     def runner(argv: list[str]) -> CommandResult:
         return CommandResult(returncode=1, stdout="")

@@ -170,7 +170,7 @@ def test_gates_block_execution(harness) -> None:
     session.clear = False
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "gates" in report.detail
     assert ledger.get(operation_id).state == "authorized"  # untouched, retryable
 
@@ -190,7 +190,7 @@ def test_unknown_client_probe_defers_fresh_execution(harness) -> None:
     session.client_probe_unknown = True
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "presence unknown" in report.detail
     assert ledger.get(operation_id).state == "authorized"  # retryable
     assert session.stops == 0 and session.starts == 0
@@ -259,7 +259,7 @@ def test_failure_path_stays_retryable_when_restore_fails(harness) -> None:
     session.start_ok = False
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "restore failed" in report.detail
     assert ledger.get(operation_id).state == "content_running"  # non-terminal
 
@@ -468,7 +468,7 @@ def test_missing_library_defers_before_side_effects(harness) -> None:
     shutil.rmtree(library / "steamapps")  # external mount absent
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "unavailable" in report.detail
     assert ledger.get(operation_id).state == "authorized"  # retryable
     assert session.stops == 0
@@ -536,7 +536,7 @@ def test_resume_stop_failure_attempts_client_restore(harness) -> None:
     session.stop_ok = False
 
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "would not exit for resume" in report.detail
     assert session.starts == 1  # prior run-state restoration attempted
     assert ledger.get(operation_id).state == "interrupted"  # still resumable
@@ -613,7 +613,7 @@ def test_resume_intake_abort_stays_retryable_when_restore_fails(harness) -> None
     session.start_ok = False
 
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "restore failed" in report.detail
     assert ledger.get(operation_id).state == "interrupted"  # non-terminal
 
@@ -958,7 +958,7 @@ def test_execute_defers_while_steamcmd_survives(harness) -> None:
     session.steamcmd_alive = True
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "aborted"
+    assert report.outcome == "deferred"
     assert "steamcmd" in report.detail
     assert ledger.get(operation_id).state == "authorized"  # retryable in place
 

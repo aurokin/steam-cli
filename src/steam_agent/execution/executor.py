@@ -39,6 +39,9 @@ ExecuteOutcome = Literal[
     "aborted",
     "failed",
     "auth_required",
+    # The refusal left the ledger row non-terminal: the operation stays
+    # authorized/interrupted and a later run retries it in place.
+    "deferred",
 ]
 
 _STATE_FULLY_INSTALLED = 4
@@ -157,7 +160,7 @@ class Executor:
                 if not self._restore_client(operation.prior_client_running):
                     return ExecutionReport(
                         operation_id,
-                        "aborted",
+                        "deferred",
                         "window lapsed; client restore failed; state left for retry",
                     )
                 ledger.transition(
@@ -175,7 +178,7 @@ class Executor:
         if not (self._library / "steamapps").is_dir():
             return ExecutionReport(
                 operation_id,
-                "aborted",
+                "deferred",
                 "library steamapps directory unavailable; deferred",
             )
         # Capture the mount identity now: an external library unmounted (or
@@ -186,7 +189,7 @@ class Executor:
         if library_identity is None:
             return ExecutionReport(
                 operation_id,
-                "aborted",
+                "deferred",
                 "library steamapps directory unavailable; deferred",
             )
 
@@ -354,7 +357,7 @@ class Executor:
         if self._session.steamcmd_running():
             return ExecutionReport(
                 operation_id,
-                "aborted",
+                "deferred",
                 "a steamcmd process is already running; deferred",
             )
 
@@ -362,7 +365,7 @@ class Executor:
         if not gates.all_clear():
             return ExecutionReport(
                 operation_id,
-                "aborted",
+                "deferred",
                 "lease gates not clear: "
                 f"game={gates.game_running} remote_play={gates.remote_play} "
                 f"download={gates.download_in_flight}",
@@ -378,7 +381,7 @@ class Executor:
                 # reconciliation retries.
                 self._restore_client(prior_running)
                 return ExecutionReport(
-                    operation_id, "aborted", "client would not exit for resume"
+                    operation_id, "deferred", "client would not exit for resume"
                 )
         else:
             # prior_client_running drives a later start_client(); recording
@@ -389,7 +392,7 @@ class Executor:
             if gates.client_running == "unknown":
                 return ExecutionReport(
                     operation_id,
-                    "aborted",
+                    "deferred",
                     "client presence unknown (probe error); deferred",
                 )
             prior_running = gates.client_running == "fail"
@@ -837,7 +840,7 @@ class Executor:
         if not self._restore_client(prior_running):
             return ExecutionReport(
                 operation_id,
-                "aborted",
+                "deferred",
                 f"{message}; client restore failed; state left for reconcile",
             )
         self._ledger.transition(operation_id, to_state, detail=detail)

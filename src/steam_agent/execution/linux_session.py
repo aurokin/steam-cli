@@ -21,6 +21,9 @@ CommandRunner = Callable[[list[str]], "CommandResult"]
 
 _SHUTDOWN_TIMEOUT_SECONDS = 60
 _START_CONFIRM_TIMEOUT_SECONDS = 90
+# An empty downloading/<appid> dir older than this is finished-download
+# residue; younger ones may be a download that has not written a file yet.
+_DOWNLOAD_RESIDUE_AGE_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +140,39 @@ class LinuxSession:
                     dirs.append(candidate)
         return dirs
 
+    @staticmethod
+    def _download_activity(downloading: Path) -> bool:
+        # The client leaves empty per-app subdirectories behind after
+        # completed downloads (observed on the target machine); stale empty
+        # residue must not wedge the gate until someone cleans it by hand.
+        # But a starting download also creates its per-app directory before
+        # writing the first file, and only age separates the two — so an
+        # empty directory younger than the residue threshold still fails.
+        # Accepted residual class (do not re-flag variants): ANY download
+        # that is still at zero files when its directory reads as old —
+        # stalled from the start, or reusing a stale per-app directory
+        # whose mtime a restart did not touch — can be misread as residue.
+        # Every member of that class has transferred nothing: stopping the
+        # client loses no progress and the client resumes the download on
+        # its own restart, whereas failing on all empty dirs wedges
+        # unattended operation behind manual residue cleanup.  The moment
+        # a download has anything to lose, it has a file, and any file
+        # content fails the gate.
+        # Explicit walk, not rglob: rglob suppresses per-directory scan
+        # errors, and an unreadable subtree must surface as OSError so the
+        # gate reads unknown instead of pass.
+        stack = [downloading]
+        while stack:
+            for entry in stack.pop().iterdir():
+                if entry.is_dir() and not entry.is_symlink():
+                    age = time.time() - entry.stat().st_mtime
+                    if age < _DOWNLOAD_RESIDUE_AGE_SECONDS:
+                        return True
+                    stack.append(entry)
+                else:
+                    return True  # file content: a transaction is in flight
+        return False
+
     def gates(self) -> LeaseGates:
         download_state: GateState = "pass"
         download_dirs = self._download_dirs()
@@ -145,7 +181,7 @@ class LinuxSession:
             download_dirs = []
         for downloading in download_dirs:
             try:
-                if any(downloading.iterdir()):
+                if self._download_activity(downloading):
                     download_state = "fail"
                     break
             except FileNotFoundError:
