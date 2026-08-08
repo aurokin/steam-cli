@@ -170,6 +170,18 @@ class Executor:
                 operation_id, "aborted", "execution window lapsed"
             )
 
+        # The configured library may be an external mount: if steamapps/ is
+        # absent, a lexical resolve still lands beneath the configured path
+        # and mkdir(parents=True) would recreate the tree on the underlying
+        # filesystem — steamcmd would fill a directory the real library will
+        # never see.  Defer with the state untouched until it is back.
+        if not (self._library / "steamapps").is_dir():
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "library steamapps directory unavailable; deferred",
+            )
+
         plan = ledger.plan_document(operation_id)
         raw_name = plan.get("install_dir_name")
         if raw_name is not None and not isinstance(raw_name, str):
@@ -316,9 +328,15 @@ class Executor:
                 self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
             )
             try:
+                # The nested manifest counts only if its body matches: the
+                # filename alone could be a stale/misnamed file from another
+                # title, and steamcmd would write into that title's dir.
+                nested = locate_manifest(install_dir=target, appid=operation.appid)
                 owned = (
-                    locate_manifest(install_dir=target, appid=operation.appid)
-                    is not None
+                    (
+                        nested is not None
+                        and manifest_appid(nested) == operation.appid
+                    )
                     or (
                         own_library_dir is not None
                         and own_library_dir.casefold() == install_dir_name.casefold()

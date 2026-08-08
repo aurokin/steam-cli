@@ -431,6 +431,33 @@ def test_case_aliased_install_dir_collision_aborts(harness) -> None:
     assert "another installed title" in report.detail
 
 
+def test_missing_library_defers_before_side_effects(harness) -> None:
+    ledger, session, _, executor, library = harness
+    shutil.rmtree(library / "steamapps")  # external mount absent
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "unavailable" in report.detail
+    assert ledger.get(operation_id).state == "authorized"  # retryable
+    assert session.stops == 0
+    assert not (library / "steamapps").exists()  # nothing recreated
+
+
+def test_nested_manifest_with_wrong_appid_is_not_ownership(harness) -> None:
+    ledger, _, _, executor, library = harness
+    stray = library / "steamapps" / "common" / "Spacewar" / "steamapps"
+    stray.mkdir(parents=True)
+    # Filename matches the request; the body belongs to another title.
+    (stray / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"999"\n\t"installdir"\t\t"Other"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "not owned" in report.detail
+
+
 def test_unowned_existing_target_directory_aborts(harness) -> None:
     ledger, _, _, executor, library = harness
     stray = library / "steamapps" / "common" / "Spacewar"
