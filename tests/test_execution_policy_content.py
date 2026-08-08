@@ -663,3 +663,30 @@ def test_verify_allow_still_requires_a_disk_floor(tmp_path: Path) -> None:
 
     with pytest.raises(PolicyError):
         load_policy(path)
+
+
+def test_launch_allowlist_rejects_non_appid_entries(tmp_path: Path) -> None:
+    path = tmp_path / "policy.toml"
+    # true is an int subclass in Python; it must not enroll AppID 1.
+    path.write_text(
+        '[grants]\nlaunch = "confirm"\n[launch]\nallowed_appids = [true]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PolicyError):
+        load_policy(path)
+
+
+def test_launch_allowlist_is_independent_of_the_other_grants(tmp_path: Path) -> None:
+    path = tmp_path / "policy.toml"
+    path.write_text(
+        '[grants]\ninstall = "confirm"\nlaunch = "confirm"\n'
+        "[launch]\nallowed_appids = [480]\n",
+        encoding="utf-8",
+    )
+
+    policy = load_policy(path)
+
+    assert policy.launch_permitted(480) is True
+    assert policy.launch_permitted(220) is False
+    assert policy.grant_for("verify") == "deny"

@@ -42,6 +42,9 @@ ExecuteOutcome = Literal[
     # The refusal left the ledger row non-terminal: the operation stays
     # authorized/interrupted and a later run retries it in place.
     "deferred",
+    # Launch's only success: the client accepted the request.  Never
+    # upgraded by observing a process (ADR 0027 §2).
+    "dispatched",
 ]
 
 _STATE_FULLY_INSTALLED = 4
@@ -198,6 +201,8 @@ class Executor:
             return ExecutionReport(
                 operation_id, "aborted", f"not executable: {operation.state}"
             )
+        if operation.operation == "launch":
+            return self._launch(operation_id, operation)
         if not ledger.window_valid(operation_id):
             ledger.expire_lapsed()
             if resuming:
@@ -820,6 +825,69 @@ class Executor:
     # operation reuse a partial directory a failed run left behind (no
     # nested manifest exists yet to prove ownership).  Retired once a
     # steamcmd-written manifest provides real evidence.
+
+    def _launch(self, operation_id: int, operation) -> ExecutionReport:
+        """Ask the client to start one allowlisted game (Phase 2c).
+
+        Nothing here touches content: no lease, no steamcmd, no manifest,
+        and no resume — an interrupted launch has no half-done state to
+        recover, so the row simply stays authorized until it lapses.
+        """
+
+        ledger = self._ledger
+        if operation.state != "authorized":
+            return ExecutionReport(
+                operation_id, "aborted", f"not executable: {operation.state}"
+            )
+        if not ledger.window_valid(operation_id):
+            ledger.expire_lapsed()
+            return ExecutionReport(
+                operation_id, "aborted", "execution window lapsed"
+            )
+        gates = self._session.gates()
+        # Only the human-activity gates apply: a download in flight is no
+        # reason to refuse a launch, but starting a second game over a
+        # running one, or over a Remote Play session, is.
+        if gates.game_running != "pass" or gates.remote_play != "pass":
+            return ExecutionReport(
+                operation_id,
+                "deferred",
+                "session busy: "
+                f"game={gates.game_running} remote_play={gates.remote_play}",
+            )
+        if gates.client_running == "unknown":
+            return ExecutionReport(
+                operation_id,
+                "deferred",
+                "client presence unknown (probe error); deferred",
+            )
+        if gates.client_running != "fail" and not self._session.start_client():
+            # "fail" is the gate's word for the client being present.
+            return ExecutionReport(
+                operation_id, "deferred", "client would not start; deferred"
+            )
+        if not self._session.launch_app(operation.appid):
+            ledger.transition(
+                operation_id,
+                "aborted",
+                detail="client rejected the launch request",
+                expected_from="authorized",
+            )
+            return ExecutionReport(
+                operation_id, "aborted", "client rejected the launch request"
+            )
+        ledger.transition(
+            operation_id,
+            "dispatched",
+            detail="launch requested; playability not observed",
+            expected_from="authorized",
+        )
+        return ExecutionReport(
+            operation_id,
+            "dispatched",
+            "launch requested; this broker does not observe whether the"
+            " game became playable",
+        )
 
     def _owned_marker(self, appid: int) -> Path:
         return self._state_dir / "owned" / f"{appid}.json"

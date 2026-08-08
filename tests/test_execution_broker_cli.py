@@ -470,3 +470,65 @@ def test_policy_verb_reports_both_grants(state_dir: Path, capsys) -> None:
         "install": "allow",
         "verify": "confirm",
     }
+
+
+def _grant_launch(state_dir: Path, *appids: int) -> None:
+    listed = ", ".join(str(appid) for appid in appids)
+    (state_dir / "policy.toml").write_text(
+        f'[grants]\nlaunch = "confirm"\n[launch]\nallowed_appids = [{listed}]\n',
+        encoding="utf-8",
+    )
+
+
+def test_launch_requires_the_appid_on_the_allowlist(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_launch(state_dir, 220)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("launch")))
+
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "not on the launch allowlist" in capsys.readouterr().err
+
+
+def test_allowlisted_launch_is_accepted(state_dir: Path, monkeypatch, capsys) -> None:
+    _grant_launch(state_dir, 480)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("launch")))
+
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "pending_confirmation"
+
+
+def test_removing_an_appid_from_the_allowlist_dead_ends_confirmation(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    # Narrowing the allowlist revokes as surely as flipping the grant.
+    _grant_launch(state_dir, 480)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("launch")))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 0
+    nonce = json.loads(capsys.readouterr().out)["nonce"]
+    _grant_launch(state_dir, 220)
+
+    assert (
+        main(["--state-dir", str(state_dir), "confirm", nonce, "--actor", "o"]) == 2
+    )
+    assert "denies 'launch'" in capsys.readouterr().err
+
+
+def test_launch_grant_without_an_allowlist_is_refused(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    (state_dir / "policy.toml").write_text(
+        '[grants]\nlaunch = "confirm"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("launch")))
+
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "allowed_appids" in capsys.readouterr().err
+
+
+def test_policy_verb_reports_the_launch_allowlist(state_dir: Path, capsys) -> None:
+    _grant_launch(state_dir, 480, 220)
+
+    assert main(["--state-dir", str(state_dir), "policy"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["launch_allowlist"] == [220, 480]

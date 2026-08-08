@@ -42,6 +42,8 @@ class FakeSession:
         self.stop_ok = True
         self.steamcmd_alive = False
         self.client_probe_unknown = False
+        self.launched: list[int] = []
+        self.launch_ok = True
 
     def gates(self) -> LeaseGates:
         state = "pass" if self.clear else "fail"
@@ -55,6 +57,10 @@ class FakeSession:
                 else ("fail" if self.running else "pass")
             ),
         )
+
+    def launch_app(self, appid: int) -> bool:
+        self.launched.append(appid)
+        return self.launch_ok
 
     def client_running(self) -> bool:
         return self.running
@@ -1187,3 +1193,80 @@ def test_verify_accepts_a_directory_heavy_install(harness) -> None:
 
     assert report.outcome == "confirmed"
     assert content.validated is True
+
+
+def test_launch_dispatches_without_touching_content(harness) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "dispatched"
+    assert "playable" in report.detail
+    assert session.launched == [480]
+    # No lease, no stop, no steamcmd, no manifest.
+    assert session.stops == 0
+    assert content.validated is None
+    assert not (library / "steamapps" / "appmanifest_480.acf").exists()
+    assert ledger.get(operation_id).state == "dispatched"
+
+
+def test_launch_starts_a_stopped_client_first(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.running = False
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "dispatched"
+    assert session.starts == 1
+    assert session.launched == [480]
+
+
+def test_launch_defers_while_a_game_is_running(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.clear = False  # game_running fails
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert session.launched == []
+    # Non-terminal: the same authorization is retried later, in place.
+    assert ledger.get(operation_id).state == "authorized"
+
+
+def test_launch_defers_when_the_client_will_not_start(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.running = False
+    session.start_ok = False
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert session.launched == []
+    assert ledger.get(operation_id).state == "authorized"
+
+
+def test_a_rejected_launch_request_is_terminal(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.launch_ok = False
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert ledger.get(operation_id).state == "aborted"
+
+
+def test_dispatched_is_never_upgraded_by_a_running_process(harness) -> None:
+    # ADR 0027: seeing a process cannot distinguish a playable game from a
+    # hung launcher or a DRM prompt, so nothing observes its way past this.
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+    executor.execute(operation_id)
+
+    session.clear = False  # a game process now appears
+    assert executor.reconcile() == []
+    assert ledger.get(operation_id).state == "dispatched"

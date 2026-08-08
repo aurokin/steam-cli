@@ -245,6 +245,16 @@ class LinuxSession:
             self._sleep(1)
         return False
 
+    def launch_app(self, appid: int) -> bool:
+        """Ask the running client to start one game; True when accepted.
+
+        True means the request was handed to the client without error, not
+        that the game is playable — that distinction is why launch's
+        terminal state is ``dispatched``.
+        """
+
+        return self._run(["steam", "-applaunch", str(appid)]).returncode == 0
+
     def start_client(self) -> bool:
         env_runtime = f"XDG_RUNTIME_DIR={_runtime_dir()}"
         unit = f"steam-broker-client-{int(time.time())}"

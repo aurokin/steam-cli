@@ -36,15 +36,31 @@ OperationState = Literal[
     "aborted",
     "failed",
     "expired",
+    "dispatched",
 ]
 
 TERMINAL_STATES: frozenset[str] = frozenset(
-    {"confirmed", "unconfirmed", "contradicted", "aborted", "failed", "expired"}
+    {
+        "confirmed",
+        "unconfirmed",
+        "contradicted",
+        "aborted",
+        "failed",
+        "expired",
+        # Launch's only success: the client was asked to start the game.
+        # Seeing a process cannot tell a playable game from a hung launcher
+        # or a DRM prompt, so nothing ever upgrades this.
+        "dispatched",
+    }
 )
 
 _TRANSITIONS: dict[str, frozenset[str]] = {
     "pending_confirmation": frozenset({"authorized", "expired", "aborted"}),
-    "authorized": frozenset({"lease_acquired", "expired", "aborted"}),
+    "authorized": frozenset(
+        # dispatched is reachable only from authorized: launch is one shot
+        # with no lease, no content phase, and no resume.
+        {"lease_acquired", "dispatched", "expired", "aborted"}
+    ),
     "lease_acquired": frozenset({"client_stopping", "aborted", "interrupted"}),
     "client_stopping": frozenset({"content_running", "aborted", "interrupted"}),
     "content_running": frozenset(

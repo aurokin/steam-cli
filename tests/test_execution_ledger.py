@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from steam_agent.execution.ledger import (
+    TERMINAL_STATES,
     ConfirmationRejected,
     ExecutionLedger,
     InvalidTransition,
@@ -157,3 +158,25 @@ def test_interrupted_supports_resume_transition(ledger: ExecutionLedger) -> None
     ledger.transition(operation_id, "interrupted")
     ledger.transition(operation_id, "content_running")
     assert ledger.get(operation_id).state == "content_running"
+
+
+def test_every_terminal_state_is_a_declared_operation_state() -> None:
+    from typing import get_args
+
+    from steam_agent.execution.ledger import OperationState
+
+    assert TERMINAL_STATES <= set(get_args(OperationState))
+
+
+def test_dispatched_is_reachable_only_from_authorized() -> None:
+    from steam_agent.execution.ledger import _TRANSITIONS
+
+    sources = {
+        state
+        for state, targets in _TRANSITIONS.items()
+        if "dispatched" in targets
+    }
+
+    assert sources == {"authorized"}
+    # Terminal: nothing leads out of it.
+    assert "dispatched" not in _TRANSITIONS

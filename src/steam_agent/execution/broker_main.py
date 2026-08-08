@@ -45,7 +45,7 @@ from steam_agent.execution.policy import (
     write_policy_template,
 )
 
-_SUPPORTED_OPERATIONS = frozenset({"install", "verify"})
+_SUPPORTED_OPERATIONS = frozenset({"install", "verify", "launch"})
 # Generous for a plan (well under a page of JSON in practice).
 _PLAN_BYTE_LIMIT = 64 * 1024
 
@@ -312,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
             or appid > 0xFFFFFFFF
         ):
             return _fail("plan target appid is malformed")
+        if operation == "launch" and not policy.launch_permitted(appid):
+            return _fail("appid is not on the launch allowlist")
         with _state_lock(state_dir):
             try:
                 config = _load_config(state_dir)
@@ -350,7 +352,11 @@ def main(argv: list[str] | None = None) -> int:
                 current = load_policy(state_dir / "policy.toml")
             except PolicyError:
                 current = None
-            if current is not None and current.grant_for(operation) == "allow":
+            if (
+                current is not None
+                and current.grant_for(operation) == "allow"
+                and (operation != "launch" or current.launch_permitted(appid))
+            ):
                 denied = _floor_denial(
                     Path(config["library"]), current.min_free_gb
                 )
@@ -384,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
                 "version": policy.version,
                 "grants": policy.grants,
                 "limits": {"min_free_gb": policy.min_free_gb},
+                "launch_allowlist": sorted(policy.launch_allowlist),
             }
         )
         return 0
@@ -420,7 +427,13 @@ def main(argv: list[str] | None = None) -> int:
             except InvalidTransition:
                 pass  # already executing; run enforces policy from here
             return _fail(str(error))
-        if policy.grant_for(operation.operation) not in {"confirm", "allow"}:
+        if policy.grant_for(operation.operation) not in {
+            "confirm",
+            "allow",
+        } or (
+            operation.operation == "launch"
+            and not policy.launch_permitted(operation.appid)
+        ):
             try:
                 ledger.transition(
                     operation_id,
@@ -457,7 +470,16 @@ def main(argv: list[str] | None = None) -> int:
             denial = str(error)
             denial_detail = "policy unreadable before execution"
         else:
-            if policy.grant_for(operation.operation) not in {"confirm", "allow"}:
+            if policy.grant_for(operation.operation) not in {
+                "confirm",
+                "allow",
+            } or (
+                operation.operation == "launch"
+                and not policy.launch_permitted(operation.appid)
+            ):
+                # Removing an AppID from the allowlist revokes it as surely
+                # as flipping the grant; both are re-read at every decision
+                # point, including this one.
                 denial = f"policy now denies {operation.operation!r}"
                 denial_detail = "policy revoked before execution"
         if denial is not None and operation.state not in {
@@ -499,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
                 "detail": report.detail,
             }
         )
-        return 0 if report.outcome == "confirmed" else 1
+        return 0 if report.outcome in {"confirmed", "dispatched"} else 1
 
     if arguments.command == "reconcile":
         try:

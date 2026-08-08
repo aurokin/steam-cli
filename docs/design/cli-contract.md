@@ -703,11 +703,12 @@ steam-agent-broker [--state-dir PATH] policy
 equivalent is `STEAM_BROKER_STATE`. The directory is created mode 0700 and
 holds the policy file, the ledger, the adoption journal, logs, and steamcmd's
 private HOME with its cached credentials. Stdout is deterministic JSON;
-diagnostics go to stderr. Exit 0 is success, 1 is a completed run whose
-outcome was not `confirmed`, and 2 is a refusal or error.
+diagnostics go to stderr. Exit 0 is success (`confirmed`, or `dispatched`
+for launch), 1 is a completed run whose outcome was neither, and 2 is a
+refusal or error.
 
-`install` and `verify` are the executable operation classes; every other
-class is denied regardless of policy content. `install` covers update — they
+`install`, `verify`, and `launch` are the executable operation classes;
+every other class is denied regardless of policy content. `install` covers update — they
 share one steamcmd mechanism and one plan class. `verify` is the repair
 capability: Valve's `app_update ... validate` pass, granted separately
 because it replaces locally modified official files, so a mod installed over
@@ -720,10 +721,14 @@ residue left in a deleted directory can still satisfy it, and validate would
 then re-download. The load-bearing bound is that verify needs an existing
 client manifest for the AppID at all: it can re-acquire a title the owner
 already installed, never add a new one, which is why it is a separate grant
-rather than a way around `install = "deny"`. Uninstall remains human-in-Steam, move ships
-as an inert plan (ADR 0029), and store, market, wallet, credential, and
-account-settings operations are absent code paths rather than policy
-entries.
+rather than a way around `install = "deny"`. `launch` is the client plane: it asks the running client to start one
+allowlisted game and touches no content. It takes no lease, stops nothing,
+and runs no steamcmd. Its terminal outcome is `dispatched`, which is never
+upgraded by observing a process — seeing one cannot distinguish a playable
+game from a hung launcher or a DRM prompt. Uninstall remains human-in-Steam,
+move ships as an inert plan (ADR 0029), and store, market, wallet,
+credential, and account-settings operations are absent code paths rather
+than policy entries.
 
 ### Authorization
 
@@ -734,13 +739,21 @@ every decision point, failing closed when unreadable.
 [grants]
 install = "allow"   # or "confirm" (two-step) or "deny" (kill switch)
 verify = "confirm"  # same three values, granted independently
+launch = "confirm"
 
 [limits]
 min_free_gb = 25    # required whenever any grant is "allow"
+
+[launch]
+allowed_appids = [480]   # required whenever launch is not "deny"
 ```
 
 Each class is granted on its own; an `install` grant never carries `verify`.
-An omitted key is `deny`.
+An omitted key is `deny`. `launch` needs two independent permissions: the
+grant says launching is a capability at all, and `allowed_appids` says which
+titles. A live `launch` grant with an empty or absent allowlist is refused
+rather than read as "any game", and removing an AppID revokes it exactly as
+flipping the grant does — both are re-read at request, confirm, and run.
 
 Under `confirm`, `request` emits `{"operation_id", "nonce", "state":
 "pending_confirmation"}` and the operation runs only after `confirm` consumes
@@ -765,6 +778,7 @@ execution window; one operation per machine is active at a time; a plan's
 | `aborted` | terminated without completing (window lapsed, policy revoked, gates regressed) | terminal |
 | `failed` | content work started and did not succeed | terminal |
 | `auth_required` | steamcmd needs an interactive Steam Guard login | terminal |
+| `dispatched` | launch only: the client accepted the request. Playability is not observed and nothing upgrades this | terminal |
 
 A `deferred` outcome is not a failure and must not be resubmitted under a new
 idempotency key: the same operation is still authorized and a later `run`
