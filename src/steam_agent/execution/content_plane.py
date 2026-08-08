@@ -228,6 +228,11 @@ class SteamcmdAdapter:
             ):
                 if value:
                     line = line.replace(value, label)
+            # Any absolute path still present is by definition NOT one of
+            # the configured ones — a diagnostic like "ERROR opening
+            # /home/user/file" on an allowlisted line must not persist a
+            # private path verbatim.
+            line = re.sub(r"(?:/[^/\s\"']+){2,}/?", "<path>", line)
             # 17 digits from 7656…: SteamID64 individual accounts span
             # 76561197…–76561202… (32-bit account-ID space), not just the
             # 7656119 prefix.

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -98,16 +97,14 @@ class Executor:
         self._journal_dir = state_dir / "journal"
 
     def _lock(self) -> object:
-        # Keyed by the resolved library, not the state dir: two brokers with
-        # different state dirs but one library must share one lock.  (The
-        # library itself is never written to — ADR 0027 permits only the
-        # adopted manifest under steamapps/.)
-        library_key = hashlib.sha256(
-            str(self._library.resolve()).encode("utf-8")
-        ).hexdigest()[:16]
+        # One lock per user, not per library or state dir: a single Steam
+        # client manages every configured library, so brokers targeting
+        # different libraries still contend for the same global client
+        # (stop/start) and must serialize.  Keyed by euid so unrelated
+        # users on a shared host do not contend.
         # Fixed /tmp, not tempfile.gettempdir(): TMPDIR is caller-controlled
         # and a per-process value would defeat cross-broker serialization.
-        lock_path = Path("/tmp") / f"steam-broker-{library_key}.lock"
+        lock_path = Path("/tmp") / f"steam-broker-u{os.geteuid()}.lock"
         # /tmp is shared: O_NOFOLLOW refuses a planted symlink outright,
         # ownership is checked on the opened inode, and the directory entry
         # is re-lstat'ed after locking so an unlink/replace cannot yield two

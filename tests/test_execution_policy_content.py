@@ -311,6 +311,36 @@ def test_stderr_never_merges_into_a_recognized_stdout_line(
     assert "1 unrecognized line(s) omitted" in log
 
 
+def test_unconfigured_paths_scrubbed_from_recognized_lines(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import subprocess
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    # An allowlisted marker ("ERROR") with an arbitrary private path: the
+    # path is not one of the configured replacements and must still be
+    # scrubbed.
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            "ERROR opening /home/someuser/private-file for read"
+        ),
+    )
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+    )
+    result = adapter.install(
+        account="o", appid=480, install_dir=tmp_path / "i", operation_id=1
+    )
+    log = result.log_path.read_text(encoding="utf-8")
+    assert "/home/someuser" not in log
+    assert "<path>" in log
+
+
 def test_locale_invalid_output_still_classifies(tmp_path: Path, monkeypatch) -> None:
     import subprocess
 

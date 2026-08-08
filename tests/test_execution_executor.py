@@ -365,11 +365,11 @@ def test_null_plan_name_treated_as_unspecified(harness) -> None:
 
 
 def test_symlinked_lock_file_is_rejected(harness) -> None:
-    import hashlib
+    import os
 
     ledger, _, _, executor, library = harness
-    key = hashlib.sha256(str(library.resolve()).encode("utf-8")).hexdigest()[:16]
-    lock_path = Path("/tmp") / f"steam-broker-{key}.lock"
+    lock_path = Path("/tmp") / f"steam-broker-u{os.geteuid()}.lock"
+    lock_path.unlink(missing_ok=True)  # earlier tests create the real lock
     decoy = library.parent / "decoy"
     decoy.write_text("", encoding="utf-8")
     lock_path.symlink_to(decoy)
@@ -403,6 +403,27 @@ def test_lock_scoped_to_library_not_state_dir(harness, tmp_path: Path) -> None:
         session=session,
         content=content,
         library=library,
+        state_dir=tmp_path / "other-state",
+    )
+    lock = executor._lock()
+    try:
+        with pytest.raises(ExecutorLockedError):
+            other._lock()
+    finally:
+        lock.close()
+
+
+def test_lock_shared_across_libraries(harness, tmp_path: Path) -> None:
+    # One Steam client manages every library: brokers on different
+    # libraries must still serialize.
+    ledger, session, content, executor, _ = harness
+    other_library = tmp_path / "other-library"
+    (other_library / "steamapps").mkdir(parents=True)
+    other = Executor(
+        ledger=ledger,
+        session=session,
+        content=content,
+        library=other_library,
         state_dir=tmp_path / "other-state",
     )
     lock = executor._lock()
