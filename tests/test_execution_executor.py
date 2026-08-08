@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -476,6 +477,59 @@ def test_reconcile_adopting_stop_failure_attempts_restore(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "adopting"  # deferred, retryable
     assert any("deferred" in action for action in actions)
+    assert session.starts == 1  # prior run-state restoration attempted
+
+
+def test_stale_marker_does_not_vouch_for_replaced_directory(harness) -> None:
+    ledger, _, content, executor, library = harness
+    content.outcome = "failed"
+    first = _authorized(ledger)
+    assert executor.execute(first).outcome == "failed"  # marker written
+
+    # The partial dir is removed and the path repurposed with other content.
+    target = library / "steamapps" / "common" / "Spacewar"
+    shutil.rmtree(target)
+    target.mkdir(parents=True)
+    (target / "unrelated.bin").write_text("keep", encoding="utf-8")
+
+    content.outcome = "installed"
+    retry = _authorized(ledger)
+    report = executor.execute(retry)
+    assert report.outcome == "aborted"
+    assert "not owned" in report.detail
+
+
+def test_content_adapter_exception_restores_client(harness) -> None:
+    ledger, session, content, executor, _ = harness
+
+    def raise_oserror(**kwargs):
+        raise OSError("log dir unwritable")
+
+    content.install = raise_oserror
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert ledger.get(operation_id).state == "failed"
+    assert session.starts == 1  # prior run-state restored
+
+
+def test_reconcile_adopting_post_stop_regression_restores(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "adopting"):
+        ledger.transition(operation_id, state)
+    original_stop = session.stop_client
+
+    def stop_then_regress() -> bool:
+        result = original_stop()
+        session.clear = False  # a game appeared during the stop
+        return result
+
+    session.stop_client = stop_then_regress
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "adopting"  # deferred, retryable
+    assert any("regressed" in action for action in actions)
     assert session.starts == 1  # prior run-state restoration attempted
 
 

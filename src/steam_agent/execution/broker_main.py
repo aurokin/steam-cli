@@ -66,9 +66,11 @@ def _fail(message: str) -> int:
 def _state_lock(state_dir: Path):
     """Serialize reconfiguration with intake (broker-owned dir; blocking)."""
 
-    state_dir.mkdir(parents=True, exist_ok=True)
-    # Owner-only from the first moment it exists: a permissive umask must
-    # never open a window for another identity to pre-create policy/state.
+    # Owner-only from the first moment it exists: mkdir's mode is masked by
+    # the umask (never widened), so 0o700 closes the pre-chmod window a
+    # permissive umask would otherwise open for another identity to
+    # pre-create policy/state.  The chmod still repairs a pre-existing dir.
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_dir.chmod(0o700)
     handle = (state_dir / "state.lock").open("a")
     try:

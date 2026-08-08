@@ -294,12 +294,11 @@ class Executor:
                         and own_library_dir.casefold() == install_dir_name.casefold()
                     )
                     # A prior broker operation for this AppID recorded the
-                    # directory before its steamcmd ran: a failed partial
-                    # install stays retryable without manual cleanup.
-                    or (
-                        (claim := self._owned_dir_claim(operation.appid))
-                        is not None
-                        and claim.casefold() == install_dir_name.casefold()
+                    # directory (name and inode) before its steamcmd ran: a
+                    # failed partial install stays retryable without manual
+                    # cleanup.
+                    or self._marker_owns_target(
+                        operation.appid, install_dir_name, target
                     )
                     or not any(target.iterdir())
                 )
@@ -397,13 +396,26 @@ class Executor:
         # run that fails after a partial download leaves no nested manifest,
         # and without this record every fresh retry would fail the
         # not-owned check above until the directory was removed by hand.
-        self._record_owned_dir(operation.appid, install_dir_name)
-        result = self._content.install(
-            account=operation.account_alias,
-            appid=operation.appid,
-            install_dir=target,
-            operation_id=operation_id,
-        )
+        self._record_owned_dir(operation.appid, install_dir_name, target)
+        try:
+            result = self._content.install(
+                account=operation.account_alias,
+                appid=operation.appid,
+                install_dir=target,
+                operation_id=operation_id,
+            )
+        except OSError as error:
+            # The adapter can raise outside steamcmd itself (unwritable log
+            # dir, full disk); the promised client run-state must still be
+            # restored rather than leaving Steam stopped for manual repair.
+            # Class name only: the message may carry private paths, which
+            # stay out of ledger details and broker output.
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail=f"content adapter error: {error.__class__.__name__}",
+                message="content adapter failed before completing",
+            )
         # Restore the client before recording a terminal state: a crash in
         # between then leaves a non-terminal row that reconciliation still
         # owns, instead of a terminal row with the client silently stopped.
@@ -562,24 +574,50 @@ class Executor:
     def _owned_marker(self, appid: int) -> Path:
         return self._state_dir / "owned" / f"{appid}.json"
 
-    def _owned_dir_claim(self, appid: int) -> str | None:
+    def _marker_owns_target(
+        self, appid: int, install_dir_name: str, target: Path
+    ) -> bool:
         try:
             record = json.loads(
                 self._owned_marker(appid).read_text(encoding="utf-8")
             )
         except (OSError, ValueError):
-            return None
+            return False
         if not isinstance(record, dict):
-            return None
+            return False
         name = record.get("install_dir_name")
-        return name if isinstance(name, str) else None
+        if not isinstance(name, str) or name.casefold() != install_dir_name.casefold():
+            return False
+        # Bound to the recorded directory inode, not just the name: a
+        # partial dir the user removed and replaced with unrelated content
+        # at the same path must not inherit the marker's vouching.
+        try:
+            current = os.lstat(target)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == (
+            record.get("dev"),
+            record.get("ino"),
+        )
 
-    def _record_owned_dir(self, appid: int, install_dir_name: str) -> None:
+    def _record_owned_dir(
+        self, appid: int, install_dir_name: str, target: Path
+    ) -> None:
+        # Create the directory ourselves (steamcmd accepts an existing one)
+        # so the marker can bind to its inode identity from the start.
+        target.mkdir(parents=True, exist_ok=True)
+        identity = os.lstat(target)
         marker = self._owned_marker(appid)
         marker.parent.mkdir(parents=True, exist_ok=True)
         _durable_write(
             marker,
-            json.dumps({"install_dir_name": install_dir_name}).encode("utf-8"),
+            json.dumps(
+                {
+                    "install_dir_name": install_dir_name,
+                    "dev": identity.st_dev,
+                    "ino": identity.st_ino,
+                }
+            ).encode("utf-8"),
         )
 
     def _restore_client(self, prior_running: bool | None) -> bool:
@@ -736,6 +774,10 @@ class Executor:
                     not post_stop.all_clear()
                     or post_stop.client_running != "pass"
                 ):
+                    # The stop succeeded; a transient probe error or newly
+                    # active gate must not leave a previously running client
+                    # stopped across deferrals.
+                    restore()
                     actions.append(
                         f"{operation_id}: lease regressed during stop;"
                         " adoption reconcile deferred"
