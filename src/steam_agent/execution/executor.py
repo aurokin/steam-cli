@@ -169,10 +169,27 @@ class Executor:
             # recoverable-update contract (ADR 0027 clause 5): steamcmd
             # validates and repairs content on retry, and failure cost is
             # bounded at temporary unplayability, never a second full copy.
-            existing = manifest_install_dir(
+            own_manifest = (
                 self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
             )
-            install_dir_name = existing or f"app_{operation.appid}"
+            if own_manifest.exists():
+                existing = manifest_install_dir(own_manifest)
+                if existing is None:
+                    # An install exists but its directory is unknowable;
+                    # falling back to app_<appid> would orphan it.
+                    ledger.transition(
+                        operation_id,
+                        "aborted",
+                        detail="existing manifest unreadable",
+                    )
+                    return ExecutionReport(
+                        operation_id,
+                        "aborted",
+                        "existing manifest for this title is unreadable",
+                    )
+                install_dir_name = existing
+            else:
+                install_dir_name = f"app_{operation.appid}"
         if not safe_install_dir_name(install_dir_name):
             ledger.transition(
                 operation_id, "aborted", detail="unsafe install_dir_name"
@@ -226,7 +243,9 @@ class Executor:
                     "aborted",
                     "another title's manifest is unreadable; collision unprovable",
                 )
-            if other_dir == install_dir_name:
+            # Casefolded: a case-insensitive library filesystem (exFAT)
+            # aliases names that differ only by case.
+            if other_dir.casefold() == install_dir_name.casefold():
                 ledger.transition(
                     operation_id,
                     "aborted",
@@ -236,6 +255,39 @@ class Executor:
                     operation_id,
                     "aborted",
                     "install_dir_name belongs to another installed title",
+                )
+
+        if target.exists():
+            # A fresh operation may reuse an existing directory only with
+            # ownership evidence: steamcmd's own manifest from a prior
+            # attempt, the client manifest for this AppID naming it, or an
+            # empty directory.  Anything else (orphaned, manually managed)
+            # must not be written over.
+            own_library_dir = manifest_install_dir(
+                self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
+            )
+            try:
+                owned = (
+                    locate_manifest(install_dir=target, appid=operation.appid)
+                    is not None
+                    or (
+                        own_library_dir is not None
+                        and own_library_dir.casefold() == install_dir_name.casefold()
+                    )
+                    or not any(target.iterdir())
+                )
+            except OSError:
+                owned = False
+            if not owned:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="existing target directory not owned by this title",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "existing target directory is not owned by this title",
                 )
 
         gates = self._session.gates()
@@ -442,6 +494,12 @@ class Executor:
 
     def _restore_note(self, prior_running: bool | None) -> str:
         return "" if self._restore_client(prior_running) else "; client restore failed"
+
+    def release_client(self, operation_id: int) -> bool:
+        """Best-effort prior-client restoration for out-of-band aborts."""
+
+        operation = self._ledger.get(operation_id)
+        return self._restore_client(operation.prior_client_running)
 
     def _verified_outcome(self, appid: int) -> tuple[str, str]:
         """Manifest-evidence verdict shared by execution and reconciliation."""

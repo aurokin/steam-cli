@@ -89,6 +89,12 @@ class LinuxSession:
 
     # -- probes -----------------------------------------------------------
 
+    @staticmethod
+    def _pgrep(*arguments: str) -> list[str]:
+        # Scope to the invoking user: another user's Steam is neither
+        # stoppable nor relevant to this session's lifecycle.
+        return ["pgrep", "-U", str(os.getuid()), *arguments]
+
     def _absent(self, pattern: list[str]) -> GateState:
         result = self._run(pattern)
         if result.returncode == 0:
@@ -140,7 +146,7 @@ class LinuxSession:
             except OSError:
                 download_state = "unknown"
 
-        client = self._run(["pgrep", "-x", "steam"])
+        client = self._run(self._pgrep("-x", "steam"))
         client_state: GateState
         if client.returncode == 0:
             client_state = "fail"
@@ -151,8 +157,8 @@ class LinuxSession:
 
         return LeaseGates(
             # 15-char comm limit: match full command lines (Phase 0 finding).
-            game_running=self._absent(["pgrep", "-f", "reaper SteamLaunch"]),
-            remote_play=self._absent(["pgrep", "-f", "[s]treaming_client"]),
+            game_running=self._absent(self._pgrep("-f", "reaper SteamLaunch")),
+            remote_play=self._absent(self._pgrep("-f", "[s]treaming_client")),
             download_in_flight=download_state,
             client_running=client_state,
         )
@@ -160,17 +166,17 @@ class LinuxSession:
     def client_running(self) -> bool:
         """Proof of presence (rc 0 only); used to confirm a started client."""
 
-        return self._run(["pgrep", "-x", "steam"]).returncode == 0
+        return self._run(self._pgrep("-x", "steam")).returncode == 0
 
     def client_possibly_running(self) -> bool:
         """Fail-closed presence: anything but an explicit no-match counts."""
 
-        return self._run(["pgrep", "-x", "steam"]).returncode != 1
+        return self._run(self._pgrep("-x", "steam")).returncode != 1
 
     def steamcmd_running(self) -> bool:
         """Fail-closed: a probe error must defer resume, not permit it."""
 
-        return self._run(["pgrep", "-f", "steamcmd"]).returncode != 1
+        return self._run(self._pgrep("-f", "steamcmd")).returncode != 1
 
     # -- lifecycle --------------------------------------------------------
 
@@ -180,8 +186,8 @@ class LinuxSession:
         self._run(["steam", "-shutdown"])
         deadline = time.monotonic() + _SHUTDOWN_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            steam = self._run(["pgrep", "-x", "steam"]).returncode
-            helper = self._run(["pgrep", "-x", "steamwebhelper"]).returncode
+            steam = self._run(self._pgrep("-x", "steam")).returncode
+            helper = self._run(self._pgrep("-x", "steamwebhelper")).returncode
             # pgrep: 1 means no match; anything else nonzero is a probe
             # error and must not count as proof the tree exited.
             if steam == 1 and helper == 1:

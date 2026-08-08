@@ -312,6 +312,14 @@ def main(argv: list[str] | None = None) -> int:
             operation.state in {"authorized", "interrupted"}
             and policy.grant_for(operation.operation) != "confirm"
         ):
+            # An interrupted operation may have left the client stopped;
+            # restore before terminalizing (terminal rows are invisible to
+            # reconciliation) and leave the state for retry if that fails.
+            if not executor.release_client(operation_id):
+                return _fail(
+                    f"policy now denies {operation.operation!r};"
+                    " client restore failed; operation left for reconcile"
+                )
             ledger.transition(
                 operation_id, "aborted", detail="policy revoked before execution"
             )

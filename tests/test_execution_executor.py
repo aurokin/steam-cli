@@ -381,6 +381,41 @@ def test_install_dir_claimed_by_other_title_aborts(harness) -> None:
     assert "another installed title" in report.detail
 
 
+def test_case_aliased_install_dir_collision_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_999.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"999"\n\t"installdir"\t\t"spacewar"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger)  # plan says "Spacewar"
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "another installed title" in report.detail
+
+
+def test_unowned_existing_target_directory_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    stray = library / "steamapps" / "common" / "Spacewar"
+    stray.mkdir(parents=True)
+    (stray / "somefile.bin").write_text("data", encoding="utf-8")
+
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "not owned" in report.detail
+
+
+def test_unreadable_own_manifest_blocks_fallback(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"480"\n}\n', encoding="utf-8"  # no installdir
+    )
+    operation_id = _authorized(ledger, install_dir_name="")
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "unreadable" in report.detail
+
+
 def test_stop_failure_attempts_client_restore(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.stop_ok = False
