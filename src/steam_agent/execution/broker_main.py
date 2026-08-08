@@ -43,6 +43,8 @@ from steam_agent.execution.policy import (
 )
 
 _SUPPORTED_OPERATIONS = frozenset({"install"})
+# Generous for a plan (well under a page of JSON in practice).
+_PLAN_BYTE_LIMIT = 64 * 1024
 
 
 def _default_state_dir() -> Path:
@@ -223,8 +225,14 @@ def main(argv: list[str] | None = None) -> int:
             policy = load_policy(state_dir / "policy.toml")
         except PolicyError as error:
             return _fail(str(error))
+        # Bounded read across the trust boundary: the whole plan (unknown
+        # fields included) is later persisted into the ledger, so an
+        # unbounded stream could exhaust memory or state-disk space.
+        raw_plan = sys.stdin.read(_PLAN_BYTE_LIMIT + 1)
+        if len(raw_plan) > _PLAN_BYTE_LIMIT:
+            return _fail("operation plan exceeds the size limit")
         try:
-            plan = json.load(sys.stdin)
+            plan = json.loads(raw_plan)
         except json.JSONDecodeError:
             return _fail("stdin is not a JSON operation plan")
         if not isinstance(plan, dict):

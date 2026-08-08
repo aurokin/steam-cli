@@ -24,6 +24,7 @@ from steam_agent.execution.content_plane import (
     adopt_manifest,
     clear_adoption_journal,
     locate_manifest,
+    manifest_appid,
     manifest_install_dir,
     manifest_state_flags,
     reconcile_adoption,
@@ -65,6 +66,10 @@ def safe_install_dir_name(name: str) -> bool:
 
 class ExecutorLockedError(RuntimeError):
     """Another executor process holds the machine lock."""
+
+
+class _TargetEscapedError(OSError):
+    """The install target left library containment after the pre-checks."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +431,15 @@ class Executor:
                 install_dir=target,
                 operation_id=operation_id,
             )
+        except _TargetEscapedError:
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="install target escaped containment during stop",
+                message="install target changed during client stop",
+                outcome="aborted",
+                to_state="aborted",
+            )
         except OSError as error:
             # The adapter can raise outside steamcmd itself (unwritable log
             # dir, full disk); the promised client run-state must still be
@@ -464,6 +478,16 @@ class Executor:
                 prior_running,
                 detail="no steamcmd-written manifest",
                 message="steamcmd produced no manifest",
+            )
+        # Filename alone is not proof: a stale or malformed file left at
+        # appmanifest_<appid>.acf could carry another title's body, and
+        # adopting it would confirm the wrong manifest.
+        if manifest_appid(source) != operation.appid:
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="manifest appid mismatch",
+                message="steamcmd manifest does not match the requested appid",
             )
 
         # steamcmd can run for up to 30 minutes; re-check the full lease and
@@ -630,12 +654,29 @@ class Executor:
             record.get("ino"),
         )
 
+    def _target_contained(self, target: Path) -> bool:
+        try:
+            return not target.is_symlink() and target.resolve().is_relative_to(
+                self._library.resolve()
+            )
+        except OSError:
+            return False
+
     def _record_owned_dir(
         self, appid: int, install_dir_name: str, target: Path
     ) -> None:
+        # Re-check containment HERE, not only at intake: the client stop
+        # between the pre-checks and this write can take up to a minute, and
+        # a symlink planted at common/ (or the target) in that window would
+        # be followed by mkdir.  Checked again after creation so a racing
+        # replacement cannot slip between the check and the mkdir.
+        if not self._target_contained(target):
+            raise _TargetEscapedError(target.name)
         # Create the directory ourselves (steamcmd accepts an existing one)
         # so the marker can bind to its inode identity from the start.
         target.mkdir(parents=True, exist_ok=True)
+        if not self._target_contained(target):
+            raise _TargetEscapedError(target.name)
         identity = os.lstat(target)
         marker = self._owned_marker(appid)
         marker.parent.mkdir(parents=True, exist_ok=True)

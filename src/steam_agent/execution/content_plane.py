@@ -158,7 +158,11 @@ class SteamcmdAdapter:
                     process.kill()
                 out, err = process.communicate()
             returncode = process.returncode
-            output = _captured_text(out) + _captured_text(err)
+            # Explicit separator: without one, a stdout tail lacking its
+            # newline would merge with stderr's first line, and a recognized
+            # marker could smuggle an unrecognized (unredactable) line past
+            # the log filter below.
+            output = _captured_text(out) + "\n" + _captured_text(err)
         # Classify on the raw output first: redaction could mangle a marker
         # (an account alias like "all" is a substring of "fully installed").
         # Success additionally requires a clean exit: output text alone must
@@ -204,6 +208,15 @@ def locate_manifest(*, install_dir: Path, appid: int) -> Path | None:
 
     candidate = install_dir / "steamapps" / f"appmanifest_{appid}.acf"
     return candidate if candidate.is_file() else None
+
+
+def manifest_appid(manifest: Path) -> int | None:
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r'"appid"\s+"(\d+)"', text)
+    return None if match is None else int(match.group(1))
 
 
 def manifest_install_dir(manifest: Path) -> str | None:

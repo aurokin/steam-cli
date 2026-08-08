@@ -148,6 +148,15 @@ def test_reconcile_works_despite_broken_policy(state_dir: Path, capsys) -> None:
     assert "actions" in capsys.readouterr().out
 
 
+def test_oversized_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["padding"] = "x" * (64 * 1024)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "size limit" in capsys.readouterr().err
+
+
 def test_non_object_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     monkeypatch.setattr("sys.stdin", io.StringIO('"just a string"'))

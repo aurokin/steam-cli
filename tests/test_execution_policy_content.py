@@ -237,13 +237,14 @@ def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: str | bytes) -> None:
+    def __init__(self, stdout: str | bytes, stderr: str = "") -> None:
         self.pid = 4242
         self.returncode = 0
         self._stdout = stdout
+        self._stderr = stderr
 
     def communicate(self, timeout=None):
-        return self._stdout, ""
+        return self._stdout, self._stderr
 
 
 def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> None:
@@ -276,6 +277,38 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     assert "76561199000000001" not in log
     assert "76561200000000000" not in log  # beyond the 7656119 prefix
     assert "<account>" in log and "<steamid>" in log
+
+
+def test_stderr_never_merges_into_a_recognized_stdout_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import subprocess
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    # stdout ends without a newline on a recognized marker; stderr starts
+    # with an unrecognized private line.  Merged, the marker would smuggle
+    # the private line past the allowlist filter.
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            "Success! App '480' fully installed.",
+            "/home/someuser/.secret-place diagnostic",
+        ),
+    )
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+    )
+    result = adapter.install(
+        account="o", appid=480, install_dir=tmp_path / "i", operation_id=1
+    )
+    assert result.outcome == "installed"
+    log = result.log_path.read_text(encoding="utf-8")
+    assert ".secret-place" not in log
+    assert "1 unrecognized line(s) omitted" in log
 
 
 def test_locale_invalid_output_still_classifies(tmp_path: Path, monkeypatch) -> None:

@@ -538,6 +538,48 @@ def test_resume_with_replaced_target_directory_aborts(harness) -> None:
     assert "not owned" in report.detail
 
 
+def test_common_replaced_during_stop_aborts(harness) -> None:
+    ledger, session, _, executor, library = harness
+    outside = library.parent / "outside"
+    outside.mkdir()
+    original_stop = session.stop_client
+
+    def stop_and_plant() -> bool:
+        result = original_stop()
+        (library / "steamapps" / "common").symlink_to(outside)
+        return result
+
+    session.stop_client = stop_and_plant
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "changed during" in report.detail
+    assert not (outside / "Spacewar").exists()  # nothing written outside
+
+
+def test_manifest_with_wrong_appid_is_not_adopted(harness) -> None:
+    ledger, _, content, executor, library = harness
+
+    def install_stale_manifest(*, account, appid, install_dir, operation_id):
+        manifest_dir = install_dir / "steamapps"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / f"appmanifest_{appid}.acf").write_text(
+            _MANIFEST.replace('"480"', '"999"'), encoding="utf-8"
+        )
+        from steam_agent.execution.content_plane import ContentResult
+
+        log = install_dir / "fake.log"
+        log.write_text("log", encoding="utf-8")
+        return ContentResult(outcome="installed", log_path=log)
+
+    content.install = install_stale_manifest
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "does not match" in report.detail
+    assert not (library / "steamapps" / "appmanifest_480.acf").exists()
+
+
 def test_adoption_filesystem_error_fails_cleanly(harness) -> None:
     ledger, session, _, executor, _ = harness
     executor._journal_dir.parent.mkdir(parents=True, exist_ok=True)
