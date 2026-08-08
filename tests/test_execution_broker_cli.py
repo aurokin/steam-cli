@@ -138,6 +138,17 @@ def test_malformed_appid_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     assert "appid" in capsys.readouterr().err
 
 
+def test_non_string_install_dir_name_rejected(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["install_dir_name"] = 123
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "string" in capsys.readouterr().err
+
+
 def test_foreign_machine_id_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     plan = json.loads(_plan())

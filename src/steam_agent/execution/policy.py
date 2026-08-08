@@ -60,7 +60,7 @@ def load_policy(path: Path) -> ExecutionPolicy:
         allowed = SUPPORTED_GRANTS.get(key)
         if allowed is None:
             raise PolicyError(f"unsupported grant key {key!r}")
-        if value not in allowed:
+        if not isinstance(value, str) or value not in allowed:
             raise PolicyError(f"unsupported grant value {value!r} for {key!r}")
         grants[key] = value
 

@@ -13,7 +13,6 @@ from dataclasses import dataclass
 import fcntl
 import hashlib
 from pathlib import Path
-import tempfile
 from typing import Literal
 
 from steam_agent.execution.content_plane import (
@@ -87,7 +86,9 @@ class Executor:
         library_key = hashlib.sha256(
             str(self._library.resolve()).encode("utf-8")
         ).hexdigest()[:16]
-        lock_path = Path(tempfile.gettempdir()) / f"steam-broker-{library_key}.lock"
+        # Fixed /tmp, not tempfile.gettempdir(): TMPDIR is caller-controlled
+        # and a per-process value would defeat cross-broker serialization.
+        lock_path = Path("/tmp") / f"steam-broker-{library_key}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("w")
         try:
@@ -124,7 +125,14 @@ class Executor:
 
         plan = ledger.plan_document(operation_id)
         raw_name = plan.get("install_dir_name")
-        install_dir_name = "" if raw_name is None else str(raw_name)
+        if raw_name is not None and not isinstance(raw_name, str):
+            ledger.transition(
+                operation_id, "aborted", detail="unsafe install_dir_name"
+            )
+            return ExecutionReport(
+                operation_id, "aborted", "install_dir_name must be a string"
+            )
+        install_dir_name = raw_name or ""
         if not install_dir_name:
             # Prefer the directory the client already uses for this AppID:
             # inventing a new one would re-download and orphan the install.

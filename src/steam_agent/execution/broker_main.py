@@ -174,10 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(target, dict):
             return _fail("plan target is malformed")
         install_dir_name = plan.get("install_dir_name")
-        if install_dir_name is not None and not safe_install_dir_name(
-            str(install_dir_name)
+        if install_dir_name is not None and (
+            not isinstance(install_dir_name, str)
+            or not safe_install_dir_name(install_dir_name)
         ):
-            return _fail("install_dir_name must be a single path component")
+            return _fail("install_dir_name must be a string path component")
         appid = target.get("appid")
         # A JSON integer only: int() would silently coerce 480.9 or true
         # into a different AppID than the plan the human confirms.

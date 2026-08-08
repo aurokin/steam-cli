@@ -48,6 +48,11 @@ def test_policy_unattended_value_fails_closed(tmp_path: Path) -> None:
         )
 
 
+def test_policy_composite_value_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError):
+        load_policy(_write_policy(tmp_path, '[grants]\ninstall = ["confirm"]\n'))
+
+
 def test_policy_missing_grant_is_deny(tmp_path: Path) -> None:
     policy = load_policy(_write_policy(tmp_path, "[grants]\n"))
     assert policy.grant_for("install") == "deny"
