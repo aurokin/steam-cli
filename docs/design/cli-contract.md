@@ -648,7 +648,25 @@ completion time unknown. Hard gates precede preference evidence.
 
 Plans return inert `operation-plan/0.1` data with bounded expiry, deterministic
 identity, preconditions, risks, interactive-human-only confirmation, official
-HTTPS references, rollback guidance, and unknown postconditions. Move requires
+references, rollback guidance, and unknown postconditions.
+
+`human_open_references` stay exactly what schema `0.1` fixed: official HTTPS
+pages under the closed `product_page | support_page` purposes, inert to open.
+
+`uninstall` plans add one `ui_instructions` step offering the Steam client
+shortcut `steam://uninstall/<appid>`, because uninstall is the one operation
+this project will never execute (Phase 0 proved steamcmd cannot uninstall
+consumer titles) and the human finishes it inside Steam. It is instruction
+text for a person, deliberately not a typed reference: activating a
+`steam://` URI hands work to the local client rather than opening a page.
+Nothing here opens it, an agent that invokes it has crossed the ADR 0013
+execution boundary, and the CLI cannot confirm the client honors the URI
+because confirming it would mean invoking it — treat it as an unverified
+convenience, not a tested contract. No other operation offers one:
+`steam://install/` and `steam://rungameid/` start work immediately, whereas
+`steam://uninstall/` opens a dialog the human still confirms.
+
+Move requires
 exactly one destination ordinal from 1 through 1024; every other operation
 rejects that option. The command does not open a URL or Steam URI, spawn a
 process, access a client, modify files, or claim completion.

@@ -137,6 +137,23 @@ _SUPPORT_URLS: dict[str, str] = {
     "verify": "https://help.steampowered.com/en/faqs/view/0C48-FCBD-DA71-93EB",
 }
 
+# Client URI shortcuts offered to the human as instruction text, for the
+# operations this project will never execute itself.  Uninstall is the
+# deliberate case (owner decision 2026-08-08): steamcmd cannot uninstall
+# consumer titles, so the human finishes inside Steam and this saves them
+# the navigation.  These are NOT human_open_references: those are inert
+# HTTPS pages under schema 0.1, and a steam:// URI performs work when
+# activated.  Only URIs whose activation still requires the human to
+# confirm in a Steam dialog belong here — never steam://install or
+# steam://rungameid, which start work immediately.
+_CLIENT_URI_STEPS: dict[str, str] = {
+    "uninstall": (
+        "Shortcut: open steam://uninstall/{appid} and confirm in the dialog"
+        " Steam presents. This CLI never opens it and cannot confirm the"
+        " client honors it."
+    ),
+}
+
 
 def _bounded_int(value: object, *, name: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
@@ -199,6 +216,15 @@ class ConfirmationRequirement:
 
 @dataclass(frozen=True, slots=True)
 class HumanOpenReference:
+    """A reference returned for a human to open; never invoked here.
+
+    Every reference is an official HTTPS page, inert to open.  The Steam
+    client URI that uninstall plans offer is deliberately NOT a reference:
+    activating it hands work to the local client rather than opening a page,
+    and schema ``0.1`` fixes both this shape and the ``purpose`` enum.  It
+    travels as human instruction text instead (see ``_UI_INSTRUCTIONS``).
+    """
+
     purpose: Literal["product_page", "support_page"]
     url: str
     return_url: Literal[True] = True
@@ -305,7 +331,7 @@ def build_operation_plan(
         precondition_summary=summary,
         risks=risks,
         confirmation=ConfirmationRequirement(),
-        ui_instructions=_UI_INSTRUCTIONS[operation],
+        ui_instructions=_ui_instructions(operation, normalized_appid),
         human_open_references=(
             HumanOpenReference(
                 "product_page",
@@ -319,6 +345,14 @@ def build_operation_plan(
         rollback=_ROLLBACK[operation],
         postconditions=postconditions,
     )
+
+
+def _ui_instructions(operation: str, appid: int) -> tuple[str, ...]:
+    steps = _UI_INSTRUCTIONS[operation]
+    shortcut = _CLIENT_URI_STEPS.get(operation)
+    if shortcut is None:
+        return steps
+    return (*steps, shortcut.format(appid=appid))
 
 
 def _normalize_preconditions(

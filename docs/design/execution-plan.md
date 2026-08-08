@@ -347,8 +347,14 @@ and hands over an inert plan. Move's source cleanup inherits this: see §10.
   2b repair, 2c launch allowlist (dispatched-terminal), 2d move-by-reinstall
   (composite of §10; terminates `confirmed_with_residue`, human source
   cleanup).
-- **Phase 3 — scheduler**: maintenance windows, overnight cycles, per-day
-  byte budgets, per-appid grant scoping. (Standing grants shipped early as
+- **Phase 3 — unattended policy limits** (owner decision 2026-08-08:
+  scheduling machinery is explicitly out of scope for this project). The
+  loop that decides when to act — walking the backlog, picking a moment,
+  invoking the CLI — belongs to the owner's agent and its own scheduler,
+  which needs no code here. This project ships only the limits that must be
+  *enforced at authorization*, because a confused or injected driver must
+  not be able to talk its way past them: maintenance windows, per-day byte
+  budgets, and per-appid grant scoping. (Standing grants shipped early as
   ADR 0028's `allow`; the kill switch already exists as
   `install = "deny"`.) Then second-OS port behind its own gate.
 - **Phase last (ideally never)** — move / cold-file surgery ADR.
