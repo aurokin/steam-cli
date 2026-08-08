@@ -266,6 +266,15 @@ def main(argv: list[str] | None = None) -> int:
             or not safe_install_dir_name(install_dir_name)
         ):
             return _fail("install_dir_name must be a string path component")
+        idempotency_key = plan.get("idempotency_key")
+        # A string only, with sane bounds: a missing/empty key would let a
+        # keyless plan execute and then permanently poison the ledger's
+        # unique key index; non-strings (1 vs "1") would collapse distinct
+        # plans into one key.
+        if not isinstance(idempotency_key, str) or not (
+            8 <= len(idempotency_key) <= 128
+        ):
+            return _fail("plan idempotency_key must be a string of 8-128 characters")
         appid = target.get("appid")
         # A JSON integer only: int() would silently coerce 480.9 or true
         # into a different AppID than the plan the human confirms.  Steam
@@ -292,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
             ledger, _ = _components(state_dir)
             try:
                 operation_id, nonce = ledger.request(
-                    plan_key=str(plan.get("idempotency_key", "")),
+                    plan_key=idempotency_key,
                     plan_document=json.dumps(plan, sort_keys=True),
                     operation=operation,
                     appid=appid,

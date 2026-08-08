@@ -897,6 +897,26 @@ def test_window_lapse_during_stop_skips_content(harness, monkeypatch) -> None:
     assert session.starts == 1  # prior run-state restored
 
 
+def test_library_mount_change_during_download_skips_adoption(
+    harness, monkeypatch
+) -> None:
+    ledger, session, content, executor, _ = harness
+    original_install = content.install
+
+    def install_and_remount(**kwargs):
+        result = original_install(**kwargs)
+        # The external library was unmounted/replaced during the download.
+        monkeypatch.setattr(executor, "_library_on_device", lambda _d: False)
+        return result
+
+    content.install = install_and_remount
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "mount changed" in report.detail
+    assert session.starts == 1  # prior run-state restored
+
+
 def test_gate_regression_during_download_skips_adoption(harness) -> None:
     ledger, session, content, executor, _ = harness
     original_install = content.install

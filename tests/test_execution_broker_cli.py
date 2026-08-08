@@ -180,6 +180,23 @@ def test_empty_install_dir_name_accepted_as_unspecified(
     assert json.loads(capsys.readouterr().out)["state"] == "pending_confirmation"
 
 
+def test_missing_idempotency_key_rejected(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    for bad in (None, "", "short", 123):
+        plan = json.loads(_plan())
+        if bad is None:
+            del plan["idempotency_key"]
+        else:
+            plan["idempotency_key"] = bad
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+        assert (
+            main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+        )
+        assert "idempotency_key" in capsys.readouterr().err
+
+
 def test_oversized_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     plan = json.loads(_plan())

@@ -178,6 +178,18 @@ class Executor:
                 "aborted",
                 "library steamapps directory unavailable; deferred",
             )
+        # Capture the mount identity now: an external library unmounted (or
+        # replaced) later would make the lexical containment checks pass
+        # against a different volume.  Revalidated before content starts,
+        # in the steamcmd abort poll, and before adoption.
+        try:
+            library_device = os.lstat(self._library / "steamapps").st_dev
+        except OSError:
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "library steamapps directory unavailable; deferred",
+            )
 
         plan = ledger.plan_document(operation_id)
         raw_name = plan.get("install_dir_name")
@@ -430,6 +442,15 @@ class Executor:
                 outcome="aborted",
                 to_state="aborted",
             )
+        if not self._library_on_device(library_device):
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="library mount changed before content start",
+                message="library mount changed before content start",
+                outcome="aborted",
+                to_state="aborted",
+            )
 
         ledger.transition(
             operation_id,
@@ -455,6 +476,7 @@ class Executor:
                 abort_when=lambda: (
                     self._session.client_possibly_running()
                     or not ledger.window_valid(operation_id)
+                    or not self._library_on_device(library_device)
                 ),
             )
         except _TargetEscapedError:
@@ -530,6 +552,13 @@ class Executor:
         # steamcmd can run for up to 30 minutes; re-check the full lease and
         # re-assert the stopped client before touching steamapps/ — never
         # adopt under a live client or a lease that regressed.
+        if not self._library_on_device(library_device):
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="library mount changed during content run",
+                message="library mount changed during content run; adoption skipped",
+            )
         late_gates = self._session.gates()
         if not late_gates.all_clear():
             return self._finish_failure(
@@ -718,6 +747,12 @@ class Executor:
             record.get("dev"),
             record.get("ino"),
         )
+
+    def _library_on_device(self, device: int) -> bool:
+        try:
+            return os.lstat(self._library / "steamapps").st_dev == device
+        except OSError:
+            return False
 
     def _target_contained(self, target: Path) -> bool:
         try:
