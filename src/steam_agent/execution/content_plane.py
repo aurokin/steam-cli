@@ -413,6 +413,15 @@ def reconcile_adoption(
         # An unreadable journal proves nothing either way; the caller must
         # defer (restoring the client), never crash or destroy evidence.
         raise AdoptionError("adoption journal unreadable") from error
+    # The journal's paths must match this configuration exactly: a
+    # semantically corrupted (or foreign) journal must never aim the
+    # restore/unlink below at an arbitrary recorded path.
+    if destination != library / "steamapps" / f"appmanifest_{appid}.acf":
+        raise AdoptionError("adoption journal names an unexpected destination")
+    if record.get("backup") is not None and Path(
+        str(record["backup"])
+    ) != journal_dir / f"appmanifest_{appid}.acf.backup":
+        raise AdoptionError("adoption journal names an unexpected backup")
     if operation_id is not None and record.get("operation_id") != operation_id:
         # A prior operation's journal that survived only because its swap
         # already completed; discard it rather than let it vouch for this one.

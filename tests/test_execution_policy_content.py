@@ -192,6 +192,33 @@ def test_reconcile_client_rewritten_fresh_manifest_counts_completed(
     assert adopted.is_file()  # not unlinked
 
 
+def test_reconcile_foreign_destination_journal_rejected(tmp_path: Path) -> None:
+    import json as json_module
+
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    victim = tmp_path / "victim.acf"
+    victim.write_text("do not touch", encoding="utf-8")
+    # Valid JSON, but the destination points outside this configuration.
+    (journal_dir / "adoption-1902490.json").write_text(
+        json_module.dumps(
+            {
+                "appid": 1902490,
+                "destination": str(victim),
+                "checksum": "0" * 64,
+                "backup": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(AdoptionError):
+        reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
+    assert victim.read_text(encoding="utf-8") == "do not touch"
+
+
 def test_reconcile_corrupt_journal_raises_adoption_error(tmp_path: Path) -> None:
     from steam_agent.execution.content_plane import AdoptionError
 
