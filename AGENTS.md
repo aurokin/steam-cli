@@ -11,11 +11,18 @@ M1–M7 are accepted. Preserve their schema `0.1` contracts and safety boundarie
   `steam_agent.execution`.
 - Execution exists ONLY behind the `steam-agent-broker` entry point per
   [ADR 0027](docs/adr/0027-provisioned-execution.md) as re-scoped by
-  [ADR 0028](docs/adr/0028-trusted-manager-execution.md): install/update
-  plans, policy-gated authorization (grants `deny | confirm | allow` within
-  limits), ledger-first state transitions, fail-closed gates. Uninstall
-  stays human-in-Steam; store/market/wallet/credential operations are
-  hard-denied forever.
+  [ADR 0028](docs/adr/0028-trusted-manager-execution.md): policy-gated
+  authorization (grants `deny | confirm | allow` within limits),
+  ledger-first state transitions, fail-closed gates. Exactly three
+  executable classes, each granted independently — `install` (with update),
+  `verify` ([ADR 0030](docs/adr/0030-verify-as-a-second-executable-class.md)),
+  and `launch`, which additionally requires a per-AppID allowlist and
+  terminates `dispatched`
+  ([ADR 0031](docs/adr/0031-launch-allowlist-dispatched-terminal.md)).
+  Widening that set needs a new accepted ADR, not a code change. Uninstall
+  stays human-in-Steam and move ships as an inert plan
+  ([ADR 0029](docs/adr/0029-move-as-inert-plan.md));
+  store/market/wallet/credential operations are hard-denied forever.
 - Preserve the M1 last-good rule: partial or failed scans do not replace a
   complete installed projection.
 - Keep `unknown`, `false`, empty, inaccessible, and stale distinct. Separate

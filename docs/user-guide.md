@@ -194,14 +194,28 @@ is safe to uninstall, backed up, current, or downloadable on time. Plans are
 inert: they return official references and instructions but never open Steam,
 launch a process, change a file, or claim completion.
 
-## Execute an install or update with the broker
+## Execute an install, repair, or launch with the broker
 
 `steam-agent` never changes Steam. Execution lives in a second executable,
 `steam-agent-broker`, which runs on the machine it manages and is provisioned
 separately: installing the planner does not enable it. The full contract is in
 the [CLI contract](design/cli-contract.md); the decisions behind it are
 [ADR 0027](adr/0027-provisioned-execution.md) as re-scoped by
-[ADR 0028](adr/0028-trusted-manager-execution.md).
+[ADR 0028](adr/0028-trusted-manager-execution.md),
+[ADR 0030](adr/0030-verify-as-a-second-executable-class.md), and
+[ADR 0031](adr/0031-launch-allowlist-dispatched-terminal.md).
+
+Three operation classes are executable, each granted on its own — holding one
+never implies another:
+
+| Class | What it does | Note |
+| --- | --- | --- |
+| `install` | installs or updates a title | covers update; they share one mechanism |
+| `verify` | Valve's validate pass, the repair capability | replaces locally modified official files, so it removes mods over game content |
+| `launch` | asks the client to start one game | also needs the AppID on `[launch] allowed_appids` |
+
+Uninstall and move stay human-executed by decision, not by omission: the
+planner emits a plan and you finish in Steam.
 
 Provision it once, then grant an operation class:
 
@@ -224,7 +238,25 @@ steam-agent-broker status --limit 5
 Setting `install = "allow"` with a `[limits] min_free_gb` floor authorizes
 qualifying requests automatically, so the loop shortens to `request` then
 `run`. Setting `install = "deny"` is the kill switch: it refuses new requests
-and stops any authorized operation that has not started.
+and stops any authorized operation that has not started. The same three
+values apply to `verify` and `launch`.
+
+`launch` needs two permissions rather than one — the grant, and the AppID on
+the allowlist:
+
+```toml
+[grants]
+launch = "confirm"
+
+[launch]
+allowed_appids = [480]
+```
+
+A launch grant with no allowlist is refused rather than read as "any game",
+and removing an AppID revokes it exactly as flipping the grant does. A launch
+ends at `dispatched`: the client accepted the request. The broker does not
+watch whether the game became playable, because a process cannot be told
+apart from a hung launcher or a DRM prompt.
 
 Three behaviors matter when scripting against it. A `deferred` outcome means
 no content work completed and the same operation is still authorized, so retry

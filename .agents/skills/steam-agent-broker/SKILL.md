@@ -1,6 +1,6 @@
 ---
 name: steam-agent-broker
-description: Install or update owned Steam titles on a machine this checkout provisions, using the `steam-agent-broker` execution CLI. Use when the user asks to actually install, update, or re-acquire a game, to check what an execution attempt did, or to recover an interrupted operation. Do not use for library questions, rankings, or plans — those are read-only and belong to the `steam-agent` skill.
+description: Install, update, repair, or launch owned Steam titles on a machine this checkout provisions, using the `steam-agent-broker` execution CLI. Use when the user asks to actually install, update, re-acquire, verify/repair, or start a game, to check what an execution attempt did, or to recover an interrupted operation. Do not use for library questions, rankings, or plans — those are read-only and belong to the `steam-agent` skill.
 ---
 
 # Execute with Steam Agent Broker
@@ -23,10 +23,23 @@ for why the boundaries are where they are.
 2. If the broker is not initialized, say so and stop. Provisioning it
    (`init --library ... --steamcmd ...`) is an owner decision, not a step to
    take on the user's behalf.
-3. Only `install` is executable, and it covers updates of the same title.
-   Uninstall, move, launch, repair, and anything touching the store, market,
-   wallet, credentials, or account settings are not implemented. Do not
-   attempt them by other means — no direct `steamcmd` calls, no editing
+3. Three classes are executable, each granted independently in the policy
+   file — holding one never implies another. Check `policy` output rather
+   than assuming:
+   - `install` — installs or updates the same title.
+   - `verify` — Valve's validate pass, the repair capability. It replaces
+     locally modified official files, so it removes mods installed over game
+     content. Say that before running it on a title the user may have
+     modded. It repairs an existing install and refuses a title that is not
+     installed.
+   - `launch` — asks the client to start one game. It additionally requires
+     the AppID in `[launch] allowed_appids`; a refusal there is the owner's
+     recorded intent, not an error to work around.
+4. Uninstall and move are planned by `steam-agent` and finished by a human in
+   Steam — that is a decision, not a gap, so offer the plan rather than
+   apologizing for a missing feature. Anything touching the store, market,
+   wallet, credentials, or account settings does not exist. Do not attempt
+   any of it by other means — no direct `steamcmd` calls, no editing
    `appmanifest` files, no deleting game directories.
 
 ## Run an operation
@@ -72,6 +85,10 @@ backgrounding it and polling `steam-agent-broker status --limit 5`.
   flight, unknown client state), but one reports that state was left for
   reconcile, meaning a client the broker stopped may still be stopped. Run
   `reconcile` when the detail says so, and tell the user Steam may be down.
+- `dispatched` — launch only, and terminal. The client accepted the request;
+  that is the entire claim. Do not report the game as running or playable,
+  and do not go looking for a process to upgrade the claim — a process
+  cannot be told apart from a hung launcher or a DRM prompt.
 - `aborted`, `failed`, `unconfirmed`, `contradicted` — terminal. Report what
   the detail says; a new attempt needs a new plan with a fresh key.
 - `auth_required` — steamcmd needs an interactive Steam Guard login from the
