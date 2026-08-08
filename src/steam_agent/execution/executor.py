@@ -262,6 +262,10 @@ class Executor:
                 f"lease gates regressed before adoption; adoption skipped{note}",
             )
         if self._session.client_possibly_running() and not self._session.stop_client():
+            # The failed stop may still have killed the main process (helper
+            # lingering, probe error): attempt restoration before going
+            # terminal so the prior run-state is not silently lost.
+            note = self._restore_note(prior_running)
             ledger.transition(
                 operation_id,
                 "failed",
@@ -270,7 +274,7 @@ class Executor:
             return ExecutionReport(
                 operation_id,
                 "failed",
-                "client restarted mid-operation; adoption skipped",
+                f"client restarted mid-operation; adoption skipped{note}",
             )
 
         ledger.transition(operation_id, "adopting")

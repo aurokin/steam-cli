@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 from typing import Literal
 
@@ -33,6 +34,14 @@ class AdoptionError(RuntimeError):
     """Manifest adoption could not be completed or rolled back cleanly."""
 
 
+def _fsync_dir(directory: Path) -> None:
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _durable_write(path: Path, data: bytes) -> None:
     """Atomic and power-loss durable: fsync the file, rename, fsync the dir."""
 
@@ -42,11 +51,7 @@ def _durable_write(path: Path, data: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(path)
-    directory_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    _fsync_dir(path.parent)
 
 
 def _captured_text(captured: str | bytes | None) -> str:
@@ -103,20 +108,30 @@ class SteamcmdAdapter:
         ]
         environment = dict(os.environ, HOME=str(self._home))
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 argv,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
+                text=True,
                 env=environment,
+                start_new_session=True,
             )
-            output = completed.stdout + completed.stderr
-        except subprocess.TimeoutExpired as error:
-            output = _captured_text(error.stdout) + _captured_text(error.stderr)
         except OSError as error:
             output = f"steamcmd unavailable: {error}"
+        else:
+            try:
+                out, err = process.communicate(timeout=self._timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the whole session group: the configured script wraps
+                # the real steamcmd binary, and killing only the leader
+                # would leave a live writer in the install directory.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    process.kill()
+                out, err = process.communicate()
+            output = _captured_text(out) + _captured_text(err)
         # Classify on the raw output first: redaction could mangle a marker
         # (an account alias like "all" is a substring of "fully installed").
         if _AUTH_FAILURE.search(output):
@@ -232,6 +247,7 @@ def clear_adoption_journal(*, appid: int, journal_dir: Path) -> None:
     """Retire the journal once its swap is durably complete."""
 
     (journal_dir / f"adoption-{appid}.json").unlink(missing_ok=True)
+    _fsync_dir(journal_dir)
 
 
 def reconcile_adoption(
@@ -259,12 +275,19 @@ def reconcile_adoption(
         current = hashlib.sha256(destination.read_bytes()).hexdigest()
         if current == checksum:
             journal_path.unlink()
+            _fsync_dir(journal_dir)
             return "completed"
     backup_value = record.get("backup")
+    # The restored manifest must be durable before the journal disappears:
+    # losing the journal while the restore is still in the page cache would
+    # leave no recovery record for the next pass.
     if backup_value is not None and Path(str(backup_value)).is_file():
-        destination.write_bytes(Path(str(backup_value)).read_bytes())
+        _durable_write(destination, Path(str(backup_value)).read_bytes())
         journal_path.unlink()
+        _fsync_dir(journal_dir)
         return "restored"
     destination.unlink(missing_ok=True)
+    _fsync_dir(destination.parent)
     journal_path.unlink()
+    _fsync_dir(journal_dir)
     return "restored"

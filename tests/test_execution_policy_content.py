@@ -179,22 +179,30 @@ def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
     assert not (journal_dir / "adoption-1902490.json").exists()
 
 
+class _FakeProcess:
+    def __init__(self, stdout: str) -> None:
+        self.pid = 4242
+        self._stdout = stdout
+
+    def communicate(self, timeout=None):
+        return self._stdout, ""
+
+
 def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> None:
     import subprocess
-    from types import SimpleNamespace
 
     from steam_agent.execution.content_plane import SteamcmdAdapter
 
     home = tmp_path / "home"
     install_dir = tmp_path / "install"
 
-    def _run(*args, **kwargs):
-        return SimpleNamespace(
-            stdout=f"Logging in user 'ownername' ... dir {install_dir} home {home}",
-            stderr="",
-        )
-
-    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            f"Logging in user 'ownername' ... dir {install_dir} home {home}"
+        ),
+    )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
         private_home=home,
@@ -211,16 +219,14 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
 
 def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) -> None:
     import subprocess
-    from types import SimpleNamespace
 
     from steam_agent.execution.content_plane import SteamcmdAdapter
 
-    def _run(*args, **kwargs):
-        return SimpleNamespace(
-            stdout="Success! App '480' fully installed.", stderr=""
-        )
-
-    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess("Success! App '480' fully installed."),
+    )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
         private_home=tmp_path / "home",
@@ -237,24 +243,26 @@ def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) 
     )
 
 
-def test_steamcmd_timeout_bytes_output_is_decoded(tmp_path: Path, monkeypatch) -> None:
-    import subprocess
+def test_steamcmd_timeout_kills_entire_process_tree(tmp_path: Path) -> None:
+    import os
 
     from steam_agent.execution.content_plane import SteamcmdAdapter
 
-    def _timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(
-            cmd="steamcmd", timeout=1, output=b"partial \xff output", stderr=None
-        )
-
-    monkeypatch.setattr(subprocess, "run", _timeout)
+    script = tmp_path / "steamcmd.sh"
+    script.write_text("#!/bin/sh\nsleep 30 &\necho child $!\nwait\n", encoding="utf-8")
+    script.chmod(0o755)
     adapter = SteamcmdAdapter(
-        steamcmd_script=tmp_path / "steamcmd.sh",
+        steamcmd_script=script,
         private_home=tmp_path / "home",
         log_dir=tmp_path / "logs",
+        timeout_seconds=1,
     )
     result = adapter.install(
         account="o", appid=480, install_dir=tmp_path / "i", operation_id=1
     )
     assert result.outcome == "failed"
-    assert "partial" in result.log_path.read_text(encoding="utf-8")
+    child_pid = int(
+        result.log_path.read_text(encoding="utf-8").split("child")[1].split()[0]
+    )
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)  # the wrapped child must not survive the timeout
