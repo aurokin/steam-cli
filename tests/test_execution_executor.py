@@ -13,7 +13,11 @@ from steam_agent.execution.content_plane import (
     adopt_manifest,
     locate_manifest,
 )
-from steam_agent.execution.executor import Executor, safe_install_dir_name
+from steam_agent.execution.executor import (
+    Executor,
+    ExecutorLockedError,
+    safe_install_dir_name,
+)
 from steam_agent.execution.ledger import ExecutionLedger
 from steam_agent.execution.linux_session import LeaseGates
 
@@ -110,7 +114,7 @@ def harness(tmp_path: Path):
 
 
 def _authorized(
-    ledger: ExecutionLedger, *, install_dir_name: str = "Spacewar"
+    ledger: ExecutionLedger, *, install_dir_name: str | None = "Spacewar"
 ) -> int:
     _, nonce = ledger.request(
         plan_key="k" * 8,
@@ -297,6 +301,39 @@ def test_missing_plan_name_reuses_existing_installdir(harness) -> None:
         encoding="utf-8"
     )
     assert '"installdir"\t\t"OldDir"' in adopted  # not app_480
+
+
+def test_null_plan_name_treated_as_unspecified(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"480"\n\t"installdir"\t\t"OldDir"\n'
+        '\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger, install_dir_name=None)
+    report = executor.execute(operation_id)
+    assert report.outcome == "confirmed"
+    adopted = (library / "steamapps" / "appmanifest_480.acf").read_text(
+        encoding="utf-8"
+    )
+    assert '"installdir"\t\t"OldDir"' in adopted  # not literal "None"
+
+
+def test_lock_scoped_to_library_not_state_dir(harness, tmp_path: Path) -> None:
+    ledger, session, content, executor, library = harness
+    other = Executor(
+        ledger=ledger,
+        session=session,
+        content=content,
+        library=library,
+        state_dir=tmp_path / "other-state",
+    )
+    lock = executor._lock()
+    try:
+        with pytest.raises(ExecutorLockedError):
+            other._lock()
+    finally:
+        lock.close()
 
 
 def test_install_dir_claimed_by_other_title_aborts(harness) -> None:

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import fcntl
+import hashlib
 from pathlib import Path
+import tempfile
 from typing import Literal
 
 from steam_agent.execution.content_plane import (
@@ -78,7 +80,14 @@ class Executor:
         self._journal_dir = state_dir / "journal"
 
     def _lock(self) -> object:
-        lock_path = self._state_dir / "executor.lock"
+        # Keyed by the resolved library, not the state dir: two brokers with
+        # different state dirs but one library must share one lock.  (The
+        # library itself is never written to — ADR 0027 permits only the
+        # adopted manifest under steamapps/.)
+        library_key = hashlib.sha256(
+            str(self._library.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
+        lock_path = Path(tempfile.gettempdir()) / f"steam-broker-{library_key}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("w")
         try:
@@ -114,10 +123,15 @@ class Executor:
             )
 
         plan = ledger.plan_document(operation_id)
-        install_dir_name = str(plan.get("install_dir_name", ""))
+        raw_name = plan.get("install_dir_name")
+        install_dir_name = "" if raw_name is None else str(raw_name)
         if not install_dir_name:
             # Prefer the directory the client already uses for this AppID:
             # inventing a new one would re-download and orphan the install.
+            # Reusing the live directory in place is the accepted
+            # recoverable-update contract (ADR 0027 clause 5): steamcmd
+            # validates and repairs content on retry, and failure cost is
+            # bounded at temporary unplayability, never a second full copy.
             existing = manifest_install_dir(
                 self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
             )
