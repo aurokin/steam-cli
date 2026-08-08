@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -180,3 +181,83 @@ def test_dispatched_is_reachable_only_from_authorized() -> None:
     assert sources == {"authorized"}
     # Terminal: nothing leads out of it.
     assert "dispatched" not in _TRANSITIONS
+
+
+def test_a_dispatched_row_frees_the_single_active_slot(tmp_path: Path) -> None:
+    # A terminal state the single-active index does not know about would
+    # block every later operation on that machine, forever.
+    ledger = ExecutionLedger(tmp_path / "ledger.sqlite3")
+    try:
+        _, nonce = ledger.request(
+            plan_key="k" * 16,
+            plan_document="{}",
+            operation="launch",
+            appid=480,
+            account_alias="owner",
+            machine_id="machine-a",
+            policy_version="v",
+        )
+        operation_id = ledger.confirm(nonce=nonce, actor="owner")
+        ledger.transition(operation_id, "dispatched")
+
+        assert ledger.active() is None
+        assert [row[0] for row in ledger.recent(5)] == [operation_id]
+        # The slot is genuinely free: a second operation can be requested.
+        ledger.request(
+            plan_key="j" * 16,
+            plan_document="{}",
+            operation="install",
+            appid=220,
+            account_alias="owner",
+            machine_id="machine-a",
+            policy_version="v",
+        )
+    finally:
+        ledger.close()
+
+
+def test_a_ledger_predating_a_terminal_state_is_rebuilt(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = ExecutionLedger(path)
+    ledger.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX one_active_operation")
+        connection.execute(
+            "CREATE UNIQUE INDEX one_active_operation ON operations(machine_id)"
+            " WHERE state NOT IN ('confirmed','aborted')"
+        )
+
+    reopened = ExecutionLedger(path)
+    try:
+        stored = reopened._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='one_active_operation'"
+        ).fetchone()[0]
+        for state in TERMINAL_STATES:
+            assert f"'{state}'" in stored
+    finally:
+        reopened.close()
+
+
+def test_concurrent_openers_rebuild_the_active_index_once(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ExecutionLedger(path).close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX one_active_operation")
+        connection.execute(
+            "CREATE UNIQUE INDEX one_active_operation ON operations(machine_id)"
+            " WHERE state NOT IN ('confirmed')"
+        )
+
+    opened = [ExecutionLedger(path) for _ in range(4)]
+    try:
+        definitions = {
+            ledger._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='one_active_operation'"
+            ).fetchone()[0]
+            for ledger in opened
+        }
+        assert len(definitions) == 1
+        assert "'dispatched'" in definitions.pop()
+    finally:
+        for ledger in opened:
+            ledger.close()

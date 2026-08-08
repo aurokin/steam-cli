@@ -74,6 +74,12 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
     ),
 }
 
+# Every terminal-state predicate is built from TERMINAL_STATES, never
+# spelled out again.  A hand-written copy that misses a state is not a
+# cosmetic drift: the single-active index would treat the missing state as
+# still active and block every later operation on that machine.
+_TERMINAL_SQL = "(" + ",".join(f"'{state}'" for state in sorted(TERMINAL_STATES)) + ")"
+
 DEFAULT_NONCE_TTL_SECONDS = 15 * 60
 DEFAULT_EXECUTION_WINDOW_SECONDS = 4 * 60 * 60
 
@@ -179,16 +185,7 @@ class ExecutionLedger:
                 )
                 """
             )
-            self._connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS one_active_operation
-                ON operations(machine_id)
-                WHERE state NOT IN (
-                    'confirmed','unconfirmed','contradicted',
-                    'aborted','failed','expired'
-                )
-                """
-            )
+            self._rebuild_active_index()
             # One idempotency key, one attempt that could ever execute —
             # durably, so a transport retry can never mint a second nonce
             # for a plan that already ran (or is running).  'expired' rows
@@ -201,6 +198,32 @@ class ExecutionLedger:
                 WHERE state != 'expired'
                 """
             )
+
+    def _rebuild_active_index(self) -> None:
+        """Bring the single-active index up to the current terminal set.
+
+        A partial index carries its predicate in its own definition, so a
+        ledger created before a terminal state existed keeps the old one and
+        would treat rows in that state as still active.  The check and the
+        rebuild share one BEGIN IMMEDIATE: two brokers opening the same
+        pre-upgrade ledger must not both see the stale definition and race
+        to drop and recreate it.
+        """
+
+        wanted = (
+            "CREATE UNIQUE INDEX one_active_operation"
+            " ON operations(machine_id)"
+            f" WHERE state NOT IN {_TERMINAL_SQL}"
+        )
+        with self._transaction():
+            stored = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index'"
+                " AND name='one_active_operation'"
+            ).fetchone()
+            if stored is not None and stored[0] == wanted:
+                return
+            self._connection.execute("DROP INDEX IF EXISTS one_active_operation")
+            self._connection.execute(wanted)
 
     # -- intake -----------------------------------------------------------
 
@@ -419,9 +442,8 @@ class ExecutionLedger:
 
     def active(self) -> LedgerOperation | None:
         row = self._connection.execute(
-            "SELECT operation_id FROM operations WHERE state NOT IN"
-            " ('confirmed','unconfirmed','contradicted','aborted','failed',"
-            "'expired') LIMIT 1"
+            f"SELECT operation_id FROM operations WHERE state NOT IN"
+            f" {_TERMINAL_SQL} LIMIT 1"
         ).fetchone()
         return None if row is None else self.get(int(row[0]))
 
@@ -432,9 +454,8 @@ class ExecutionLedger:
 
         rows = self._connection.execute(
             "SELECT operation_id, operation, appid, state, detail, updated_at"
-            " FROM operations WHERE state IN"
-            " ('confirmed','unconfirmed','contradicted','aborted','failed',"
-            "'expired') ORDER BY operation_id DESC LIMIT ?",
+            f" FROM operations WHERE state IN {_TERMINAL_SQL}"
+            " ORDER BY operation_id DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [tuple(row) for row in rows]
