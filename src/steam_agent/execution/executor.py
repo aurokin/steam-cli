@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from steam_agent.execution.content_plane import (
+    AdoptionError,
     SteamcmdAdapter,
     adopt_manifest,
     clear_adoption_journal,
@@ -406,31 +407,45 @@ class Executor:
                 "failed",
                 f"lease gates regressed before adoption; adoption skipped{note}",
             )
-        if self._session.client_possibly_running() and not self._session.stop_client():
-            # The failed stop may still have killed the main process (helper
-            # lingering, probe error): attempt restoration before going
-            # terminal so the prior run-state is not silently lost.
-            note = self._restore_note(prior_running)
-            ledger.transition(
-                operation_id,
-                "failed",
-                detail="client restarted mid-operation; adoption skipped",
-            )
-            return ExecutionReport(
-                operation_id,
-                "failed",
-                f"client restarted mid-operation; adoption skipped{note}",
-            )
+        # One final client-absent probe follows the stop: a client that
+        # respawns between this probe and the millisecond-scale adoption is
+        # an accepted residual race (Steam startup takes seconds).
+        if self._session.client_possibly_running():
+            stopped = self._session.stop_client()
+            if not stopped or self._session.client_possibly_running():
+                # The failed stop may still have killed the main process
+                # (helper lingering, probe error): attempt restoration
+                # before going terminal so the prior state is not lost.
+                note = self._restore_note(prior_running)
+                ledger.transition(
+                    operation_id,
+                    "failed",
+                    detail="client restarted mid-operation; adoption skipped",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "failed",
+                    f"client restarted mid-operation; adoption skipped{note}",
+                )
 
         ledger.transition(operation_id, "adopting")
-        adopted = adopt_manifest(
-            source=source,
-            library=self._library,
-            appid=operation.appid,
-            install_dir_name=install_dir_name,
-            journal_dir=self._journal_dir,
-            operation_id=operation_id,
-        )
+        try:
+            adopted = adopt_manifest(
+                source=source,
+                library=self._library,
+                appid=operation.appid,
+                install_dir_name=install_dir_name,
+                journal_dir=self._journal_dir,
+                operation_id=operation_id,
+            )
+        except AdoptionError as error:
+            note = self._restore_note(prior_running)
+            ledger.transition(
+                operation_id, "failed", detail=f"adoption failed: {error}"
+            )
+            return ExecutionReport(
+                operation_id, "failed", f"adoption failed: {error}{note}"
+            )
         # Leave the ledger's adopting state before retiring the journal: a
         # crash in between then reconciles from a state whose branch does not
         # consult the journal, never as adopting-with-no-journal (which would

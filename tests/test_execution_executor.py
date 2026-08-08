@@ -427,6 +427,28 @@ def test_stop_failure_attempts_client_restore(harness) -> None:
     assert ledger.get(operation_id).state == "aborted"
 
 
+def test_client_relaunch_surviving_late_stop_fails(harness) -> None:
+    ledger, session, content, executor, _ = harness
+    original_install = content.install
+
+    def install_and_relaunch(**kwargs):
+        result = original_install(**kwargs)
+        session.running = True  # client relaunched during the download
+
+        def stop_but_respawn() -> bool:
+            session.stops += 1
+            return True  # exits, but respawns instantly; running stays True
+
+        session.stop_client = stop_but_respawn
+        return result
+
+    content.install = install_and_relaunch
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "adoption skipped" in report.detail
+
+
 def test_gate_regression_during_download_skips_adoption(harness) -> None:
     ledger, session, content, executor, _ = harness
     original_install = content.install

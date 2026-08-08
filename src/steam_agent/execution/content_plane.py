@@ -59,7 +59,12 @@ def _durable_write(path: Path, data: bytes) -> None:
     """Atomic and power-loss durable: fsync the file, rename, fsync the dir."""
 
     temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("wb") as handle:
+    # O_NOFOLLOW: steamapps/ is shared, and a planted .tmp symlink must not
+    # redirect this write outside the intended file.
+    descriptor = os.open(
+        temporary, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+    )
+    with os.fdopen(descriptor, "wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
@@ -214,11 +219,18 @@ def manifest_state_flags(manifest: Path) -> int | None:
 
 def _patched_manifest(source: Path, install_dir_name: str) -> str:
     text = source.read_text(encoding="utf-8", errors="replace")
-    return re.sub(
+    patched, count = re.subn(
         r'("installdir"\s+")[^"]*(")',
         lambda match: f"{match.group(1)}{install_dir_name}{match.group(2)}",
         text,
     )
+    if count != 1:
+        # A manifest whose installdir cannot be pointed at the target must
+        # never be adopted — the client would look in the wrong directory.
+        raise AdoptionError(
+            f"manifest installdir field missing or ambiguous ({count} matches)"
+        )
+    return patched
 
 
 def adopt_manifest(

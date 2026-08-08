@@ -163,6 +163,48 @@ def test_reconcile_torn_write_restores_backup(tmp_path: Path) -> None:
     assert prior.read_text(encoding="utf-8") == "old"
 
 
+def test_adopt_rejects_manifest_without_installdir(tmp_path: Path) -> None:
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    target = tmp_path / "target"
+    (target / "steamapps").mkdir(parents=True)
+    (target / "steamapps" / "appmanifest_1902490.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"1902490"\n\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(AdoptionError):
+        adopt_manifest(
+            source=locate_manifest(install_dir=target, appid=1902490),
+            library=library,
+            appid=1902490,
+            install_dir_name="Desk Job",
+            journal_dir=tmp_path / "journal",
+            operation_id=7,
+        )
+
+
+def test_adopt_refuses_planted_tmp_symlink(tmp_path: Path) -> None:
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    target = _target_with_manifest(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_text("do not overwrite", encoding="utf-8")
+    (library / "steamapps" / "appmanifest_1902490.acf.tmp").symlink_to(victim)
+
+    with pytest.raises((AdoptionError, OSError)):
+        adopt_manifest(
+            source=locate_manifest(install_dir=target, appid=1902490),
+            library=library,
+            appid=1902490,
+            install_dir_name="Desk Job",
+            journal_dir=tmp_path / "journal",
+            operation_id=7,
+        )
+    assert victim.read_text(encoding="utf-8") == "do not overwrite"
+
+
 def test_reconcile_without_journal_is_clean(tmp_path: Path) -> None:
     library = _library(tmp_path)
     assert (
