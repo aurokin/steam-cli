@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Detached Phase 0 sequence (main-library mode, free titles only).
 # Launch on herb:  systemd-run --user --collect --unit spike-runner \
-#                    bash ~/workspace/spike-phase0/scripts/runner.sh REDACTED
+#                    bash ~/workspace/spike-phase0/scripts/runner.sh <account>
 # Progress: evidence JSONL + $SPIKE_DIR/runner.log; DONE marker on completion.
 set -uo pipefail
 DIR="$(dirname "$0")"
