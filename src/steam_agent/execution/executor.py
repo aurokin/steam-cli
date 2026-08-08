@@ -52,7 +52,12 @@ def safe_install_dir_name(name: str) -> bool:
         return False
     # Typical filesystem component limit; a longer name would only surface
     # as ENAMETOOLONG mid-operation, after the client was already stopped.
-    if len(name.encode("utf-8")) > 255:
+    # JSON can legally carry unpaired surrogates, which no real filesystem
+    # name can hold — reject them instead of crashing intake.
+    try:
+        if len(name.encode("utf-8")) > 255:
+            return False
+    except UnicodeEncodeError:
         return False
     # Control characters (newlines especially) could inject VDF fields.
     return not any(ord(character) < 32 for character in name)

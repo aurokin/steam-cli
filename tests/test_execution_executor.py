@@ -684,6 +684,7 @@ def test_safe_install_dir_name_rejects_acf_breaking_characters() -> None:
     assert not safe_install_dir_name("two\nlines")
     assert not safe_install_dir_name("../../outside")
     assert not safe_install_dir_name("x" * 256)  # exceeds component limit
+    assert not safe_install_dir_name("\ud800")  # unpaired surrogate
     assert safe_install_dir_name("Desk Job")
 
 

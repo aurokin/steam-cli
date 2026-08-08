@@ -259,7 +259,7 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
         "Popen",
         lambda *args, **kwargs: _FakeProcess(
             f"Logging in user 'ownername' (76561199000000001)"
-            f" ... dir {install_dir} home {home}"
+            f" buddy 76561200000000000 ... dir {install_dir} home {home}"
         ),
     )
     adapter = SteamcmdAdapter(
@@ -274,6 +274,7 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     assert "ownername" not in log
     assert str(install_dir) not in log and str(home) not in log
     assert "76561199000000001" not in log
+    assert "76561200000000000" not in log  # beyond the 7656119 prefix
     assert "<account>" in log and "<steamid>" in log
 
 

@@ -190,7 +190,10 @@ class SteamcmdAdapter:
             ):
                 if value:
                     line = line.replace(value, label)
-            kept.append(re.sub(r"\b7656119\d{10}\b", "<steamid>", line))
+            # 17 digits from 7656…: SteamID64 individual accounts span
+            # 76561197…–76561202… (32-bit account-ID space), not just the
+            # 7656119 prefix.
+            kept.append(re.sub(r"\b7656\d{13}\b", "<steamid>", line))
         kept.append(f"[{dropped} unrecognized line(s) omitted]")
         log_path.write_text("\n".join(kept) + "\n", encoding="utf-8", errors="replace")
         return ContentResult(outcome=outcome, log_path=log_path)
@@ -255,6 +258,11 @@ def adopt_manifest(
 
     destination = library / "steamapps" / f"appmanifest_{appid}.acf"
     journal_dir.mkdir(parents=True, exist_ok=True)
+    # The journal directory's own entry must be durable before anything is
+    # journaled into it: a power loss could otherwise persist the swapped
+    # manifest while losing the journal (and backup) entirely, and
+    # reconciliation would read the mutation as unprovable ("clean").
+    _fsync_dir(journal_dir.parent)
     patched = _patched_manifest(source, install_dir_name)
     checksum = hashlib.sha256(patched.encode("utf-8")).hexdigest()
 
