@@ -131,8 +131,9 @@ def main(argv: list[str] | None = None) -> int:
         (state_dir / "broker.json").write_text(
             json.dumps(
                 {
-                    "library": str(arguments.library),
-                    "steamcmd": str(arguments.steamcmd),
+                    # Absolute paths: later commands may run from any cwd.
+                    "library": str(arguments.library.resolve()),
+                    "steamcmd": str(arguments.steamcmd.resolve()),
                     "machine_id": str(arguments.machine_id),
                 },
                 sort_keys=True,

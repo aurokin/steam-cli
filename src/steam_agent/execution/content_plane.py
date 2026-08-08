@@ -109,10 +109,15 @@ class SteamcmdAdapter:
 
         # Raw steamcmd output carries the account name and private absolute
         # paths; the repository boundary keeps both out of persisted logs.
+        # Redaction is bounded to the identifiers the broker was configured
+        # with — values steamcmd invents (persona names, SteamIDs) cannot be
+        # matched textually, and these logs stay inside the broker-owned
+        # state directory, never in fixtures or committed files.
         for value, label in (
             (account, "<account>"),
             (str(self._home), "<steamcmd-home>"),
             (str(install_dir), "<install-dir>"),
+            (str(self._script), "<steamcmd>"),
         ):
             if value:
                 output = output.replace(value, label)

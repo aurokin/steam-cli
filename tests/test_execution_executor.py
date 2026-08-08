@@ -33,6 +33,7 @@ class FakeSession:
         self.stops = 0
         self.starts = 0
         self.start_ok = True
+        self.steamcmd_alive = False
 
     def gates(self) -> LeaseGates:
         state = "pass" if self.clear else "fail"
@@ -45,6 +46,12 @@ class FakeSession:
 
     def client_running(self) -> bool:
         return self.running
+
+    def client_possibly_running(self) -> bool:
+        return self.running
+
+    def steamcmd_running(self) -> bool:
+        return self.steamcmd_alive
 
     def stop_client(self) -> bool:
         self.stops += 1
@@ -253,6 +260,34 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "confirmed"
     assert any("completed" in action for action in actions)
+
+
+def test_gate_regression_during_download_skips_adoption(harness) -> None:
+    ledger, session, content, executor, _ = harness
+    original_install = content.install
+
+    def install_and_regress(**kwargs):
+        session.clear = False  # a game/Remote Play/download appeared mid-run
+        return original_install(**kwargs)
+
+    content.install = install_and_regress
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "regressed" in report.detail
+    assert ledger.get(operation_id).state == "failed"
+
+
+def test_reconcile_defers_while_steamcmd_survives(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    for state in ("lease_acquired", "client_stopping", "content_running"):
+        ledger.transition(operation_id, state)
+    session.steamcmd_alive = True
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "content_running"  # untouched
+    assert any("deferred" in action for action in actions)
 
 
 def test_safe_install_dir_name_rejects_acf_breaking_characters() -> None:

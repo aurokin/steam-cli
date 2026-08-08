@@ -155,12 +155,12 @@ class Executor:
 
         if resuming:
             prior_running = operation.prior_client_running or False
-            if self._session.client_running() and not self._session.stop_client():
+            if self._session.client_possibly_running() and not self._session.stop_client():
                 return ExecutionReport(
                     operation_id, "aborted", "client would not exit for resume"
                 )
         else:
-            prior_running = self._session.client_running()
+            prior_running = self._session.client_possibly_running()
             ledger.transition(
                 operation_id,
                 "lease_acquired",
@@ -219,10 +219,23 @@ class Executor:
                 operation_id, "failed", f"steamcmd produced no manifest{note}"
             )
 
-        # steamcmd can run for up to 30 minutes; if the client came back in
-        # the meantime (user or autostart), re-assert the stopped state
-        # before touching its steamapps/ — never adopt under a live client.
-        if self._session.client_running() and not self._session.stop_client():
+        # steamcmd can run for up to 30 minutes; re-check the full lease and
+        # re-assert the stopped client before touching steamapps/ — never
+        # adopt under a live client or a lease that regressed.
+        late_gates = self._session.gates()
+        if not late_gates.all_clear():
+            note = self._restore_note(prior_running)
+            ledger.transition(
+                operation_id,
+                "failed",
+                detail="lease gates regressed before adoption",
+            )
+            return ExecutionReport(
+                operation_id,
+                "failed",
+                f"lease gates regressed before adoption; adoption skipped{note}",
+            )
+        if self._session.client_possibly_running() and not self._session.stop_client():
             ledger.transition(
                 operation_id,
                 "failed",
@@ -352,6 +365,13 @@ class Executor:
             restore()
             return actions
         if state == "content_running":
+            if self._session.steamcmd_running():
+                # A surviving steamcmd child would make resume a second
+                # concurrent writer; defer until it is provably gone.
+                actions.append(
+                    f"{operation_id}: steamcmd may still be running; deferred"
+                )
+                return actions
             if ledger.window_valid(operation_id):
                 actions.append(f"{operation_id}: resume via execute()")
                 ledger.transition(operation_id, "interrupted", detail="resume candidate")

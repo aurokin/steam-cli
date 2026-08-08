@@ -117,7 +117,19 @@ class LinuxSession:
         )
 
     def client_running(self) -> bool:
+        """Proof of presence (rc 0 only); used to confirm a started client."""
+
         return self._run(["pgrep", "-x", "steam"]).returncode == 0
+
+    def client_possibly_running(self) -> bool:
+        """Fail-closed presence: anything but an explicit no-match counts."""
+
+        return self._run(["pgrep", "-x", "steam"]).returncode != 1
+
+    def steamcmd_running(self) -> bool:
+        """Fail-closed: a probe error must defer resume, not permit it."""
+
+        return self._run(["pgrep", "-f", "steamcmd"]).returncode != 1
 
     # -- lifecycle --------------------------------------------------------
 
