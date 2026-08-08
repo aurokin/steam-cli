@@ -126,8 +126,12 @@ recovery per the plan's reconciliation table. Eval matrix and regression
 scenarios listed above implemented and passing; two-reviewer pass on the
 execution schemas (`operation-execution/0.1`, plan schema bump).
 
-## Phase 0 evidence (herb, 2026-08-07/08 — evidence in
-`scripts/spike-phase0/results-herb/`)
+## Phase 0 evidence (target machine, 2026-08-07/08)
+
+The raw capture directory was removed from the repository and its history
+on 2026-08-08: the captures embedded account identifiers and private
+filesystem paths. The findings below are the retained record; captures
+remain on the target machine only.
 
 - PASS — install + single-manifest adoption, 4/4 cycles (Spacewar ×3, Desk
   Job 4.2 GB): client indexes steamcmd-installed titles at StateFlags=4 with
@@ -138,8 +142,11 @@ execution schemas (`operation-execution/0.1`, plan schema bump).
 - PASS — kill matrix automated cases: resume after kill -9 mid-download;
   torn-manifest checksum detection with journal-directed recovery.
 - PASS — coverage 70/70 servable (34 native Linux depots, 36 Windows-depot/
-  Proton via `@sSteamCmdForcePlatformType windows`). Caveat: depot visibility
-  is a proxy; a sampled Proton-title install remains to be run.
+  Proton via `@sSteamCmdForcePlatformType windows`). Caveat closed
+  2026-08-08: a sampled Windows-depot title (Zuma Deluxe, 3330, os
+  `windows,macos`) installed to completion under the platform override into
+  the disposable spike library, with Windows binaries present and the
+  Valve-written manifest at the expected nested location.
 - FAIL — `app_uninstall`: 4/4 silent no-ops with valid authentication;
   steamcmd cannot uninstall consumer titles. DECIDED (owner, 2026-08-08):
   uninstall remains human-present inside Steam — the agent ranks candidates
@@ -155,6 +162,15 @@ execution schemas (`operation-execution/0.1`, plan schema bump).
   not hygiene.
 - FINDING: the client strips offline-added `libraryfolders.vdf` entries;
   library creation is UI-only (benign: execution targets existing libraries).
-- OPEN: Guard-token longevity (clock started 2026-08-08 under private HOME),
-  mid-game gate polarity run, manual mutual-exclusion case, sampled
-  Proton-title install.
+- PASS (2026-08-08) — mid-game gate polarity, observed against a real
+  Proton game running on the target machine: `game_running` flipped to
+  `fail` and a live `run` returned `deferred` with the ledger row left
+  retryable and the client untouched.
+- PASS (2026-08-08) — mutual exclusion: a second `run` while the per-user
+  lock was held refused with "another execution holds the lock", taking no
+  side effects.
+- ONGOING — Guard-token longevity (clock started 2026-08-08 under the
+  broker's private steamcmd HOME). Now instrumented rather than open: a
+  weekly systemd user timer samples cached-token validity and appends a
+  dated PASS/FAIL to `guard-longevity.log` in the broker state directory
+  (no account name or raw output recorded). First two samples PASS.

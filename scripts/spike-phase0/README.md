@@ -1,14 +1,14 @@
-# Phase 0 spike — herb.home.arpa
+# Phase 0 spike — target machine
 
 Acceptance evidence for [ADR 0027](../../docs/adr/0027-provisioned-execution.md)
 per the [execution plan](../../docs/design/execution-plan.md) and
 [Linux session model](../../docs/design/execution-linux-session-model.md).
-Target: herb (CachyOS, KDE Wayland, native Steam, single library at
-`~/.local/share/Steam`, 68 installed titles as of 2026-08-07). Herb drives a
+Target: the always-on gaming PC (CachyOS, KDE Wayland, native Steam, single library at
+`~/.local/share/Steam`, 68 installed titles as of 2026-08-07). It drives a
 CRT and must never be made headless — nothing here touches the display stack.
 
-Scripts run ON herb as `auro` (copy the directory over, or run via
-`ssh auro@herb.home.arpa`). Everything writes evidence JSONL to
+Scripts run ON the target machine as the desktop user (copy the directory
+over, or run them over SSH). Everything writes evidence JSONL to
 `~/workspace/spike-phase0/evidence/`; the disposable library and the vendored
 steamcmd live under `~/workspace/spike-phase0/` and never touch the main
 library except where a script says so explicitly.
@@ -34,7 +34,11 @@ re-run — evidence lands in the same JSONL), group-writable-library ACL test
 (needs the `steam-broker` user to exist; comes with the identity bootstrap,
 validate item 1 of the session model).
 
-## Results so far (evidence in `results-herb/`)
+## Results so far
+
+Raw captures were removed from this repository and its history on
+2026-08-08 (they embedded account identifiers and private paths); they
+remain on the target machine only. The findings below are the record.
 
 2026-08-07 — 00/01/08/02 run remotely: metadata backup taken (12K), vendored
 steamcmd bootstraps and anonymous-login OK, and shutdown timing PASSED 5/5
@@ -68,13 +72,23 @@ pending). **Kill matrix PASS** (resume after kill -9; torn-manifest
 checksum detection + swap recovery). **Coverage: 70/70 servable (gate PASS at
 100 %)** — Proton-aware re-read of the same app_info data: 34 native Linux
 depots, 36 Windows-depot/Proton (servable via
-`@sSteamCmdForcePlatformType windows`; a sampled Proton install remains to
-confirm the override path). Table: `results-herb/coverage-v2.tsv`. Auth findings: private
+`@sSteamCmdForcePlatformType windows`). Auth findings: private
 STEAMCMD_HOME is mandatory (client clobbers a shared config.vdf); fail-fast
 auth with runner abort prevents failed-login cascades. Residual state:
 Desk Job (4.2G) and Spacewar remain installed and client-adopted — benign
-free titles; removal awaits an approved uninstall mechanism. Client left
-running.
+free titles; removal is a human step in Steam per the uninstall decision.
+Client left running.
+
+2026-08-08 (closeout) — remaining Phase 0 items closed against the live
+machine: **mid-game gate polarity PASS** (real Proton game running →
+`game_running=fail`, broker `run` returned `deferred` with the row
+retryable and the client untouched); **mutual exclusion PASS** (a second
+`run` while the per-user lock was held refused with no side effects);
+**sampled Proton install PASS** (Zuma Deluxe 3330, os `windows,macos`,
+installed to completion under the platform override into the disposable
+spike library — Windows binaries present, Valve-written manifest at the
+expected nested location). Guard-token longevity is now instrumented by a
+weekly systemd user timer rather than tracked by hand.
 
 ## Safety rails
 

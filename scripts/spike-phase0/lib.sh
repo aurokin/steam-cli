@@ -1,4 +1,4 @@
-# Shared helpers for Phase 0 spike scripts (run ON herb as auro).
+# Shared helpers for Phase 0 spike scripts (run ON the target machine).
 # Every script sources this and emits evidence JSONL to $SPIKE_DIR/evidence/.
 
 set -euo pipefail
