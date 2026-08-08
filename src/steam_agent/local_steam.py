@@ -81,8 +81,10 @@ class ResidualContent:
     A byte count of ``0`` means the directory was looked for and is absent;
     ``None`` means it could not be measured.  ``state`` is ``measured`` only
     when all three counts are trustworthy, ``partial`` when the walk was
-    truncated or a subtree was unreadable, and ``unknown`` when measurement
-    did not run.
+    truncated, a subtree was unreadable, or a whole tree turned out to be a
+    link, and ``unknown`` when measurement did not run.  Links inside a tree
+    are counted at their own size and never followed, because their targets
+    are not content this tree strands.
 
     Steam Cloud and ``userdata`` are deliberately excluded: locating them
     requires enumerating account directories, which this scanner does not do.
@@ -869,8 +871,10 @@ def _measure_tree(root: Path, budget: list[int]) -> tuple[int | None, bool]:
     except OSError:
         # Denied or otherwise unreadable: not the same claim as missing.
         return 0, False
-    # A junction has directory mode rather than S_IFLNK, so it needs its own
-    # check; both mean the content lives outside this tree.
+    # A linked root is different from a link inside the tree: here the whole
+    # tree lives somewhere else, so nothing was measured and a zero must not
+    # read as an absence.  A junction has directory mode rather than
+    # S_IFLNK, so it needs its own check.
     if stat.S_ISLNK(status.st_mode) or root.is_junction():
         return 0, False
     total = 0
@@ -886,15 +890,20 @@ def _measure_tree(root: Path, budget: list[int]) -> tuple[int | None, bool]:
                         return total, False
                     budget[0] -= 1
                     try:
-                        # is_junction() is os.DirEntry API from Python
-                        # 3.12, which this project requires.
+                        # A link inside the tree is a pointer, not bytes
+                        # this tree owns: a Proton prefix holds over a
+                        # thousand links into the shared Proton runtime
+                        # (measured on the target machine), which no
+                        # uninstall of this game strands.  Count the link
+                        # itself, never its target, and do not call the
+                        # measurement truncated for it.  is_junction() is
+                        # os.DirEntry API from Python 3.12, which this
+                        # project requires; NTFS junctions are not symlinks
+                        # and would otherwise be walked into.
                         if entry.is_symlink() or entry.is_junction():
-                            # The link stays behind an uninstall, but its
-                            # target lives elsewhere and is not this tree's
-                            # bytes to count.  Unmeasured, so not complete.
-                            # NTFS junctions are not symlinks and would
-                            # otherwise be walked into.
-                            complete = False
+                            total += entry.stat(
+                                follow_symlinks=False
+                            ).st_size
                         elif entry.is_dir(follow_symlinks=False):
                             stack.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False):

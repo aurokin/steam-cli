@@ -686,6 +686,9 @@ def test_residual_content_is_measured_per_directory(tmp_path: Path) -> None:
 
 
 def test_residual_measurement_never_follows_directory_symlinks(tmp_path: Path) -> None:
+    # A Proton prefix holds over a thousand links into the shared Proton
+    # runtime, so a link inside the tree is counted at its own size and its
+    # target is neither followed nor treated as an unmeasured gap.
     steamapps = _root_with_app(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -697,7 +700,8 @@ def test_residual_measurement_never_follows_directory_symlinks(tmp_path: Path) -
     residual = scan_local_steam(tmp_path).apps[0].residual
 
     assert residual is not None
-    assert residual.compatdata_bytes == 0
+    assert residual.state == "measured"
+    assert (residual.compatdata_bytes or 0) < 5000
 
 
 def test_unreadable_residual_subtree_reports_partial_not_a_smaller_total(
@@ -741,23 +745,6 @@ def test_residual_walk_stops_at_the_entry_budget(
     assert 0 <= (residual.compatdata_bytes or 0) < 1000
 
 
-def test_symlinked_residual_root_is_incomplete_rather_than_absent(
-    tmp_path: Path,
-) -> None:
-    steamapps = _root_with_app(tmp_path)
-    outside = tmp_path / "elsewhere"
-    outside.mkdir()
-    (outside / "big").write_bytes(b"c" * 4000)
-    (steamapps / "compatdata").mkdir()
-    (steamapps / "compatdata" / "8").symlink_to(outside, target_is_directory=True)
-
-    residual = scan_local_steam(tmp_path).apps[0].residual
-
-    assert residual is not None
-    assert residual.state == "partial"
-    assert residual.compatdata_bytes == 0
-
-
 def test_unreadable_residual_root_is_not_reported_as_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -779,22 +766,22 @@ def test_unreadable_residual_root_is_not_reported_as_absent(
     assert residual.compatdata_bytes == 0
 
 
-def test_a_residual_tree_holding_only_a_symlink_is_not_measured_as_empty(
-    tmp_path: Path,
-) -> None:
+def test_a_linked_root_is_unmeasured_rather_than_absent(tmp_path: Path) -> None:
+    # The distinction that matters: a link *inside* the tree points at
+    # content the tree does not own, but a link *as* the tree means nothing
+    # here was measured, so a zero must not be read as an absence.
     steamapps = _root_with_app(tmp_path)
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "big").write_bytes(b"d" * 3000)
-    compatdata = steamapps / "compatdata" / "8"
-    compatdata.mkdir(parents=True)
-    (compatdata / "link").symlink_to(outside, target_is_directory=True)
+    (steamapps / "shadercache").mkdir()
+    (steamapps / "shadercache" / "8").symlink_to(outside, target_is_directory=True)
 
     residual = scan_local_steam(tmp_path).apps[0].residual
 
     assert residual is not None
     assert residual.state == "partial"
-    assert residual.compatdata_bytes == 0
+    assert residual.shadercache_bytes == 0
 
 
 def test_a_tree_that_exactly_fits_the_budget_is_measured_whole(
