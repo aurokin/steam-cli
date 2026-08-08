@@ -108,9 +108,20 @@ def build_parser() -> argparse.ArgumentParser:
 def _load_config(state_dir: Path) -> dict[str, str]:
     config_path = state_dir / "broker.json"
     try:
-        return json.loads(config_path.read_text(encoding="utf-8"))
+        raw = config_path.read_text(encoding="utf-8")
     except OSError as error:
         raise PolicyError("broker not initialized; run init first") from error
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise PolicyError("broker.json is corrupt; rerun init") from error
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("library"), str)
+        or not isinstance(config.get("steamcmd"), str)
+    ):
+        raise PolicyError("broker.json is corrupt; rerun init")
+    return config
 
 
 def _components(state_dir: Path) -> tuple[ExecutionLedger, Executor]:
@@ -170,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                 except PolicyError as error:
                     return _fail(str(error))
                 wrote_template = True
-            (state_dir / "broker.json").write_text(
+            config_temporary = state_dir / "broker.json.tmp"
+            config_temporary.write_text(
                 json.dumps(
                     {
                         # Absolute paths: later commands run from any cwd.
@@ -182,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 encoding="utf-8",
             )
+            # Atomic: an interrupted init must never leave partial JSON.
+            config_temporary.replace(state_dir / "broker.json")
         _emit(
             {
                 "initialized": True,

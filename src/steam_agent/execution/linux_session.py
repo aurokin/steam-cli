@@ -149,11 +149,12 @@ class LinuxSession:
             except OSError:
                 download_state = "unknown"
 
-        client = self._run(self._pgrep("-x", "steam"))
+        client = self._run(self._pgrep("-x", "steam")).returncode
+        helper = self._run(self._pgrep("-x", "steamwebhelper")).returncode
         client_state: GateState
-        if client.returncode == 0:
+        if client == 0 or helper == 0:
             client_state = "fail"
-        elif client.returncode == 1:
+        elif client == 1 and helper == 1:
             client_state = "pass"
         else:
             client_state = "unknown"
@@ -172,9 +173,15 @@ class LinuxSession:
         return self._run(self._pgrep("-x", "steam")).returncode == 0
 
     def client_possibly_running(self) -> bool:
-        """Fail-closed presence: anything but an explicit no-match counts."""
+        """Fail-closed presence: anything but an explicit no-match counts.
 
-        return self._run(self._pgrep("-x", "steam")).returncode != 1
+        A surviving steamwebhelper counts as a running client — part of the
+        tree can hold library state even after the main process exits.
+        """
+
+        steam = self._run(self._pgrep("-x", "steam")).returncode
+        helper = self._run(self._pgrep("-x", "steamwebhelper")).returncode
+        return steam != 1 or helper != 1
 
     def steamcmd_running(self) -> bool:
         """Fail-closed: a probe error must defer resume, not permit it."""

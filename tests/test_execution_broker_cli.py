@@ -135,6 +135,12 @@ def test_unsafe_install_dir_name_rejected(
     assert "path component" in capsys.readouterr().err
 
 
+def test_corrupt_broker_config_fails_cleanly(state_dir: Path, capsys) -> None:
+    (state_dir / "broker.json").write_text("{partial", encoding="utf-8")
+    assert main(["--state-dir", str(state_dir), "status"]) == 2
+    assert "corrupt" in capsys.readouterr().err
+
+
 def test_reconcile_works_despite_broken_policy(state_dir: Path, capsys) -> None:
     # Recovery must never be blocked behind policy repair.
     (state_dir / "policy.toml").write_text("not valid [ toml", encoding="utf-8")

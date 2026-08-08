@@ -485,6 +485,16 @@ def test_gate_regression_during_download_skips_adoption(harness) -> None:
     assert ledger.get(operation_id).state == "failed"
 
 
+def test_execute_defers_while_steamcmd_survives(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.steamcmd_alive = True
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "steamcmd" in report.detail
+    assert ledger.get(operation_id).state == "authorized"  # retryable in place
+
+
 def test_reconcile_defers_while_steamcmd_survives(harness) -> None:
     ledger, session, _, executor, _ = harness
     operation_id = _authorized(ledger)

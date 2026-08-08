@@ -293,6 +293,19 @@ class Executor:
                     "existing target directory is not owned by this title",
                 )
 
+        # Any surviving steamcmd (an orphaned child of a crashed run — even
+        # one owned by a misconfigured second broker) is a concurrent
+        # writer; never start another beside it.  One state dir per library
+        # is the deployment contract; the /tmp flock covers live processes
+        # and this probe covers detached ones.  Checked before any side
+        # effect so the operation stays retryable in place.
+        if self._session.steamcmd_running():
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "a steamcmd process is already running; deferred",
+            )
+
         gates = self._session.gates()
         if not gates.all_clear():
             return ExecutionReport(
