@@ -127,8 +127,15 @@ class LinuxSession:
                 continue
             except OSError:
                 return None
-            for match in re.finditer(r'"path"\s+"([^"]*)"', text):
-                candidate = Path(match.group(1)) / "steamapps" / "downloading"
+            # A readable but truncated/malformed file could silently drop a
+            # secondary library.  No path fields at all, or unbalanced
+            # braces (truncation), means the library list is structurally
+            # incomplete — fail closed instead of trusting what survives.
+            paths = re.findall(r'"path"\s+"([^"]*)"', text)
+            if not paths or text.count("{") != text.count("}"):
+                return None
+            for value in paths:
+                candidate = Path(value) / "steamapps" / "downloading"
                 if candidate not in dirs:
                     dirs.append(candidate)
         return dirs

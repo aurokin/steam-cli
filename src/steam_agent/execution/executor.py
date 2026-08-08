@@ -50,6 +50,10 @@ def safe_install_dir_name(name: str) -> bool:
         return False
     if any(character in name for character in ("/", "\\", '"')):
         return False
+    # Typical filesystem component limit; a longer name would only surface
+    # as ENAMETOOLONG mid-operation, after the client was already stopped.
+    if len(name.encode("utf-8")) > 255:
+        return False
     # Control characters (newlines especially) could inject VDF fields.
     return not any(ord(character) < 32 for character in name)
 
@@ -274,14 +278,15 @@ class Executor:
                     "install_dir_name belongs to another installed title",
                 )
 
-        if target.exists() and not resuming:
-            # A fresh operation may reuse an existing directory only with
-            # ownership evidence: steamcmd's own manifest from a prior
-            # attempt, the client manifest for this AppID naming it, or an
-            # empty directory.  Anything else (orphaned, manually managed)
-            # must not be written over.  A resume is exempt: the single-
-            # active constraint proves the partial content is this
-            # operation's own prior work even before a manifest exists.
+        if target.exists():
+            # An existing directory may be reused only with ownership
+            # evidence: steamcmd's own manifest from a prior attempt, the
+            # client manifest for this AppID naming it, the inode-bound
+            # marker, or an empty directory.  Anything else (orphaned,
+            # manually managed) must not be written over.  Resumes are NOT
+            # exempt: the partial directory could have been deleted and the
+            # path repurposed while the operation sat interrupted, which
+            # only the marker's inode comparison detects.
             own_library_dir = manifest_install_dir(
                 self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
             )
@@ -392,12 +397,13 @@ class Executor:
             "content_running",
             detail="resume" if resuming else None,
         )
-        # Durable ownership evidence BEFORE steamcmd can write anything: a
-        # run that fails after a partial download leaves no nested manifest,
-        # and without this record every fresh retry would fail the
-        # not-owned check above until the directory was removed by hand.
-        self._record_owned_dir(operation.appid, install_dir_name, target)
         try:
+            # Durable ownership evidence BEFORE steamcmd can write anything:
+            # a run that fails after a partial download leaves no nested
+            # manifest, and without this record every fresh retry would fail
+            # the not-owned check above until the directory was removed by
+            # hand.
+            self._record_owned_dir(operation.appid, install_dir_name, target)
             result = self._content.install(
                 account=operation.account_alias,
                 appid=operation.appid,
@@ -480,7 +486,15 @@ class Executor:
                 journal_dir=self._journal_dir,
                 operation_id=operation_id,
             )
-        except AdoptionError as error:
+        except (AdoptionError, OSError) as error:
+            # Raw OSError covers the pre-swap steps (journal dir creation,
+            # backup read/write) that adopt_manifest does not wrap itself.
+            # Class name only for those: the message may carry private paths.
+            reason = (
+                str(error)
+                if isinstance(error, AdoptionError)
+                else f"filesystem error: {error.__class__.__name__}"
+            )
             # Repair via the journal before any terminal transition: the
             # error may have struck after the rename landed (completed), and
             # a terminal row must never leave a live journal behind.
@@ -500,8 +514,8 @@ class Executor:
                 return self._finish_failure(
                     operation_id,
                     prior_running,
-                    detail=f"adoption failed: {error}; journal {verdict}",
-                    message=f"adoption failed: {error}",
+                    detail=f"adoption failed: {reason}; journal {verdict}",
+                    message=f"adoption failed: {reason}",
                 )
         # Leave the ledger's adopting state before retiring the journal: a
         # crash in between then reconciles from a state whose branch does not

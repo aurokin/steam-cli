@@ -332,14 +332,26 @@ def main(argv: list[str] | None = None) -> int:
             operation = ledger.get(operation_id)
         except LedgerError as error:
             return _fail(str(error))
+        # An unreadable policy follows the same restoration-and-abort path
+        # as an explicit denial: either way execution is not permitted, and
+        # an interrupted operation's stopped client must not stay stopped
+        # until someone repairs the policy file.
+        denial: str | None = None
         try:
             policy = load_policy(state_dir / "policy.toml")
         except PolicyError as error:
-            return _fail(str(error))
-        if (
-            operation.state in {"authorized", "interrupted"}
-            and policy.grant_for(operation.operation) != "confirm"
-        ):
+            denial = str(error)
+            denial_detail = "policy unreadable before execution"
+        else:
+            if policy.grant_for(operation.operation) != "confirm":
+                denial = f"policy now denies {operation.operation!r}"
+                denial_detail = "policy revoked before execution"
+        if denial is not None and operation.state not in {
+            "authorized",
+            "interrupted",
+        }:
+            return _fail(denial)
+        if denial is not None:
             # An interrupted operation may have left the client stopped;
             # restore before terminalizing (terminal rows are invisible to
             # reconciliation) and leave the state for retry if that fails.
@@ -349,13 +361,11 @@ def main(argv: list[str] | None = None) -> int:
                 return _fail(str(error))
             if not released:
                 return _fail(
-                    f"policy now denies {operation.operation!r};"
+                    f"{denial};"
                     " client restore failed; operation left for reconcile"
                 )
-            ledger.transition(
-                operation_id, "aborted", detail="policy revoked before execution"
-            )
-            return _fail(f"policy now denies {operation.operation!r}")
+            ledger.transition(operation_id, "aborted", detail=denial_detail)
+            return _fail(denial)
         try:
             report = executor.execute(operation_id)
         except ExecutorLockedError as error:

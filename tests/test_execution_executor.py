@@ -192,9 +192,10 @@ def test_reconcile_interrupted_download_resumes(harness) -> None:
     operation_id = _authorized(ledger)
     for state in ("lease_acquired", "client_stopping", "content_running"):
         ledger.transition(operation_id, state)
-    # Partial payload without a nested manifest must not block the resume.
+    # Partial payload without a nested manifest must not block the resume;
+    # the marker (written before steamcmd ran) is the ownership evidence.
     partial = library / "steamapps" / "common" / "Spacewar"
-    partial.mkdir(parents=True)
+    executor._record_owned_dir(480, "Spacewar", partial)
     (partial / "partial.bin").write_text("x", encoding="utf-8")
 
     actions = executor.reconcile()
@@ -499,6 +500,40 @@ def test_stale_marker_does_not_vouch_for_replaced_directory(harness) -> None:
     assert "not owned" in report.detail
 
 
+def test_resume_with_replaced_target_directory_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    for state in (
+        "lease_acquired",
+        "client_stopping",
+        "content_running",
+        "interrupted",
+    ):
+        ledger.transition(operation_id, state)
+    target = library / "steamapps" / "common" / "Spacewar"
+    executor._record_owned_dir(480, "Spacewar", target)
+    # The partial dir vanishes and the path is repurposed mid-interruption.
+    shutil.rmtree(target)
+    target.mkdir(parents=True)
+    (target / "unrelated.bin").write_text("keep", encoding="utf-8")
+
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "not owned" in report.detail
+
+
+def test_adoption_filesystem_error_fails_cleanly(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    executor._journal_dir.parent.mkdir(parents=True, exist_ok=True)
+    executor._journal_dir.write_text("", encoding="utf-8")  # blocks mkdir
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "failed"
+    assert "filesystem error" in report.detail
+    assert ledger.get(operation_id).state == "failed"
+    assert session.starts == 1  # prior run-state restored
+
+
 def test_content_adapter_exception_restores_client(harness) -> None:
     ledger, session, content, executor, _ = harness
 
@@ -632,6 +667,7 @@ def test_safe_install_dir_name_rejects_acf_breaking_characters() -> None:
     assert not safe_install_dir_name('Bad"Name')
     assert not safe_install_dir_name("two\nlines")
     assert not safe_install_dir_name("../../outside")
+    assert not safe_install_dir_name("x" * 256)  # exceeds component limit
     assert safe_install_dir_name("Desk Job")
 
 

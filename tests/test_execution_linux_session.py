@@ -52,6 +52,24 @@ def test_download_gate_covers_all_configured_libraries(tmp_path: Path) -> None:
     assert session.gates().download_in_flight == "fail"
 
 
+def test_truncated_library_config_is_unknown_not_pass(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    (library / "steamapps").mkdir(parents=True)
+    # Truncated mid-file: the surviving path entry must not be trusted as
+    # the complete library list.
+    (library / "steamapps" / "libraryfolders.vdf").write_text(
+        f'"libraryfolders"\n{{\n\t"0"\n\t{{\n\t\t"path"\t\t"{library}"\n\t}}\n'
+        '\t"1"\n\t{\n\t\t"pa',
+        encoding="utf-8",
+    )
+
+    def runner(argv: list[str]) -> CommandResult:
+        return CommandResult(returncode=1, stdout="")
+
+    session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
+    assert session.gates().download_in_flight == "unknown"
+
+
 def test_unreadable_library_config_is_unknown_not_pass(tmp_path: Path) -> None:
     library = tmp_path / "library"
     (library / "steamapps").mkdir(parents=True)

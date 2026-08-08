@@ -207,6 +207,25 @@ def test_policy_revocation_dead_ends_confirmation(
     assert json.loads(capsys.readouterr().out)["active"] is None  # aborted
 
 
+def test_run_with_unreadable_policy_aborts_operation(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan()))
+    main(["--state-dir", str(state_dir), "request", "--account", "o"])
+    nonce = json.loads(capsys.readouterr().out)["nonce"]
+    main(["--state-dir", str(state_dir), "confirm", nonce, "--actor", "a"])
+    capsys.readouterr()
+
+    # An unreadable policy must dead-end the operation like a denial, not
+    # leave it (and a possibly stopped client) waiting on policy repair.
+    (state_dir / "policy.toml").write_text("not valid [ toml", encoding="utf-8")
+    assert main(["--state-dir", str(state_dir), "run"]) == 2
+    capsys.readouterr()
+    assert main(["--state-dir", str(state_dir), "status"]) == 0
+    assert json.loads(capsys.readouterr().out)["active"] is None  # aborted
+
+
 def test_replayed_nonce_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     monkeypatch.setattr("sys.stdin", io.StringIO(_plan()))
