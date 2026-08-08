@@ -237,7 +237,7 @@ def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: str) -> None:
+    def __init__(self, stdout: str | bytes) -> None:
         self.pid = 4242
         self.returncode = 0
         self._stdout = stdout
@@ -275,6 +275,31 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     assert str(install_dir) not in log and str(home) not in log
     assert "76561199000000001" not in log
     assert "<account>" in log and "<steamid>" in log
+
+
+def test_locale_invalid_output_still_classifies(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    # Invalid UTF-8 in steamcmd output must be decoded leniently, never
+    # raised out of classification with the client stopped.
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: _FakeProcess(
+            b"Success! App '480' fully installed. \xff\xfe"
+        ),
+    )
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+    )
+    result = adapter.install(
+        account="o", appid=480, install_dir=tmp_path / "i", operation_id=1
+    )
+    assert result.outcome == "installed"
 
 
 def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) -> None:

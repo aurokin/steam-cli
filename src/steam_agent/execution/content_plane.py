@@ -73,7 +73,6 @@ def _durable_write(path: Path, data: bytes) -> None:
 
 
 def _captured_text(captured: str | bytes | None) -> str:
-    # TimeoutExpired carries bytes even when the run used text=True.
     if captured is None:
         return ""
     if isinstance(captured, bytes):
@@ -137,7 +136,9 @@ class SteamcmdAdapter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                text=True,
+                # Bytes, decoded leniently below: text mode would raise
+                # UnicodeDecodeError on locale-invalid steamcmd output,
+                # escaping classification with the client still stopped.
                 env=environment,
                 start_new_session=True,
             )
