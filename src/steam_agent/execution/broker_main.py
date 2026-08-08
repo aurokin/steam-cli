@@ -241,8 +241,15 @@ def main(argv: list[str] | None = None) -> int:
             return _fail("install_dir_name must be a string path component")
         appid = target.get("appid")
         # A JSON integer only: int() would silently coerce 480.9 or true
-        # into a different AppID than the plan the human confirms.
-        if not isinstance(appid, int) or isinstance(appid, bool) or appid <= 0:
+        # into a different AppID than the plan the human confirms.  Steam
+        # AppIDs are 32-bit; anything larger is malformed (and would
+        # overflow the ledger's INTEGER column).
+        if (
+            not isinstance(appid, int)
+            or isinstance(appid, bool)
+            or appid <= 0
+            or appid > 0xFFFFFFFF
+        ):
             return _fail("plan target appid is malformed")
         with _state_lock(state_dir):
             try:

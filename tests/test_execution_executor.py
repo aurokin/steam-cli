@@ -425,6 +425,19 @@ def test_unowned_existing_target_directory_aborts(harness) -> None:
     assert "not owned" in report.detail
 
 
+def test_plan_name_conflicting_with_existing_install_aborts(harness) -> None:
+    ledger, _, _, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"480"\n\t"installdir"\t\t"OldDir"\n'
+        '\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    operation_id = _authorized(ledger)  # plan explicitly says "Spacewar"
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "move is not an executable operation" in report.detail
+
+
 def test_unreadable_own_manifest_blocks_fallback(harness) -> None:
     ledger, _, _, executor, library = harness
     (library / "steamapps" / "appmanifest_480.acf").write_text(

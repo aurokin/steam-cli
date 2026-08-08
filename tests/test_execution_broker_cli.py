@@ -157,11 +157,14 @@ def test_non_object_plan_rejected(state_dir: Path, monkeypatch, capsys) -> None:
 
 def test_malformed_appid_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
-    plan = json.loads(_plan())
-    plan["target"]["appid"] = "not-an-appid"
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
-    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
-    assert "appid" in capsys.readouterr().err
+    for bad in ("not-an-appid", 2**64, 0, True):
+        plan = json.loads(_plan())
+        plan["target"]["appid"] = bad
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+        assert (
+            main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+        )
+        assert "appid" in capsys.readouterr().err
 
 
 def test_non_string_install_dir_name_rejected(

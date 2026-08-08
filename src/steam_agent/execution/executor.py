@@ -163,34 +163,48 @@ class Executor:
                 operation_id, "aborted", "install_dir_name must be a string"
             )
         install_dir_name = raw_name or ""
-        if not install_dir_name:
-            # Prefer the directory the client already uses for this AppID:
-            # inventing a new one would re-download and orphan the install.
-            # Reusing the live directory in place is the accepted
-            # recoverable-update contract (ADR 0027 clause 5): steamcmd
-            # validates and repairs content on retry, and failure cost is
-            # bounded at temporary unplayability, never a second full copy.
-            own_manifest = (
-                self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
-            )
-            if own_manifest.exists():
-                existing = manifest_install_dir(own_manifest)
-                if existing is None:
-                    # An install exists but its directory is unknowable;
-                    # falling back to app_<appid> would orphan it.
-                    ledger.transition(
-                        operation_id,
-                        "aborted",
-                        detail="existing manifest unreadable",
-                    )
-                    return ExecutionReport(
-                        operation_id,
-                        "aborted",
-                        "existing manifest for this title is unreadable",
-                    )
-                install_dir_name = existing
-            else:
-                install_dir_name = f"app_{operation.appid}"
+        # The directory the client already uses for this AppID always wins:
+        # any other directory would re-download and orphan the install, and
+        # move is not an executable operation in Phase 1.  Reusing the live
+        # directory in place is the accepted recoverable-update contract
+        # (ADR 0027 clause 5): steamcmd validates and repairs content on
+        # retry, and failure cost is bounded at temporary unplayability.
+        own_manifest = (
+            self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
+        )
+        if own_manifest.exists():
+            existing = manifest_install_dir(own_manifest)
+            if existing is None:
+                # An install exists but its directory is unknowable; any
+                # chosen directory could orphan it.
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="existing manifest unreadable",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "existing manifest for this title is unreadable",
+                )
+            if (
+                install_dir_name
+                and install_dir_name.casefold() != existing.casefold()
+            ):
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail="plan name conflicts with existing install directory",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "plan install_dir_name conflicts with the existing install"
+                    " directory; move is not an executable operation",
+                )
+            install_dir_name = existing
+        elif not install_dir_name:
+            install_dir_name = f"app_{operation.appid}"
         if not safe_install_dir_name(install_dir_name):
             ledger.transition(
                 operation_id, "aborted", detail="unsafe install_dir_name"
