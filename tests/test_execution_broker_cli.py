@@ -428,3 +428,45 @@ def test_confirm_minted_row_confirmable_after_flip_to_allow(
         main(["--state-dir", str(state_dir), "confirm", nonce, "--actor", "o"]) == 0
     )
     assert json.loads(capsys.readouterr().out)["state"] == "authorized"
+
+
+def test_verify_is_granted_separately_from_install(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    # Repair replaces locally modified official files, so an install grant
+    # must not carry it.
+    _grant_install(state_dir)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("verify")))
+
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "denies 'verify'" in capsys.readouterr().err
+
+
+def test_verify_grant_admits_verify_but_not_install(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    (state_dir / "policy.toml").write_text(
+        '[grants]\nverify = "confirm"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("verify")))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "pending_confirmation"
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan("install")))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "denies 'install'" in capsys.readouterr().err
+
+
+def test_policy_verb_reports_both_grants(state_dir: Path, capsys) -> None:
+    (state_dir / "policy.toml").write_text(
+        '[grants]\ninstall = "allow"\nverify = "confirm"\n'
+        "[limits]\nmin_free_gb = 5\n",
+        encoding="utf-8",
+    )
+
+    assert main(["--state-dir", str(state_dir), "policy"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["grants"] == {
+        "install": "allow",
+        "verify": "confirm",
+    }

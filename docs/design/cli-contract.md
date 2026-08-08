@@ -706,10 +706,24 @@ private HOME with its cached credentials. Stdout is deterministic JSON;
 diagnostics go to stderr. Exit 0 is success, 1 is a completed run whose
 outcome was not `confirmed`, and 2 is a refusal or error.
 
-`install` is the only executable operation class; every other class is denied
-regardless of policy content. Uninstall remains human-in-Steam, and store,
-market, wallet, credential, and account-settings operations are absent code
-paths rather than policy entries.
+`install` and `verify` are the executable operation classes; every other
+class is denied regardless of policy content. `install` covers update — they
+share one steamcmd mechanism and one plan class. `verify` is the repair
+capability: Valve's `app_update ... validate` pass, granted separately
+because it replaces locally modified official files, so a mod installed over
+official content is replaced without further warning. It repairs an existing
+install rather than creating one: before any content work it requires both
+Valve's FullyInstalled bit in the existing manifest and a real file with
+bytes under the install directory, so a stale manifest over deleted content
+is refused rather than turned into a download. That is evidence, not proof —
+residue left in a deleted directory can still satisfy it, and validate would
+then re-download. The load-bearing bound is that verify needs an existing
+client manifest for the AppID at all: it can re-acquire a title the owner
+already installed, never add a new one, which is why it is a separate grant
+rather than a way around `install = "deny"`. Uninstall remains human-in-Steam, move ships
+as an inert plan (ADR 0029), and store, market, wallet, credential, and
+account-settings operations are absent code paths rather than policy
+entries.
 
 ### Authorization
 
@@ -719,10 +733,14 @@ every decision point, failing closed when unreadable.
 ```toml
 [grants]
 install = "allow"   # or "confirm" (two-step) or "deny" (kill switch)
+verify = "confirm"  # same three values, granted independently
 
 [limits]
 min_free_gb = 25    # required whenever any grant is "allow"
 ```
+
+Each class is granted on its own; an `install` grant never carries `verify`.
+An omitted key is `deny`.
 
 Under `confirm`, `request` emits `{"operation_id", "nonce", "state":
 "pending_confirmation"}` and the operation runs only after `confirm` consumes

@@ -12,7 +12,11 @@ from steam_agent.execution.content_plane import (
     manifest_state_flags,
     reconcile_adoption,
 )
-from steam_agent.execution.policy import PolicyError, load_policy
+from steam_agent.execution.policy import (
+    PolicyError,
+    load_policy,
+    write_policy_template,
+)
 
 _MANIFEST = '''"AppState"
 {
@@ -628,3 +632,34 @@ def test_steamcmd_timeout_kills_entire_process_tree(tmp_path: Path) -> None:
     child_pid = int(pid_file.read_text(encoding="utf-8").strip())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)  # the wrapped child must not survive the timeout
+
+
+def test_default_template_denies_both_operation_classes(tmp_path: Path) -> None:
+    path = tmp_path / "policy.toml"
+    write_policy_template(path)
+
+    policy = load_policy(path)
+
+    assert policy.grant_for("install") == "deny"
+    assert policy.grant_for("verify") == "deny"
+
+
+def test_an_unknown_operation_class_is_denied_even_when_the_file_omits_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "policy.toml"
+    path.write_text('[grants]\nverify = "confirm"\n', encoding="utf-8")
+
+    policy = load_policy(path)
+
+    assert policy.grant_for("verify") == "confirm"
+    assert policy.grant_for("install") == "deny"
+    assert policy.grant_for("uninstall") == "deny"
+
+
+def test_verify_allow_still_requires_a_disk_floor(tmp_path: Path) -> None:
+    path = tmp_path / "policy.toml"
+    path.write_text('[grants]\nverify = "allow"\n', encoding="utf-8")
+
+    with pytest.raises(PolicyError):
+        load_policy(path)

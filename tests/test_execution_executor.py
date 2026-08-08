@@ -85,6 +85,7 @@ class FakeContent:
     outcome: str = "installed"
     log_dir: Path = field(default_factory=Path)
     write_manifest: bool = True
+    validated: bool | None = None
 
     def install(
         self,
@@ -93,8 +94,10 @@ class FakeContent:
         appid: int,
         install_dir: Path,
         operation_id: int,
+        validate: bool = False,
         abort_when=None,
     ) -> ContentResult:
+        self.validated = validate
         log_path = self.log_dir / f"install-{appid}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("log", encoding="utf-8")
@@ -130,7 +133,10 @@ _PLAN_KEYS = itertools.count()
 
 
 def _authorized(
-    ledger: ExecutionLedger, *, install_dir_name: str | None = "Spacewar"
+    ledger: ExecutionLedger,
+    *,
+    install_dir_name: str | None = "Spacewar",
+    operation: str = "install",
 ) -> int:
     _, nonce = ledger.request(
         # Unique per operation: one idempotency key never mints twice.
@@ -138,11 +144,11 @@ def _authorized(
         plan_document=json.dumps(
             {
                 "schema": "operation-plan/0.1",
-                "operation": "install",
+                "operation": operation,
                 "install_dir_name": install_dir_name,
             }
         ),
-        operation="install",
+        operation=operation,
         appid=480,
         account_alias="owner",
         machine_id="machine-a",
@@ -1046,3 +1052,138 @@ def test_reconcile_adopting_rolled_back_fails(harness) -> None:
     assert ledger.get(operation_id).state == "failed"
     assert any("restored" in action for action in actions)
     assert adopted.read_text(encoding="utf-8") == "old"  # backup reinstated
+
+
+def test_verify_runs_the_validate_pass_over_the_existing_install(harness) -> None:
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    installed = library / "steamapps" / "common" / "Spacewar"
+    installed.mkdir(parents=True)
+    (installed / "game.bin").write_bytes(b"content")
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "confirmed"
+    assert content.validated is True
+    # Repairs the directory the client already uses; never a second copy.
+    assert (library / "steamapps" / "common" / "Spacewar").exists()
+
+
+def test_install_does_not_run_the_validate_pass(harness) -> None:
+    ledger, _, content, executor, _ = harness
+
+    executor.execute(_authorized(ledger))
+
+    assert content.validated is False
+
+
+def test_verify_refuses_a_title_that_is_not_installed(harness) -> None:
+    ledger, _, content, executor, _ = harness
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert "not installed" in report.detail
+    # Refused before any content work: verify repairs, it never downloads.
+    assert content.validated is None
+    assert ledger.get(operation_id).state == "aborted"
+
+
+def test_verify_refuses_a_stale_manifest_over_a_deleted_directory(harness) -> None:
+    # Otherwise validate would take the full download path, letting a verify
+    # grant perform the install that install = "deny" refuses.
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert "not fully installed" in report.detail
+    assert content.validated is None
+
+
+def test_verify_refuses_an_empty_install_directory(harness) -> None:
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    (library / "steamapps" / "common" / "Spacewar").mkdir(parents=True)
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert content.validated is None
+
+
+@pytest.mark.parametrize(
+    "residue",
+    [
+        pytest.param(("dir", "empty-subdir"), id="empty subdirectory"),
+        pytest.param(("file", ".DS_Store"), id="zero-byte dotfile"),
+    ],
+)
+def test_verify_does_not_mistake_residue_for_an_installed_game(
+    harness, residue: tuple[str, str]
+) -> None:
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    target = library / "steamapps" / "common" / "Spacewar"
+    target.mkdir(parents=True)
+    kind, name = residue
+    if kind == "dir":
+        (target / name).mkdir()
+    else:
+        (target / name).write_bytes(b"")
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert content.validated is None
+
+
+def test_verify_refuses_a_manifest_without_the_installed_bit(harness) -> None:
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST.replace('"StateFlags"\t\t"4"', '"StateFlags"\t\t"1026"'),
+        encoding="utf-8",
+    )
+    target = library / "steamapps" / "common" / "Spacewar"
+    target.mkdir(parents=True)
+    (target / "game.bin").write_bytes(b"content")
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert content.validated is None
+
+
+def test_verify_accepts_a_directory_heavy_install(harness) -> None:
+    # Subdirectories must not exhaust the probe before a sibling file
+    # settles the question.
+    ledger, _, content, executor, library = harness
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST, encoding="utf-8"
+    )
+    target = library / "steamapps" / "common" / "Spacewar"
+    target.mkdir(parents=True)
+    for index in range(200):
+        (target / f"dir{index}").mkdir()
+    (target / "game.bin").write_bytes(b"content")
+    operation_id = _authorized(ledger, operation="verify", install_dir_name=None)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "confirmed"
+    assert content.validated is True

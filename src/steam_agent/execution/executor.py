@@ -47,6 +47,53 @@ ExecuteOutcome = Literal[
 _STATE_FULLY_INSTALLED = 4
 
 
+# Valve's EAppState FullyInstalled bit, the same signal the M1 scanner
+# reads.  Duplicated rather than imported: the planner and the broker are
+# deliberately separate programs.
+_APP_STATE_FULLY_INSTALLED = 1 << 2
+# A runaway bound, not a sampling limit: the probe returns at the first
+# non-empty file, so a real install exits almost immediately whatever this
+# is set to, and only a pathological all-empty tree ever approaches it.
+_CONTENT_PROBE_ENTRIES = 100_000
+
+
+def _holds_a_nonempty_file(root: Path) -> bool:
+    """Whether the tree holds a regular file with bytes, within a budget.
+
+    Directory entries alone do not prove an install: an empty subdirectory
+    or a stray dotfile is residue.  Links are not followed — their targets
+    are not this directory's content.
+    """
+
+    budget = _CONTENT_PROBE_ENTRIES
+    stack = [root]
+    while stack:
+        directories: list[Path] = []
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if budget <= 0:
+                        return False
+                    budget -= 1
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(Path(entry.path))
+                        elif entry.stat(follow_symlinks=False).st_size > 0:
+                            # Answer from this directory before descending:
+                            # a directory-heavy tree must not spend the
+                            # budget on subdirectories that a sibling file
+                            # would have settled.
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        stack.extend(directories)
+    return False
+
+
 def safe_install_dir_name(name: str) -> bool:
     """True only for one path component that can be quoted into an ACF value."""
 
@@ -193,6 +240,12 @@ class Executor:
                 "library steamapps directory unavailable; deferred",
             )
 
+        # verify (Phase 2b) is the user-facing repair capability: the same
+        # Valve validate pass, separately granted because it replaces
+        # locally modified official files.  It repairs an install and never
+        # creates one, so an absent manifest is a refusal, not a download.
+        validating = operation.operation == "verify"
+
         plan = ledger.plan_document(operation_id)
         raw_name = plan.get("install_dir_name")
         if raw_name is not None and not isinstance(raw_name, str):
@@ -245,6 +298,14 @@ class Executor:
                     " install directory; move is not an executable operation",
                 )
             install_dir_name = existing
+        elif validating:
+            return self._abort_intake(
+                operation_id,
+                operation.prior_client_running,
+                detail="verify requires an existing install",
+                message="this title is not installed; verify repairs an"
+                " install rather than creating one",
+            )
         elif not install_dir_name:
             install_dir_name = f"app_{operation.appid}"
         if not safe_install_dir_name(install_dir_name):
@@ -279,6 +340,37 @@ class Executor:
                 detail="install target escapes library",
                 message="install target resolves outside the library",
             )
+        if validating:
+            # A manifest is not content.  A stale appmanifest left over a
+            # deleted directory would otherwise send validate down the full
+            # download path, letting a verify grant perform the install that
+            # install = "deny" refuses.  Two independent signals must agree:
+            # Valve's own FullyInstalled bit, and a real file with bytes in
+            # it — an empty subdirectory or a stray .DS_Store is residue,
+            # not a game.  Anything unreadable counts as absent.
+            #
+            # Accepted residual case, deliberately not chased further: a
+            # stale FullyInstalled manifest over a hand-deleted directory
+            # that still holds one non-empty file passes this probe, and
+            # validate then re-downloads.  No filesystem heuristic can
+            # prove bytes are Steam-managed content without the depot
+            # manifest, which is what validate itself fetches.  The bound
+            # that matters is elsewhere: verify requires an existing client
+            # manifest for the AppID, so the worst case re-acquires a title
+            # the owner already installed — bandwidth and disk, the cost
+            # ADR 0028 accepts — and can never add a new one.
+            flags = manifest_state_flags(own_manifest)
+            installed_bit = flags is not None and bool(
+                flags & _APP_STATE_FULLY_INSTALLED
+            )
+            if not (installed_bit and _holds_a_nonempty_file(target)):
+                return self._abort_intake(
+                    operation_id,
+                    operation.prior_client_running,
+                    detail="verify found no installed content",
+                    message="this title is not fully installed on disk;"
+                    " verify repairs an install rather than creating one",
+                )
         for manifest in sorted((self._library / "steamapps").glob("appmanifest_*.acf")):
             if manifest.name == f"appmanifest_{operation.appid}.acf":
                 continue
@@ -471,6 +563,7 @@ class Executor:
                 appid=operation.appid,
                 install_dir=target,
                 operation_id=operation_id,
+                validate=validating,
                 # The adapter polls this and kills steamcmd promptly: a
                 # client relaunched mid-download is a concurrent writer, and
                 # a lapsed window ends the authorization for further content

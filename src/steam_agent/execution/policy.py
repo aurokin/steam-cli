@@ -1,9 +1,11 @@
 """Execution policy: which operation classes the owner has granted.
 
 Grants are ``allow`` (auto-authorize at request time within [limits]),
-``confirm`` (two-step explicit approval), or ``deny``, for exactly one
-operation class: ``install`` (update shares install's mechanism and plan
-class).  Everything else is denied here regardless of file content —
+``confirm`` (two-step explicit approval), or ``deny``, for two operation
+classes: ``install`` (update shares install's mechanism and plan class) and
+``verify`` (the repair capability — Valve's validate pass, granted
+separately because it replaces locally modified official files).
+Everything else is denied here regardless of file content —
 unknown keys, unknown values, and ``allow_unattended`` all fail closed.
 The policy file is the owner's recorded intent, an accident brake, and
 the kill switch (``install = "deny"``); it is not an enforcement boundary
@@ -18,18 +20,23 @@ from pathlib import Path
 import tomllib
 
 SUPPORTED_GRANTS: dict[str, frozenset[str]] = {
-    "install": frozenset({"allow", "confirm", "deny"})
+    "install": frozenset({"allow", "confirm", "deny"}),
+    "verify": frozenset({"allow", "confirm", "deny"}),
 }
 
 POLICY_TEMPLATE = """\
 # steam-agent-broker execution policy (ADR 0028).
-# Supported: install = "allow" | "confirm" | "deny".  Anything else fails
-# closed.  "allow" auto-authorizes requests and requires [limits]
-# min_free_gb (decimal GB measured on the library filesystem).  This file
-# is the owner's recorded intent and the kill switch, not an enforcement
-# boundary.
+# Supported keys: install and verify, each "allow" | "confirm" | "deny".
+# Anything else fails closed.  "allow" auto-authorizes requests and
+# requires [limits] min_free_gb (decimal GB measured on the library
+# filesystem).  verify runs Valve's validate pass, which replaces locally
+# modified official files, so granting it "allow" also authorizes
+# unattended replacement of any mods installed over official content.
+# This file is the owner's recorded intent and the kill switch, not an
+# enforcement boundary.
 [grants]
 install = "deny"
+verify = "deny"
 
 # [limits]
 # min_free_gb = 25

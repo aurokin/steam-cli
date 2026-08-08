@@ -45,7 +45,7 @@ from steam_agent.execution.policy import (
     write_policy_template,
 )
 
-_SUPPORTED_OPERATIONS = frozenset({"install"})
+_SUPPORTED_OPERATIONS = frozenset({"install", "verify"})
 # Generous for a plan (well under a page of JSON in practice).
 _PLAN_BYTE_LIMIT = 64 * 1024
 

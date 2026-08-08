@@ -322,7 +322,9 @@ the files in place.
 - **Phases 2a/2b/2c — independent verb additions**, each gated on its own
   spike line and shippable alone: 2a uninstall-as-inert-plan (candidate
   ranking + inventory + in-Steam instructions; human executes, per §10a),
-  2b repair, 2c launch allowlist (dispatched-terminal). A former 2d
+  2b repair — IMPLEMENTED as the `verify` operation class
+  ([ADR 0030](../adr/0030-verify-as-a-second-executable-class.md)) — and
+  2c launch allowlist (dispatched-terminal). A former 2d
   (move-by-reinstall) is cancelled by ADR 0029 — move ships as an inert plan
   and needs no broker work.
 - **Phase 3 — unattended policy limits** (owner decision 2026-08-08:

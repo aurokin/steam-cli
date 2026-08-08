@@ -125,17 +125,27 @@ class SteamcmdAdapter:
         appid: int,
         install_dir: Path,
         operation_id: int,
+        validate: bool = False,
         abort_when: Callable[[], bool] | None = None,
     ) -> ContentResult:
+        """Run ``app_update``, optionally with Valve's ``validate`` pass.
+
+        ``validate`` is the same Valve verb the client's "verify integrity"
+        button uses: it re-checks every file against the depot manifest and
+        replaces whatever differs, which is why it is a separately granted
+        capability rather than a flag on install.
+        """
+
         self._home.mkdir(parents=True, exist_ok=True)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         # Per-attempt filename (an operation can retry after interruption):
         # every attempt keeps its own evidence instead of the last one's.
         # The pid disambiguates a quick crash-restart within one second.
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        kind = "verify" if validate else "install"
         log_path = (
             self._log_dir
-            / f"install-{appid}-op{operation_id}-{stamp}-p{os.getpid()}.log"
+            / f"{kind}-{appid}-op{operation_id}-{stamp}-p{os.getpid()}.log"
         )
         argv = [
             str(self._script),
@@ -147,6 +157,7 @@ class SteamcmdAdapter:
             account,
             "+app_update",
             str(appid),
+            *(["validate"] if validate else []),
             "+quit",
         ]
         environment = dict(os.environ, HOME=str(self._home))
