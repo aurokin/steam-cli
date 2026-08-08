@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import itertools
 import json
 from pathlib import Path
 import shutil
@@ -125,11 +126,15 @@ def harness(tmp_path: Path):
     ledger.close()
 
 
+_PLAN_KEYS = itertools.count()
+
+
 def _authorized(
     ledger: ExecutionLedger, *, install_dir_name: str | None = "Spacewar"
 ) -> int:
     _, nonce = ledger.request(
-        plan_key="k" * 8,
+        # Unique per operation: one idempotency key never mints twice.
+        plan_key=f"test-key-{next(_PLAN_KEYS):08d}",
         plan_document=json.dumps(
             {
                 "schema": "operation-plan/0.1",
@@ -863,6 +868,33 @@ def test_window_lapse_during_download_fails(harness, monkeypatch) -> None:
     assert report.outcome == "failed"
     assert "window lapsed" in report.detail
     assert session.starts == 1  # prior run-state still restored
+
+
+def test_window_lapse_during_stop_skips_content(harness, monkeypatch) -> None:
+    ledger, session, content, executor, _ = harness
+    installed = []
+    original_install = content.install
+
+    def tracking_install(**kwargs):
+        installed.append(1)
+        return original_install(**kwargs)
+
+    content.install = tracking_install
+    original_stop = session.stop_client
+
+    def stop_and_lapse() -> bool:
+        result = original_stop()
+        # The shutdown consumed the rest of the authorization window.
+        monkeypatch.setattr(ledger, "window_valid", lambda _oid: False)
+        return result
+
+    session.stop_client = stop_and_lapse
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "before content start" in report.detail
+    assert not installed  # steamcmd never started outside the window
+    assert session.starts == 1  # prior run-state restored
 
 
 def test_gate_regression_during_download_skips_adoption(harness) -> None:

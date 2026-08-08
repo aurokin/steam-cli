@@ -22,10 +22,13 @@ def ledger(tmp_path: Path) -> ExecutionLedger:
 
 
 def _request(
-    ledger: ExecutionLedger, machine: str = "herb", ttl: int = 900
+    ledger: ExecutionLedger,
+    machine: str = "herb",
+    ttl: int = 900,
+    key: str = "k" * 8,
 ) -> tuple[int, str]:
     return ledger.request(
-        plan_key="k" * 8,
+        plan_key=key,
         plan_document='{"schema": "operation-plan/0.1"}',
         operation="install",
         appid=1902490,
@@ -93,7 +96,7 @@ def test_expired_nonce_rejected(ledger: ExecutionLedger) -> None:
 def test_single_active_operation_per_machine(ledger: ExecutionLedger) -> None:
     _request(ledger)
     with pytest.raises(LedgerError):
-        _request(ledger)
+        _request(ledger, key="different-key")  # same machine, distinct plan
 
 
 def test_terminal_frees_the_machine_slot(ledger: ExecutionLedger) -> None:
@@ -102,7 +105,19 @@ def test_terminal_frees_the_machine_slot(ledger: ExecutionLedger) -> None:
     for state in ("lease_acquired", "client_stopping", "content_running"):
         ledger.transition(operation_id, state)
     ledger.transition(operation_id, "failed", detail="test")
-    _request(ledger)  # does not raise
+    _request(ledger, key="next-plan")  # does not raise
+
+
+def test_idempotency_key_replay_rejected(ledger: ExecutionLedger) -> None:
+    operation_id, nonce = _request(ledger)
+    ledger.confirm(nonce=nonce, actor="a")
+    for state in ("lease_acquired", "client_stopping", "content_running"):
+        ledger.transition(operation_id, state)
+    ledger.transition(operation_id, "failed", detail="test")
+    # Terminal or not, a recorded key must never mint a second nonce.
+    with pytest.raises(LedgerError):
+        _request(ledger)
+    _request(ledger, key="fresh-key")  # a new plan proceeds normally
 
 
 def test_transition_table_enforced(ledger: ExecutionLedger) -> None:

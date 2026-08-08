@@ -173,6 +173,18 @@ class ExecutionLedger:
                 )
                 """
             )
+            # One idempotency key, one attempt that could ever execute —
+            # durably, so a transport retry can never mint a second nonce
+            # for a plan that already ran (or is running).  'expired' rows
+            # are excluded: a nonce that lapsed unconfirmed never executed,
+            # and re-requesting that plan is legitimate.
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS one_operation_per_plan_key
+                ON operations(plan_key)
+                WHERE state != 'expired'
+                """
+            )
 
     # -- intake -----------------------------------------------------------
 
@@ -205,6 +217,19 @@ class ExecutionLedger:
         expires = now + timedelta(seconds=nonce_ttl_seconds)
         try:
             with self._transaction():
+                # Idempotency: a retry of an already-recorded plan (lost
+                # response, transport replay) must surface as an error, not
+                # a fresh nonce that could execute the plan a second time.
+                duplicate = self._connection.execute(
+                    "SELECT state FROM operations"
+                    " WHERE plan_key = ? AND state != 'expired' LIMIT 1",
+                    (plan_key,),
+                ).fetchone()
+                if duplicate is not None:
+                    raise LedgerError(
+                        "idempotency key already recorded"
+                        f" (state: {duplicate[0]})"
+                    )
                 cursor = self._connection.execute(
                     """
                     INSERT INTO operations (

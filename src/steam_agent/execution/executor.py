@@ -416,6 +416,21 @@ class Executor:
                 to_state="aborted",
             )
 
+        # The client stop above can consume real time; content writes are
+        # authorized only inside the window, so revalidate before steamcmd
+        # starts (the abort poll below keeps enforcing it mid-run).
+        if not ledger.window_valid(operation_id):
+            # Nothing has been mutated yet, so this is an abort, not a
+            # failure (also the only legal terminal from client_stopping).
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="window lapsed before content start",
+                message="execution window lapsed before content start",
+                outcome="aborted",
+                to_state="aborted",
+            )
+
         ledger.transition(
             operation_id,
             "content_running",
@@ -433,10 +448,14 @@ class Executor:
                 appid=operation.appid,
                 install_dir=target,
                 operation_id=operation_id,
-                # A client relaunched mid-download is a concurrent writer;
-                # the adapter polls this and kills steamcmd promptly instead
-                # of leaving the overlap open until the late probe.
-                abort_when=self._session.client_possibly_running,
+                # The adapter polls this and kills steamcmd promptly: a
+                # client relaunched mid-download is a concurrent writer, and
+                # a lapsed window ends the authorization for further content
+                # writes — neither may wait for the post-download checks.
+                abort_when=lambda: (
+                    self._session.client_possibly_running()
+                    or not ledger.window_valid(operation_id)
+                ),
             )
         except _TargetEscapedError:
             return self._finish_failure(
