@@ -237,14 +237,25 @@ def test_reconcile_foreign_operation_journal_is_stale(tmp_path: Path) -> None:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: str | bytes, stderr: str = "") -> None:
+    """Stands in for Popen: writes canned output into the spool handles."""
+
+    def __init__(self, stdout: str | bytes, stderr: str | bytes = "") -> None:
         self.pid = 4242
         self.returncode = 0
         self._stdout = stdout
         self._stderr = stderr
 
-    def communicate(self, timeout=None):
-        return self._stdout, self._stderr
+    def bind(self, kwargs) -> "_FakeProcess":
+        for data, key in ((self._stdout, "stdout"), (self._stderr, "stderr")):
+            handle = kwargs.get(key)
+            if handle is not None and hasattr(handle, "write"):
+                handle.write(
+                    data if isinstance(data, bytes) else data.encode("utf-8")
+                )
+        return self
+
+    def wait(self, timeout=None) -> int:
+        return self.returncode
 
 
 def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> None:
@@ -261,7 +272,8 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
         lambda *args, **kwargs: _FakeProcess(
             f"Logging in user 'ownername' (76561199000000001)"
             f" buddy 76561200000000000 ... dir {install_dir} home {home}"
-        ),
+            f"\nLogin OK for user 'OWNERNAME'"  # case-normalized echo
+        ).bind(kwargs),
     )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
@@ -272,7 +284,7 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
         account="ownername", appid=480, install_dir=install_dir, operation_id=1
     )
     log = result.log_path.read_text(encoding="utf-8")
-    assert "ownername" not in log
+    assert "ownername" not in log.lower().replace("<account>", "")
     assert str(install_dir) not in log and str(home) not in log
     assert "76561199000000001" not in log
     assert "76561200000000000" not in log  # beyond the 7656119 prefix
@@ -295,7 +307,7 @@ def test_stderr_never_merges_into_a_recognized_stdout_line(
         lambda *args, **kwargs: _FakeProcess(
             "Success! App '480' fully installed.",
             "/home/someuser/.secret-place diagnostic",
-        ),
+        ).bind(kwargs),
     )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
@@ -326,7 +338,7 @@ def test_unconfigured_paths_scrubbed_from_recognized_lines(
         "Popen",
         lambda *args, **kwargs: _FakeProcess(
             "ERROR opening /home/someuser/private-file for read"
-        ),
+        ).bind(kwargs),
     )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
@@ -353,7 +365,7 @@ def test_locale_invalid_output_still_classifies(tmp_path: Path, monkeypatch) -> 
         "Popen",
         lambda *args, **kwargs: _FakeProcess(
             b"Success! App '480' fully installed. \xff\xfe"
-        ),
+        ).bind(kwargs),
     )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",
@@ -374,7 +386,7 @@ def test_marker_substring_account_still_classifies(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(
         subprocess,
         "Popen",
-        lambda *args, **kwargs: _FakeProcess("Success! App '480' fully installed."),
+        lambda *args, **kwargs: _FakeProcess("Success! App '480' fully installed.").bind(kwargs),
     )
     adapter = SteamcmdAdapter(
         steamcmd_script=tmp_path / "steamcmd.sh",

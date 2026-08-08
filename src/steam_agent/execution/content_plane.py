@@ -31,6 +31,9 @@ _AUTH_FAILURE = re.compile(
 _SUCCESS = re.compile(r"fully installed", re.IGNORECASE)
 _DEFAULT_TIMEOUT_SECONDS = 30 * 60
 _DEFAULT_ABORT_POLL_SECONDS = 15.0
+# Per-stream cap when reading spooled steamcmd output back for
+# classification; beyond it, keep the head and tail (markers live there).
+_OUTPUT_CAPTURE_LIMIT = 4 * 1024 * 1024
 
 # Only recognized steamcmd diagnostic lines are persisted (after literal
 # redaction); everything else is dropped with a count.  The repository
@@ -75,12 +78,20 @@ def _durable_write(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
-def _captured_text(captured: str | bytes | None) -> str:
-    if captured is None:
+def _read_spooled(path: Path, limit: int = _OUTPUT_CAPTURE_LIMIT) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size <= limit:
+                data = handle.read()
+            else:
+                half = limit // 2
+                head = handle.read(half)
+                handle.seek(size - half)
+                data = head + b"\n[output truncated]\n" + handle.read()
+    except OSError:
         return ""
-    if isinstance(captured, bytes):
-        return captured.decode("utf-8", errors="replace")
-    return captured
+    return data.decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,56 +153,72 @@ class SteamcmdAdapter:
         timed_out = False
         aborted = False
         returncode: int | None = None
+        output: str | None = None
+        # Spool both streams to disk: pipes held until process exit would
+        # buffer unbounded steamcmd output in broker memory for up to 30
+        # minutes.  Bytes throughout, decoded leniently on read-back (text
+        # mode would raise UnicodeDecodeError on locale-invalid output).
+        stdout_spool = log_path.with_name(log_path.name + ".out.tmp")
+        stderr_spool = log_path.with_name(log_path.name + ".err.tmp")
         try:
-            process = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                # Bytes, decoded leniently below: text mode would raise
-                # UnicodeDecodeError on locale-invalid steamcmd output,
-                # escaping classification with the client still stopped.
-                env=environment,
-                start_new_session=True,
-            )
-        except OSError as error:
-            output = f"steamcmd unavailable: {error}"
-        else:
-            # Poll while steamcmd runs: a Steam client relaunched during a
-            # 30-minute download is a concurrent writer in the same install
-            # directory, and waiting for the post-download probe would leave
-            # that overlap window open the whole time.
-            deadline = time.monotonic() + self._timeout
-            while True:
-                remaining = deadline - time.monotonic()
+            with (
+                stdout_spool.open("wb") as out_handle,
+                stderr_spool.open("wb") as err_handle,
+            ):
                 try:
-                    out, err = process.communicate(
-                        timeout=min(self._abort_poll, max(remaining, 0.0))
+                    process = subprocess.Popen(
+                        argv,
+                        stdout=out_handle,
+                        stderr=err_handle,
+                        stdin=subprocess.DEVNULL,
+                        env=environment,
+                        start_new_session=True,
                     )
-                    break
-                except subprocess.TimeoutExpired:
-                    if remaining <= 0:
-                        timed_out = True
-                    elif abort_when is not None and abort_when():
-                        aborted = True
-                    else:
-                        continue
-                    # Kill the whole session group: the configured script
-                    # wraps the real steamcmd binary, and killing only the
-                    # leader would leave a live writer in the install
-                    # directory.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        process.kill()
-                    out, err = process.communicate()
-                    break
-            returncode = process.returncode
-            # Explicit separator: without one, a stdout tail lacking its
-            # newline would merge with stderr's first line, and a recognized
-            # marker could smuggle an unrecognized (unredactable) line past
-            # the log filter below.
-            output = _captured_text(out) + "\n" + _captured_text(err)
+                except OSError as error:
+                    output = f"steamcmd unavailable: {error}"
+                else:
+                    # Poll while steamcmd runs: a Steam client relaunched
+                    # during a 30-minute download is a concurrent writer in
+                    # the same install directory, and waiting for the
+                    # post-download probe would leave that overlap window
+                    # open the whole time.
+                    deadline = time.monotonic() + self._timeout
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        try:
+                            process.wait(
+                                timeout=min(self._abort_poll, max(remaining, 0.0))
+                            )
+                            break
+                        except subprocess.TimeoutExpired:
+                            if remaining <= 0:
+                                timed_out = True
+                            elif abort_when is not None and abort_when():
+                                aborted = True
+                            else:
+                                continue
+                            # Kill the whole session group: the configured
+                            # script wraps the real steamcmd binary, and
+                            # killing only the leader would leave a live
+                            # writer in the install directory.
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError):
+                                process.kill()
+                            process.wait()
+                            break
+                    returncode = process.returncode
+            if output is None:
+                # Explicit separator: a stdout tail lacking its newline must
+                # not merge with stderr's first line, or a recognized marker
+                # could smuggle an unrecognized (unredactable) line past the
+                # log filter below.
+                output = (
+                    _read_spooled(stdout_spool) + "\n" + _read_spooled(stderr_spool)
+                )
+        finally:
+            stdout_spool.unlink(missing_ok=True)
+            stderr_spool.unlink(missing_ok=True)
         # Classify on the raw output first: redaction could mangle a marker
         # (an account alias like "all" is a substring of "fully installed").
         # Success additionally requires a clean exit: output text alone must
@@ -224,10 +251,15 @@ class SteamcmdAdapter:
                 (str(self._home), "<steamcmd-home>"),
                 (str(install_dir), "<install-dir>"),
                 (str(self._script), "<steamcmd>"),
-                (account, "<account>"),
             ):
                 if value:
                     line = line.replace(value, label)
+            if account:
+                # Case-insensitive: steamcmd may echo the login with its
+                # case normalized, and the identifier must not survive that.
+                line = re.sub(
+                    re.escape(account), "<account>", line, flags=re.IGNORECASE
+                )
             # Any absolute path still present is by definition NOT one of
             # the configured ones — a diagnostic like "ERROR opening
             # /home/user/file" on an allowlisted line must not persist a
