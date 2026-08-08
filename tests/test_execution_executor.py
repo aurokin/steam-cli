@@ -187,10 +187,14 @@ def test_missing_manifest_fails(harness) -> None:
 
 
 def test_reconcile_interrupted_download_resumes(harness) -> None:
-    ledger, _, _, executor, _ = harness
+    ledger, _, _, executor, library = harness
     operation_id = _authorized(ledger)
     for state in ("lease_acquired", "client_stopping", "content_running"):
         ledger.transition(operation_id, state)
+    # Partial payload without a nested manifest must not block the resume.
+    partial = library / "steamapps" / "common" / "Spacewar"
+    partial.mkdir(parents=True)
+    (partial / "partial.bin").write_text("x", encoding="utf-8")
 
     actions = executor.reconcile()
     assert any("resume" in action for action in actions)
@@ -220,14 +224,19 @@ def test_unsafe_install_dir_name_aborts_before_side_effects(harness) -> None:
     assert session.stops == 0  # client never touched
 
 
-def test_client_restore_failure_is_reported(harness) -> None:
+def test_client_restore_failure_stays_retryable(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.start_ok = False
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
-    assert report.outcome == "confirmed"
+    assert report.outcome == "aborted"
     assert "client restore failed" in report.detail
-    assert "client restore failed" in (ledger.get(operation_id).detail or "")
+    # Non-terminal: reconciliation retries once the client can start again.
+    assert ledger.get(operation_id).state == "client_restart_pending"
+
+    session.start_ok = True
+    executor.reconcile()
+    assert ledger.get(operation_id).state == "confirmed"
 
 
 def test_reconcile_interrupted_stays_resumable(harness) -> None:

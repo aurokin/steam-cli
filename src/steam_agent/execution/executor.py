@@ -258,12 +258,14 @@ class Executor:
                     "install_dir_name belongs to another installed title",
                 )
 
-        if target.exists():
+        if target.exists() and not resuming:
             # A fresh operation may reuse an existing directory only with
             # ownership evidence: steamcmd's own manifest from a prior
             # attempt, the client manifest for this AppID naming it, or an
             # empty directory.  Anything else (orphaned, manually managed)
-            # must not be written over.
+            # must not be written over.  A resume is exempt: the single-
+            # active constraint proves the partial content is this
+            # operation's own prior work even before a manifest exists.
             own_library_dir = manifest_install_dir(
                 self._library / "steamapps" / f"appmanifest_{operation.appid}.acf"
             )
@@ -439,21 +441,45 @@ class Executor:
                 operation_id=operation_id,
             )
         except AdoptionError as error:
-            note = self._restore_note(prior_running)
-            ledger.transition(
-                operation_id, "failed", detail=f"adoption failed: {error}"
+            # Repair via the journal before any terminal transition: the
+            # error may have struck after the rename landed (completed), and
+            # a terminal row must never leave a live journal behind.
+            verdict = reconcile_adoption(
+                library=self._library,
+                appid=operation.appid,
+                journal_dir=self._journal_dir,
+                operation_id=operation_id,
             )
-            return ExecutionReport(
-                operation_id, "failed", f"adoption failed: {error}{note}"
-            )
+            if verdict == "completed":
+                adopted = (
+                    self._library
+                    / "steamapps"
+                    / f"appmanifest_{operation.appid}.acf"
+                )
+            else:
+                note = self._restore_note(prior_running)
+                ledger.transition(
+                    operation_id,
+                    "failed",
+                    detail=f"adoption failed: {error}; journal {verdict}",
+                )
+                return ExecutionReport(
+                    operation_id, "failed", f"adoption failed: {error}{note}"
+                )
         # Leave the ledger's adopting state before retiring the journal: a
         # crash in between then reconciles from a state whose branch does not
         # consult the journal, never as adopting-with-no-journal (which would
         # read as an unproven adoption after the manifest was already swapped).
         ledger.transition(operation_id, "client_restart_pending")
         clear_adoption_journal(appid=operation.appid, journal_dir=self._journal_dir)
-        client_restored = self._restore_client(prior_running)
-        note = "" if client_restored else "; client restore failed"
+        if not self._restore_client(prior_running):
+            # Never terminalize while restoration is failing: the state
+            # stays at client_restart_pending so reconciliation retries.
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "client restore failed; state left for reconcile retry",
+            )
 
         # Verification is manifest-evidence-based by design (ADR 0027 semantic
         # postconditions; Phase 0 measured 4/4 client adoption with zero
@@ -478,7 +504,7 @@ class Executor:
                     "contradicted",
                     "client rejected the adopted manifest and is re-downloading",
                 )
-            if prior_running and client_restored:
+            if prior_running:
                 detail = "client_adopted; first_run_required"
                 summary = "content present and adopted; first run still required"
             else:
@@ -487,17 +513,17 @@ class Executor:
                     "content present and adopted; client validation deferred"
                     " to next client start; first run still required"
                 )
-            ledger.transition(operation_id, "confirmed", detail=detail + note)
-            return ExecutionReport(operation_id, "confirmed", summary + note)
+            ledger.transition(operation_id, "confirmed", detail=detail)
+            return ExecutionReport(operation_id, "confirmed", summary)
         ledger.transition(
             operation_id,
             "unconfirmed",
-            detail=f"manifest StateFlags={flags}{note}",
+            detail=f"manifest StateFlags={flags}",
         )
         return ExecutionReport(
             operation_id,
             "unconfirmed",
-            f"adoption not confirmed (StateFlags={flags}){note}",
+            f"adoption not confirmed (StateFlags={flags})",
         )
 
     def _restore_client(self, prior_running: bool | None) -> bool:
@@ -609,11 +635,24 @@ class Executor:
                     f"{operation_id}: lease gates not clear; adoption reconcile deferred"
                 )
                 return actions
-            if self._session.client_possibly_running() and not self._session.stop_client():
-                actions.append(
-                    f"{operation_id}: client running; adoption reconcile deferred"
-                )
-                return actions
+            if self._session.client_possibly_running():
+                if not self._session.stop_client():
+                    actions.append(
+                        f"{operation_id}: client running; adoption reconcile deferred"
+                    )
+                    return actions
+                # The stop can take up to a minute; re-check the lease and
+                # client absence before repairing the live manifest.
+                post_stop = self._session.gates()
+                if (
+                    not post_stop.all_clear()
+                    or post_stop.client_running != "pass"
+                ):
+                    actions.append(
+                        f"{operation_id}: lease regressed during stop;"
+                        " adoption reconcile deferred"
+                    )
+                    return actions
             verdict = reconcile_adoption(
                 library=self._library,
                 appid=active.appid,
