@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="Scaffold state dir and policy.")
     init.add_argument("--library", type=Path, required=True)
     init.add_argument("--steamcmd", type=Path, required=True)
-    init.add_argument("--machine-id", default="local")
+    init.add_argument("--machine-id", default=None)
 
     request = commands.add_parser(
         "request", help="Submit one operation-plan JSON on stdin."
@@ -153,6 +153,14 @@ def main(argv: list[str] | None = None) -> int:
             # Ledger, policy, logs, and the steamcmd credential cache live
             # here; never trust the umask to keep other identities out.
             state_dir.chmod(0o700)
+            # An omitted --machine-id preserves the configured identity;
+            # re-init must never silently retarget the single-active key.
+            machine_id = arguments.machine_id
+            if machine_id is None:
+                try:
+                    machine_id = _load_config(state_dir).get("machine_id", "local")
+                except PolicyError:
+                    machine_id = "local"
             # Idempotent re-init: keep an existing (possibly owner-edited)
             # policy rather than failing, so a partial init is repairable.
             wrote_template = False
@@ -168,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
                         # Absolute paths: later commands run from any cwd.
                         "library": str(arguments.library.resolve()),
                         "steamcmd": str(arguments.steamcmd.resolve()),
-                        "machine_id": str(arguments.machine_id),
+                        "machine_id": str(machine_id),
                     },
                     sort_keys=True,
                 ),

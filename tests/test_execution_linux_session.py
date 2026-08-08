@@ -50,3 +50,20 @@ def test_download_gate_covers_all_configured_libraries(tmp_path: Path) -> None:
 
     session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
     assert session.gates().download_in_flight == "fail"
+
+
+def test_unreadable_library_config_is_unknown_not_pass(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    (library / "steamapps").mkdir(parents=True)
+    vdf = library / "steamapps" / "libraryfolders.vdf"
+    vdf.write_text('"libraryfolders"\n{\n}\n', encoding="utf-8")
+    vdf.chmod(0o000)
+
+    def runner(argv: list[str]) -> CommandResult:
+        return CommandResult(returncode=1, stdout="")
+
+    session = LinuxSession(library=library, runner=runner, sleep=lambda _: None)
+    try:
+        assert session.gates().download_in_flight == "unknown"
+    finally:
+        vdf.chmod(0o644)

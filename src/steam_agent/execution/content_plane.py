@@ -29,6 +29,19 @@ _AUTH_FAILURE = re.compile(
 _SUCCESS = re.compile(r"fully installed", re.IGNORECASE)
 _DEFAULT_TIMEOUT_SECONDS = 30 * 60
 
+# Only recognized steamcmd diagnostic lines are persisted (after literal
+# redaction); everything else is dropped with a count.  The repository
+# boundary keeps raw responses and personal identifiers out of logs, and
+# unrecognized output is exactly where unredactable identifiers appear.
+_LOG_LINE_RECOGNIZED = re.compile(
+    r"steamcmd unavailable|Steam Console Client|Loading Steam API|Logging in"
+    r"|Login|Waiting for|Connecting|\bOK\b|FAILED|ERROR|Success|fully installed"
+    r"|Update state|progress:|validating|preallocating|downloading"
+    r"|Rate Limit|two-factor|Cached credentials|Invalid Password"
+    r"|force_install_dir|app_update|licenses",
+    re.IGNORECASE,
+)
+
 
 class AdoptionError(RuntimeError):
     """Manifest adoption could not be completed or rolled back cleanly."""
@@ -151,22 +164,26 @@ class SteamcmdAdapter:
         else:
             outcome = "failed"
 
-        # Raw steamcmd output carries the account name and private absolute
-        # paths; the repository boundary keeps both out of persisted logs.
-        # Redaction is bounded to the identifiers the broker was configured
-        # with — values steamcmd invents (persona names, SteamIDs) cannot be
-        # matched textually, and these logs stay inside the broker-owned
-        # state directory, never in fixtures or committed files.
-        for value, label in (
-            (account, "<account>"),
-            (str(self._home), "<steamcmd-home>"),
-            (str(install_dir), "<install-dir>"),
-            (str(self._script), "<steamcmd>"),
-        ):
-            if value:
-                output = output.replace(value, label)
-        output = re.sub(r"\b7656119\d{10}\b", "<steamid>", output)
-        log_path.write_text(output, encoding="utf-8", errors="replace")
+        # Persist recognized diagnostic lines only, with configured
+        # identifiers and SteamIDs redacted; unrecognized output (where
+        # unredactable identifiers would hide) is dropped with a count.
+        kept: list[str] = []
+        dropped = 0
+        for line in output.splitlines():
+            if not _LOG_LINE_RECOGNIZED.search(line):
+                dropped += 1
+                continue
+            for value, label in (
+                (account, "<account>"),
+                (str(self._home), "<steamcmd-home>"),
+                (str(install_dir), "<install-dir>"),
+                (str(self._script), "<steamcmd>"),
+            ):
+                if value:
+                    line = line.replace(value, label)
+            kept.append(re.sub(r"\b7656119\d{10}\b", "<steamid>", line))
+        kept.append(f"[{dropped} unrecognized line(s) omitted]")
+        log_path.write_text("\n".join(kept) + "\n", encoding="utf-8", errors="replace")
         return ContentResult(outcome=outcome, log_path=log_path)
 
 

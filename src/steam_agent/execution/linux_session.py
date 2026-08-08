@@ -97,12 +97,14 @@ class LinuxSession:
             return "pass"  # pgrep: no match
         return "unknown"
 
-    def _download_dirs(self) -> list[Path]:
+    def _download_dirs(self) -> list[Path] | None:
         # Stopping the client interrupts downloads in every configured
         # library.  libraryfolders.vdf normally lives only in the primary
         # library, so also consult the standard config locations in case the
         # broker targets a secondary one.  (The session helper runs in the
         # desktop user's session, so its HOME is the right root here.)
+        # Returns None when a configuration file exists but is unreadable:
+        # the library list is then unknown and the gate must not pass.
         dirs = [self._library / "steamapps" / "downloading"]
         vdf_candidates = [
             self._library / "steamapps" / "libraryfolders.vdf",
@@ -112,8 +114,10 @@ class LinuxSession:
         for vdf in vdf_candidates:
             try:
                 text = vdf.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError:
+                return None
             for match in re.finditer(r'"path"\s+"([^"]*)"', text):
                 candidate = Path(match.group(1)) / "steamapps" / "downloading"
                 if candidate not in dirs:
@@ -122,7 +126,11 @@ class LinuxSession:
 
     def gates(self) -> LeaseGates:
         download_state: GateState = "pass"
-        for downloading in self._download_dirs():
+        download_dirs = self._download_dirs()
+        if download_dirs is None:
+            download_state = "unknown"
+            download_dirs = []
+        for downloading in download_dirs:
             try:
                 if any(downloading.iterdir()):
                     download_state = "fail"

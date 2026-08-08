@@ -67,6 +67,8 @@ def test_init_is_idempotent_after_partial_state(state_dir: Path, tmp_path: Path,
         )
         == 0
     )
+    config = json.loads((state_dir / "broker.json").read_text(encoding="utf-8"))
+    assert config["machine_id"] == "herb"  # omitted flag preserves identity
 
 
 def test_init_makes_state_dir_owner_only(state_dir: Path) -> None:
