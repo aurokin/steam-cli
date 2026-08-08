@@ -182,11 +182,11 @@ class Executor:
         plan = ledger.plan_document(operation_id)
         raw_name = plan.get("install_dir_name")
         if raw_name is not None and not isinstance(raw_name, str):
-            ledger.transition(
-                operation_id, "aborted", detail="unsafe install_dir_name"
-            )
-            return ExecutionReport(
-                operation_id, "aborted", "install_dir_name must be a string"
+            return self._abort_intake(
+                operation_id,
+                operation.prior_client_running,
+                detail="unsafe install_dir_name",
+                message="install_dir_name must be a string",
             )
         install_dir_name = raw_name or ""
         # The directory the client already uses for this AppID always wins:
@@ -203,66 +203,52 @@ class Executor:
             # another title's body and point at that title's directory,
             # which the collision scan below skips by filename.
             if manifest_appid(own_manifest) != operation.appid:
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail="existing manifest appid mismatch",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "existing manifest for this title has a mismatched appid",
+                    message="existing manifest for this title has a mismatched appid",
                 )
             existing = manifest_install_dir(own_manifest)
             if existing is None:
                 # An install exists but its directory is unknowable; any
                 # chosen directory could orphan it.
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail="existing manifest unreadable",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "existing manifest for this title is unreadable",
+                    message="existing manifest for this title is unreadable",
                 )
             if (
                 install_dir_name
                 and install_dir_name.casefold() != existing.casefold()
             ):
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail="plan name conflicts with existing install directory",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "plan install_dir_name conflicts with the existing install"
-                    " directory; move is not an executable operation",
+                    message="plan install_dir_name conflicts with the existing"
+                    " install directory; move is not an executable operation",
                 )
             install_dir_name = existing
         elif not install_dir_name:
             install_dir_name = f"app_{operation.appid}"
         if not safe_install_dir_name(install_dir_name):
-            ledger.transition(
-                operation_id, "aborted", detail="unsafe install_dir_name"
-            )
-            return ExecutionReport(
+            return self._abort_intake(
                 operation_id,
-                "aborted",
-                "install_dir_name must be a single path component",
+                operation.prior_client_running,
+                detail="unsafe install_dir_name",
+                message="install_dir_name must be a single path component",
             )
         common = self._library / "steamapps" / "common"
         target = common / install_dir_name
         if target.is_symlink():
             # Even an in-library symlink can alias another title's directory.
-            ledger.transition(
-                operation_id, "aborted", detail="install target is a symlink"
-            )
-            return ExecutionReport(
-                operation_id, "aborted", "install target is a symlink"
+            return self._abort_intake(
+                operation_id,
+                operation.prior_client_running,
+                detail="install target is a symlink",
+                message="install target is a symlink",
             )
         try:
             # A pre-existing symlink at the target (or at common/ itself)
@@ -273,13 +259,11 @@ class Executor:
         except OSError:
             escapes = True
         if escapes:
-            ledger.transition(
-                operation_id, "aborted", detail="install target escapes library"
-            )
-            return ExecutionReport(
+            return self._abort_intake(
                 operation_id,
-                "aborted",
-                "install target resolves outside the library",
+                operation.prior_client_running,
+                detail="install target escapes library",
+                message="install target resolves outside the library",
             )
         for manifest in sorted((self._library / "steamapps").glob("appmanifest_*.acf")):
             if manifest.name == f"appmanifest_{operation.appid}.acf":
@@ -288,28 +272,21 @@ class Executor:
             if other_dir is None:
                 # Unreadable/malformed manifest: ownership of the target
                 # directory cannot be proven, so fail closed.
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail=f"cannot inspect {manifest.name}",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "another title's manifest is unreadable; collision unprovable",
+                    message="another title's manifest is unreadable;"
+                    " collision unprovable",
                 )
             # Casefolded: a case-insensitive library filesystem (exFAT)
             # aliases names that differ only by case.
             if other_dir.casefold() == install_dir_name.casefold():
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail="install_dir_name claimed by another title",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "install_dir_name belongs to another installed title",
+                    message="install_dir_name belongs to another installed title",
                 )
 
         if target.exists():
@@ -350,15 +327,11 @@ class Executor:
             except OSError:
                 owned = False
             if not owned:
-                ledger.transition(
+                return self._abort_intake(
                     operation_id,
-                    "aborted",
+                    operation.prior_client_running,
                     detail="existing target directory not owned by this title",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "aborted",
-                    "existing target directory is not owned by this title",
+                    message="existing target directory is not owned by this title",
                 )
 
         # Any surviving steamcmd (an orphaned child of a crashed run — even
@@ -583,12 +556,23 @@ class Executor:
             # Repair via the journal before any terminal transition: the
             # error may have struck after the rename landed (completed), and
             # a terminal row must never leave a live journal behind.
-            verdict = reconcile_adoption(
-                library=self._library,
-                appid=operation.appid,
-                journal_dir=self._journal_dir,
-                operation_id=operation_id,
-            )
+            try:
+                verdict = reconcile_adoption(
+                    library=self._library,
+                    appid=operation.appid,
+                    journal_dir=self._journal_dir,
+                    operation_id=operation_id,
+                )
+            except (AdoptionError, OSError):
+                # Unreadable journal/destination: the swap is unprovable
+                # either way — restore the client and stay in adopting so
+                # reconciliation retries rather than destroying evidence.
+                self._restore_client(prior_running)
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "adoption journal unreadable; state left for reconcile",
+                )
             if verdict == "completed":
                 adopted = (
                     self._library
@@ -791,6 +775,32 @@ class Executor:
         self._ledger.transition(operation_id, to_state, detail=detail)
         return ExecutionReport(operation_id, outcome, message)
 
+    def _abort_intake(
+        self,
+        operation_id: int,
+        prior_running: bool | None,
+        *,
+        detail: str,
+        message: str,
+    ) -> ExecutionReport:
+        """Terminal intake abort under the restore-before-terminal contract.
+
+        A resumed operation reaches the intake checks with the client still
+        stopped from its interrupted run, and terminal rows are invisible to
+        reconciliation — so restoration must come first, and a failed
+        restoration stays non-terminal for retry.  Fresh operations have no
+        recorded prior state yet and the restore is a no-op.
+        """
+
+        return self._finish_failure(
+            operation_id,
+            prior_running,
+            detail=detail,
+            message=message,
+            outcome="aborted",
+            to_state="aborted",
+        )
+
     def release_client(self, operation_id: int) -> bool:
         """Best-effort prior-client restoration for out-of-band aborts.
 
@@ -937,12 +947,21 @@ class Executor:
                         " adoption reconcile deferred"
                     )
                     return actions
-            verdict = reconcile_adoption(
-                library=self._library,
-                appid=active.appid,
-                journal_dir=self._journal_dir,
-                operation_id=operation_id,
-            )
+            try:
+                verdict = reconcile_adoption(
+                    library=self._library,
+                    appid=active.appid,
+                    journal_dir=self._journal_dir,
+                    operation_id=operation_id,
+                )
+            except (AdoptionError, OSError):
+                # Unreadable journal/destination: unprovable either way —
+                # restore the client and defer rather than crash recovery.
+                restore()
+                actions.append(
+                    f"{operation_id}: adoption journal unreadable; deferred"
+                )
+                return actions
             if verdict != "completed":
                 # restored: the destination is the pre-operation backup.
                 # clean/stale: this operation never journaled its adoption

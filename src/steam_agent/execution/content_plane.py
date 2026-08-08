@@ -265,10 +265,14 @@ class SteamcmdAdapter:
             # /home/user/file" on an allowlisted line must not persist a
             # private path verbatim.
             line = re.sub(r"(?:/[^/\s\"']+){2,}/?", "<path>", line)
-            # 17 digits from 7656…: SteamID64 individual accounts span
-            # 76561197…–76561202… (32-bit account-ID space), not just the
-            # 7656119 prefix.
-            kept.append(re.sub(r"\b7656\d{13}\b", "<steamid>", line))
+            # Every SteamID rendering: SteamID64 (17 digits from 7656…,
+            # spanning the whole 32-bit account-ID space), bracketed
+            # SteamID3 ("[U:1:…]" — steamcmd's actual login-line format),
+            # and legacy SteamID2.
+            line = re.sub(r"\b7656\d{13}\b", "<steamid>", line)
+            line = re.sub(r"\[U:\d+:\d+\]", "<steamid>", line)
+            line = re.sub(r"\bSTEAM_\d+:\d+:\d+\b", "<steamid>", line)
+            kept.append(line)
         kept.append(f"[{dropped} unrecognized line(s) omitted]")
         log_path.write_text("\n".join(kept) + "\n", encoding="utf-8", errors="replace")
         return ContentResult(outcome=outcome, log_path=log_path)
@@ -401,23 +405,41 @@ def reconcile_adoption(
     journal_path = journal_dir / f"adoption-{appid}.json"
     if not journal_path.is_file():
         return "clean"
-    record = json.loads(journal_path.read_text(encoding="utf-8"))
+    try:
+        record = json.loads(journal_path.read_text(encoding="utf-8"))
+        destination = Path(str(record["destination"]))
+        checksum = str(record["checksum"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        # An unreadable journal proves nothing either way; the caller must
+        # defer (restoring the client), never crash or destroy evidence.
+        raise AdoptionError("adoption journal unreadable") from error
     if operation_id is not None and record.get("operation_id") != operation_id:
         # A prior operation's journal that survived only because its swap
         # already completed; discard it rather than let it vouch for this one.
         journal_path.unlink()
         return "stale"
-    destination = Path(str(record["destination"]))
-    checksum = str(record["checksum"])
+    backup_value = record.get("backup")
 
     if destination.is_file():
-        current = hashlib.sha256(destination.read_bytes()).hexdigest()
+        try:
+            current = hashlib.sha256(destination.read_bytes()).hexdigest()
+        except OSError as error:
+            raise AdoptionError("adoption destination unreadable") from error
         if current == checksum:
             # Leave the journal for the caller to retire AFTER the ledger
             # leaves adopting; deleting it here would let a crash read a
             # completed swap as adopting-with-no-journal (unprovable).
             return "completed"
-    backup_value = record.get("backup")
+        # A byte mismatch is not proof of a torn swap: a client started
+        # between the crash and this recovery rewrites the adopted manifest
+        # in its own formatting (recovery's own stop_client triggers that
+        # shutdown rewrite too).  For a fresh install (no backup) a
+        # parseable manifest for this appid at the destination can only be
+        # the landed swap — unlinking it would orphan the downloaded
+        # content.  With a backup the old manifest is indistinguishable
+        # from a rewritten new one, so the conservative restore stands.
+        if backup_value is None and manifest_appid(destination) == appid:
+            return "completed"
     # The restored manifest must be durable before the journal disappears:
     # losing the journal while the restore is still in the page cache would
     # leave no recovery record for the next pass.

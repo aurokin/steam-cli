@@ -176,9 +176,20 @@ def main(argv: list[str] | None = None) -> int:
             # re-init must never silently retarget the single-active key.
             machine_id = arguments.machine_id
             if machine_id is None:
-                try:
-                    machine_id = _load_config(state_dir).get("machine_id", "local")
-                except PolicyError:
+                if (state_dir / "broker.json").exists():
+                    # A corrupt config must not silently retarget the
+                    # single-active key to the default: repairing an
+                    # existing broker requires reasserting its identity.
+                    try:
+                        machine_id = _load_config(state_dir).get(
+                            "machine_id", "local"
+                        )
+                    except PolicyError:
+                        return _fail(
+                            "broker.json is corrupt; rerun init with"
+                            " --machine-id to reassert this broker's identity"
+                        )
+                else:
                     machine_id = "local"
             # Idempotent re-init: keep an existing (possibly owner-edited)
             # policy rather than failing, so a partial init is repairable.

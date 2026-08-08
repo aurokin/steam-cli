@@ -571,14 +571,10 @@ def test_stale_marker_does_not_vouch_for_replaced_directory(harness) -> None:
 
 
 def test_resume_with_replaced_target_directory_aborts(harness) -> None:
-    ledger, _, _, executor, library = harness
+    ledger, session, _, executor, library = harness
     operation_id = _authorized(ledger)
-    for state in (
-        "lease_acquired",
-        "client_stopping",
-        "content_running",
-        "interrupted",
-    ):
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "interrupted"):
         ledger.transition(operation_id, state)
     target = library / "steamapps" / "common" / "Spacewar"
     executor._record_owned_dir(480, "Spacewar", target)
@@ -586,10 +582,35 @@ def test_resume_with_replaced_target_directory_aborts(harness) -> None:
     shutil.rmtree(target)
     target.mkdir(parents=True)
     (target / "unrelated.bin").write_text("keep", encoding="utf-8")
+    session.running = False  # client still stopped from the interrupted run
 
     report = executor.execute(operation_id)
     assert report.outcome == "aborted"
     assert "not owned" in report.detail
+    # The terminal abort must first restore the stopped client: terminal
+    # rows are invisible to reconciliation.
+    assert session.starts == 1
+    assert ledger.get(operation_id).state == "aborted"
+
+
+def test_resume_intake_abort_stays_retryable_when_restore_fails(harness) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "interrupted"):
+        ledger.transition(operation_id, state)
+    target = library / "steamapps" / "common" / "Spacewar"
+    executor._record_owned_dir(480, "Spacewar", target)
+    shutil.rmtree(target)
+    target.mkdir(parents=True)
+    (target / "unrelated.bin").write_text("keep", encoding="utf-8")
+    session.running = False
+    session.start_ok = False
+
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "restore failed" in report.detail
+    assert ledger.get(operation_id).state == "interrupted"  # non-terminal
 
 
 def test_common_replaced_during_stop_aborts(harness) -> None:
@@ -756,6 +777,24 @@ def test_reconcile_verify_rejects_misnamed_manifest(harness) -> None:
     operation = ledger.get(operation_id)
     assert operation.state == "unconfirmed"
     assert "mismatch" in operation.detail
+
+
+def test_reconcile_corrupt_journal_defers_and_restores(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "adopting"):
+        ledger.transition(operation_id, state)
+    executor._journal_dir.mkdir(parents=True, exist_ok=True)
+    (executor._journal_dir / "adoption-480.json").write_text(
+        '{"appid": 480, "operation', encoding="utf-8"  # truncated
+    )
+    session.running = False
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "adopting"  # deferred, retryable
+    assert session.starts == 1  # client restored despite the corrupt journal
+    assert any("journal unreadable" in action for action in actions)
 
 
 def test_reconcile_restores_client_when_journal_cleanup_fails(harness) -> None:

@@ -163,6 +163,48 @@ def test_reconcile_torn_write_restores_backup(tmp_path: Path) -> None:
     assert prior.read_text(encoding="utf-8") == "old"
 
 
+def test_reconcile_client_rewritten_fresh_manifest_counts_completed(
+    tmp_path: Path,
+) -> None:
+    library = _library(tmp_path)
+    target = _target_with_manifest(tmp_path)
+    journal_dir = tmp_path / "journal"
+    adopted = adopt_manifest(
+        source=locate_manifest(install_dir=target, appid=1902490),
+        library=library,
+        appid=1902490,
+        install_dir_name="Desk Job",
+        journal_dir=journal_dir,
+        operation_id=7,
+    )
+    # The client started after the crash and rewrote the adopted manifest
+    # in its own formatting; a fresh install (no backup) must not have the
+    # landed swap unlinked over a byte mismatch.
+    adopted.write_text(
+        '"AppState"\n{\n\t"appid"\t\t"1902490"\n'
+        '\t"installdir"\t\t"Desk Job"\n\t"StateFlags"\t\t"4"\n}\n',
+        encoding="utf-8",
+    )
+    assert (
+        reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
+        == "completed"
+    )
+    assert adopted.is_file()  # not unlinked
+
+
+def test_reconcile_corrupt_journal_raises_adoption_error(tmp_path: Path) -> None:
+    from steam_agent.execution.content_plane import AdoptionError
+
+    library = _library(tmp_path)
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    (journal_dir / "adoption-1902490.json").write_text(
+        '{"appid": 1902', encoding="utf-8"  # truncated
+    )
+    with pytest.raises(AdoptionError):
+        reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
+
+
 def test_adopt_rejects_manifest_without_installdir(tmp_path: Path) -> None:
     from steam_agent.execution.content_plane import AdoptionError
 
@@ -273,6 +315,7 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
             f"Logging in user 'ownername' (76561199000000001)"
             f" buddy 76561200000000000 ... dir {install_dir} home {home}"
             f"\nLogin OK for user 'OWNERNAME'"  # case-normalized echo
+            f"\nLogging in user 'ownername' [U:1:99999999] to Steam Public...OK"
         ).bind(kwargs),
     )
     adapter = SteamcmdAdapter(
@@ -288,6 +331,7 @@ def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> 
     assert str(install_dir) not in log and str(home) not in log
     assert "76561199000000001" not in log
     assert "76561200000000000" not in log  # beyond the 7656119 prefix
+    assert "U:1:99999999" not in log  # SteamID3, steamcmd's real login format
     assert "<account>" in log and "<steamid>" in log
 
 

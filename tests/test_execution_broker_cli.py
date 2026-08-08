@@ -135,6 +135,27 @@ def test_unsafe_install_dir_name_rejected(
     assert "path component" in capsys.readouterr().err
 
 
+def test_reinit_over_corrupt_config_requires_machine_id(
+    state_dir: Path, tmp_path: Path, capsys
+) -> None:
+    (state_dir / "broker.json").write_text("{partial", encoding="utf-8")
+    base = [
+        "--state-dir",
+        str(state_dir),
+        "init",
+        "--library",
+        str(tmp_path / "library"),
+        "--steamcmd",
+        str(tmp_path / "steamcmd.sh"),
+    ]
+    # Omitting --machine-id must not silently retarget "herb" to "local".
+    assert main(base) == 2
+    assert "--machine-id" in capsys.readouterr().err
+    assert main([*base, "--machine-id", "herb"]) == 0
+    config = json.loads((state_dir / "broker.json").read_text(encoding="utf-8"))
+    assert config["machine_id"] == "herb"
+
+
 def test_corrupt_broker_config_fails_cleanly(state_dir: Path, capsys) -> None:
     (state_dir / "broker.json").write_text("{partial", encoding="utf-8")
     assert main(["--state-dir", str(state_dir), "status"]) == 2
