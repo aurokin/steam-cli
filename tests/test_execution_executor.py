@@ -224,6 +224,17 @@ def test_unsafe_install_dir_name_aborts_before_side_effects(harness) -> None:
     assert session.stops == 0  # client never touched
 
 
+def test_failure_path_stays_retryable_when_restore_fails(harness) -> None:
+    ledger, session, content, executor, _ = harness
+    content.outcome = "failed"
+    session.start_ok = False
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "restore failed" in report.detail
+    assert ledger.get(operation_id).state == "content_running"  # non-terminal
+
+
 def test_client_restore_failure_stays_retryable(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.start_ok = False

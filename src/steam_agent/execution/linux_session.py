@@ -91,8 +91,11 @@ class LinuxSession:
 
     @staticmethod
     def _pgrep(*arguments: str) -> list[str]:
-        # Scope to the invoking user: another user's Steam is neither
-        # stoppable nor relevant to this session's lifecycle.
+        # Scope to the invoking user.  LinuxSession always executes inside
+        # the desktop user's session (class docstring) — Phase 1 as that
+        # user directly, later behind their session helper — so the
+        # invoking UID IS the Steam-owning UID; another user's processes
+        # are neither stoppable nor relevant here.
         return ["pgrep", "-U", str(os.getuid()), *arguments]
 
     def _absent(self, pattern: list[str]) -> GateState:

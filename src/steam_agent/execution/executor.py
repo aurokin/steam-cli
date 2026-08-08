@@ -319,15 +319,15 @@ class Executor:
             ledger.transition(operation_id, "client_stopping")
             if prior_running and not self._session.stop_client():
                 # The main process may already be gone with a helper (or a
-                # probe error) lingering; try to restore the prior state
-                # before going terminal.  A second -silent start is safe:
+                # probe error) lingering.  A second -silent start is safe:
                 # Steam is single-instance.
-                note = self._restore_note(prior_running)
-                ledger.transition(
-                    operation_id, "aborted", detail="client would not exit cleanly"
-                )
-                return ExecutionReport(
-                    operation_id, "aborted", f"client would not exit cleanly{note}"
+                return self._finish_failure(
+                    operation_id,
+                    prior_running,
+                    detail="client would not exit cleanly",
+                    message="client would not exit cleanly",
+                    outcome="aborted",
+                    to_state="aborted",
                 )
 
         # Shutdown can take up to a minute; re-check the lease between the
@@ -336,16 +336,13 @@ class Executor:
         # must now be provably absent as well.
         post_stop_gates = self._session.gates()
         if not post_stop_gates.all_clear() or post_stop_gates.client_running != "pass":
-            note = self._restore_note(prior_running)
-            ledger.transition(
+            return self._finish_failure(
                 operation_id,
-                "aborted",
+                prior_running,
                 detail="lease gates regressed during client stop",
-            )
-            return ExecutionReport(
-                operation_id,
-                "aborted",
-                f"lease gates regressed during client stop{note}",
+                message="lease gates regressed during client stop",
+                outcome="aborted",
+                to_state="aborted",
             )
 
         ledger.transition(
@@ -363,34 +360,28 @@ class Executor:
         # between then leaves a non-terminal row that reconciliation still
         # owns, instead of a terminal row with the client silently stopped.
         if result.outcome == "auth_required":
-            note = self._restore_note(prior_running)
-            ledger.transition(
-                operation_id, "failed", detail="auth_required: owner re-seed"
-            )
-            return ExecutionReport(
+            return self._finish_failure(
                 operation_id,
-                "auth_required",
-                f"steamcmd needs re-authentication{note}",
+                prior_running,
+                detail="auth_required: owner re-seed",
+                message="steamcmd needs re-authentication",
+                outcome="auth_required",
             )
         if result.outcome != "installed":
-            note = self._restore_note(prior_running)
-            ledger.transition(
-                operation_id, "failed", detail=f"steamcmd failed: {result.log_path.name}"
-            )
-            return ExecutionReport(
+            return self._finish_failure(
                 operation_id,
-                "failed",
-                f"steamcmd failed; see {result.log_path.name}{note}",
+                prior_running,
+                detail=f"steamcmd failed: {result.log_path.name}",
+                message=f"steamcmd failed; see {result.log_path.name}",
             )
 
         source = locate_manifest(install_dir=target, appid=operation.appid)
         if source is None:
-            note = self._restore_note(prior_running)
-            ledger.transition(
-                operation_id, "failed", detail="no steamcmd-written manifest"
-            )
-            return ExecutionReport(
-                operation_id, "failed", f"steamcmd produced no manifest{note}"
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail="no steamcmd-written manifest",
+                message="steamcmd produced no manifest",
             )
 
         # steamcmd can run for up to 30 minutes; re-check the full lease and
@@ -398,16 +389,11 @@ class Executor:
         # adopt under a live client or a lease that regressed.
         late_gates = self._session.gates()
         if not late_gates.all_clear():
-            note = self._restore_note(prior_running)
-            ledger.transition(
+            return self._finish_failure(
                 operation_id,
-                "failed",
+                prior_running,
                 detail="lease gates regressed before adoption",
-            )
-            return ExecutionReport(
-                operation_id,
-                "failed",
-                f"lease gates regressed before adoption; adoption skipped{note}",
+                message="lease gates regressed before adoption; adoption skipped",
             )
         # One final client-absent probe follows the stop: a client that
         # respawns between this probe and the millisecond-scale adoption is
@@ -416,18 +402,12 @@ class Executor:
             stopped = self._session.stop_client()
             if not stopped or self._session.client_possibly_running():
                 # The failed stop may still have killed the main process
-                # (helper lingering, probe error): attempt restoration
-                # before going terminal so the prior state is not lost.
-                note = self._restore_note(prior_running)
-                ledger.transition(
+                # (helper lingering, probe error).
+                return self._finish_failure(
                     operation_id,
-                    "failed",
+                    prior_running,
                     detail="client restarted mid-operation; adoption skipped",
-                )
-                return ExecutionReport(
-                    operation_id,
-                    "failed",
-                    f"client restarted mid-operation; adoption skipped{note}",
+                    message="client restarted mid-operation; adoption skipped",
                 )
 
         ledger.transition(operation_id, "adopting")
@@ -457,14 +437,11 @@ class Executor:
                     / f"appmanifest_{operation.appid}.acf"
                 )
             else:
-                note = self._restore_note(prior_running)
-                ledger.transition(
+                return self._finish_failure(
                     operation_id,
-                    "failed",
+                    prior_running,
                     detail=f"adoption failed: {error}; journal {verdict}",
-                )
-                return ExecutionReport(
-                    operation_id, "failed", f"adoption failed: {error}{note}"
+                    message=f"adoption failed: {error}",
                 )
         # Leave the ledger's adopting state before retiring the journal: a
         # crash in between then reconciles from a state whose branch does not
@@ -533,8 +510,27 @@ class Executor:
             return True
         return self._session.start_client()
 
-    def _restore_note(self, prior_running: bool | None) -> str:
-        return "" if self._restore_client(prior_running) else "; client restore failed"
+    def _finish_failure(
+        self,
+        operation_id: int,
+        prior_running: bool | None,
+        *,
+        detail: str,
+        message: str,
+        outcome: ExecuteOutcome = "failed",
+        to_state: str = "failed",
+    ) -> ExecutionReport:
+        """Restore the client, then terminalize; stay non-terminal if
+        restoration fails so reconciliation retries it."""
+
+        if not self._restore_client(prior_running):
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                f"{message}; client restore failed; state left for reconcile",
+            )
+        self._ledger.transition(operation_id, to_state, detail=detail)
+        return ExecutionReport(operation_id, outcome, message)
 
     def release_client(self, operation_id: int) -> bool:
         """Best-effort prior-client restoration for out-of-band aborts."""
