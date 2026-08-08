@@ -98,6 +98,17 @@ def test_unsupported_operation_rejected(state_dir: Path, monkeypatch, capsys) ->
     assert "not executable" in capsys.readouterr().err
 
 
+def test_unsafe_install_dir_name_rejected(
+    state_dir: Path, monkeypatch, capsys
+) -> None:
+    _grant_install(state_dir)
+    plan = json.loads(_plan())
+    plan["install_dir_name"] = "../../outside"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "path component" in capsys.readouterr().err
+
+
 def test_replayed_nonce_rejected(state_dir: Path, monkeypatch, capsys) -> None:
     _grant_install(state_dir)
     monkeypatch.setattr("sys.stdin", io.StringIO(_plan()))

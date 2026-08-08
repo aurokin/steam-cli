@@ -23,7 +23,11 @@ from pathlib import Path
 import sys
 
 from steam_agent.execution.content_plane import SteamcmdAdapter
-from steam_agent.execution.executor import Executor, ExecutorLockedError
+from steam_agent.execution.executor import (
+    Executor,
+    ExecutorLockedError,
+    safe_install_dir_name,
+)
 from steam_agent.execution.ledger import (
     ConfirmationRejected,
     ExecutionLedger,
@@ -156,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         target = plan.get("target", {})
         if not isinstance(target, dict):
             return _fail("plan target is malformed")
+        install_dir_name = plan.get("install_dir_name")
+        if install_dir_name is not None and not safe_install_dir_name(
+            str(install_dir_name)
+        ):
+            return _fail("install_dir_name must be a single path component")
         ledger, _ = _components(state_dir)
         try:
             operation_id, nonce = ledger.request(

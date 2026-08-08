@@ -9,6 +9,7 @@ evidence to exactly one recovery action (executor.reconcile).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -111,6 +112,19 @@ class ExecutionLedger:
     def close(self) -> None:
         self._connection.close()
 
+    @contextmanager
+    def _transaction(self):
+        # isolation_level=None leaves sqlite3 in autocommit; a state change
+        # and its audit event must land in one explicit transaction so a
+        # crash can never advance durable state without its event.
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        self._connection.execute("COMMIT")
+
     def _migrate(self) -> None:
         with self._connection:
             self._connection.execute(
@@ -185,7 +199,7 @@ class ExecutionLedger:
         now = _utcnow()
         expires = now + timedelta(seconds=nonce_ttl_seconds)
         try:
-            with self._connection:
+            with self._transaction():
                 cursor = self._connection.execute(
                     """
                     INSERT INTO operations (
@@ -210,12 +224,12 @@ class ExecutionLedger:
                         _stamp(now),
                     ),
                 )
+                operation_id = int(cursor.lastrowid or 0)
+                self._event(operation_id, "none", "pending_confirmation", None)
         except sqlite3.IntegrityError as error:
             raise LedgerError(
                 "another operation is already active for this machine"
             ) from error
-        operation_id = int(cursor.lastrowid or 0)
-        self._event(operation_id, "none", "pending_confirmation", None)
         return operation_id, nonce
 
     def confirm(
@@ -229,7 +243,7 @@ class ExecutionLedger:
 
         now = _utcnow()
         window = now + timedelta(seconds=execution_window_seconds)
-        with self._connection:
+        with self._transaction():
             cursor = self._connection.execute(
                 """
                 UPDATE operations
@@ -243,12 +257,12 @@ class ExecutionLedger:
                 (actor, _stamp(window), _stamp(now), nonce, _stamp(now)),
             )
             row = cursor.fetchone()
-        if row is None:
-            raise ConfirmationRejected(
-                "nonce missing, already consumed, or expired"
-            )
-        operation_id = int(row[0])
-        self._event(operation_id, "pending_confirmation", "authorized", actor)
+            if row is None:
+                raise ConfirmationRejected(
+                    "nonce missing, already consumed, or expired"
+                )
+            operation_id = int(row[0])
+            self._event(operation_id, "pending_confirmation", "authorized", actor)
         return operation_id
 
     # -- state machine ----------------------------------------------------
@@ -274,22 +288,22 @@ class ExecutionLedger:
             assignments += ", prior_client_running=?"
             parameters.append(1 if prior_client_running else 0)
         parameters.extend([operation_id, current.state])
-        with self._connection:
+        with self._transaction():
             cursor = self._connection.execute(
                 f"UPDATE operations SET {assignments}"
                 " WHERE operation_id=? AND state=?",
                 parameters,
             )
-        if cursor.rowcount != 1:
-            raise InvalidTransition("operation state changed concurrently")
-        self._event(operation_id, current.state, to_state, detail)
+            if cursor.rowcount != 1:
+                raise InvalidTransition("operation state changed concurrently")
+            self._event(operation_id, current.state, to_state, detail)
 
     def expire_lapsed(self) -> list[int]:
         """Expire pending confirmations and authorized-but-lapsed windows."""
 
         now = _stamp(_utcnow())
         expired: list[int] = []
-        with self._connection:
+        with self._transaction():
             for state, column in (
                 ("pending_confirmation", "nonce_expires_at"),
                 ("authorized", "execution_window_expires_at"),
@@ -304,8 +318,8 @@ class ExecutionLedger:
                 )
                 for row in cursor.fetchall():
                     expired.append(int(row[0]))
-        for operation_id in expired:
-            self._event(operation_id, "lapsed", "expired", None)
+            for operation_id in expired:
+                self._event(operation_id, "lapsed", "expired", None)
         return expired
 
     # -- reads ------------------------------------------------------------
@@ -375,9 +389,9 @@ class ExecutionLedger:
         to_state: str,
         detail: str | None,
     ) -> None:
-        with self._connection:
-            self._connection.execute(
-                "INSERT INTO events (operation_id, at, from_state, to_state,"
-                " detail) VALUES (?,?,?,?,?)",
-                (operation_id, _stamp(_utcnow()), from_state, to_state, detail),
-            )
+        # Always called inside an open _transaction(); never commits itself.
+        self._connection.execute(
+            "INSERT INTO events (operation_id, at, from_state, to_state,"
+            " detail) VALUES (?,?,?,?,?)",
+            (operation_id, _stamp(_utcnow()), from_state, to_state, detail),
+        )

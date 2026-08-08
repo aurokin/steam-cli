@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from steam_agent.execution.content_plane import ContentResult
+from steam_agent.execution.content_plane import (
+    ContentResult,
+    adopt_manifest,
+    locate_manifest,
+)
 from steam_agent.execution.executor import Executor
 from steam_agent.execution.ledger import ExecutionLedger
 from steam_agent.execution.linux_session import LeaseGates
@@ -28,6 +32,7 @@ class FakeSession:
         self.running = running
         self.stops = 0
         self.starts = 0
+        self.start_ok = True
 
     def gates(self) -> LeaseGates:
         state = "pass" if self.clear else "fail"
@@ -48,6 +53,8 @@ class FakeSession:
 
     def start_client(self) -> bool:
         self.starts += 1
+        if not self.start_ok:
+            return False
         self.running = True
         return True
 
@@ -90,14 +97,16 @@ def harness(tmp_path: Path):
     ledger.close()
 
 
-def _authorized(ledger: ExecutionLedger) -> int:
+def _authorized(
+    ledger: ExecutionLedger, *, install_dir_name: str = "Spacewar"
+) -> int:
     _, nonce = ledger.request(
         plan_key="k" * 8,
         plan_document=json.dumps(
             {
                 "schema": "operation-plan/0.1",
                 "operation": "install",
-                "install_dir_name": "Spacewar",
+                "install_dir_name": install_dir_name,
             }
         ),
         operation="install",
@@ -182,3 +191,75 @@ def test_reconcile_pre_content_death_aborts_cleanly(harness) -> None:
     actions = executor.reconcile()
     assert actions and "aborted" in actions[0]
     assert ledger.get(operation_id).state == "aborted"
+
+
+def test_unsafe_install_dir_name_aborts_before_side_effects(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger, install_dir_name="../../outside")
+    report = executor.execute(operation_id)
+    assert report.outcome == "aborted"
+    assert "path component" in report.detail
+    assert ledger.get(operation_id).state == "aborted"
+    assert session.stops == 0  # client never touched
+
+
+def test_client_restore_failure_is_reported(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.start_ok = False
+    operation_id = _authorized(ledger)
+    report = executor.execute(operation_id)
+    assert report.outcome == "confirmed"
+    assert "client restore failed" in report.detail
+    assert "client restore failed" in (ledger.get(operation_id).detail or "")
+
+
+def test_reconcile_interrupted_stays_resumable(harness) -> None:
+    ledger, _, _, executor, _ = harness
+    operation_id = _authorized(ledger)
+    for state in ("lease_acquired", "client_stopping", "content_running"):
+        ledger.transition(operation_id, state)
+
+    executor.reconcile()
+    actions = executor.reconcile()  # a second pass must not make it terminal
+    assert ledger.get(operation_id).state == "interrupted"
+    assert any("resume" in action for action in actions)
+
+
+def _adopting_operation(ledger: ExecutionLedger, executor: Executor, library: Path) -> int:
+    operation_id = _authorized(ledger)
+    for state in ("lease_acquired", "client_stopping", "content_running", "adopting"):
+        ledger.transition(operation_id, state)
+    prior = library / "steamapps" / "appmanifest_480.acf"
+    prior.write_text("old", encoding="utf-8")
+    target = library.parent / "adoption-target" / "steamapps"
+    target.mkdir(parents=True)
+    (target / "appmanifest_480.acf").write_text(_MANIFEST, encoding="utf-8")
+    adopt_manifest(
+        source=locate_manifest(install_dir=target.parent, appid=480),
+        library=library,
+        appid=480,
+        install_dir_name="Spacewar",
+        journal_dir=executor._journal_dir,
+    )
+    return operation_id
+
+
+def test_reconcile_adopting_completed_confirms(harness) -> None:
+    ledger, _, _, executor, library = harness
+    operation_id = _adopting_operation(ledger, executor, library)
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "confirmed"
+    assert any("completed" in action for action in actions)
+
+
+def test_reconcile_adopting_rolled_back_fails(harness) -> None:
+    ledger, _, _, executor, library = harness
+    operation_id = _adopting_operation(ledger, executor, library)
+    adopted = library / "steamapps" / "appmanifest_480.acf"
+    adopted.write_text('"AppState" { torn', encoding="utf-8")  # simulate crash
+
+    actions = executor.reconcile()
+    assert ledger.get(operation_id).state == "failed"
+    assert any("restored" in action for action in actions)
+    assert adopted.read_text(encoding="utf-8") == "old"  # backup reinstated

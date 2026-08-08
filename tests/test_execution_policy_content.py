@@ -152,3 +152,24 @@ def test_reconcile_without_journal_is_clean(tmp_path: Path) -> None:
         )
         == "clean"
     )
+
+
+def test_steamcmd_timeout_bytes_output_is_decoded(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd="steamcmd", timeout=1, output=b"partial \xff output", stderr=None
+        )
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "steamcmd.sh",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+    )
+    result = adapter.install(account="o", appid=480, install_dir=tmp_path / "i")
+    assert result.outcome == "failed"
+    assert "partial" in result.log_path.read_text(encoding="utf-8")

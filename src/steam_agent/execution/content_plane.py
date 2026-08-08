@@ -33,6 +33,15 @@ class AdoptionError(RuntimeError):
     """Manifest adoption could not be completed or rolled back cleanly."""
 
 
+def _captured_text(captured: str | bytes | None) -> str:
+    # TimeoutExpired carries bytes even when the run used text=True.
+    if captured is None:
+        return ""
+    if isinstance(captured, bytes):
+        return captured.decode("utf-8", errors="replace")
+    return captured
+
+
 @dataclass(frozen=True, slots=True)
 class ContentResult:
     outcome: ContentOutcome
@@ -86,7 +95,7 @@ class SteamcmdAdapter:
             )
             output = completed.stdout + completed.stderr
         except subprocess.TimeoutExpired as error:
-            output = (error.stdout or "") + (error.stderr or "")
+            output = _captured_text(error.stdout) + _captured_text(error.stderr)
         except OSError as error:
             output = f"steamcmd unavailable: {error}"
         log_path.write_text(output, encoding="utf-8", errors="replace")

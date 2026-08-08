@@ -36,6 +36,14 @@ ExecuteOutcome = Literal[
 _STATE_FULLY_INSTALLED = 4
 
 
+def safe_install_dir_name(name: str) -> bool:
+    """True only for a single path component: adoption never leaves the library."""
+
+    if not name or name in {".", ".."}:
+        return False
+    return not any(character in name for character in ("/", "\\", "\0"))
+
+
 class ExecutorLockedError(RuntimeError):
     """Another executor process holds the machine lock."""
 
@@ -100,6 +108,21 @@ class Executor:
                 operation_id, "aborted", "execution window lapsed"
             )
 
+        plan = ledger.plan_document(operation_id)
+        install_dir_name = str(plan.get("install_dir_name", ""))
+        if not install_dir_name:
+            install_dir_name = f"app_{operation.appid}"
+        if not safe_install_dir_name(install_dir_name):
+            ledger.transition(
+                operation_id, "aborted", detail="unsafe install_dir_name"
+            )
+            return ExecutionReport(
+                operation_id,
+                "aborted",
+                "install_dir_name must be a single path component",
+            )
+        target = self._library / "steamapps" / "common" / install_dir_name
+
         gates = self._session.gates()
         if not gates.all_clear():
             return ExecutionReport(
@@ -132,12 +155,6 @@ class Executor:
                     operation_id, "aborted", "client would not exit cleanly"
                 )
 
-        plan = ledger.plan_document(operation_id)
-        install_dir_name = str(plan.get("install_dir_name", ""))
-        if not install_dir_name:
-            install_dir_name = f"app_{operation.appid}"
-        target = self._library / "steamapps" / "common" / install_dir_name
-
         ledger.transition(
             operation_id,
             "content_running",
@@ -152,17 +169,21 @@ class Executor:
             ledger.transition(
                 operation_id, "failed", detail="auth_required: owner re-seed"
             )
-            self._restore_client(prior_running)
+            note = self._restore_note(prior_running)
             return ExecutionReport(
-                operation_id, "auth_required", "steamcmd needs re-authentication"
+                operation_id,
+                "auth_required",
+                f"steamcmd needs re-authentication{note}",
             )
         if result.outcome != "installed":
             ledger.transition(
                 operation_id, "failed", detail=f"steamcmd failed: {result.log_path.name}"
             )
-            self._restore_client(prior_running)
+            note = self._restore_note(prior_running)
             return ExecutionReport(
-                operation_id, "failed", f"steamcmd failed; see {result.log_path.name}"
+                operation_id,
+                "failed",
+                f"steamcmd failed; see {result.log_path.name}{note}",
             )
 
         source = locate_manifest(install_dir=target, appid=operation.appid)
@@ -170,9 +191,9 @@ class Executor:
             ledger.transition(
                 operation_id, "failed", detail="no steamcmd-written manifest"
             )
-            self._restore_client(prior_running)
+            note = self._restore_note(prior_running)
             return ExecutionReport(
-                operation_id, "failed", "steamcmd produced no manifest"
+                operation_id, "failed", f"steamcmd produced no manifest{note}"
             )
 
         ledger.transition(operation_id, "adopting")
@@ -185,8 +206,15 @@ class Executor:
         )
 
         ledger.transition(operation_id, "client_restart_pending")
-        self._restore_client(prior_running)
+        client_restored = self._restore_client(prior_running)
+        note = "" if client_restored else "; client restore failed"
 
+        # Verification is manifest-evidence-based by design (ADR 0027 semantic
+        # postconditions; Phase 0 measured 4/4 client adoption with zero
+        # re-download).  The downloading/ probe is a best-effort contradiction
+        # detector, not proof of client acceptance — the client validates on
+        # its own schedule, so the outcome wording below distinguishes whether
+        # a running client has had any chance to observe the adoption.
         ledger.transition(operation_id, "verifying")
         flags = manifest_state_flags(adopted)
         if flags == _STATE_FULLY_INSTALLED:
@@ -204,36 +232,50 @@ class Executor:
                     "contradicted",
                     "client rejected the adopted manifest and is re-downloading",
                 )
-            ledger.transition(
-                operation_id,
-                "confirmed",
-                detail="client_adopted; first_run_required",
-            )
-            return ExecutionReport(
-                operation_id,
-                "confirmed",
-                "content present and adopted; first run still required",
-            )
+            if prior_running and client_restored:
+                detail = "client_adopted; first_run_required"
+                summary = "content present and adopted; first run still required"
+            else:
+                detail = "content_present; client validation deferred to next client start"
+                summary = (
+                    "content present and adopted; client validation deferred"
+                    " to next client start; first run still required"
+                )
+            ledger.transition(operation_id, "confirmed", detail=detail + note)
+            return ExecutionReport(operation_id, "confirmed", summary + note)
         ledger.transition(
             operation_id,
             "unconfirmed",
-            detail=f"manifest StateFlags={flags}",
+            detail=f"manifest StateFlags={flags}{note}",
         )
         return ExecutionReport(
             operation_id,
             "unconfirmed",
-            f"adoption not confirmed (StateFlags={flags})",
+            f"adoption not confirmed (StateFlags={flags}){note}",
         )
 
-    def _restore_client(self, prior_running: bool | None) -> None:
-        if prior_running:
-            self._session.start_client()
+    def _restore_client(self, prior_running: bool | None) -> bool:
+        """Restore prior client run-state; False means a restart was needed but failed."""
+
+        if not prior_running:
+            return True
+        return self._session.start_client()
+
+    def _restore_note(self, prior_running: bool | None) -> str:
+        return "" if self._restore_client(prior_running) else "; client restore failed"
 
     # -- reconciliation ---------------------------------------------------
 
     def reconcile(self) -> list[str]:
         """Map every non-terminal operation to exactly one recovery action."""
 
+        lock = self._lock()
+        try:
+            return self._reconcile_locked()
+        finally:
+            lock.close()  # type: ignore[attr-defined]
+
+    def _reconcile_locked(self) -> list[str]:
         actions: list[str] = []
         ledger = self._ledger
         ledger.expire_lapsed()
@@ -243,12 +285,16 @@ class Executor:
         state = active.state
         operation_id = active.operation_id
 
+        def restore() -> None:
+            if not self._restore_client(active.prior_client_running):
+                actions.append(f"{operation_id}: client restore failed")
+
         if state in {"pending_confirmation", "authorized"}:
             return actions  # no side effects yet; expiry alone governs
         if state in {"lease_acquired", "client_stopping"}:
             ledger.transition(operation_id, "aborted", detail="reconciled: no side effects")
             actions.append(f"{operation_id}: aborted (died before content ran)")
-            self._restore_client(active.prior_client_running)
+            restore()
             return actions
         if state == "content_running":
             if ledger.window_valid(operation_id):
@@ -259,7 +305,19 @@ class Executor:
                     operation_id, "failed", detail="window lapsed mid-download"
                 )
                 actions.append(f"{operation_id}: failed (window lapsed; partial dir invisible)")
-                self._restore_client(active.prior_client_running)
+                restore()
+            return actions
+        if state == "interrupted":
+            # Already a resume candidate: leave it resumable while the window
+            # holds; repeated reconciliation must never make it terminal.
+            if ledger.window_valid(operation_id):
+                actions.append(f"{operation_id}: resume via execute()")
+            else:
+                ledger.transition(
+                    operation_id, "failed", detail="window lapsed before resume"
+                )
+                actions.append(f"{operation_id}: failed (window lapsed before resume)")
+                restore()
             return actions
         if state == "adopting":
             verdict = reconcile_adoption(
@@ -267,18 +325,29 @@ class Executor:
                 appid=active.appid,
                 journal_dir=self._journal_dir,
             )
+            if verdict == "restored":
+                # The destination is the pre-operation backup (or absent);
+                # this operation's adoption did not survive.
+                ledger.transition(
+                    operation_id, "failed", detail="reconciled: adoption rolled back"
+                )
+                actions.append(f"{operation_id}: adoption restored -> failed")
+                restore()
+                return actions
+            ledger.transition(
+                operation_id, "client_restart_pending", detail=f"adoption {verdict}"
+            )
+            restore()
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
-            flags_path = (
+            flags = manifest_state_flags(
                 self._library / "steamapps" / f"appmanifest_{active.appid}.acf"
             )
-            flags = manifest_state_flags(flags_path)
             outcome = "confirmed" if flags == _STATE_FULLY_INSTALLED else "unconfirmed"
             ledger.transition(operation_id, outcome, detail=f"reconciled: {verdict}")
             actions.append(f"{operation_id}: adoption {verdict} -> {outcome}")
-            self._restore_client(active.prior_client_running)
             return actions
-        if state in {"client_restart_pending", "verifying", "interrupted"}:
-            self._restore_client(active.prior_client_running)
+        if state in {"client_restart_pending", "verifying"}:
+            restore()
             if state != "verifying":
                 ledger.transition(operation_id, "verifying", detail="reconciled")
             flags = manifest_state_flags(
