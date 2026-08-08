@@ -269,6 +269,7 @@ def test_reconcile_adopting_completed_confirms(harness) -> None:
     actions = executor.reconcile()
     assert ledger.get(operation_id).state == "confirmed"
     assert any("completed" in action for action in actions)
+    assert not (executor._journal_dir / "adoption-480.json").exists()  # retired
 
 
 def test_reconcile_leaves_state_while_restore_fails(harness) -> None:
@@ -426,7 +427,7 @@ def test_symlinked_install_target_aborts(harness) -> None:
     operation_id = _authorized(ledger)
     report = executor.execute(operation_id)
     assert report.outcome == "aborted"
-    assert "outside the library" in report.detail
+    assert "symlink" in report.detail
     assert session.stops == 0
 
 

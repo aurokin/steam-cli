@@ -123,17 +123,29 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = arguments.state_dir or _default_state_dir()
 
     if arguments.command == "init":
+        # Reconfiguring while an operation is active could point a
+        # confirmed plan at a different library, script, or machine key.
+        if (state_dir / "ledger.sqlite3").exists():
+            ledger = ExecutionLedger(state_dir / "ledger.sqlite3")
+            active = ledger.active()
+            ledger.close()
+            if active is not None:
+                return _fail(
+                    "an operation is active; refusing to reconfigure the broker"
+                )
         state_dir.mkdir(parents=True, exist_ok=True)
         # Ledger, policy, logs, and the steamcmd credential cache live here;
         # never trust the umask to keep other identities out.
         state_dir.chmod(0o700)
         # Idempotent re-init: keep an existing (possibly owner-edited)
         # policy rather than failing, so a partial first init is repairable.
+        wrote_template = False
         if not (state_dir / "policy.toml").exists():
             try:
                 write_policy_template(state_dir / "policy.toml")
             except PolicyError as error:
                 return _fail(str(error))
+            wrote_template = True
         (state_dir / "broker.json").write_text(
             json.dumps(
                 {
@@ -146,7 +158,16 @@ def main(argv: list[str] | None = None) -> int:
             ),
             encoding="utf-8",
         )
-        _emit({"initialized": True, "policy": "deny-all template written"})
+        _emit(
+            {
+                "initialized": True,
+                "policy": (
+                    "deny-all template written"
+                    if wrote_template
+                    else "existing policy retained"
+                ),
+            }
+        )
         return 0
 
     # Policy gates intake and execution only, and is re-read at each

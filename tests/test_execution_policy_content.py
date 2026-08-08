@@ -120,7 +120,7 @@ def test_adoption_backs_up_prior_manifest(tmp_path: Path) -> None:
     assert backup.read_text(encoding="utf-8") == "old"
 
 
-def test_reconcile_completed_swap_clears_journal(tmp_path: Path) -> None:
+def test_reconcile_completed_swap_keeps_journal_for_caller(tmp_path: Path) -> None:
     library = _library(tmp_path)
     target = _target_with_manifest(tmp_path)
     journal_dir = tmp_path / "journal"
@@ -136,7 +136,8 @@ def test_reconcile_completed_swap_clears_journal(tmp_path: Path) -> None:
         reconcile_adoption(library=library, appid=1902490, journal_dir=journal_dir)
         == "completed"
     )
-    assert not (journal_dir / "adoption-1902490.json").exists()
+    # Retirement is the caller's job after the ledger leaves adopting.
+    assert (journal_dir / "adoption-1902490.json").exists()
 
 
 def test_reconcile_torn_write_restores_backup(tmp_path: Path) -> None:

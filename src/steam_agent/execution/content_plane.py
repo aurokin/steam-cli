@@ -285,8 +285,9 @@ def reconcile_adoption(
     if destination.is_file():
         current = hashlib.sha256(destination.read_bytes()).hexdigest()
         if current == checksum:
-            journal_path.unlink()
-            _fsync_dir(journal_dir)
+            # Leave the journal for the caller to retire AFTER the ledger
+            # leaves adopting; deleting it here would let a crash read a
+            # completed swap as adopting-with-no-journal (unprovable).
             return "completed"
     backup_value = record.get("backup")
     # The restored manifest must be durable before the journal disappears:

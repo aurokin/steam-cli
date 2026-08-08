@@ -129,6 +129,15 @@ class Executor:
         if not ledger.window_valid(operation_id):
             ledger.expire_lapsed()
             if resuming:
+                # The client may still be stopped from the interrupted run;
+                # restore it before this row becomes terminal (terminal rows
+                # are invisible to reconciliation).
+                if not self._restore_client(operation.prior_client_running):
+                    return ExecutionReport(
+                        operation_id,
+                        "aborted",
+                        "window lapsed; client restore failed; state left for retry",
+                    )
                 ledger.transition(
                     operation_id, "failed", detail="window lapsed before resume"
                 )
@@ -168,6 +177,14 @@ class Executor:
             )
         common = self._library / "steamapps" / "common"
         target = common / install_dir_name
+        if target.is_symlink():
+            # Even an in-library symlink can alias another title's directory.
+            ledger.transition(
+                operation_id, "aborted", detail="install target is a symlink"
+            )
+            return ExecutionReport(
+                operation_id, "aborted", "install target is a symlink"
+            )
         try:
             # A pre-existing symlink at the target (or at common/ itself)
             # would let a safe-looking name write outside the library;
@@ -188,7 +205,21 @@ class Executor:
         for manifest in sorted((self._library / "steamapps").glob("appmanifest_*.acf")):
             if manifest.name == f"appmanifest_{operation.appid}.acf":
                 continue
-            if manifest_install_dir(manifest) == install_dir_name:
+            other_dir = manifest_install_dir(manifest)
+            if other_dir is None:
+                # Unreadable/malformed manifest: ownership of the target
+                # directory cannot be proven, so fail closed.
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail=f"cannot inspect {manifest.name}",
+                )
+                return ExecutionReport(
+                    operation_id,
+                    "aborted",
+                    "another title's manifest is unreadable; collision unprovable",
+                )
+            if other_dir == install_dir_name:
                 ledger.transition(
                     operation_id,
                     "aborted",
@@ -523,6 +554,7 @@ class Executor:
             ledger.transition(
                 operation_id, "client_restart_pending", detail=f"adoption {verdict}"
             )
+            clear_adoption_journal(appid=active.appid, journal_dir=self._journal_dir)
             if not restore():
                 return actions  # retried from client_restart_pending
             ledger.transition(operation_id, "verifying", detail=f"adoption {verdict}")
