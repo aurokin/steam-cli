@@ -56,6 +56,13 @@ class WarningKind(StrEnum):
     INACCESSIBLE = "inaccessible"
     DUPLICATE = "duplicate"
     MISSING = "missing"
+    # The scan read this manifest correctly and excluded it on purpose: the
+    # app is not installed by M1's definition.  Distinct from the kinds
+    # above, which all mean something could not be read or trusted, because
+    # only those make a scan incomplete.  A paused download and a leftover
+    # uninstalled manifest are ordinary on a real machine and must not
+    # freeze the projection.
+    OUT_OF_SCOPE = "out_of_scope"
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,7 +610,7 @@ def _read_manifest(
     if state_flags & _APP_STATE_UNINSTALLED != 0:
         warnings.append(
             LocalSteamWarning(
-                WarningKind.MALFORMED,
+                WarningKind.OUT_OF_SCOPE,
                 "uninstalled_app_state",
                 "Manifest asserts the Uninstalled state and was skipped",
                 manifest,
@@ -664,7 +671,7 @@ def _read_manifest(
     if not fully_installed and not plausible_existing_update:
         warnings.append(
             LocalSteamWarning(
-                WarningKind.MALFORMED,
+                WarningKind.OUT_OF_SCOPE,
                 "not_fully_installed",
                 "Manifest lacks proof of a complete or existing in-place installation and was skipped",
                 manifest,

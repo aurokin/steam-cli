@@ -35,6 +35,17 @@ from a Steam account.
 equivalent is `STEAM_AGENT_DATA_DIR`. `sync installed` resolves its Steam root
 from `--steam-root`, then `STEAM_AGENT_STEAM_ROOT`, then platform defaults.
 
+A complete `sync installed` run atomically replaces that machine's installed
+projection; a partial or failed run preserves the previous one. A run is
+partial when the scan could not see or trust everything — an inaccessible
+library, a malformed manifest, an unrecordable install path. It is NOT
+partial merely because a manifest was correctly excluded from the projection:
+a paused or stalled download and a leftover uninstalled manifest are ordinary
+states, are reported as `not_fully_installed` and `uninstalled_app_state`
+warning codes on a complete run, and do not block promotion. Treating them as
+partial froze the projection for as long as the condition lasted, which on a
+real machine is indefinitely.
+
 All M1 capabilities are local and credential-free. Secret-like arguments such
 as `--api-key`, `--token`, `--password`, `--cookie`, and `--client-secret` are
 rejected without echoing their value.

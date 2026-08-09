@@ -561,3 +561,81 @@ def test_residual_measurements_survive_promotion_and_stay_pathless(
     assert game.residual_compatdata_bytes == 0
     assert game.residual_workshop_bytes == 0
     assert str(tmp_path) not in json.dumps(installed_item(game))
+
+
+def _library_with(
+    base: Path, manifests: dict[int, str], *, without_dirs: frozenset[int] = frozenset()
+) -> Path:
+    root = base / "root"
+    steamapps = root / "steamapps"
+    (steamapps / "common").mkdir(parents=True)
+    (steamapps / "libraryfolders.vdf").write_text(
+        '"libraryfolders" { "0" { "path" "." "apps" { } } }', encoding="utf-8"
+    )
+    for appid, flags in manifests.items():
+        if appid not in without_dirs:
+            (steamapps / "common" / f"App{appid}").mkdir(exist_ok=True)
+        (steamapps / f"appmanifest_{appid}.acf").write_text(
+            f'"AppState" {{ "appid" "{appid}" "name" "App{appid}"'
+            f' "installdir" "App{appid}" "StateFlags" "{flags}" }}',
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_a_paused_download_does_not_freeze_the_installed_projection(
+    tmp_path: Path,
+) -> None:
+    # 1538 over a directory that was never staged is what a stalled first
+    # download leaves behind (observed on a real machine).  With the
+    # directory present it would count as an in-place update and stay
+    # installed; without one there is nothing installed to project.  Either
+    # way the scan saw everything, so it is complete and still promotes.
+    root = _library_with(
+        tmp_path, {10: "4", 20: "1538"}, without_dirs=frozenset({20})
+    )
+
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        result = sync_installed(
+            storage, steam_root=root, machine_id="fixture-machine", clock=Clock()
+        )
+        games = storage.list_installed("fixture-machine")
+
+    assert result.run.status == "complete"
+    assert [game.appid for game in games] == [10]
+    # The exclusion is still reported; it just no longer blocks promotion.
+    assert "not_fully_installed" in (result.run.error_detail or "")
+
+
+def test_a_leftover_uninstalled_manifest_does_not_freeze_the_projection(
+    tmp_path: Path,
+) -> None:
+    root = _library_with(
+        tmp_path, {10: "4", 20: "1"}, without_dirs=frozenset({20})
+    )
+
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        result = sync_installed(
+            storage, steam_root=root, machine_id="fixture-machine", clock=Clock()
+        )
+
+    assert result.run.status == "complete"
+    assert "uninstalled_app_state" in (result.run.error_detail or "")
+
+
+def test_an_unreadable_library_still_blocks_promotion(tmp_path: Path) -> None:
+    # The last-good rule is unchanged for warnings that mean the scan could
+    # not see everything.
+    root = _library_with(tmp_path, {10: "4"})
+    (root / "steamapps" / "appmanifest_30.acf").write_text(
+        '"AppState" { "appid" "30" ', encoding="utf-8"
+    )
+
+    with Storage(tmp_path / "db.sqlite3") as storage:
+        result = sync_installed(
+            storage, steam_root=root, machine_id="fixture-machine", clock=Clock()
+        )
+        games = storage.list_installed("fixture-machine")
+
+    assert result.run.status == "partial"
+    assert games == []

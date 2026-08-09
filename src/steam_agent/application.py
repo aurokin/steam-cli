@@ -10,7 +10,12 @@ import platform
 import sys
 from typing import Callable
 
-from steam_agent.local_steam import LocalSteamScan, ResidualContent, scan_local_steam
+from steam_agent.local_steam import (
+    LocalSteamScan,
+    ResidualContent,
+    WarningKind,
+    scan_local_steam,
+)
 from steam_agent.storage import (
     EvidenceInput,
     InstalledObservation,
@@ -233,7 +238,18 @@ def sync_installed(
             )
             recorded.append(app.appid)
 
-        status = "partial" if scan.warnings or skipped else "complete"
+        # A scan is partial when it could not see or trust everything, not
+        # when it correctly excluded an app that is not installed.  Treating
+        # every warning as partial meant one paused download or one leftover
+        # uninstalled manifest froze the last-good projection permanently
+        # (observed on a real library).  Out-of-scope codes are still
+        # reported on the run; they just no longer block promotion.
+        blocking = [
+            warning
+            for warning in scan.warnings
+            if warning.kind is not WarningKind.OUT_OF_SCOPE
+        ]
+        status = "partial" if blocking or skipped else "complete"
         warning_codes = sorted({warning.code for warning in scan.warnings})
         if skipped:
             warning_codes.append("unrecordable_install")
