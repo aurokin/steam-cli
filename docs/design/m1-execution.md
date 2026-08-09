@@ -84,7 +84,7 @@ Each sync run is recorded as `complete`, `partial`, or `failed`:
 - Scanner warnings, unsafe/unrecordable install paths, malformed manifests, or
   inaccessible declared libraries make the run partial. Valid observations are
   retained for diagnostics, but the run is not promoted.
-  (Amended 2026-08-09, after a real library froze its projection: warnings
+  (Amended 2026-08-08, after a real library froze its projection: warnings
   that merely record a manifest being correctly excluded from the projection —
   `not_fully_installed`, `uninstalled_app_state` — no longer make a run
   partial. Only warnings meaning the scan could not see or trust everything
