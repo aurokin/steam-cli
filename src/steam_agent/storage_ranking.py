@@ -2,6 +2,11 @@
 
 These recipes rank already-normalized evidence. They never inspect disks, call
 providers, open Steam, or imply that an uninstall/install action is safe.
+
+``reclaim_bytes`` is what an uninstall frees, which is not the same as what
+the title occupies: a Proton prefix, shader cache, and Workshop content
+survive it.  A candidate known to strand such content carries a
+``residual_content`` gate saying so; the sizes live in the uninstall plan.
 """
 
 from __future__ import annotations
@@ -28,6 +33,11 @@ class ReclaimCandidate:
     freshness: Freshness
     size_bytes: int | None
     evidence_ids: tuple[int | str, ...] = ()
+    # Whether measured content survives this title's uninstall (Proton
+    # prefix, shader cache, Workshop items).  Defaults to unknown so a
+    # projection promoted before residual measurement existed says nothing
+    # rather than claiming there is none.
+    residual: EvidenceState = "unknown"
 
     def __post_init__(self) -> None:
         _validate_appid(self.appid)
@@ -36,6 +46,8 @@ class ReclaimCandidate:
             raise ValueError("installed state is invalid")
         if self.freshness not in {"fresh", "stale", "unknown"}:
             raise ValueError("freshness is invalid")
+        if self.residual not in {"present", "absent", "unknown"}:
+            raise ValueError("residual state is invalid")
         _validate_optional_bytes(self.size_bytes)
         _validate_evidence_ids(self.evidence_ids)
 
@@ -175,6 +187,18 @@ def rank_reclaim_space(
         )
         gates = (installed_gate, freshness_gate, size_gate)
         eligibility = _eligibility(gates)
+        # Appended AFTER eligibility, and only when there is something to
+        # report.  Stranded content does not disqualify an uninstall, so
+        # this gate must never be the reason a candidate is excluded, and
+        # an unmeasured projection must not turn every candidate
+        # conditional — hence "pass", and hence no gate at all in the
+        # absent and unmeasured cases, where output stays byte-identical to
+        # a ranking that never knew about residuals.
+        if item.residual == "present":
+            gates = (
+                *gates,
+                Gate("residual_content", "pass", "residual_content_present"),
+            )
         reclaim = item.size_bytes
         fraction = None if reclaim is None else (reclaim * 10_000) // target_bytes
         results.append(

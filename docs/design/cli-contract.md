@@ -641,7 +641,16 @@ lineage; runtime, transfer queue, update currency, per-library capacity, save,
 media, Workshop/mod, and compatibility-tool state are typed unavailable.
 
 Storage ranking returns `storage-ranking/0.1`. `reclaim-space/0.1` ranks known
-content-size evidence, not safe uninstall actions. `travel-install/0.1` uses
+content-size evidence, not safe uninstall actions. `reclaim_bytes` is what an
+uninstall frees, which is less than what the title occupies: a candidate
+measured to strand a Proton prefix, shader cache, or Workshop content carries
+an extra `residual_content` gate whose reason is `residual_content_present`.
+That gate is informational and always `pass` — stranded content is a caveat,
+not a reason a title cannot be uninstalled, so it never changes eligibility
+or `reclaim_bytes`. No gate is emitted when nothing survives the uninstall or
+when residuals were never measured, so a projection promoted before
+measurement existed ranks exactly as before. The sizes themselves are in the
+uninstall plan. `travel-install/0.1` uses
 declared minimum-storage intervals and non-storage compatibility evidence but
 always leaves actual footprint, download/update bytes, bandwidth, queue, and
 completion time unknown. Hard gates precede preference evidence.

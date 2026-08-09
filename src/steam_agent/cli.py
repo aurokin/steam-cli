@@ -4369,6 +4369,9 @@ def _dispatch_reclaim_rank(args: argparse.Namespace, database_path: Path) -> int
             now=now,
         )
         names = {item.appid: item.name for item in snapshot.games}
+        residuals = {
+            game.appid: _residual_presence(game) for game in snapshot.games
+        }
         ranked = rank_reclaim_space(
             tuple(
                 ReclaimCandidate(
@@ -4383,6 +4386,7 @@ def _dispatch_reclaim_rank(args: argparse.Namespace, database_path: Path) -> int
                         else None
                     ),
                     evidence_ids=item.installed.evidence_ids,
+                    residual=residuals.get(item.appid, "unknown"),
                 )
                 for item in batch.items
             ),
@@ -4745,6 +4749,19 @@ _RESIDUAL_FIELDS: tuple[tuple[str, str], ...] = (
     ("shadercache", "residual_shadercache_bytes"),
     ("workshop", "residual_workshop_bytes"),
 )
+
+
+def _residual_presence(game: InstalledGame | None) -> str:
+    """Whether measured content survives this title's uninstall.
+
+    ``unknown`` covers both an absent projection row and one promoted
+    before residual measurement existed; neither is evidence of absence.
+    """
+
+    summary = _residual_summary(game)
+    if summary is None:
+        return "unknown"
+    return "present" if summary.kinds else "absent"
 
 
 def _residual_summary(game: InstalledGame | None) -> ResidualSummary | None:

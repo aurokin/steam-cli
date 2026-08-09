@@ -160,3 +160,56 @@ def test_travel_validation_rejects_duplicate_candidates_and_partial_intervals() 
         rank_travel_install((one, one), budget_bytes=1)
     with pytest.raises(ValueError):
         TravelCandidate(1, None, "present", "fresh", "absent", "fresh", "pass", 1, None)
+
+
+def _reclaim(**values: object) -> ReclaimCandidate:
+    arguments: dict[str, object] = {
+        "appid": 480,
+        "name": "Spacewar",
+        "installed": "present",
+        "freshness": "fresh",
+        "size_bytes": 8_000_000_000,
+    }
+    arguments.update(values)
+    return ReclaimCandidate(**arguments)  # type: ignore[arg-type]
+
+
+def test_stranded_content_is_reported_without_disqualifying_the_candidate() -> None:
+    ranking = rank_reclaim_space(
+        (_reclaim(residual="present"),), target_bytes=1_000_000_000
+    )
+
+    result = ranking.results[0]
+    gate = next(item for item in result.gates if item.name == "residual_content")
+    assert gate.reason == "residual_content_present"
+    # Stranding content is a caveat, not a reason the title cannot be
+    # uninstalled, and it never changes what an uninstall frees.
+    assert gate.state == "pass"
+    assert result.eligibility == "eligible"
+    assert result.reclaim_bytes == 8_000_000_000
+
+
+@pytest.mark.parametrize("residual", ["absent", "unknown"])
+def test_a_candidate_with_nothing_to_report_is_unchanged(residual: str) -> None:
+    ranking = rank_reclaim_space(
+        (_reclaim(residual=residual),), target_bytes=1_000_000_000
+    )
+    baseline = rank_reclaim_space((_reclaim(),), target_bytes=1_000_000_000)
+
+    assert ranking.results[0] == baseline.results[0]
+    assert not any(
+        gate.name == "residual_content" for gate in ranking.results[0].gates
+    )
+
+
+def test_an_unmeasured_projection_does_not_downgrade_every_candidate() -> None:
+    # The default is unknown, so a projection promoted before residual
+    # measurement existed must rank exactly as it always did.
+    ranking = rank_reclaim_space((_reclaim(),), target_bytes=1_000_000_000)
+
+    assert ranking.results[0].eligibility == "eligible"
+
+
+def test_residual_state_is_validated() -> None:
+    with pytest.raises(ValueError):
+        _reclaim(residual="maybe")

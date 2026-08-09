@@ -24,7 +24,7 @@ Use `steam-agent` as the evidence source. Prefer its cache-only reads and keep t
 - Rank cached wishlist deals: `deals query --scope wishlist`; keep country, store class, provider attribution, and freshness visible.
 - Assess an explicit target: `compatibility assess APPID --target machine:ALIAS`; report bounded compatibility evidence, not promised performance or frame rate.
 - Rank group fit: `group recommend`. Use `group ownership` or `group eligibility` when the user wants copies or hard eligibility for explicit AppIDs.
-- Rank reclaim-space or travel candidates: `storage rank`. A reclaim candidate is not proof that uninstalling is safe, backed up, or recoverable.
+- Rank reclaim-space or travel candidates: `storage rank`. A reclaim candidate is not proof that uninstalling is safe, backed up, or recoverable. `reclaim_bytes` is what an uninstall frees, not what the title occupies — a `residual_content` gate means a Proton prefix, shader cache, or Workshop content stays behind, and `operations plan uninstall` reports how much. Never present the reclaim figure as the space recovered when that gate is present.
 
 Supply the account, machine, country, and language context required by the leaf help. Prefer configured aliases from the user's environment; do not expose raw account identifiers or private filesystem paths.
 

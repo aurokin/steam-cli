@@ -320,14 +320,18 @@ the files in place.
   Originally "explicit confirmation for everything"; superseded by ADR
   0028's policy grants (`allow` within limits auto-authorizes).
 - **Phases 2a/2b/2c — independent verb additions**, each gated on its own
-  spike line and shippable alone: 2a uninstall-as-inert-plan (candidate
-  ranking + inventory + in-Steam instructions; human executes, per §10a),
-  2b repair — IMPLEMENTED as the `verify` operation class
+  spike line and shippable alone: 2a uninstall-as-inert-plan — IMPLEMENTED
+  (reclaim-space ranking, per-app residual inventory measured by the
+  installed scan and reported as plan risk plus a ranking gate, and in-Steam
+  instructions with the `steam://uninstall/<appid>` shortcut; human executes,
+  per §10a) — 2b repair — IMPLEMENTED as the `verify` operation class
   ([ADR 0030](../adr/0030-verify-as-a-second-executable-class.md)) — and
   2c launch allowlist, dispatched-terminal — IMPLEMENTED
   ([ADR 0031](../adr/0031-launch-allowlist-dispatched-terminal.md)). A former 2d
   (move-by-reinstall) is cancelled by ADR 0029 — move ships as an inert plan
-  and needs no broker work.
+  and needs no broker work. **Phase 2 is complete.** The remaining execution
+  work is the §11 boundary-eval refusal matrix (unbuilt; the broker's
+  refusals are unit-tested only) and Phase 3.
 - **Phase 3 — unattended policy limits** (owner decision 2026-08-08:
   scheduling machinery is explicitly out of scope for this project). The
   loop that decides when to act — walking the backlog, picking a moment,

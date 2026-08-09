@@ -190,7 +190,11 @@ steam-agent operations plan verify APPID --account primary --machine local
 ```
 
 Storage ranking proves only the evidence it reports. It does not prove a game
-is safe to uninstall, backed up, current, or downloadable on time. Plans are
+is safe to uninstall, backed up, current, or downloadable on time. Read
+`reclaim_bytes` as what an uninstall frees, not what the title occupies: a
+Proton prefix, shader cache, and subscribed Workshop content survive it. A
+candidate measured to leave such content behind carries a `residual_content`
+gate, and `operations plan uninstall APPID` reports how much. Plans are
 inert: they return official references and instructions but never open Steam,
 launch a process, change a file, or claim completion.
 

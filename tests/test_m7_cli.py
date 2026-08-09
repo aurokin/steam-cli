@@ -756,3 +756,36 @@ def test_plans_other_than_uninstall_carry_no_residual_claim(
     assert code == 0
     codes = {item["code"] for item in value["data"]["plan"]["risks"]}
     assert not any(item.startswith("residual_content") for item in codes)
+
+
+def test_reclaim_ranking_flags_a_candidate_that_strands_content(
+    tmp_path: Path, capsys: object
+) -> None:
+    seed(tmp_path)
+    code, ranked, stderr = invoke(
+        tmp_path,
+        capsys,
+        "storage",
+        "rank",
+        "--recipe",
+        "reclaim-space/0.1",
+        "--machine",
+        "local",
+        "--target-bytes",
+        "1000000000",
+        "--limit",
+        "10",
+    )
+
+    assert code == 0
+    assert stderr == ""
+    result = next(item for item in ranked["data"]["results"] if item["appid"] == 10)
+    gate = next(
+        item for item in result["gates"] if item["name"] == "residual_content"
+    )
+    assert gate["reason"] == "residual_content_present"
+    # Reported, not penalized: reclaim_bytes still means what an uninstall
+    # frees, and the candidate stays rankable.
+    assert result["eligibility"] == "eligible"
+    assert result["reclaim_bytes"] == 2_000_000_000
+    assert "/private" not in json.dumps(ranked)
