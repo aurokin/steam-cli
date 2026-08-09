@@ -12,7 +12,7 @@ Use `steam-agent` as the evidence source. Prefer its cache-only reads and keep t
 1. Start with `steam-agent --help` when the intent-to-command mapping is unclear. Use `<family> <leaf> --help` for exact options.
 2. Put global `--data-dir` before the command. Request `--format json` and inspect the returned context, completeness, warnings, and evidence fields before answering.
 3. Run only the smallest read that answers the question. Do not sync, authenticate, probe a provider, or change Steam Agent's local state unless the user explicitly asks to acquire or change that evidence. Never do those things in a read-only evaluation.
-4. Never launch, install, uninstall, move, or otherwise change Steam from this skill. `steam-agent` cannot do it, and `operations plan` emits instructions for a human rather than authorizing execution. Execution exists only in a separate, separately provisioned CLI with its own skill; it is out of scope here and must not be invoked from this one.
+4. Never launch, install, uninstall, move, verify/repair, or otherwise change Steam from this skill. `steam-agent` cannot do it, and `operations plan` emits instructions for a human rather than authorizing execution. Execution exists only in a separate, separately provisioned CLI with its own skill; it is out of scope here and must not be invoked from this one.
 5. State what the evidence supports and what remains unknown, stale, partial, inaccessible, or unsupported. Do not collapse any of those states into `false` or an empty result.
 
 ## Choose the command
@@ -26,6 +26,8 @@ Use `steam-agent` as the evidence source. Prefer its cache-only reads and keep t
 - Rank group fit: `group recommend`. Use `group ownership` or `group eligibility` when the user wants copies or hard eligibility for explicit AppIDs.
 - Rank reclaim-space or travel candidates: `storage rank`. A reclaim candidate is not proof that uninstalling is safe, backed up, or recoverable. `reclaim_bytes` is what an uninstall frees, not what the title occupies — a `residual_content` gate means a Proton prefix, shader cache, or Workshop content stays behind, and `operations plan uninstall` reports how much. Never present the reclaim figure as the space recovered when that gate is present.
 
+- Prepare an operation for a human or for the broker: `operations plan launch|install|uninstall|move|verify|backup APPID --account ALIAS --machine MACHINE` (move also needs `--destination-library-ordinal`). The plan is inert: it returns risks, preconditions, and instructions, and authorizes nothing. Use `operations observe --machine ALIAS` for current local installed state.
+
 Supply the account, machine, country, and language context required by the leaf help. Prefer configured aliases from the user's environment; do not expose raw account identifiers or private filesystem paths.
 
 ## Preserve evidence boundaries
@@ -34,5 +36,5 @@ Supply the account, machine, country, and language context required by the leaf 
 - Exact numeric player counts are currently unsupported. Say so directly instead of deriving a count from multiplayer categories.
 - Separate hard eligibility from subjective ranking. A high score cannot override a failed or unknown hard gate.
 - Keep ownership, wishlist membership, and installation state separate. Installation is machine-specific.
-- Do not follow returned links automatically. Distinguish human-open references from agent-readable or automated-ingest evidence.
+- Do not follow returned links automatically. Distinguish human-open references from agent-readable or automated-ingest evidence. An `uninstall` plan's `ui_instructions` include a `steam://uninstall/<appid>` shortcut for the human: relay it as text. `steam://` is a supported Valve mechanism, so quoting one is unremarkable — activating any URI from this skill crosses the read-only boundary.
 - When the cache lacks sufficient evidence, name the missing or stale capability. Ask before proposing any command that would contact a provider or persist new evidence.

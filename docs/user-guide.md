@@ -27,7 +27,11 @@ steam-agent sync installed --machine local --steam-root "/path/to/Steam"
 The scanner reads Steam files and discovers additional libraries from
 `libraryfolders.vdf`; it does not repair or modify them. A partial or failed
 scan records its diagnostics but does not replace the last complete installed
-projection.
+projection. A run is partial only when the scan could not see or trust
+everything; a manifest correctly excluded from the projection — a paused
+download, a leftover uninstalled entry — is reported as a warning on a complete
+run and does not block promotion. The [CLI contract](design/cli-contract.md)
+has the exact rule.
 
 ## Output and local data
 
@@ -229,10 +233,13 @@ steam-agent-broker init --library ~/.local/share/Steam --steamcmd /path/to/steam
 steam-agent-broker policy
 ```
 
-Submit a plan on stdin, then run it. Under `install = "confirm"` the request
-returns a nonce that must be consumed before the operation may run:
+Produce the plan with the planner and hand the broker the plan object, not the
+response envelope. Under `install = "confirm"` the request returns a nonce that
+must be consumed before the operation may run:
 
 ```bash
+steam-agent operations plan install APPID --account primary --machine local \
+  --format json | jq .data.plan > plan.json
 steam-agent-broker request --account ALIAS < plan.json
 steam-agent-broker confirm NONCE --actor owner
 steam-agent-broker run
@@ -329,9 +336,20 @@ For a complete local reset:
 4. If custom `--data-dir` profiles were used, also remove the platform-default
    Steam Agent directory after checking it for other profiles; the shared
    provider request budget is stored there.
-5. Remove user-controlled copies, backups, or snapshots separately if desired.
+5. If `steam-agent-broker` was provisioned, quiesce it before deleting
+   anything: run `steam-agent-broker status`, let anything mid-run finish, and
+   run `steam-agent-broker reconcile` if a row was interrupted. Rows merely
+   awaiting confirmation or deferred for a busy session hold no unrecovered
+   state and can simply lapse. The ledger and adoption journal are what
+   recovery reads, so deleting them under an interrupted operation can strand
+   content or leave the Steam client stopped. Then remove its state directory
+   (`~/.local/state/steam-broker`, or the `--state-dir` / `STEAM_BROKER_STATE`
+   location). It holds the policy file, the operation ledger, the adoption
+   journal, logs, and steamcmd's private HOME with its cached Steam
+   credentials; none of that lives in the Steam Agent data directory.
+6. Remove user-controlled copies, backups, or snapshots separately if desired.
 
-This reset affects Steam Agent only. It does not revoke provider keys, delete
+This reset affects Steam Agent, and the broker's state if you removed it. It does not revoke provider keys, delete
 Steam account data at Valve, or change Steam client state.
 
 ## Troubleshooting

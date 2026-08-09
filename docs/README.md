@@ -47,7 +47,7 @@ Time-sensitive provider facts should also record a verification date.
 ## Canonical design sources
 
 The [design map](design/README.md) routes to the maintained architecture, CLI
-contract, product vocabulary, safety model, provider evidence, lifecycle rules,
+contract, product vocabulary, safety model, provider evidence, broker execution, lifecycle rules,
 testing strategy, and historical M1–M7 records.
 
 The [ADR index](adr/README.md) is the decision register. A completed issue or a

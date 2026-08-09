@@ -72,6 +72,8 @@ registration is UI-only.
 The broker's executable surface stays exactly `install` (covering update).
 Every other content verb is either planned-and-human-executed (uninstall,
 move) or not yet built (repair, launch). (Superseded in part by
-[ADR 0030](0030-verify-as-a-second-executable-class.md): repair shipped as
-the `verify` class. Move remains an inert plan, which is this ADR's
-decision.)
+[ADR 0030](0030-verify-as-a-second-executable-class.md): repair shipped as the
+`verify` class, and by
+[ADR 0031](0031-launch-allowlist-dispatched-terminal.md): launch shipped as an
+allowlisted client-plane class terminating `dispatched`. Move remains an inert
+plan, which is this ADR's decision.)

@@ -1,6 +1,6 @@
 # CLI and JSON contract
 
-Status: canonical implemented M1–M7 process contract.
+Status: canonical implemented M1–M7 and broker execution process contract.
 
 The project ships two executables with different powers. `steam-agent` is the
 planner: it observes, ranks, and emits inert plans, and never mutates Steam
@@ -45,6 +45,11 @@ states, are reported as `not_fully_installed` and `uninstalled_app_state`
 warning codes on a complete run, and do not block promotion. Treating them as
 partial froze the projection for as long as the condition lasted, which on a
 real machine is indefinitely.
+
+`sync installed` also sizes the per-app directories a Steam uninstall leaves
+behind. This is the scanner's only recursive walk and is bounded per app; the
+measurement rules and what a truncated result means are under M7 with the
+`uninstall` plan below.
 
 All M1 capabilities are local and credential-free. Secret-like arguments such
 as `--api-key`, `--token`, `--password`, `--cookie`, and `--client-secret` are
@@ -725,7 +730,8 @@ holds the policy file, the ledger, the adoption journal, logs, and steamcmd's
 private HOME with its cached credentials. Stdout is deterministic JSON;
 diagnostics go to stderr. Exit 0 is success (`confirmed`, or `dispatched`
 for launch), 1 is a completed run whose outcome was neither, and 2 is a
-refusal or error.
+refusal or error. `request` reads a bare `operation-plan/0.1` object on stdin;
+the planner returns that object at `data.plan` inside its response envelope.
 
 `install`, `verify`, and `launch` are the executable operation classes;
 every other class is denied regardless of policy content. `install` covers update — they
@@ -741,9 +747,9 @@ residue left in a deleted directory can still satisfy it, and validate would
 then re-download. The load-bearing bound is that verify needs an existing
 client manifest for the AppID at all: it can re-acquire a title the owner
 already installed, never add a new one, which is why it is a separate grant
-rather than a way around `install = "deny"`. `launch` is the client plane: it asks the running client to start one
-allowlisted game and touches no content. It takes no lease, stops nothing,
-and runs no steamcmd. Its terminal outcome is `dispatched`, which is never
+rather than a way around `install = "deny"`. `launch` is the client plane: it asks the client to start one allowlisted game
+and touches no content, starting the client first if it is not running. It
+takes no lease, stops nothing, and runs no steamcmd. Its terminal outcome is `dispatched`, which is never
 upgraded by observing a process — seeing one cannot distinguish a playable
 game from a hung launcher or a DRM prompt. Uninstall remains human-in-Steam,
 move ships as an inert plan (ADR 0029), and store, market, wallet,
@@ -765,7 +771,7 @@ launch = "confirm"
 min_free_gb = 25    # required whenever any grant is "allow"
 
 [launch]
-allowed_appids = [480]   # required whenever launch is not "deny"
+allowed_appids = [480]   # required whenever launch is not "deny"; at most 256
 ```
 
 Each class is granted on its own; an `install` grant never carries `verify`.
@@ -794,7 +800,7 @@ execution window; one operation per machine is active at a time; a plan's
 | --- | --- | --- |
 | `confirmed` | content present and adopted by the client | terminal |
 | `unconfirmed` / `contradicted` | ran, but verification did not prove the expected end state | terminal |
-| `deferred` | no content work completed. Usually refused before any side effect (lease gate not clear, steamcmd already running, client presence unknown); the client-restore-failure case instead reports that state was left for reconcile and may leave the client stopped | left retryable |
+| `deferred` | no content work completed. Usually refused before any side effect (lease gate not clear, steamcmd already running, client presence unknown); the client-restore-failure case instead reports that state was left for reconcile and may leave the client stopped. A launch defers instead when a game is already running or a Remote Play session is active — a download in flight does not block a launch | left retryable |
 | `aborted` | terminated without completing (window lapsed, policy revoked, gates regressed) | terminal |
 | `failed` | content work started and did not succeed | terminal |
 | `auth_required` | steamcmd needs an interactive Steam Guard login | terminal |

@@ -6,9 +6,11 @@ bounded evidence, preserves provenance and uncertainty, and returns stable JSON
 for questions about ownership, deals, recommendations, compatibility, groups,
 and local storage.
 
-It is not an autonomous Steam client. It never launches, installs, moves, or
-uninstalls games. Operation plans are instructions for a person to carry out in
-Steam.
+`steam-agent` is not an autonomous Steam client: it never launches, installs,
+moves, or uninstalls games, and never executes a plan it generated. Operation
+plans are inert documents. A person carries out uninstall and move in Steam;
+the separately provisioned `steam-agent-broker` executes install, verify, and
+launch (see Safety and maturity below).
 
 ## Project status
 
@@ -22,7 +24,7 @@ M1 through M7 are implemented and accepted. The current CLI can:
 | What to play | Apply deterministic recipes to cached evidence and explicit preferences |
 | Compatibility | Assess declared requirements for one machine or Steam Deck without performance promises |
 | Discovery and groups | Rank a bounded known-game universe and preserve unknown ownership or missing copies |
-| Local operations | Observe and rank storage evidence, then generate inert human-executed plans |
+| Local operations | Observe and rank storage evidence, then generate inert operation plans |
 
 Provider coverage is deliberately conservative. Missing, inaccessible, stale,
 and false are different results; unsupported evidence remains unknown.
@@ -113,9 +115,15 @@ does not mutate Steam or execute generated plans.
 Execution is a separate, separately provisioned executable,
 `steam-agent-broker`, accepted by
 [ADR 0027](docs/adr/0027-provisioned-execution.md) as re-scoped by
-[ADR 0028](docs/adr/0028-trusted-manager-execution.md). It installs and updates
-owned titles on the machine it runs on, behind a policy grant, an operation
-ledger, and fail-closed session gates. Uninstall remains a human step inside
-Steam, and store, market, wallet, credential, and account-settings operations
-are not implemented at all. Installing the planner does not provision it; see
+[ADR 0028](docs/adr/0028-trusted-manager-execution.md),
+[ADR 0030](docs/adr/0030-verify-as-a-second-executable-class.md), and
+[ADR 0031](docs/adr/0031-launch-allowlist-dispatched-terminal.md). It executes
+exactly three independently granted operation classes on the machine it runs
+on — `install` (which covers update), `verify` (Valve's validate pass, the
+repair capability), and `launch` (which also requires the AppID on an explicit
+allowlist) — behind a policy grant, an operation ledger, and fail-closed
+session gates. Widening that set needs a new accepted ADR. Uninstall and move
+remain human steps inside Steam by decision
+([ADR 0029](docs/adr/0029-move-as-inert-plan.md)), and store, market, wallet,
+credential, and account-settings operations are not implemented at all. Installing the planner does not provision it; see
 the [user guide](docs/user-guide.md).

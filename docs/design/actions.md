@@ -1,10 +1,12 @@
 # Actions and automation boundaries
 
-Status: accepted M7 read/rank/inert-plan boundary; future action classes are
-proposed policy vocabulary. External policy references last verified 2026-07-10.
+Status: accepted M7 planner read/rank/inert-plan boundary; broker execution
+classes accepted by ADR 0029-0031. External policy references last verified
+2026-07-10.
 
-The current product observes bounded local state, ranks evidence, and returns
-inert human plans. Read access does not imply permission to mutate Steam, and
+The planner observes bounded local state, ranks evidence, and returns inert
+human plans; the separately provisioned broker executes install/update,
+verify, and launch under policy grants. Read access does not imply permission to mutate Steam, and
 technical feasibility does not imply a supported automation contract. The
 accepted planner boundary is
 [ADR 0013](../adr/0013-m7-read-only-operation-plans.md); the execution

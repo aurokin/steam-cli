@@ -1,6 +1,6 @@
 # ADR 0013: M7 read-only operation plans
 
-Status: accepted 2026-07-15
+Status: accepted 2026-07-15; the execution prohibition is superseded for the provisioned broker surface by [ADR 0027](0027-provisioned-execution.md) on 2026-08-08 (the observation, ranking, and inert-plan clauses continue to govern the planner)
 
 ## Context
 

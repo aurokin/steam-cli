@@ -6,6 +6,13 @@ supersedes the execution prohibition of
 surface only; ADR 0013's observation, ranking, and inert-plan clauses
 continue to govern the planner surface)
 
+Amended 2026-08-08: Decision item 2 and the session-helper clause of item 3 are
+superseded by [ADR 0028](0028-trusted-manager-execution.md); Decision item 7
+(the move composite) by [ADR 0029](0029-move-as-inert-plan.md); the executable
+surface is extended by
+[ADR 0030](0030-verify-as-a-second-executable-class.md) and
+[ADR 0031](0031-launch-allowlist-dispatched-terminal.md).
+
 ## Context
 
 ADR 0013 accepted observe/rank/inert-plan capabilities and approved no

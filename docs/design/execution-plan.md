@@ -2,8 +2,9 @@
 
 Status: working plan under [ADR 0027](../adr/0027-provisioned-execution.md)
 as re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md)
-(trusted-manager model, single identity); Phase 1 implemented
-(`steam-agent-broker`).
+(trusted-manager model, single identity); Phases 1 and 2 implemented
+(`steam-agent-broker`: install/update, verify, launch). Remaining: the §11
+boundary-eval refusal matrix and Phase 3.
 
 Goal: extend steam-agent (Python CLI, read-only today by ADR 0013) so the
 owner's trusted manager agent, driving the broker CLI directly over SSH, can

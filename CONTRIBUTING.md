@@ -29,6 +29,7 @@ the same command as `steam-agent ...`.
 | `src/steam_agent/migrations/` | Forward-only schema changes |
 | `src/steam_agent/*query*.py` | Cache-only query composition |
 | `src/steam_agent/steam_*.py` and provider modules | Bounded acquisition adapters |
+| `src/steam_agent/execution/` | `steam-agent-broker`: policy, ledger, session gates, and the only code that changes Steam. The planner never imports it. |
 | `tests/` | Deterministic unit, CLI, storage, and acceptance tests |
 | [`evals/`](evals/README.md) | Common-question scenarios, deterministic oracles, and opt-in model runs |
 | `docs/design/` | Current design and historical milestone records |

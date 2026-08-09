@@ -110,6 +110,16 @@ implies mutation authority. See the accepted
 [action boundary](actions.md) and
 [ADR 0013](../adr/0013-m7-read-only-operation-plans.md).
 
+Execution lives in a separate executable, `steam-agent-broker`
+(`src/steam_agent/execution/`), with its own state directory, policy, ledger,
+and fail-closed session gates; the planner never imports it. That surface is
+accepted by [ADR 0027](../adr/0027-provisioned-execution.md) as re-scoped by
+[ADR 0028](../adr/0028-trusted-manager-execution.md) and extended by
+[ADR 0030](../adr/0030-verify-as-a-second-executable-class.md) and
+[ADR 0031](../adr/0031-launch-allowlist-dispatched-terminal.md). Its design is
+in the [execution plan](execution-plan.md) and the
+[CLI contract](cli-contract.md).
+
 An MCP server, library API, daemon, semantic retriever, or another game-library
 adapter could reuse the application/query layer in the future. None is accepted
 merely by appearing here, and none should duplicate provider or truth-state
@@ -133,7 +143,7 @@ semantics.
 - Free-form natural-language interpretation inside the CLI.
 - SteamDB scraping or unreviewed browser/client automation.
 - A universal hardware benchmark or guaranteed frame-rate prediction.
-- Automated launch, install, move, uninstall, purchase, wishlist, social, or
-  account mutation.
+- Automated move, uninstall, purchase, wishlist, social, or account mutation;
+  automated launch and install exist only in the broker, under its grants.
 - Hidden preference inference that overwrites explicit feedback.
 - Treating manual-only references as approved automated-ingest sources.
