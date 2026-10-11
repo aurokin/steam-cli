@@ -3,7 +3,8 @@
 Status: working plan under [ADR 0027](../adr/0027-provisioned-execution.md)
 as re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md)
 (trusted-manager model, single identity); Phases 1 and 2 implemented
-(`steam-agent-broker`: install/update, verify, launch). Remaining: the §11
+(`steam-agent-broker`: install/update, verify, launch; direct requests and game stop
+are accepted separately in [ADR 0032](../adr/0032-agent-requests-and-attributed-game-stop.md)). Remaining: the §11
 boundary-eval refusal matrix and Phase 3.
 
 Goal: extend steam-agent (Python CLI, read-only today by ADR 0013) so the
@@ -11,11 +12,12 @@ owner's trusted manager agent, driving the broker CLI directly over SSH, can
 keep a gaming PC's Steam library installed, updated, and curated — unattended
 where granted, confirmed where not.
 
-Scope discipline: v1 targets ONE OS — **Linux** (owner decision, resolved) —
+Original content-plane scope: v1 targets **Linux** (owner decision, resolved) —
 specified completely, with named portability seams (executor adapters,
 path/identity abstraction) but no pretense that the session/permission model is
 already portable. Other OSes are later ports, each behind its own
-Phase-0-equivalent acceptance gate.
+Phase-0-equivalent acceptance gate. Current Windows/Linux client support and
+remaining qualification are in [agent host support](agent-host-support.md).
 
 Non-goals: fine-grained download-queue control, CEF/SteamClient.* injection,
 cold-file surgery (removed from the roadmap by ADR 0029), any store/market/
@@ -160,6 +162,13 @@ Three mechanisms with named responsibilities (not pretended into one):
 **Recovery transition table** — deterministic: each evidence combination maps
 to exactly one action. Startup reconciliation walks every non-terminal row.
 "Window valid" = the confirmed execution window (§6) has not lapsed.
+
+**Historical design table below, superseded for operator use.** The implemented
+broker does not cleanup-delete partial content or automatically recovery-repair
+after expiry, and does not continue from `client_stopping` into a download.
+Use the current [interrupted-operation recovery guide](../user-guide.md#interrupted-operation-recovery).
+Earlier fresh-install cleanup and internal recovery-repair proposals in §4
+are also historical, not implemented recovery commands.
 
 | Died during | Evidence | Action (exactly one) |
 | --- | --- | --- |

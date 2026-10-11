@@ -111,6 +111,21 @@ def test_partial_scan_returns_typed_warnings_and_keeps_safe_evidence() -> None:
     }
 
 
+def test_residual_measurement_only_walks_selected_manifest(monkeypatch) -> None:
+    measured: list[tuple[Path, int]] = []
+    residual = local_steam.ResidualContent(1, 2, 3, "measured")
+
+    def measure(steamapps: Path, appid: int):
+        measured.append((steamapps, appid))
+        return residual
+
+    monkeypatch.setattr(local_steam, "_measure_residual_content", measure)
+    result = scan_local_steam(FIXTURES / "problems" / "root")
+    assert "duplicate_app" in {warning.code for warning in result.warnings}
+    assert measured == [(app.manifest_path.parent, app.appid) for app in result.apps]
+    assert all(app.residual == residual for app in result.apps)
+
+
 def test_missing_index_still_scans_primary_library(tmp_path: Path) -> None:
     steamapps = tmp_path / "steamapps"
     steamapps.mkdir()

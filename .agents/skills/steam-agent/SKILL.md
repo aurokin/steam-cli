@@ -17,11 +17,12 @@ Use `steam-agent` as the evidence source. Prefer its cache-only reads and keep t
 
 ## Choose the command
 
-- Find library membership or installation: `games query`. Use `--scope library` to join visible-owned and installed evidence, `--scope installed` for this machine, `--scope wishlist` for wishlist membership, and `--scope owned --playtime zero` for owned games with zero recorded playtime.
+- Find library membership or installation: `games query`. Repeat `--appid` for exact cached candidates; inspect scope completeness before interpreting a missing item. Use `--scope library` to join visible-owned and installed evidence, `--scope installed` for this machine, `--scope wishlist` for wishlist membership, and `--scope owned --playtime zero` for owned games with zero recorded playtime. Wishlist `--include-names` uses separately attributed selected-account/machine cache evidence and leaves missing names null.
 - Check multiplayer declarations or filter explicit candidates: `discovery query`. For `--scope appids`, repeat `--appid` once per candidate and set `--limit` to the candidate count. Add `--require-mode online_co_op` only when filtering to positive declared support.
 - Recommend an owned game: `recommendations query`. Use `--recipe resume/0.1` to continue something or `--recipe preference-fit/0.1 --require installed=true` for an installed choice.
 - Rank cached wishlist fit: `recommendations wishlist`.
 - Rank cached wishlist deals: `deals query --scope wishlist`; keep country, store class, provider attribution, and freshness visible.
+- Prepare wishlist changes or a purchase decision: `wishlist plan` or `deals plan`. Follow the [core agent contract](../../../docs/design/cli-contract.md#inert-wishlist-and-purchase-handoffs). These are cache-only human handoffs; a stale or conflicting baseline blocks definitive wishlist expectations, and licenses, editions and checkout total remain unknown. Never treat a proposal as a completed change.
 - Assess an explicit target: `compatibility assess APPID --target machine:ALIAS`; report bounded compatibility evidence, not promised performance or frame rate.
 - Rank group fit: `group recommend`. Use `group ownership` or `group eligibility` when the user wants copies or hard eligibility for explicit AppIDs.
 - Rank reclaim-space or travel candidates: `storage rank`. A reclaim candidate is not proof that uninstalling is safe, backed up, or recoverable. `reclaim_bytes` is what an uninstall frees, not what the title occupies — a `residual_content` gate means a Proton prefix, shader cache, or Workshop content stays behind, and `operations plan uninstall` reports how much. Never present the reclaim figure as the space recovered when that gate is present.

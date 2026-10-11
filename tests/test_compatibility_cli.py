@@ -552,9 +552,9 @@ def test_assess_opens_existing_cache_read_only_and_does_not_create_missing_store
     real_storage = cli.Storage
     readonly_flags: list[bool] = []
 
-    def open_storage(path: Path, *, readonly: bool = False):
+    def open_storage(path: Path, *, readonly: bool = False, clock=cli._utc_now):
         readonly_flags.append(readonly)
-        return real_storage(path, readonly=readonly)
+        return real_storage(path, readonly=readonly, clock=clock)
 
     monkeypatch.setattr(cli, "Storage", open_storage)
     code, _, stderr = invoke(

@@ -3,7 +3,9 @@
 The deterministic acceptance spine makes no provider requests. It runs on
 Python 3.12 and 3.13 in GitHub Actions and checks the locked development
 environment, Ruff, pytest, source/wheel builds, and the installed command rather
-than only importing the checkout.
+than only importing the checkout. A separate Windows/macOS job runs portable
+client, ledger, lock, request-receipt and capability-catalog tests plus the
+installed-wheel smoke; it does not claim full content-plane qualification.
 
 Run the same gate locally:
 
@@ -21,6 +23,29 @@ checks the entry point and implemented milestone help, validates fresh-profile
 typed-unavailable queries including M7 observation, verifies the complete
 source migration set and database reopen, and checks that secret-like
 command-line input is rejected without being echoed.
+
+Core delivery adds installed-process original-request lookup/reuse/conflict and
+dispatch-pending reconciliation without replay. Disposable broker subprocesses
+exercise actual kill points, competing callers, OS locks and surviving writers;
+their adapters cannot touch Steam. Four-route synthetic HTTP canaries verify
+explicit process-environment key ingress without output, file, SQLite or live
+WAL retention. Bounded pipe capture retains only per-stream head/tail memory;
+harmless noisy subprocesses exercise capture and broker-death behavior without
+raw disk spools. These are deterministic contract checks.
+
+Native qualification scripts use owned fixtures and emit coarse results:
+`scripts/qualify_windows_process.py` checks whole-job completion/cancellation and
+bounded pipe capture;
+`scripts/qualify_windows_filesystem.py` checks NTFS identity/adoption/recovery and
+unsafe links; `scripts/qualify_windows_desktop.py` checks read-only desktop bridge
+dispatch and fresh-task collection; `scripts/qualify_windows_stop.py` checks
+attribution and graceful close of owned hidden windows, permission revocation,
+ignored close requests and windowless refusal. The desktop scripts require an
+importable installed package, pywin32 and a same-user non-elevated desktop token. Failed
+original jobs remain available for collection. These scripts perform no Steam
+operation and do not qualify actual game saves, authenticated SteamCMD, content
+leases or power-loss durability. Native results belong in the
+[host record](design/agent-host-support.md).
 
 The normal suite executes every deterministic assertion in the active M4, M5,
 and M7 common-question scenarios. It also checks the schema `0.3` corpus

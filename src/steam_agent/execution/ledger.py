@@ -13,16 +13,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 from pathlib import Path
 import secrets
 import sqlite3
-from typing import Literal
+from typing import Literal, get_args
 
 SCHEMA = "operation-execution/0.1"
 
 OperationState = Literal[
     "pending_confirmation",
     "authorized",
+    "dispatch_pending",
     "lease_acquired",
     "client_stopping",
     "content_running",
@@ -38,6 +40,9 @@ OperationState = Literal[
     "expired",
     "dispatched",
 ]
+
+_SUPPORTED_STATES = frozenset(get_args(OperationState))
+_SUPPORTED_OPERATIONS = frozenset({"install", "verify", "launch", "stop"})
 
 TERMINAL_STATES: frozenset[str] = frozenset(
     {
@@ -57,10 +62,11 @@ TERMINAL_STATES: frozenset[str] = frozenset(
 _TRANSITIONS: dict[str, frozenset[str]] = {
     "pending_confirmation": frozenset({"authorized", "expired", "aborted"}),
     "authorized": frozenset(
-        # dispatched is reachable only from authorized: launch is one shot
-        # with no lease, no content phase, and no resume.
-        {"lease_acquired", "dispatched", "expired", "aborted"}
+        # Client-plane dispatch records intent before the external command:
+        # a crash thereafter is uncertain, never permission to replay it.
+        {"lease_acquired", "dispatch_pending", "expired", "aborted"}
     ),
+    "dispatch_pending": frozenset({"dispatched", "unconfirmed"}),
     "lease_acquired": frozenset({"client_stopping", "aborted", "interrupted"}),
     "client_stopping": frozenset({"content_running", "aborted", "interrupted"}),
     "content_running": frozenset(
@@ -86,6 +92,10 @@ DEFAULT_EXECUTION_WINDOW_SECONDS = 4 * 60 * 60
 
 class LedgerError(RuntimeError):
     """Base error for ledger failures."""
+
+
+class UnsupportedLedger(LedgerError):
+    """A newer or unrecognized ledger must remain untouched."""
 
 
 class InvalidTransition(LedgerError):
@@ -123,13 +133,50 @@ def _stamp(value: datetime) -> str:
 class ExecutionLedger:
     """SQLite-backed operation ledger under the broker CLI's state dir."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
         self._path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path, isolation_level=None)
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
-        self._migrate()
+        if readonly:
+            # Inspection must not create a ledger, migrate its schema, expire
+            # requests, or acquire a write transaction.
+            self._connection = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None,
+            )
+            self._connection.execute("PRAGMA query_only=ON")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            # Refuse downgrade before journal-mode changes or index rebuilds.
+            # Row versions protect ledgers predating database version markers.
+            self._require_supported()
+            if not readonly:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA foreign_keys=ON")
+                self._migrate()
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def _require_supported(self) -> None:
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] != 0:
+            raise UnsupportedLedger("unsupported ledger database version")
+        if self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"
+        ).fetchone() is None:
+            return
+        states = tuple(sorted(_SUPPORTED_STATES))
+        operations = tuple(sorted(_SUPPORTED_OPERATIONS))
+        try:
+            unsupported = self._connection.execute(
+                "SELECT 1 FROM operations WHERE schema IS NULL OR state IS NULL OR operation IS NULL OR schema != ?"
+                f" OR state NOT IN ({','.join('?' for _ in states)})"
+                f" OR operation NOT IN ({','.join('?' for _ in operations)}) LIMIT 1",
+                (SCHEMA, *states, *operations),
+            ).fetchone()
+        except sqlite3.Error:
+            raise UnsupportedLedger("unsupported ledger operation layout") from None
+        if unsupported is not None:
+            raise UnsupportedLedger("unsupported ledger row schema, state or operation")
 
     def close(self) -> None:
         self._connection.close()
@@ -141,6 +188,8 @@ class ExecutionLedger:
         # crash can never advance durable state without its event.
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            # Another opener may have written a newer row since construction.
+            self._require_supported()
             yield
         except BaseException:
             self._connection.execute("ROLLBACK")
@@ -250,6 +299,8 @@ class ExecutionLedger:
 
         # token_hex, not token_urlsafe: a nonce is retyped as a CLI argument
         # and must never begin with "-" or argparse consumes it as a flag.
+        if operation not in _SUPPORTED_OPERATIONS:
+            raise UnsupportedLedger("unsupported ledger operation")
         nonce = secrets.token_hex(16)
         # A pending row whose nonce lapsed would otherwise hold the
         # single-active slot forever and block every new request.
@@ -404,7 +455,43 @@ class ExecutionLedger:
 
     # -- reads ------------------------------------------------------------
 
+    def lookup_request_id(self, request_id: str) -> LedgerOperation | None:
+        """Look up direct intent without expiry, confirmation or resumption."""
+        key = "intent:" + hashlib.sha256(request_id.encode()).hexdigest()
+        row = self._connection.execute(
+            "SELECT operation_id FROM operations WHERE plan_key=?"
+            " ORDER BY operation_id LIMIT 1", (key,),
+        ).fetchone()
+        return None if row is None else self.get(row[0])
+
+    def find_request(
+        self, plan_key: str, *, plan_document: str, include_expired: bool = False
+    ) -> tuple[LedgerOperation, str | None] | None:
+        """Return an existing request bound to the same plan.
+
+        Convenience clients may resume a lost response without creating a
+        new attempt. Terminal results remain receipts; they never authorize
+        replay. Direct callers include expired receipts to keep their request
+        IDs bound permanently; legacy callers retain the nonexpired lookup.
+        Callers use the same canonical serialization as request.
+        """
+
+        row = self._connection.execute(
+            "SELECT operation_id, plan_document, nonce FROM operations"
+            " WHERE plan_key=? AND (? OR state != 'expired')"
+            " ORDER BY operation_id LIMIT 1",
+            (plan_key, include_expired),
+        ).fetchone()
+        if row is None:
+            return None
+        if row[1] != plan_document:
+            raise LedgerError("idempotency key already recorded for different plan content")
+        operation = self.get(int(row[0]))
+        nonce = row[2] if operation.state == "pending_confirmation" else None
+        return operation, nonce
+
     def get(self, operation_id: int) -> LedgerOperation:
+        self._require_supported()
         row = self._connection.execute(
             """
             SELECT operation_id, plan_key, operation, appid, account_alias,

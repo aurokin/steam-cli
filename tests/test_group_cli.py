@@ -13,6 +13,11 @@ from steam_agent.storage import Machine, OwnedObservation, Storage
 NOW = datetime(2026, 7, 12, 18, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def fixture_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+
 def invoke(tmp_path: Path, capsys: object, *arguments: str):
     code = cli.main(["--data-dir", str(tmp_path), *arguments])
     captured = capsys.readouterr()  # type: ignore[attr-defined]
@@ -20,7 +25,7 @@ def invoke(tmp_path: Path, capsys: object, *arguments: str):
 
 
 def configure(tmp_path: Path, *, with_owned: bool = False) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("local", "Machine", "linux", "x86_64"), observed_at=NOW
         )
@@ -121,7 +126,7 @@ def declared_payload(appid: int) -> dict[str, object]:
 
 
 def seed_declared(tmp_path: Path, appid: int, *, at: datetime = NOW) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("primary")
         assert account is not None
         run, _, _ = storage.begin_declared_app_sync(
@@ -239,7 +244,7 @@ def test_stale_account_owned_rows_remain_unknown_for_copy_guarantees(
 ) -> None:
     configure(tmp_path, with_owned=True)
     create_profile(tmp_path, capsys, "synthetic:Guest")
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             """UPDATE sync_runs SET started_at=?, completed_at=?
                WHERE capability='owned.visible.read'""",
@@ -279,7 +284,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
     configure(tmp_path, with_owned=True)
     create_profile(tmp_path, capsys, "synthetic:Guest")
     path = tmp_path / "steam-agent.sqlite3"
-    with Storage(path) as storage:
+    with Storage(path, clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             "UPDATE sync_runs SET promoted=0 WHERE capability='owned.visible.read'"
         )
@@ -288,7 +293,7 @@ def test_unpromoted_complete_owned_run_remains_unknown_for_copy_guarantees(
         cli.MemberRef("account", "primary"),
         cli.MemberRef("synthetic", "guest"),
     )
-    with Storage(path, readonly=True) as storage:
+    with Storage(path, readonly=True, clock=lambda: NOW) as storage:
         (
             ownership,
             missing,
@@ -314,7 +319,7 @@ def test_group_with_only_unsynced_accounts_is_unavailable(
     tmp_path: Path, capsys: object
 ) -> None:
     configure(tmp_path)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.configure_steam_account(
             alias="other",
             steam_id64="76561198999999998",
@@ -482,13 +487,13 @@ def test_group_eligibility_reports_missing_declared_evidence_in_completeness(
 def test_group_eligibility_propagates_stale_declared_facts(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    test_now = NOW
     monkeypatch.setattr(cli, "_utc_now", lambda: test_now)
     configure(tmp_path)
     create_profile(tmp_path, capsys, "synthetic:Alpha")
     create_profile(tmp_path, capsys, "synthetic:Beta")
     seed_declared(tmp_path, 400, at=test_now)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             "UPDATE declared_app_current SET observed_at=?",
             ((test_now - timedelta(days=8)).isoformat().replace("+00:00", "Z"),),
@@ -523,7 +528,7 @@ def test_group_eligibility_propagates_stale_declared_facts(
 
 
 def configure_second_account(tmp_path: Path, alias: str, steam_id64: str) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.configure_steam_account(
             alias=alias,
             steam_id64=steam_id64,
@@ -544,7 +549,7 @@ def seed_failed_owned_sync(
     error_code: str,
     attempted_at: datetime = NOW,
 ) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account(alias)
         assert account is not None
         run = storage.begin_sync(
@@ -621,7 +626,7 @@ def test_group_member_freshness_uses_one_command_timestamp(
 ) -> None:
     configure(tmp_path, with_owned=True)
     configure_second_account(tmp_path, "other", "76561198999999998")
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         other = storage.get_account("other")
         assert other is not None
         run = storage.begin_sync(
@@ -679,7 +684,7 @@ def test_group_fresh_empty_authoritative_member_preserves_unknown_ownership(
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path)
     create_profile(tmp_path, capsys, "synthetic:Guest")
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("primary")
         assert account is not None
         run = storage.begin_sync(
@@ -724,7 +729,7 @@ def test_group_inaccessible_with_irrelevant_authoritative_snapshot_is_unavailabl
         "primary",
         error_code="OWNED_GAMES_INACCESSIBLE_OR_UNKNOWN_ACCOUNT",
     )
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("other")
         assert account is not None
         run = storage.begin_sync(
@@ -897,7 +902,7 @@ def test_group_member_stale_beats_not_synced_precedence(
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     configure(tmp_path, with_owned=True)
     configure_second_account(tmp_path, "other", "76561198999999998")
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             """UPDATE sync_runs SET started_at=?, completed_at=?
                WHERE capability='owned.visible.read'""",

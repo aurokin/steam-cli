@@ -7,7 +7,7 @@ repair, lock, or otherwise modify any Steam-owned path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import os
 from pathlib import Path
@@ -435,7 +435,11 @@ def scan_local_steam(steam_root: str | Path) -> LocalSteamScan:
                 )
                 continue
             seen_apps[app.appid] = manifest
-            apps.append(app)
+            # Duplicate manifests contribute diagnostics, but only the chosen
+            # installation should incur the bounded recursive content walk.
+            apps.append(replace(
+                app, residual=_measure_residual_content(manifest.parent, app.appid)
+            ))
 
     return LocalSteamScan(
         parser_version=KEYVALUES_PARSER_VERSION,
@@ -696,7 +700,6 @@ def _read_manifest(
         state_flags=state_flags,
         library_path=library_path,
         manifest_path=manifest,
-        residual=_measure_residual_content(manifest.parent, appid),
     )
 
 

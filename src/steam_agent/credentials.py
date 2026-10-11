@@ -19,8 +19,15 @@ import secrets
 import stat
 from typing import Iterator, Literal, Protocol, runtime_checkable
 
-import keyring
-from keyring import errors as keyring_errors
+
+def __getattr__(name: str) -> object:
+    # Preserve the module's historical keyring monkeypatch seam while keeping
+    # planner help/cache queries free of optional credential-store imports.
+    if name == "keyring":
+        import keyring
+
+        return keyring
+    raise AttributeError(name)
 
 
 CredentialErrorCode = Literal[
@@ -160,6 +167,8 @@ def _backend_id(backend: object) -> str:
 
 
 def _select_native_backend(expected_id: str | None = None) -> object:
+    import keyring
+
     backend = keyring.get_keyring()
     if _approved_backend(backend) and (
         expected_id is None or _backend_id(backend) == expected_id
@@ -204,6 +213,8 @@ class NativeKeyringStore:
         )
 
     def put(self, ref: CredentialRef, secret: SecretValue) -> None:
+        from keyring import errors as keyring_errors
+
         try:
             self._backend.set_password(ref.service, ref.account, secret.reveal())
         except keyring_errors.KeyringLocked:
@@ -212,6 +223,8 @@ class NativeKeyringStore:
             raise CredentialError("CREDENTIAL_WRITE_FAILED") from None
 
     def resolve(self, ref: CredentialRef) -> SecretValue | None:
+        from keyring import errors as keyring_errors
+
         try:
             value = self._backend.get_password(ref.service, ref.account)
         except keyring_errors.KeyringLocked:
@@ -225,6 +238,8 @@ class NativeKeyringStore:
         return SecretValue(value)
 
     def delete(self, ref: CredentialRef) -> bool:
+        from keyring import errors as keyring_errors
+
         try:
             if not self.contains(ref):
                 return False

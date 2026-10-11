@@ -1,5 +1,13 @@
 # Phase 0 spike — target machine
 
+Status: **Historical experiment, not a current operator runbook.** These scripts
+predate the trusted-manager model and accepted human-only uninstall boundary.
+The uninstall/main-library experiments and separate broker-user bootstrap below
+must not be treated as present product instructions. Use the current
+[user guide](../../docs/user-guide.md#interrupted-operation-recovery) and
+[host support record](../../docs/design/agent-host-support.md) for operation and
+qualification; do not rerun historical destructive experiments as routine tests.
+
 Acceptance evidence for [ADR 0027](../../docs/adr/0027-provisioned-execution.md)
 per the [execution plan](../../docs/design/execution-plan.md) and
 [Linux session model](../../docs/design/execution-linux-session-model.md).

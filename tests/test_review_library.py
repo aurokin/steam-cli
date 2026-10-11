@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import steam_agent.storage as storage_module
 from steam_agent.review_library import (
     REVIEW_DISCLOSURE_VERSION,
     ReviewSyncError,
@@ -21,12 +20,6 @@ from steam_agent.wishlist_recommendation_query import _review_snapshot
 
 
 NOW = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
-
-
-class FrozenDatetime(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        return NOW if tz is not None else NOW.replace(tzinfo=None)
 
 
 class Clock:
@@ -451,8 +444,7 @@ def test_pre_network_cooldown_leaves_every_subject_unevaluated(tmp_path) -> None
 def test_review_projection_is_global_but_account_demand_isolated_and_pruned(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(storage_module, "datetime", FrozenDatetime)
-    with Storage(tmp_path / "state.sqlite3") as storage:
+    with Storage(tmp_path / "state.sqlite3", clock=lambda: NOW) as storage:
         first = setup_wishlist(storage, 1)
         second = setup_wishlist(storage, 1, alias="secondary")
         sync_wishlist_reviews(storage, account_id=first, max_items=1, client=Client(), clock=Clock())
@@ -510,8 +502,7 @@ def test_provider_deletion_removes_review_cache_consent_and_cooldown(tmp_path) -
 def test_account_provider_deletion_removes_sole_review_but_rehomes_shared(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(storage_module, "datetime", FrozenDatetime)
-    with Storage(tmp_path / "state.sqlite3") as storage:
+    with Storage(tmp_path / "state.sqlite3", clock=lambda: NOW) as storage:
         first = setup_wishlist(storage, 1)
         sync_wishlist_reviews(
             storage, account_id=first, max_items=1, client=Client(), clock=Clock()
@@ -525,7 +516,7 @@ def test_account_provider_deletion_removes_sole_review_but_rehomes_shared(
             "SELECT COUNT(*) FROM wishlist_current WHERE account_id=?", (first,)
         ).fetchone()[0] == 1
 
-    with Storage(tmp_path / "shared.sqlite3") as storage:
+    with Storage(tmp_path / "shared.sqlite3", clock=lambda: NOW) as storage:
         first = setup_wishlist(storage, 1)
         second = setup_wishlist(storage, 1, alias="secondary")
         sync_wishlist_reviews(

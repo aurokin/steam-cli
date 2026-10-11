@@ -1,6 +1,6 @@
 """Content plane: steamcmd downloads and journaled single-manifest adoption.
 
-steamcmd always runs with the broker's private HOME (Phase 0: a shared HOME
+Linux steamcmd runs with the broker's private HOME (Phase 0: a shared HOME
 lets the running client clobber steamcmd's credential cache) and with
 ``@NoPromptForPassword`` so authentication failure is a typed state, never a
 prompt or a retry.  Adoption writes exactly one file into the client's
@@ -20,7 +20,16 @@ import re
 import signal
 import subprocess
 import time
-from typing import Literal
+from typing import Literal, TYPE_CHECKING, BinaryIO
+
+from steam_agent.process_environment import child_environment
+from steam_agent.execution.windows_process import WindowsJobProcess
+from steam_agent.execution.output_capture import BoundedOutputCapture
+
+if TYPE_CHECKING:
+    from steam_agent.execution.windows_filesystem import WindowsFileIdentity, WindowsFilesystem
+
+OwnedContentProcess = subprocess.Popen[bytes] | WindowsJobProcess
 
 ContentOutcome = Literal["installed", "auth_required", "failed"]
 
@@ -31,8 +40,8 @@ _AUTH_FAILURE = re.compile(
 _SUCCESS = re.compile(r"fully installed", re.IGNORECASE)
 _DEFAULT_TIMEOUT_SECONDS = 30 * 60
 _DEFAULT_ABORT_POLL_SECONDS = 15.0
-# Per-stream cap when reading spooled steamcmd output back for
-# classification; beyond it, keep the head and tail (markers live there).
+_PROCESS_CLEANUP_SECONDS = 5.0
+# Per-stream bounded memory capture; retain head and tail for classification.
 _OUTPUT_CAPTURE_LIMIT = 4 * 1024 * 1024
 
 # Only recognized steamcmd diagnostic lines are persisted (after literal
@@ -51,6 +60,36 @@ _LOG_LINE_RECOGNIZED = re.compile(
 
 class AdoptionError(RuntimeError):
     """Manifest adoption could not be completed or rolled back cleanly."""
+
+
+class ContentProcessError(OSError):
+    """Owned content-process cleanup or polling failed; text is fixed."""
+
+
+def _terminate_owned_process(process: OwnedContentProcess) -> None:
+    """Stop this adapter's session group and bound the wait for its leader.
+
+    A leader-only fallback cannot prove that wrapped writers also exited, so
+    failed group termination remains an error even if the leader was reaped.
+    """
+
+    unconfirmed = False
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except Exception as error:
+        unconfirmed = not isinstance(error, ProcessLookupError)
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            unconfirmed = True
+    try:
+        process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+    except Exception:
+        unconfirmed = True
+    if unconfirmed:
+        raise ContentProcessError("content process cleanup unconfirmed") from None
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -78,26 +117,21 @@ def _durable_write(path: Path, data: bytes) -> None:
     _fsync_dir(path.parent)
 
 
-def _read_spooled(path: Path, limit: int = _OUTPUT_CAPTURE_LIMIT) -> str:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
-            if size <= limit:
-                data = handle.read()
-            else:
-                half = limit // 2
-                head = handle.read(half)
-                handle.seek(size - half)
-                data = head + b"\n[output truncated]\n" + handle.read()
-    except OSError:
-        return ""
-    return data.decode("utf-8", errors="replace")
-
-
 @dataclass(frozen=True, slots=True)
 class ContentResult:
     outcome: ContentOutcome
     log_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsContentResult(ContentResult):
+    """A completed native job bound to one operation and confirmed NTFS target."""
+
+    appid: int
+    operation_id: int
+    operation: Literal["install", "verify"]
+    target_identity: WindowsFileIdentity
+    process_backend: Literal["windows-job/1"] = "windows-job/1"
 
 
 class SteamcmdAdapter:
@@ -118,6 +152,33 @@ class SteamcmdAdapter:
         self._timeout = timeout_seconds
         self._abort_poll = abort_poll_seconds
 
+    def _prepare_directories(self) -> None:
+        self._home.mkdir(parents=True, exist_ok=True)
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+
+    def _environment(self) -> dict[str, str]:
+        return child_environment(overrides={"HOME": str(self._home)})
+
+    def _spawn(
+        self, argv: list[str], stdout: BinaryIO, stderr: BinaryIO,
+        environment: dict[str, str],
+    ) -> OwnedContentProcess:
+        if os.name == "nt":
+            raise ContentProcessError("Windows content requires the owned job backend")
+        return subprocess.Popen(
+            argv, stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL,
+            env=environment, start_new_session=True,
+        )
+
+    def _terminate(self, process: OwnedContentProcess) -> None:
+        _terminate_owned_process(process)
+
+    def _close(self, process: OwnedContentProcess) -> None:
+        pass  # Popen owns its leader resources; the Linux group has no handle.
+
+    def _result(self, outcome: ContentOutcome, log_path: Path) -> ContentResult:
+        return ContentResult(outcome=outcome, log_path=log_path)
+
     def install(
         self,
         *,
@@ -136,8 +197,7 @@ class SteamcmdAdapter:
         capability rather than a flag on install.
         """
 
-        self._home.mkdir(parents=True, exist_ok=True)
-        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_directories()
         # Per-attempt filename (an operation can retry after interruption):
         # every attempt keeps its own evidence instead of the last one's.
         # The pid disambiguates a quick crash-restart within one second.
@@ -160,41 +220,33 @@ class SteamcmdAdapter:
             *(["validate"] if validate else []),
             "+quit",
         ]
-        environment = dict(os.environ, HOME=str(self._home))
+        environment = self._environment()
         timed_out = False
         aborted = False
+        poll_failed = False
         returncode: int | None = None
         output: str | None = None
-        # Spool both streams to disk: pipes held until process exit would
-        # buffer unbounded steamcmd output in broker memory for up to 30
-        # minutes.  Bytes throughout, decoded leniently on read-back (text
-        # mode would raise UnicodeDecodeError on locale-invalid output).
-        stdout_spool = log_path.with_name(log_path.name + ".out.tmp")
-        stderr_spool = log_path.with_name(log_path.name + ".err.tmp")
-        try:
-            with (
-                stdout_spool.open("wb") as out_handle,
-                stderr_spool.open("wb") as err_handle,
-            ):
+        # Readers drain immediately into bounded head/tail memory. Broker
+        # death cannot leave raw output files or unbounded disk growth.
+        with BoundedOutputCapture(limit=_OUTPUT_CAPTURE_LIMIT) as capture:
+            try:
+                process = self._spawn(argv, capture.stdout, capture.stderr, environment)
+            except OSError:
+                output = "steamcmd unavailable"
+                capture.close_writers()
+            else:
+                # Poll while steamcmd runs: a Steam client relaunched
+                # during a 30-minute download is a concurrent writer in
+                # the same install directory, and waiting for the
+                # post-download probe would leave that overlap window
+                # open the whole time.
+                cleanup_attempted = False
                 try:
-                    process = subprocess.Popen(
-                        argv,
-                        stdout=out_handle,
-                        stderr=err_handle,
-                        stdin=subprocess.DEVNULL,
-                        env=environment,
-                        start_new_session=True,
-                    )
-                except OSError as error:
-                    output = f"steamcmd unavailable: {error}"
-                else:
-                    # Poll while steamcmd runs: a Steam client relaunched
-                    # during a 30-minute download is a concurrent writer in
-                    # the same install directory, and waiting for the
-                    # post-download probe would leave that overlap window
-                    # open the whole time.
+                    capture.close_writers()
                     deadline = time.monotonic() + self._timeout
                     while True:
+                        if capture.failed:
+                            raise ContentProcessError("content output capture failed")
                         remaining = deadline - time.monotonic()
                         try:
                             process.wait(
@@ -204,38 +256,38 @@ class SteamcmdAdapter:
                         except subprocess.TimeoutExpired:
                             if remaining <= 0:
                                 timed_out = True
-                            elif abort_when is not None and abort_when():
-                                aborted = True
-                            else:
+                            elif abort_when is not None:
+                                try:
+                                    aborted = bool(abort_when())
+                                except Exception:
+                                    # Unknown authorization or session
+                                    # state ends writes just like denial.
+                                    poll_failed = aborted = True
+                            if not timed_out and not aborted:
                                 continue
-                            # Kill the whole session group: the configured
-                            # script wraps the real steamcmd binary, and
-                            # killing only the leader would leave a live
-                            # writer in the install directory.
-                            try:
-                                os.killpg(process.pid, signal.SIGKILL)
-                            except (ProcessLookupError, PermissionError):
-                                process.kill()
-                            process.wait()
+                            cleanup_attempted = True
+                            self._terminate(process)
                             break
                     returncode = process.returncode
-            if output is None:
-                # Explicit separator: a stdout tail lacking its newline must
-                # not merge with stderr's first line, or a recognized marker
-                # could smuggle an unrecognized (unredactable) line past the
-                # log filter below.
-                output = (
-                    _read_spooled(stdout_spool) + "\n" + _read_spooled(stderr_spool)
-                )
-        finally:
-            stdout_spool.unlink(missing_ok=True)
-            stderr_spool.unlink(missing_ok=True)
+                    output = capture.finish(timeout=_PROCESS_CLEANUP_SECONDS)
+                except BaseException as error:
+                    # A failed wait/probe must not orphan the owned writer.
+                    # Cancellation also cleans up before propagating.
+                    if not cleanup_attempted:
+                        self._terminate(process)
+                    if not isinstance(error, Exception):
+                        raise
+                    raise ContentProcessError("content process polling failed") from None
+                finally:
+                    self._close(process)
         # Classify on the raw output first: redaction could mangle a marker
         # (an account alias like "all" is a substring of "fully installed").
         # Success additionally requires a clean exit: output text alone must
         # never outrank a nonzero exit or a killed/timed-out process.
-        if _AUTH_FAILURE.search(output):
-            outcome: ContentOutcome = "auth_required"
+        if poll_failed:
+            outcome: ContentOutcome = "failed"
+        elif _AUTH_FAILURE.search(output):
+            outcome = "auth_required"
         elif (
             not timed_out
             and not aborted
@@ -276,6 +328,7 @@ class SteamcmdAdapter:
             # /home/user/file" on an allowlisted line must not persist a
             # private path verbatim.
             line = re.sub(r"(?:/[^/\s\"']+){2,}/?", "<path>", line)
+            line = re.sub(r"(?:[A-Za-z]:[\\/]|\\\\)[^\r\n\"']+", "<path>", line)
             # Every SteamID rendering: SteamID64 (17 digits from 7656…,
             # spanning the whole 32-bit account-ID space), bracketed
             # SteamID3 ("[U:1:…]" — steamcmd's actual login-line format),
@@ -286,7 +339,96 @@ class SteamcmdAdapter:
             kept.append(line)
         kept.append(f"[{dropped} unrecognized line(s) omitted]")
         log_path.write_text("\n".join(kept) + "\n", encoding="utf-8", errors="replace")
-        return ContentResult(outcome=outcome, log_path=log_path)
+        return self._result(outcome, log_path)
+
+
+class WindowsSteamcmdAdapter(SteamcmdAdapter):
+    """Candidate native adapter from a separately provisioned private install.
+
+    Windows SteamCMD caches authentication beside its installation; HOME is
+    not an isolation mechanism here. Provisioning and auth/title qualification
+    remain owner work. This adapter does not lift the broker's Windows gate.
+    """
+
+    def __init__(
+        self, *, steamcmd_executable: Path, private_installation: Path,
+        log_dir: Path, filesystem: WindowsFilesystem | None = None,
+        client_installation: Path,
+        timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+        abort_poll_seconds: float = _DEFAULT_ABORT_POLL_SECONDS,
+    ) -> None:
+        from steam_agent.execution.windows_filesystem import WindowsFilesystem, validate_path
+
+        executable = validate_path(steamcmd_executable)
+        installation = validate_path(private_installation)
+        if executable.parent != installation or executable.name.casefold() != "steamcmd.exe":
+            raise ContentProcessError("Windows SteamCMD private installation is invalid")
+        client = validate_path(client_installation)
+        if installation == client or installation.is_relative_to(client) or client.is_relative_to(installation):
+            raise ContentProcessError("Windows SteamCMD installation overlaps the client")
+        self._filesystem = filesystem if filesystem is not None else WindowsFilesystem()
+        self._installation_identity = self._filesystem.identity(private_installation)
+        if self._filesystem.identity(client_installation) == self._installation_identity:
+            raise ContentProcessError("Windows SteamCMD installation overlaps the client")
+        self._executable_identity = self._filesystem.identity(steamcmd_executable, directory=False)
+        self._log_identity = self._filesystem.identity(log_dir)
+        super().__init__(
+            steamcmd_script=steamcmd_executable, private_home=private_installation,
+            log_dir=log_dir, timeout_seconds=timeout_seconds,
+            abort_poll_seconds=abort_poll_seconds,
+        )
+
+    def _prepare_directories(self) -> None:
+        if (self._filesystem.identity(self._home) != self._installation_identity
+                or self._filesystem.identity(self._script, directory=False) != self._executable_identity
+                or self._filesystem.identity(self._log_dir) != self._log_identity):
+            raise ContentProcessError("Windows SteamCMD provisioning identity changed")
+
+    def _environment(self) -> dict[str, str]:
+        return child_environment()
+
+    def _spawn(
+        self, argv: list[str], stdout: BinaryIO, stderr: BinaryIO,
+        environment: dict[str, str],
+    ) -> WindowsJobProcess:
+        self._prepare_directories()
+        return WindowsJobProcess(argv, stdout=stdout, stderr=stderr,
+                                 env=environment, cwd=self._home)
+
+    def _terminate(self, process: OwnedContentProcess) -> None:
+        try:
+            process.kill()
+            process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+        except Exception:
+            raise ContentProcessError("Windows content job cleanup unconfirmed") from None
+
+    def _close(self, process: OwnedContentProcess) -> None:
+        if not isinstance(process, WindowsJobProcess):
+            raise ContentProcessError("Windows content job backend required")
+        try:
+            process.close()
+        except Exception:
+            raise ContentProcessError("Windows content job close unconfirmed") from None
+
+    def install(
+        self, *, account: str, appid: int, install_dir: Path, operation_id: int,
+        validate: bool = False, abort_when: Callable[[], bool] | None = None,
+    ) -> WindowsContentResult:
+        # A private executable alone does not make its write target safe.
+        # The candidate coordinator additionally binds this NTFS identity to
+        # a library/AppID before ever treating it as game ownership evidence.
+        before = self._filesystem.identity(install_dir)
+        result = super().install(
+            account=account, appid=appid, install_dir=install_dir,
+            operation_id=operation_id, validate=validate, abort_when=abort_when,
+        )
+        if self._filesystem.identity(install_dir) != before:
+            raise ContentProcessError("Windows content target identity changed")
+        return WindowsContentResult(
+            outcome=result.outcome, log_path=result.log_path, appid=appid,
+            operation_id=operation_id, operation="verify" if validate else "install",
+            target_identity=before,
+        )
 
 
 def locate_manifest(*, install_dir: Path, appid: int) -> Path | None:
@@ -302,7 +444,15 @@ def manifest_appid(manifest: Path) -> int | None:
     except OSError:
         return None
     match = re.search(r'"appid"\s+"(\d+)"', text)
-    return None if match is None else int(match.group(1))
+    return None if match is None else _manifest_u32(match.group(1))
+
+
+def _manifest_u32(value: str) -> int | None:
+    """Malformed manifest numbers are unknown, including oversized decimals."""
+    if len(value) > 10 or not value.isascii() or not value.isdecimal():
+        return None
+    parsed = int(value)
+    return parsed if parsed <= 0xFFFFFFFF else None
 
 
 def manifest_install_dir(manifest: Path) -> str | None:
@@ -320,7 +470,7 @@ def manifest_state_flags(manifest: Path) -> int | None:
     except OSError:
         return None
     match = re.search(r'"StateFlags"\s+"(\d+)"', text)
-    return None if match is None else int(match.group(1))
+    return None if match is None else _manifest_u32(match.group(1))
 
 
 def _patched_manifest(source: Path, install_dir_name: str) -> str:

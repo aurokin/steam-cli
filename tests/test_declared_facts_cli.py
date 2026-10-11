@@ -76,7 +76,7 @@ def invoke(tmp_path: Path, capsys, *args: str):
 
 
 def configure(tmp_path: Path) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
         )
@@ -109,7 +109,7 @@ def configure(tmp_path: Path) -> None:
 
 
 def seed_wishlist(tmp_path: Path, *, at: datetime, appids: tuple[int, ...]) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("primary")
         assert account is not None
         storage.record_wishlist_data_consent(
@@ -139,7 +139,7 @@ def seed_wishlist(tmp_path: Path, *, at: datetime, appids: tuple[int, ...]) -> N
 
 
 def seed_installed(tmp_path: Path, *, at: datetime, appids: tuple[int, ...]) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         run = storage.begin_sync(
             provider="local_steam",
             capability="installed",
@@ -296,7 +296,7 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     )
     assert code == 0
     assert account_delete["data"]["global_public_current_preserved"] is True
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         assert (
             storage._connection.execute(  # noqa: SLF001
                 "SELECT COUNT(*) FROM declared_app_current"
@@ -315,7 +315,7 @@ def test_sync_requires_disclosure_then_persists_normalized_cache_only(
     )
     assert code == 0
     assert provider_delete["data"]["global_public_current_preserved"] is False
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         assert (
             storage._connection.execute(  # noqa: SLF001
                 "SELECT COUNT(*) FROM declared_app_current"
@@ -328,7 +328,7 @@ def test_app_facts_explicit_sync_and_discovery_query_are_bounded_cache_only(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configure(tmp_path)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("primary")
         assert account is not None
         storage.record_compatibility_data_consent(
@@ -428,7 +428,7 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configure(tmp_path)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.configure_steam_account(
             alias="other", steam_id64="76561198000000001", configured_at=NOW
         )
@@ -505,7 +505,7 @@ def test_known_discovery_never_enumerates_another_accounts_explicit_demand(
 def test_discovery_reports_retained_declared_facts_as_stale(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    test_now = NOW
     configure(tmp_path)
     monkeypatch.setattr(
         cli,
@@ -535,7 +535,7 @@ def test_discovery_reports_retained_declared_facts_as_stale(
         )[0]
         == 0
     )
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             "UPDATE declared_app_current SET observed_at=?",
             ((test_now - timedelta(days=8)).isoformat().replace("+00:00", "Z"),),
@@ -599,7 +599,7 @@ def test_discovery_reports_stale_owned_candidate_scope(
         )[0]
         == 0
     )
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             """UPDATE sync_runs SET started_at=?, completed_at=?
                WHERE capability='owned.visible.read'""",
@@ -665,7 +665,7 @@ def test_played_free_rows_do_not_enter_m6_known_or_library_scope(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
         )
@@ -792,7 +792,7 @@ def test_contract_drift_disables_transport_until_retry_time(
 def test_unsynced_owned_scope_is_truthfully_unavailable_without_provider_call(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
         )
@@ -840,7 +840,7 @@ def test_sync_validates_bounded_contract_before_unsynced_owned_return(
     capsys,
     invalid_arguments: tuple[str, str],
 ) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
         )
@@ -907,7 +907,7 @@ def test_stale_owned_last_good_makes_sync_partial(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configure(tmp_path)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             """UPDATE sync_runs SET started_at=?,completed_at=?
                WHERE capability='owned.visible.read'""",
@@ -951,7 +951,7 @@ def test_empty_owned_last_good_retains_stale_or_superseded_completeness(
     superseded: bool,
 ) -> None:
     path = tmp_path / "steam-agent.sqlite3"
-    with Storage(path) as storage:
+    with Storage(path, clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Desktop", "linux", "x86_64"), observed_at=NOW
         )
@@ -1047,7 +1047,7 @@ def test_keyboard_interrupt_finishes_typed_recoverable_run(
     )
     assert code == 1
     assert result["error"]["code"] == "INTERNAL_ERROR"
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         row = storage._connection.execute(  # noqa: SLF001
             """SELECT status,error_code FROM sync_runs
                WHERE capability='compatibility.declared.read'
@@ -1101,7 +1101,7 @@ def test_rate_limit_without_retry_after_uses_default_persisted_backoff(
         "--acknowledge-local-storage",
     )
     assert code == 0
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         retry_at = storage._connection.execute(  # noqa: SLF001
             """SELECT cooldown_until FROM provider_request_limits
                WHERE provider='steam-store-appdetails' AND budget_scope='global'"""
@@ -1182,7 +1182,7 @@ def test_app_facts_library_scope_reports_owned_lineage(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configure(tmp_path)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage._connection.execute(  # noqa: SLF001
             """UPDATE sync_runs SET started_at=?,completed_at=?
                WHERE capability='owned.visible.read'""",

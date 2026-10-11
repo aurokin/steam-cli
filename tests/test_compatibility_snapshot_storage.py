@@ -308,12 +308,23 @@ def test_snapshot_scopes_accounts_machines_and_context_without_narrow_masking(
         assert isolated.declared_apps.subjects[0].current is not None
         assert isolated.declared_apps.subjects[0].latest_demand.sync_run_id is None
         assert isolated.machine.id == "two"
-        assert [game.appid for game in isolated.owned.games] == [620]
-        assert [game.appid for game in isolated.installed.games] == [620]
+        assert isolated.owned.games == ()
+        assert isolated.installed.games == ()
         assert isolated.owned.latest is not None
         assert isolated.owned.latest.id == owned_other
         assert isolated.installed.latest is not None
         assert isolated.installed.latest.id == installed_two
+
+        isolated_owned = storage.read_compatibility_snapshot(
+            other, "two", "US", "english", [620], now=T3
+        )
+        assert [game.appid for game in isolated_owned.owned.games] == [620]
+        assert [game.appid for game in isolated_owned.installed.games] == [620]
+        assert isolated_owned.owned.latest == isolated.owned.latest
+        assert isolated_owned.owned.latest_complete == isolated.owned.latest_complete
+        assert isolated_owned.owned.latest_complete_provenance == isolated.owned.latest_complete_provenance
+        assert isolated_owned.installed.latest == isolated.installed.latest
+        assert isolated_owned.installed.latest_complete == isolated.installed.latest_complete
 
         alternate_context = storage.read_compatibility_snapshot(
             primary, "one", "CA", "english", [400], now=T3

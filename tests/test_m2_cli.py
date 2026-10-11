@@ -73,6 +73,7 @@ def test_account_discovery_and_configuration_are_redacted(
     assert code == 0
     assert stderr == ""
     assert configured["data"]["configured"] is True  # type: ignore[index]
+    assert configured["data"]["source_kind"] == "local_steam_login_registry"  # type: ignore[index]
     assert steam_id not in json.dumps(configured)
 
     _, redacted, _ = _invoke(common + ["accounts", "status"], capsys)

@@ -9,6 +9,7 @@ import pytest
 from steam_agent.execution.content_plane import (
     adopt_manifest,
     locate_manifest,
+    manifest_appid,
     manifest_state_flags,
     reconcile_adoption,
 )
@@ -25,6 +26,28 @@ _MANIFEST = '''"AppState"
 \t"StateFlags"\t\t"4"
 }
 '''
+
+
+@pytest.mark.parametrize("field", ["appid", "StateFlags"])
+@pytest.mark.parametrize("value", ["9" * 5000, "0" * 5000 + "4", "4294967296", "٤"])
+def test_malformed_manifest_numbers_are_unknown(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    manifest = tmp_path / "manifest.acf"
+    manifest.write_text(f'"{field}" "{value}"', encoding="utf-8")
+
+    reader = manifest_appid if field == "appid" else manifest_state_flags
+    assert reader(manifest) is None
+
+
+@pytest.mark.parametrize("value", [0, 0xFFFFFFFF])
+def test_manifest_state_flags_accept_unsigned_32_bit_boundaries(
+    tmp_path: Path, value: int,
+) -> None:
+    manifest = tmp_path / "manifest.acf"
+    manifest.write_text(f'"StateFlags" "{value}"', encoding="utf-8")
+
+    assert manifest_state_flags(manifest) == value
 
 
 def _write_policy(tmp_path: Path, body: str) -> Path:
@@ -424,6 +447,188 @@ class _FakeProcess:
 
     def wait(self, timeout=None) -> int:
         return self.returncode
+
+
+class _PollingProcess(_FakeProcess):
+    def __init__(self, output: str = "Success! App fully installed", *, wait_error=None) -> None:
+        super().__init__(output)
+        self.running = True
+        self.returncode = None
+        self.wait_error = wait_error
+        self.cleanup_wait_error = None
+        self.kill_error = None
+        self.kill_calls = 0
+        self.wait_timeouts: list[float | None] = []
+
+    def wait(self, timeout=None) -> int:
+        import subprocess
+
+        self.wait_timeouts.append(timeout)
+        if self.running:
+            if self.wait_error is not None:
+                raise self.wait_error
+            raise subprocess.TimeoutExpired("synthetic-owned-process", timeout)
+        if self.cleanup_wait_error is not None:
+            raise self.cleanup_wait_error
+        self.returncode = -9
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.kill_error is not None:
+            raise self.kill_error
+        self.running = False
+
+
+def _polling_adapter(tmp_path: Path, monkeypatch, process: _PollingProcess):
+    from steam_agent.execution.content_plane import SteamcmdAdapter
+
+    groups: list[int] = []
+    monkeypatch.setattr(
+        "steam_agent.execution.content_plane.subprocess.Popen",
+        lambda *args, **kwargs: process.bind(kwargs),
+    )
+
+    def kill_group(pid: int, sig: int) -> None:
+        import signal
+
+        assert sig == signal.SIGKILL
+        groups.append(pid)
+        process.running = False
+
+    monkeypatch.setattr("steam_agent.execution.content_plane.os.killpg", kill_group)
+    adapter = SteamcmdAdapter(
+        steamcmd_script=tmp_path / "synthetic-script",
+        private_home=tmp_path / "home",
+        log_dir=tmp_path / "logs",
+        timeout_seconds=30,
+        abort_poll_seconds=0.01,
+    )
+    return adapter, groups
+
+
+@pytest.mark.parametrize("error_kind", ["os", "database", "probe"])
+@pytest.mark.parametrize("output", ["Success! App fully installed", "Invalid Password"])
+def test_failed_abort_poll_terminates_owned_group_reaps_and_reports_failed(
+    tmp_path: Path, monkeypatch, error_kind: str, output: str,
+) -> None:
+    import sqlite3
+
+    process = _PollingProcess(output)
+    adapter, groups = _polling_adapter(tmp_path, monkeypatch, process)
+    error_type = {"os": OSError, "database": sqlite3.OperationalError, "probe": RuntimeError}[error_kind]
+
+    def broken_poll() -> bool:
+        raise error_type("PRIVATE-POLL-ERROR-CANARY")
+
+    result = adapter.install(
+        account="synthetic", appid=480, install_dir=tmp_path / "install",
+        operation_id=1, abort_when=broken_poll,
+    )
+
+    assert result.outcome == "failed"
+    assert groups == [process.pid]
+    assert process.kill_calls == 0
+    assert not process.running
+    assert len(process.wait_timeouts) == 2
+    assert process.wait_timeouts[-1] == 5.0
+    assert "PRIVATE-POLL-ERROR-CANARY" not in result.log_path.read_text()
+    assert not list((tmp_path / "logs").glob("*.tmp"))
+
+
+@pytest.mark.parametrize("error", [OSError("PRIVATE-WAIT-ERROR"), RuntimeError("PRIVATE-WAIT-ERROR")])
+def test_process_wait_failure_cleans_owned_process_before_sanitized_error(
+    tmp_path: Path, monkeypatch, error: Exception,
+) -> None:
+    from steam_agent.execution.content_plane import ContentProcessError
+
+    process = _PollingProcess(wait_error=error)
+    adapter, groups = _polling_adapter(tmp_path, monkeypatch, process)
+
+    with pytest.raises(ContentProcessError) as caught:
+        adapter.install(
+            account="synthetic", appid=480, install_dir=tmp_path / "install",
+            operation_id=1,
+        )
+
+    assert groups == [process.pid]
+    assert not process.running
+    assert len(process.wait_timeouts) == 2
+    assert process.wait_timeouts[-1] == 5.0
+    assert "PRIVATE" not in str(caught.value)
+    assert caught.value.__suppress_context__
+    assert not list((tmp_path / "logs").glob("*.tmp"))
+
+
+def test_process_cancellation_cleans_owned_group_before_propagating(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    process = _PollingProcess(wait_error=KeyboardInterrupt())
+    adapter, groups = _polling_adapter(tmp_path, monkeypatch, process)
+
+    with pytest.raises(KeyboardInterrupt):
+        adapter.install(
+            account="synthetic", appid=480, install_dir=tmp_path / "install",
+            operation_id=1,
+        )
+
+    assert groups == [process.pid]
+    assert not process.running
+    assert process.wait_timeouts[-1] == 5.0
+
+
+def test_owned_group_already_gone_still_reaps_leader(tmp_path: Path, monkeypatch) -> None:
+    process = _PollingProcess()
+    adapter, _ = _polling_adapter(tmp_path, monkeypatch, process)
+
+    def missing_group(pid: int, sig: int) -> None:
+        raise ProcessLookupError("PRIVATE-GONE-GROUP")
+
+    monkeypatch.setattr("steam_agent.execution.content_plane.os.killpg", missing_group)
+
+    result = adapter.install(
+        account="synthetic", appid=480, install_dir=tmp_path / "install",
+        operation_id=1, abort_when=lambda: True,
+    )
+
+    assert result.outcome == "failed"
+    assert process.kill_calls == 1
+    assert not process.running
+    assert process.wait_timeouts[-1] == 5.0
+    assert "PRIVATE-GONE-GROUP" not in result.log_path.read_text()
+
+
+@pytest.mark.parametrize("failure", ["group", "group_and_leader", "cleanup_wait"])
+def test_owned_process_cleanup_failure_is_bounded_and_fail_closed(
+    tmp_path: Path, monkeypatch, failure: str,
+) -> None:
+    from steam_agent.execution.content_plane import ContentProcessError
+
+    process = _PollingProcess()
+    adapter, groups = _polling_adapter(tmp_path, monkeypatch, process)
+    if failure in {"group", "group_and_leader"}:
+        def failed_group(pid: int, sig: int) -> None:
+            groups.append(pid)
+            raise PermissionError("PRIVATE-GROUP-ERROR")
+
+        monkeypatch.setattr("steam_agent.execution.content_plane.os.killpg", failed_group)
+        if failure == "group_and_leader":
+            process.kill_error = PermissionError("PRIVATE-LEADER-ERROR")
+    else:
+        process.cleanup_wait_error = OSError("PRIVATE-REAP-ERROR")
+
+    with pytest.raises(ContentProcessError) as caught:
+        adapter.install(
+            account="synthetic", appid=480, install_dir=tmp_path / "install",
+            operation_id=1, abort_when=lambda: True,
+        )
+
+    assert groups == [process.pid]
+    assert process.kill_calls == int(failure in {"group", "group_and_leader"})
+    assert len(process.wait_timeouts) == 2
+    assert process.wait_timeouts[-1] == 5.0
+    assert "PRIVATE" not in str(caught.value)
+    assert process.running is (failure == "group_and_leader")
 
 
 def test_steamcmd_log_redacts_account_and_paths(tmp_path: Path, monkeypatch) -> None:

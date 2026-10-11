@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "keyring>=25.6,<26",
+    "psutil>=7.0,<8",
+    "pywin32>=311,<312; sys_platform == 'win32'",
 ]
 
 [project.scripts]

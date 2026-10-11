@@ -584,10 +584,13 @@ def _bounded_run(argv: Sequence[str], timeout: float, output_limit: int) -> str 
     if not 1 <= output_limit <= _MAX_COMMAND_OUTPUT:
         raise ValueError("command output limit is invalid")
     try:
+        from steam_agent.process_environment import child_environment
+
         process = subprocess.Popen(
             command, shell=False, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=0,
+            env=child_environment(),
         )
     except OSError:
         return None

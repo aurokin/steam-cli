@@ -9,8 +9,8 @@ and local storage.
 `steam-agent` is not an autonomous Steam client: it never launches, installs,
 moves, or uninstalls games, and never executes a plan it generated. Operation
 plans are inert documents. A person carries out uninstall and move in Steam;
-the separately provisioned `steam-agent-broker` executes install, verify, and
-launch (see Safety and maturity below).
+the separately provisioned `steam-agent-broker` executes install, verify, launch, and
+stop (see Safety and maturity below).
 
 ## Project status
 
@@ -25,6 +25,7 @@ M1 through M7 are implemented and accepted. The current CLI can:
 | Compatibility | Assess declared requirements for one machine or Steam Deck without performance promises |
 | Discovery and groups | Rank a bounded known-game universe and preserve unknown ownership or missing copies |
 | Local operations | Observe and rank storage evidence, then generate inert operation plans |
+| Account handoffs | Propose baseline-bound wishlist changes and cached purchase decisions for human action |
 
 Provider coverage is deliberately conservative. Missing, inaccessible, stale,
 and false are different results; unsupported evidence remains unknown.
@@ -59,9 +60,18 @@ steam-agent sync installed --machine local --steam-root "/path/to/Steam"
 JSON is the default output. Local filesystem paths and account identifiers are
 redacted unless a command provides an explicit opt-in.
 
+For assistant agents, start with `steam-agent capabilities --all`, use exact
+`games query --appid APPID` reads, and acquire missing evidence explicitly.
+Host actions use direct broker verbs with a stable request ID and optional
+`--format json`; inspect the original request after a lost response. The
+[core agent contract](docs/design/cli-contract.md#core-agent-queries-and-explicit-acquisition)
+documents filters, credentials, recovery and inert account handoffs.
+
 Continue with the [user guide](docs/user-guide.md) for account setup, provider
 credentials, deals, recommendations, compatibility, group decisions, safe
 operation plans, data locations, and deletion.
+API workflows can start on a host without Steam installed using
+[explicit SteamID64 account setup](docs/user-guide.md#add-an-account).
 
 Agents working from this checkout can use the
 [repository-owned `steam-agent` project skill](.agents/skills/steam-agent/SKILL.md).
@@ -118,12 +128,17 @@ Execution is a separate, separately provisioned executable,
 [ADR 0028](docs/adr/0028-trusted-manager-execution.md),
 [ADR 0030](docs/adr/0030-verify-as-a-second-executable-class.md), and
 [ADR 0031](docs/adr/0031-launch-allowlist-dispatched-terminal.md). It executes
-exactly three independently granted operation classes on the machine it runs
+four independently granted operation classes on the machine it runs
 on — `install` (which covers update), `verify` (Valve's validate pass, the
 repair capability), and `launch` (which also requires the AppID on an explicit
-allowlist) — behind a policy grant, an operation ledger, and fail-closed
+allowlist), and attributed `stop` ([ADR 0032](docs/adr/0032-agent-requests-and-attributed-game-stop.md)) — behind a policy grant, an operation ledger, and fail-closed
 session gates. Widening that set needs a new accepted ADR. Uninstall and move
 remain human steps inside Steam by decision
 ([ADR 0029](docs/adr/0029-move-as-inert-plan.md)), and store, market, wallet,
 credential, and account-settings operations are not implemented at all. Installing the planner does not provision it; see
 the [user guide](docs/user-guide.md).
+
+Agent command discovery is available through `steam-agent capabilities --all`.
+Direct broker verbs use explicit request IDs; Windows/Linux runtime and client
+adapters are implemented, while Windows content execution remains gated. See
+[host support and qualification](docs/design/agent-host-support.md).

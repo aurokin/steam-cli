@@ -1,7 +1,7 @@
 """Execution policy: which operation classes the owner has granted.
 
 Grants are ``allow`` (auto-authorize at request time within [limits]),
-``confirm`` (two-step explicit approval), or ``deny``, for three operation
+``confirm`` (two-step explicit approval), or ``deny``, for four operation
 classes: ``install`` (update shares install's mechanism and plan class),
 ``verify`` (the repair capability — Valve's validate pass, granted
 separately because it replaces locally modified official files), and
@@ -25,13 +25,14 @@ SUPPORTED_GRANTS: dict[str, frozenset[str]] = {
     "install": frozenset({"allow", "confirm", "deny"}),
     "verify": frozenset({"allow", "confirm", "deny"}),
     "launch": frozenset({"allow", "confirm", "deny"}),
+    "stop": frozenset({"allow", "confirm", "deny"}),
 }
 MAX_LAUNCH_ALLOWLIST = 256
 _MAX_APPID = 0xFFFFFFFF
 
 POLICY_TEMPLATE = """\
 # steam-agent-broker execution policy (ADR 0028).
-# Supported keys: install and verify, each "allow" | "confirm" | "deny".
+# Supported keys: install, verify, launch, stop; "allow" | "confirm" | "deny".
 # Anything else fails closed.  "allow" auto-authorizes requests and
 # requires [limits] min_free_gb (decimal GB measured on the library
 # filesystem).  verify runs Valve's validate pass, which replaces locally
@@ -43,6 +44,7 @@ POLICY_TEMPLATE = """\
 install = "deny"
 verify = "deny"
 launch = "deny"
+stop = "deny"
 
 # [limits]
 # min_free_gb = 25
@@ -51,6 +53,11 @@ launch = "deny"
 # without one is refused rather than read as "any game".
 # [launch]
 # allowed_appids = [480]
+
+# stop has its own allowlist, independent of launch. Force is opt-in.
+# [stop]
+# allowed_appids = [480]
+# allow_force = false
 """
 
 
@@ -64,6 +71,8 @@ class ExecutionPolicy:
     grants: dict[str, str]
     min_free_gb: int | None = None
     launch_allowlist: frozenset[int] = frozenset()
+    stop_allowlist: frozenset[int] = frozenset()
+    stop_allow_force: bool = False
 
     def grant_for(self, operation: str) -> str:
         """Return the grant — ``allow``, ``confirm``, or ``deny``."""
@@ -81,6 +90,9 @@ class ExecutionPolicy:
 
         return appid in self.launch_allowlist
 
+    def stop_permitted(self, appid: int, *, force: bool = False) -> bool:
+        return appid in self.stop_allowlist and (not force or self.stop_allow_force)
+
 
 def load_policy(path: Path) -> ExecutionPolicy:
     try:
@@ -92,11 +104,9 @@ def load_policy(path: Path) -> ExecutionPolicy:
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise PolicyError("policy file is not valid TOML") from error
 
-    unsupported_keys = set(document) - {"grants", "limits", "launch"}
+    unsupported_keys = set(document) - {"grants", "limits", "launch", "stop"}
     if unsupported_keys:
-        raise PolicyError(
-            f"unsupported policy key {sorted(unsupported_keys)[0]!r}"
-        )
+        raise PolicyError(f"unsupported policy key {sorted(unsupported_keys)[0]!r}")
     grants_table = document.get("grants", {})
     if not isinstance(grants_table, dict):
         raise PolicyError("[grants] must be a table")
@@ -114,9 +124,7 @@ def load_policy(path: Path) -> ExecutionPolicy:
         raise PolicyError("[limits] must be a table")
     unsupported_limits = set(limits_table) - {"min_free_gb"}
     if unsupported_limits:
-        raise PolicyError(
-            f"unsupported limit key {sorted(unsupported_limits)[0]!r}"
-        )
+        raise PolicyError(f"unsupported limit key {sorted(unsupported_limits)[0]!r}")
     min_free_gb: int | None = None
     if "min_free_gb" in limits_table:
         value = limits_table["min_free_gb"]
@@ -125,7 +133,9 @@ def load_policy(path: Path) -> ExecutionPolicy:
             raise PolicyError("min_free_gb must be a non-negative integer")
         min_free_gb = value
 
-    if min_free_gb is None and "allow" in grants.values():
+    if min_free_gb is None and any(
+        value == "allow" for key, value in grants.items() if key != "stop"
+    ):
         raise PolicyError('grant "allow" requires [limits] min_free_gb')
 
     launch_table = document.get("launch", {})
@@ -133,9 +143,7 @@ def load_policy(path: Path) -> ExecutionPolicy:
         raise PolicyError("[launch] must be a table")
     unsupported_launch = set(launch_table) - {"allowed_appids"}
     if unsupported_launch:
-        raise PolicyError(
-            f"unsupported launch key {sorted(unsupported_launch)[0]!r}"
-        )
+        raise PolicyError(f"unsupported launch key {sorted(unsupported_launch)[0]!r}")
     allowlist: set[int] = set()
     if "allowed_appids" in launch_table:
         entries = launch_table["allowed_appids"]
@@ -160,12 +168,36 @@ def load_policy(path: Path) -> ExecutionPolicy:
             'granting "launch" requires a non-empty [launch] allowed_appids'
         )
 
+    stop_table = document.get("stop", {})
+    if not isinstance(stop_table, dict):
+        raise PolicyError("[stop] must be a table")
+    unsupported_stop = set(stop_table) - {"allowed_appids", "allow_force"}
+    if unsupported_stop:
+        raise PolicyError(f"unsupported stop key {sorted(unsupported_stop)[0]!r}")
+    stop_entries = stop_table.get("allowed_appids", [])
+    if not isinstance(stop_entries, list) or len(stop_entries) > MAX_LAUNCH_ALLOWLIST:
+        raise PolicyError("stop allowed_appids must be a list of at most 256 AppIDs")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _MAX_APPID
+        for value in stop_entries
+    ):
+        raise PolicyError("stop allowed_appids must contain Steam AppIDs")
+    stop_force = stop_table.get("allow_force", False)
+    if not isinstance(stop_force, bool):
+        raise PolicyError("stop allow_force must be a boolean")
+    if grants.get("stop", "deny") != "deny" and not stop_entries:
+        raise PolicyError('granting "stop" requires a non-empty [stop] allowed_appids')
+
     version = hashlib.sha256(raw).hexdigest()[:16]
     return ExecutionPolicy(
         version=version,
         grants=grants,
         min_free_gb=min_free_gb,
         launch_allowlist=frozenset(allowlist),
+        stop_allowlist=frozenset(stop_entries),
+        stop_allow_force=stop_force,
     )
 
 

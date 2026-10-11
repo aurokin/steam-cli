@@ -77,11 +77,26 @@ steam-agent owned probe [--account ALIAS]
 
 `accounts discover` returns a candidate count and whether primary selection is
 available, ambiguous, or absent. It does not return Steam identifiers, account
-names, or persona names unless `--include-identifiers` is explicit. An
-ambiguous discovery can then be configured by passing one listed identity to
-`--steam-id64`; unlisted identities are rejected. `accounts configure` persists only the chosen alias,
-SteamID64, source kind, and timestamps. `accounts status` requires the explicit
-`--include-identifiers` opt-in to return SteamID64.
+names, or persona names unless `--include-identifiers` is explicit.
+`accounts configure --from-local-most-recent` selects a unique recent account,
+or the sole local candidate, and retains `source_kind=local_steam_login_registry`.
+Missing, inaccessible, malformed and ambiguous local evidence retain their
+existing typed refusals.
+
+`accounts configure --steam-id64 ID` instead validates a positive ASCII decimal
+uint64 and stores its canonical decimal form with `source_kind=explicit_steam_id`.
+It needs no local Steam installation, account registry, credentials or provider
+request; it neither discovers a Steam root nor checks local candidates.
+`--steam-root` remains accepted for existing callers but affects only local
+selection. Explicit configuration asserts an identity to query; it does not
+establish account existence, a Steam login, ownership or API access. This change
+is accepted by [ADR 0035](../adr/0035-steam-free-account-configuration.md).
+
+`accounts configure` persists only the chosen alias, SteamID64, source kind, and
+timestamps. Existing alias/identity conflicts remain refused; configuring the
+same pair preserves its internal account ID, creation time and cached evidence.
+Both modes omit the identifier from normal output. `accounts status` requires
+the explicit `--include-identifiers` opt-in to return SteamID64.
 
 `auth set` reads and confirms the key with hidden terminal input. The default
 `os` backend must resolve to an approved native credential store. The `file`
@@ -715,13 +730,18 @@ trusted manager agent (ADR 0028). Installing the planner does not provision
 it: execution requires an initialized state directory and a policy grant.
 
 ```text
-steam-agent-broker [--state-dir PATH] init --library PATH --steamcmd PATH [--machine-id ID]
+steam-agent-broker [--state-dir PATH] init --library PATH [--steamcmd PATH] [--machine-id ID] [--account ALIAS] [--steam-login LOGIN] [--steam-executable PATH]
 steam-agent-broker [--state-dir PATH] request --account ALIAS        # operation-plan/0.1 JSON on stdin
 steam-agent-broker [--state-dir PATH] confirm NONCE --actor ACTOR
 steam-agent-broker [--state-dir PATH] run [--operation-id N]
 steam-agent-broker [--state-dir PATH] reconcile
 steam-agent-broker [--state-dir PATH] status [--limit N]
 steam-agent-broker [--state-dir PATH] policy
+steam-agent-broker [--state-dir PATH] capabilities
+steam-agent-broker [--state-dir PATH] runtime [--appid APPID]
+steam-agent-broker [--state-dir PATH] inspect OPERATION_ID
+steam-agent-broker [--state-dir PATH] install|verify|launch APPID --request-id ID [--account ALIAS] [--request-only]
+steam-agent-broker [--state-dir PATH] stop APPID --request-id ID [--account ALIAS] [--request-only] [--force]
 ```
 
 `--state-dir` defaults to `~/.local/state/steam-broker`; the environment
@@ -729,11 +749,11 @@ equivalent is `STEAM_BROKER_STATE`. The directory is created mode 0700 and
 holds the policy file, the ledger, the adoption journal, logs, and steamcmd's
 private HOME with its cached credentials. Stdout is deterministic JSON;
 diagnostics go to stderr. Exit 0 is success (`confirmed`, or `dispatched`
-for launch), 1 is a completed run whose outcome was neither, and 2 is a
+for launch/stop), 1 is a completed run whose outcome was neither, and 2 is a
 refusal or error. `request` reads a bare `operation-plan/0.1` object on stdin;
 the planner returns that object at `data.plan` inside its response envelope.
 
-`install`, `verify`, and `launch` are the executable operation classes;
+`install`, `verify`, `launch`, and `stop` are the executable operation classes;
 every other class is denied regardless of policy content. `install` covers update — they
 share one steamcmd mechanism and one plan class. `verify` is the repair
 capability: Valve's `app_update ... validate` pass, granted separately
@@ -766,12 +786,17 @@ every decision point, failing closed when unreadable.
 install = "allow"   # or "confirm" (two-step) or "deny" (kill switch)
 verify = "confirm"  # same three values, granted independently
 launch = "confirm"
+stop = "confirm"
 
 [limits]
-min_free_gb = 25    # required whenever any grant is "allow"
+min_free_gb = 25    # required for install/verify/launch "allow"; stop needs no floor
 
 [launch]
 allowed_appids = [480]   # required whenever launch is not "deny"; at most 256
+
+[stop]
+allowed_appids = [480]   # independent of the launch allowlist; at most 256
+allow_force = false     # --force also required; timeout never escalates
 ```
 
 Each class is granted on its own; an `install` grant never carries `verify`.
@@ -779,7 +804,8 @@ An omitted key is `deny`. `launch` needs two independent permissions: the
 grant says launching is a capability at all, and `allowed_appids` says which
 titles. A live `launch` grant with an empty or absent allowlist is refused
 rather than read as "any game", and removing an AppID revokes it exactly as
-flipping the grant does — both are re-read at request, confirm, and run.
+flipping the grant does — both are re-read at request, confirm, run, and
+immediately before launch dispatch after client startup.
 
 Under `confirm`, `request` emits `{"operation_id", "nonce", "state":
 "pending_confirmation"}` and the operation runs only after `confirm` consumes
@@ -804,9 +830,180 @@ execution window; one operation per machine is active at a time; a plan's
 | `aborted` | terminated without completing (window lapsed, policy revoked, gates regressed) | terminal |
 | `failed` | content work started and did not succeed | terminal |
 | `auth_required` | steamcmd needs an interactive Steam Guard login | terminal |
-| `dispatched` | launch only: the client accepted the request. Playability is not observed and nothing upgrades this | terminal |
+| `dispatched` | launch: the client accepted the request; stop: attributed processes exited or were absent, with explicit detail. Playability and saved state are not proved | terminal |
 
 A `deferred` outcome is not a failure and must not be resubmitted under a new
 idempotency key: the same operation is still authorized and a later `run`
 retries it in place. `reconcile` maps any non-terminal operation to exactly
 one recovery action and never depends on the policy file.
+
+### Agent requests and host runtime
+
+[ADR 0032](../adr/0032-agent-requests-and-attributed-game-stop.md) adds direct
+operation verbs and `operation-intent/0.1` stdin intake. Legacy
+`operation-plan/0.1` remains supported and cannot request stop. An intent
+contains `schema`, `operation`, `target.appid`, optional `target.machine_id`,
+`idempotency_key` (8–128 characters), and optional boolean `force` (stop only).
+The configured host pins machine identity. Direct verbs use the configured
+account alias by default; legacy `request` requires `--account`.
+
+Direct `--request-id` accepts 8–128 ASCII identifier characters (letters,
+digits, dot, underscore, colon and hyphen; first character alphanumeric).
+Its ledger key is a namespaced SHA-256 hash. The exact intent, including
+account and machine, is bound to it. A retry returns the existing pending nonce
+or terminal receipt with `reused: true`; an authorized/interrupted operation
+can run in place. Reusing the ID for different content is refused. A new ID
+means a deliberate new attempt. Direct requests retain their binding and expired receipt permanently; use a new
+ID for another attempt. Legacy plan intake retains its existing expired-key
+release behavior. `--request-only` suppresses automatic run;
+`confirm` always waits for the existing explicit approval flow.
+
+`init` can provision client-only operation without SteamCMD. Linux content
+execution additionally needs `--steamcmd` and an explicit `--account` alias to
+`--steam-login` mapping. Both direct and legacy content requests refuse missing
+configuration, an unmatched account alias, or an unqualified platform before
+recording new intent; refusal leaves the broker available for provisioning.
+Direct receipt reuse remains available without rechecking those prerequisites.
+Login names remain in private broker configuration;
+normal output includes neither logins nor private paths. Re-init preserves
+omitted configuration values and an existing policy. Windows selects the
+Windows session adapter and optionally discovers the client executable from
+HKCU; new Windows content requests are refused and previously recorded content
+execution remains deferred. Other platforms do not
+provide runtime attribution. Host support and remaining native qualification
+are recorded in [agent host support](agent-host-support.md).
+
+`capabilities` returns `broker-capabilities/0.1` with configured machine,
+platform, grants, allowlists, force permission and content provisioning. It
+does not attest that a desktop session or game is currently usable.
+`inspect` returns a redacted durable receipt and transition events.
+`runtime` returns `runtime-observation/0.1`, UTC observation time, and
+`observed | absent | unknown`, with AppID/PID/creation-time evidence and reason
+codes. An unknown scan can still contain positively observed processes; its
+missing evidence is never reported as empty certainty. Runtime observation
+reads live OS state, is not cache-only, and never changes a launch receipt.
+The planner's existing M1 `capabilities` contract is preserved; `--all` returns
+a separate command catalog with `runtime_checked: false`.
+
+Stop requires its own grant and nonempty AppID allowlist. Force also requires
+`[stop] allow_force = true` and an explicit force request, bound before
+confirmation. Same-user AppID environment attribution and PID/creation-time
+checks prevent process-name-only termination. Windows additionally requires
+the same non-service interactive session. Manual Steam launches are eligible
+when attributed; unavailable or ambiguous process evidence defers without
+sending a signal. SIGTERM (Linux) and WM_CLOSE (Windows) request graceful exit;
+force never follows implicitly and neither method proves a save completed.
+Stop rechecks current policy and authorization expiry after the fresh scan,
+before each exit request. Denial prevents further requests while preserving
+counts for any requests already sent.
+
+Both launch and stop commit `dispatch_pending` before the external action.
+Unacknowledged or interrupted dispatch becomes terminal `unconfirmed`; startup
+reconciliation never replays it. Stop timeout/partial completion after that
+boundary is also `unconfirmed`, not an automatically retryable signal.
+`dispatched` remains terminal and records only the bounded action claim.
+
+
+### Experimental Windows desktop bridge
+
+`steam-agent-broker --desktop runtime [--appid APPID]` and the direct verbs
+can dispatch a one-shot worker into the existing same-user Windows console
+session. This addresses SSH service session 0 without passwords or an elevated
+service. It requires the Windows-only `pywin32` dependency, a logged-in desktop,
+and Task Scheduler permission. The worker refuses an elevated token or a
+changed user/session. Requests/results are bounded, private and short-lived.
+A timeout is unknown: inspect the durable request ID before another attempt.
+Read-only Task Scheduler dispatch and fresh-task collection passed on one
+Windows host; game actions and broader failure-route qualification remain
+separate in the [host support record](agent-host-support.md). The bridge
+cannot sign in to Steam, toggle offline mode or bypass broker policy.
+
+### Core agent queries and explicit acquisition
+
+[ADR 0033](../adr/0033-agent-core-query-and-recovery-contracts.md) adds repeatable
+`games query --appid APPID` for installed, owned, wishlist and library scopes.
+Values are nonzero unsigned 32-bit identifiers, with at most 1,000 supplied;
+duplicates are collapsed and the selected IDs are sorted in
+`context.appid_filter`. Filtering limits returned items without changing the
+full scope's completeness, snapshot lineage or playtime-state totals. A missing
+item is conclusive only to the extent the returned scope evidence supports it.
+
+Wishlist `--include-names` resolves names in one cache batch, using selected
+account owned evidence first, then selected-machine installed evidence. Name
+evidence carries its own provider, retrieval time, support and scope; it does
+not establish wishlist membership or trigger hydration. Missing labels are null.
+Omitting the flag preserves the existing wishlist item shape.
+
+`sync owned|wishlist|activity|achievements --credential-source process-env`
+explicitly selects `STEAM_WEB_API_KEY` from the invoking process for the approved
+refresh. The default `stored` retains configured credential behavior. Neither
+source falls back to the other. Environment mode requires no stored reference
+or credential-unlock operation and persists no key or locator. A missing key is
+typed unavailable; no prompt is introduced. Existing acquisition/retention
+acknowledgments still apply. Native child processes exclude the provider key.
+
+### Opt-in broker results and original-request recovery
+
+Global `steam-agent-broker --format json COMMAND ...` selects
+`broker-result/0.1`. It has `context` (machine alias, platform, version), `receipt`
+(durable operation/state/terminal/dispatch certainty), `attempt` (this invocation's
+outcome/reason), `retry` (category and `automatic: false`) and `result` (legacy
+payload). A deferred invocation can retain an authorized receipt; reused
+receipts remain distinct from a new dispatch. Missing receipts are null.
+Default successful output remains compatible, including `--desktop`.
+
+`inspect --request-id ID` looks up the original binding without creating a
+ledger, migrating it, expiring a nonce or resuming work. `--version` reports the
+broker package version. Global `--expected-machine ALIAS` guards direct action
+and preflight routing before creating an intent; an alias is not attestation.
+
+`preflight install|verify|launch|stop APPID [--account ALIAS] [--force]` is
+advisory. It reports implementation, provisioning, policy, relevant session
+gates and content writer/library/disk facts. Unsupported, failed and unknown
+facts stay distinct. Generic session gates do not establish stop attribution,
+so stop preflight remains unknown until target-specific evidence is available.
+It grants no authorization, creates no nonce or operation, and reserves no lease.
+Dispatch still performs fresh authoritative checks.
+
+After a desktop timeout, use `desktop-jobs [--limit N]` and
+`desktop-collect JOB_ID [--cleanup]` to inspect the original job. The opaque
+public ID omits the scheduler token. Collection does not submit or resume work.
+Cleanup requires fresh exact task identity and proven completion; running,
+queued, foreign and unknown jobs are retained. Pair job collection with original
+request inspection before considering a deliberate new attempt.
+
+Unsupported ledger schema, state, executable class or future SQLite version
+refuses both read and write opening before migrations, WAL setup or index
+changes. Upgrade/downgrade preparation preserves existing state; never replace
+a ledger with an older snapshot to make an older binary run.
+
+### Inert wishlist and purchase handoffs
+
+[ADR 0034](../adr/0034-inert-account-and-purchase-handoffs.md) adds cache-only
+planner commands inside the existing response envelope:
+
+```text
+steam-agent wishlist plan --account ALIAS --appid APPID --action add
+steam-agent wishlist plan --account ALIAS --appid APPID --action remove
+steam-agent wishlist plan --account ALIAS --appid APPID --action reprioritize --priority N
+steam-agent deals plan --account ALIAS --appid APPID --country US
+```
+
+Wishlist proposals use `wishlist-change-proposal/0.1`, bind the promoted baseline
+ID/time and expected membership, distinguish observed priority from local desired
+priority, and set `execution_supported: false`. `--baseline-sync-id N` refuses a
+mismatched promoted baseline with `WISHLIST_BASELINE_CONFLICT`. Only a latest
+complete promoted snapshot within 24 hours supplies authoritative expectations;
+missing, future, stale or superseded evidence blocks a definitive change.
+Already-satisfied intent is reported at that baseline. Completion remains
+unobserved until a human changes Steam and a separate refresh observes it.
+
+Purchase cards use `purchase-decision-card/0.1`, with optional
+`--machine ALIAS` and `--store-class official|keyshop|unknown`. Only fresh,
+non-future, exact-AppID US/USD quotes matching store context establish a
+comparable price; retained or normalized-game quotes remain evidence. Visible
+owned inventory, compatibility and missing capabilities remain separately scoped.
+Licenses, editions, DLC prerequisites and checkout total remain unknown.
+References are official human-open URLs. Neither command acquires provider
+evidence, resolves credentials, edits an account, fills a cart or authorizes
+broker execution.

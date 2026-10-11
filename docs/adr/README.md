@@ -47,6 +47,11 @@ until evidence supports them.
 | D037 | Qualitative-review measurement amendments | [Accepted ADR 0025](0025-qualitative-review-measurement-amendments.md) | Easy; one fixed append-only amendment can be ignored by future protocols | Exact package, ledger, case, slot, attempt, canary, operation, and judgment bindings; unavailable duration remains non-authoritative and scoring-independent |
 | D038 | Qualitative-review duration-loss recovery | [Accepted ADR 0026](0026-qualitative-review-duration-loss-recovery.md) | Easy; one distinct operation schema can be ignored by future protocols | Exactly one attempt and one recovery operation per matrix; exact verdict/event, package, case, slot, canary, and isolation bindings; unavailable non-scoring duration |
 
+| D039 | Agent request receipts, attributed stop, and Windows/Linux client adapters | [Accepted ADR 0032](0032-agent-requests-and-attributed-game-stop.md) | Moderate; reconcile pending dispatch before downgrading | Durable launch intent, no-replay, policy races, process identity, force permission, request binding and platform fixtures; real game-action qualification remains separate |
+| D040 | Exact cached queries, explicit ephemeral acquisition and broker recovery contracts | [Accepted ADR 0033](0033-agent-core-query-and-recovery-contracts.md) | Additive opt-in interfaces; original request bindings preserved | Scoped cache/filter/name tests, four-route HTTP secret canaries, composed subprocess recovery and installed-wheel contract smoke |
+| D041 | Wishlist changes and purchase assistance as inert handoffs | [Accepted ADR 0034](0034-inert-account-and-purchase-handoffs.md) | Additive payload schemas; no migration or execution widening | Baseline conflicts/freshness, quote identity/context, ownership unknowns and no-acquisition/no-mutation tests |
+| D042 | Explicit account setup without a local Steam client | [Accepted ADR 0035](0035-steam-free-account-configuration.md) | Existing source-kind storage; no migration | No-local/no-provider setup, ID validation/redaction/conflicts, composed API workflow and installed-wheel absent-root smoke |
+
 ## When to create an ADR
 
 Create an ADR only when:

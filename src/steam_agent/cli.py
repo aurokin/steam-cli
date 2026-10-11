@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import errno
@@ -21,11 +21,17 @@ import unicodedata
 import warnings
 
 from steam_agent import __version__
+from steam_agent.acquisition_credentials import (
+    AcquisitionCredential,
+    resolve_acquisition_credential,
+)
+from steam_agent.cached_names import read_cached_names
+from steam_agent.core_queries_cli import installed_games_query
+from steam_agent.operations_query import operation_batch as _operation_batch
 from steam_agent.application import (
     default_credential_dir,
     default_database_path,
     discover_steam_root,
-    installed_item,
     machine_for,
     sync_installed,
     usable_steam_root,
@@ -70,6 +76,7 @@ from steam_agent.local_accounts import (
     NoLocalAccount,
     discover_local_accounts,
     select_primary_local_account,
+    validate_steam_id64,
 )
 from steam_agent.steam_web_api import SteamApiError, SteamWebApiClient
 from steam_agent.steam_wishlist import SteamWishlistClient
@@ -166,11 +173,6 @@ from steam_agent.operation_plans import (
     PlanPrecondition,
     ResidualSummary,
     build_operation_plan,
-)
-from steam_agent.operations_observe import (
-    InstalledAttempt,
-    PromotedInstalledFact,
-    observe_local_operations,
 )
 from steam_agent.requirement_parser import (
     DeclaredRequirementsText,
@@ -305,8 +307,12 @@ Intent index (read-only, cache-only; no network or Steam changes):
     _add_leaf_format(status_parser)
     capabilities_parser = commands.add_parser(
         "capabilities",
-        help="Show M1 installed.read readiness only; not a command index.",
-        description="Show M1 installed.read readiness only; not a command index.",
+        help="Show installed.read readiness, or the full command catalog with --all.",
+        description="By default, show M1 installed.read readiness only; not a command index. Use --all for the full command catalog.",
+    )
+    capabilities_parser.add_argument(
+        "--all", action="store_true",
+        help="Show the full command and action catalog without probing providers.",
     )
     _add_leaf_format(capabilities_parser)
     doctor = commands.add_parser(
@@ -339,6 +345,10 @@ Intent index (read-only, cache-only; no network or Steam changes):
     _add_leaf_format(owned_sync)
     owned_sync.add_argument("--account", default="primary")
     owned_sync.add_argument(
+        "--credential-source", choices=("stored", "process-env"), default="stored",
+        help="Select stored credentials or the fixed STEAM_WEB_API_KEY process variable.",
+    )
+    owned_sync.add_argument(
         "--acknowledge-local-storage",
         action="store_true",
         help="Accept the versioned local storage and backup disclosure.",
@@ -354,6 +364,10 @@ Intent index (read-only, cache-only; no network or Steam changes):
     )
     _add_leaf_format(wishlist_sync)
     wishlist_sync.add_argument("--account", default="primary")
+    wishlist_sync.add_argument(
+        "--credential-source", choices=("stored", "process-env"), default="stored",
+        help="Select stored credentials or the fixed STEAM_WEB_API_KEY process variable.",
+    )
     wishlist_sync.add_argument(
         "--acknowledge-local-storage",
         action="store_true",
@@ -375,12 +389,20 @@ Intent index (read-only, cache-only; no network or Steam changes):
     )
     _add_leaf_format(activity_sync)
     activity_sync.add_argument("--account", default="primary")
+    activity_sync.add_argument(
+        "--credential-source", choices=("stored", "process-env"), default="stored",
+        help="Select stored credentials or the fixed STEAM_WEB_API_KEY process variable.",
+    )
     activity_sync.add_argument("--acknowledge-local-storage", action="store_true")
     achievements_sync = sync_commands.add_parser(
         "achievements", help="Synchronize bounded achievement evidence."
     )
     _add_leaf_format(achievements_sync)
     achievements_sync.add_argument("--account", default="primary")
+    achievements_sync.add_argument(
+        "--credential-source", choices=("stored", "process-env"), default="stored",
+        help="Select stored credentials or the fixed STEAM_WEB_API_KEY process variable.",
+    )
     achievements_sync.add_argument(
         "--scope", choices=("recent", "installed", "owned"), default="recent"
     )
@@ -458,6 +480,11 @@ Global --data-dir goes before the command; --format may follow the leaf.
     )
     query.add_argument("--machine", default="local")
     query.add_argument("--account", default="primary")
+    query.add_argument("--appid", action="append", type=int, default=[])
+    query.add_argument(
+        "--include-names", action="store_true",
+        help="Add attributable cached names to wishlist items without fetching metadata.",
+    )
     query.add_argument("--include-paths", action="store_true")
     query.add_argument(
         "--playtime",
@@ -675,6 +702,16 @@ Cache-only, read-only example (no network or Steam changes):
     group_recommend.add_argument("--dislike", action="append", default=[])
     group_recommend.add_argument("--exclude-trait")
 
+    wishlist = commands.add_parser("wishlist", help="Plan inert changes from cached wishlist evidence.")
+    wishlist_commands = wishlist.add_subparsers(dest="wishlist_command", required=True)
+    wishlist_plan = wishlist_commands.add_parser("plan", help="Propose a human wishlist change without executing it.")
+    _add_leaf_format(wishlist_plan)
+    wishlist_plan.add_argument("--account", required=True)
+    wishlist_plan.add_argument("--appid", type=int, required=True)
+    wishlist_plan.add_argument("--action", choices=("add", "remove", "reprioritize"), required=True)
+    wishlist_plan.add_argument("--priority", type=int)
+    wishlist_plan.add_argument("--baseline-sync-id", type=int)
+
     deals = commands.add_parser("deals", help="Query cached wishlist deal evidence.")
     deal_commands = deals.add_subparsers(dest="deals_command", required=True)
     deal_query = deal_commands.add_parser(
@@ -689,6 +726,13 @@ Cache-only, read-only example (no network or Steam changes):
         choices=("official", "keyshop", "unknown"),
         default="official",
     )
+    deal_plan = deal_commands.add_parser("plan", help="Build a cached purchase decision card for human review.")
+    _add_leaf_format(deal_plan)
+    deal_plan.add_argument("--account", required=True)
+    deal_plan.add_argument("--appid", type=int, required=True)
+    deal_plan.add_argument("--country", required=True)
+    deal_plan.add_argument("--machine", default="local")
+    deal_plan.add_argument("--store-class", choices=("official", "keyshop", "unknown"), default="official")
 
     recommendations = commands.add_parser(
         "recommendations", help="Query deterministic cached play recommendations."
@@ -1006,14 +1050,22 @@ For reclaim-space, do not add account, country, language, or budget-bytes.
     discover_accounts.add_argument("--steam-root", type=Path)
     discover_accounts.add_argument("--include-identifiers", action="store_true")
     configure_account = account_commands.add_parser(
-        "configure", help="Persist an explicitly selected local account alias."
+        "configure", help="Configure an explicit SteamID64 or select a local account."
     )
     _add_leaf_format(configure_account)
     configure_account.add_argument("--alias", default="primary")
     selection = configure_account.add_mutually_exclusive_group(required=True)
-    selection.add_argument("--from-local-most-recent", action="store_true")
-    selection.add_argument("--steam-id64")
-    configure_account.add_argument("--steam-root", type=Path)
+    selection.add_argument(
+        "--from-local-most-recent", action="store_true",
+        help="Select the most recent account from local Steam files.",
+    )
+    selection.add_argument(
+        "--steam-id64", help="Configure this account ID without local Steam files or network access."
+    )
+    configure_account.add_argument(
+        "--steam-root", type=Path,
+        help="Steam root for local selection; unused with --steam-id64.",
+    )
     account_status = account_commands.add_parser(
         "status", help="Show redacted configured-account status."
     )
@@ -1198,7 +1250,7 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
     if args.command == "status":
         count = 0
         if database_path.exists():
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 count = len(storage.list_installed("local"))
         return _emit_success(
             args,
@@ -1210,6 +1262,10 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.command == "capabilities":
+        if args.all:
+            from steam_agent.capability_catalog import capability_catalog
+
+            return _emit_success(args, command="capabilities", data=capability_catalog())
         root = discover_steam_root()
         capability_completeness = _installed_read_completeness(root)
         return _emit_success(
@@ -1284,7 +1340,7 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
                 message="The configured Steam root is missing or inaccessible.",
                 remediation="Pass --steam-root with a readable Steam installation directory.",
             )
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             result = sync_installed(
                 storage,
                 steam_root=root,
@@ -1318,6 +1374,19 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.command == "games" and args.games_command == "query":
+        if len(args.appid) > 1000 or any(
+            not 1 <= appid <= (1 << 32) - 1 for appid in args.appid
+        ):
+            return _emit_error(
+                args, command="games.query", code=ErrorCode.INVALID_ARGUMENT,
+                message="Specify at most 1000 positive unsigned 32-bit AppIDs.", exit_code=2,
+            )
+        if args.include_names and args.scope != "wishlist":
+            return _emit_error(
+                args, command="games.query", code=ErrorCode.INVALID_ARGUMENT,
+                message="--include-names is available only for wishlist-scope queries.",
+                exit_code=2,
+            )
         if args.playtime != "any" and args.scope != "owned":
             return _emit_error(
                 args,
@@ -1330,96 +1399,14 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
             return _dispatch_wishlist_games_query(args, database_path)
         if args.scope in ("owned", "library"):
             return _dispatch_account_games_query(args, database_path)
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             installed_snapshot = storage.read_installed_snapshot(args.machine)
-        games = installed_snapshot.games
-        latest = installed_snapshot.latest
-        latest_complete = installed_snapshot.latest_complete
-        query_completeness: dict[str, Any]
-        snapshot: dict[str, Any]
-        if latest is None:
-            query_completeness = completeness(
-                CompletenessStatus.UNAVAILABLE,
-                missing_capabilities=["installed.read"],
-                warnings=[
-                    WarningRecord(
-                        code=ErrorCode.NOT_SYNCED,
-                        message="Installed games have not been synchronized for this machine.",
-                    )
-                ],
-            )
-            snapshot = {"last_attempt_status": None, "last_successful_sync_at": None}
-        elif latest.status == "complete":
-            query_completeness = completeness(CompletenessStatus.COMPLETE)
-            snapshot = {
-                "last_attempt_status": latest.status,
-                "last_successful_sync_at": latest.completed_at,
-            }
-        elif latest.status == "running":
-            running_warning = WarningRecord(
-                code=ErrorCode.SYNC_IN_PROGRESS,
-                message="An installed-games synchronization is currently in progress.",
-            )
-            if latest_complete is None:
-                query_completeness = completeness(
-                    CompletenessStatus.UNAVAILABLE,
-                    missing_capabilities=["installed.read"],
-                    warnings=[running_warning],
-                )
-                successful_at = None
-            else:
-                query_completeness = completeness(
-                    CompletenessStatus.COMPLETE,
-                    warnings=[running_warning],
-                )
-                successful_at = latest_complete.completed_at
-            snapshot = {
-                "last_attempt_status": latest.status,
-                "last_successful_sync_at": successful_at,
-            }
-        elif latest_complete is None:
-            query_completeness = completeness(
-                CompletenessStatus.UNAVAILABLE,
-                missing_capabilities=["installed.read"],
-                warnings=[
-                    WarningRecord(
-                        code=ErrorCode.PARTIAL_SCAN,
-                        message="The latest scan was incomplete and no last-good snapshot exists.",
-                    )
-                ],
-            )
-            snapshot = {
-                "last_attempt_status": latest.status,
-                "last_successful_sync_at": None,
-            }
-        else:
-            query_completeness = completeness(
-                CompletenessStatus.PARTIAL,
-                stale_capabilities=["installed.read"],
-                warnings=[
-                    WarningRecord(
-                        code=ErrorCode.STALE_LAST_GOOD,
-                        message="The latest scan was incomplete; results use the last-good snapshot.",
-                    )
-                ],
-            )
-            snapshot = {
-                "last_attempt_status": latest.status,
-                "last_successful_sync_at": latest_complete.completed_at,
-            }
+        result = installed_games_query(
+            installed_snapshot, machine_id=args.machine, include_paths=args.include_paths,
+        )
         return _emit_success(
-            args,
-            command="games.query",
-            context={"machine_id": args.machine, "scopes": ["installed"]},
-            completeness_value=query_completeness,
-            data={
-                "items": [
-                    installed_item(game, include_paths=args.include_paths)
-                    for game in games
-                ],
-                "next_cursor": None,
-                "snapshot": snapshot,
-            },
+            args, command="games.query", context=result.context,
+            completeness_value=result.completeness, data=result.data,
         )
     if args.command == "system":
         return _dispatch_system(args, database_path)
@@ -1435,6 +1422,10 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
         return _dispatch_group_profiles(args, database_path)
     if args.command == "group":
         return _dispatch_group(args, database_path)
+    if args.command == "wishlist" and args.wishlist_command == "plan":
+        return _dispatch_wishlist_plan(args, database_path)
+    if args.command == "deals" and args.deals_command == "plan":
+        return _dispatch_purchase_plan(args, database_path)
     if args.command == "deals" and args.deals_command == "query":
         return _dispatch_deals_query(args, database_path)
     if args.command == "recommendations" and args.recommendations_command == "wishlist":
@@ -1457,7 +1448,7 @@ def _dispatch(args: argparse.Namespace, database_path: Path) -> int:
 def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
     command = _command_name(args)
     if args.command in {"activity", "achievements"}:
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -1502,9 +1493,11 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
             data=result,
         )
 
-    with _credential_operation_lock(database_path):
-        credential_ref = _steam_credential_ref(database_path)
-        with Storage(database_path) as storage:
+    with (
+        _credential_operation_lock(database_path)
+        if args.credential_source == "stored" else nullcontext()
+    ):
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -1547,24 +1540,19 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                     accepted_at=_utc_now(),
                     backups_acknowledged=True,
                 )
-            metadata = storage.get_credential_reference(
-                provider=credential_ref.provider,
-                kind=credential_ref.kind,
-                profile_id=credential_ref.profile_id,
-            )
-            if metadata is None:
+            resolved = _resolve_refresh_credential(args, storage, database_path)
+            if resolved.state == "not_configured":
                 return _emit_error(
                     args,
                     command=command,
                     code=ErrorCode.AUTH_REQUIRED,
                     message="A Steam Web API user key has not been configured.",
                 )
-            resolved = _resolve_credential(metadata, credential_ref)
-            if resolved["state"] != "configured":
+            if resolved.state != "configured":
                 return _emit_error(
                     args,
                     command=command,
-                    code=_credential_error_code(resolved["state"]),
+                    code=_credential_error_code(resolved.state),
                     message="The Steam Web API credential is unavailable.",
                 )
 
@@ -1584,7 +1572,7 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                         storage,
                         account_id=account.id,
                         steamid=account.provider_account_id,
-                        api_key=resolved["secret"],
+                        api_key=resolved.secret,
                         client=_steam_activity_client(),
                         request_gate=request_gate,
                         clock=_utc_now,
@@ -1601,7 +1589,7 @@ def _dispatch_activity(args: argparse.Namespace, database_path: Path) -> int:
                         storage,
                         account_id=account.id,
                         steamid=account.provider_account_id,
-                        api_key=resolved["secret"],
+                        api_key=resolved.secret,
                         scope=args.scope,
                         explicit_appids=tuple(args.appid),
                         max_items=args.max_items,
@@ -1655,7 +1643,7 @@ def _dispatch_system(args: argparse.Namespace, database_path: Path) -> int:
             message="The machine alias is invalid.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         if args.command == "system":
             result = query_system_profile(
                 storage, machine_id=machine_id, clock=_utc_now
@@ -1915,7 +1903,7 @@ def _dispatch_sync_compatibility(args: argparse.Namespace, database_path: Path) 
             message="The declared-fact synchronization arguments are invalid.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -2665,7 +2653,7 @@ def _dispatch_discovery(args: argparse.Namespace, database_path: Path) -> int:
             message="The bounded discovery query arguments are invalid.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
             machine = storage.get_machine(args.machine)
@@ -2869,7 +2857,7 @@ def _dispatch_group_profiles(args: argparse.Namespace, database_path: Path) -> i
     except (TypeError, ValueError):
         return _group_invalid(args, command, "The group profile arguments are invalid.")
     try:
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             if args.command == "profiles":
                 if operation == "create":
                     assert ref is not None
@@ -3561,7 +3549,7 @@ def _dispatch_group(args: argparse.Namespace, database_path: Path) -> int:
             args, command, "The bounded group query arguments are invalid."
         )
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             context_account = storage.get_account(args.account)
             machine = storage.get_machine(args.machine)
             if context_account is None or machine is None:
@@ -3815,7 +3803,7 @@ def _dispatch_group_recommend(args: argparse.Namespace, database_path: Path) -> 
         )
 
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             context_account = storage.get_account(args.context_account)
             machine = storage.get_machine(args.context_machine)
             if context_account is None or machine is None:
@@ -4140,56 +4128,6 @@ def _declared_sync_source_gaps(snapshot: Mapping[str, Any]) -> list[dict[str, An
     return gaps
 
 
-def _installed_attempt(snapshot: Any) -> InstalledAttempt | None:
-    latest = snapshot.latest
-    if latest is None:
-        return None
-    return InstalledAttempt(
-        latest.status,
-        latest.completed_at or latest.started_at,
-        latest.id,
-    )
-
-
-def _operation_batch(snapshot: Any, *, appids: tuple[int, ...], now: datetime) -> Any:
-    current = {item.appid: item for item in snapshot.games}
-    facts: list[PromotedInstalledFact] = []
-    latest_complete = snapshot.latest_complete
-    for appid in appids:
-        item = current.get(appid)
-        if item is not None:
-            facts.append(
-                PromotedInstalledFact(
-                    appid=appid,
-                    presence="present",
-                    observed_at=item.observed_at,
-                    evidence_ids=(item.evidence_id,),
-                    promoted_sync_run_id=item.promoted_sync_run_id,
-                    build_id=item.build_id,
-                    size_on_disk_bytes=item.size_bytes,
-                    manifest_source_modified_at=item.manifest_mtime,
-                )
-            )
-        elif latest_complete is not None:
-            facts.append(
-                PromotedInstalledFact(
-                    appid=appid,
-                    presence="absent",
-                    observed_at=(
-                        latest_complete.completed_at or latest_complete.started_at
-                    ),
-                    evidence_ids=(f"sync-run:{latest_complete.id}",),
-                    promoted_sync_run_id=latest_complete.id,
-                )
-            )
-    return observe_local_operations(
-        requested_appids=appids,
-        installed_facts=tuple(facts),
-        generated_at=now,
-        latest_attempt=_installed_attempt(snapshot),
-    )
-
-
 def _operation_completeness(snapshot: Any, batch: Any) -> dict[str, Any]:
     if snapshot.latest_complete is None:
         return completeness(
@@ -4246,7 +4184,7 @@ def _dispatch_operations_observe(
             message="Installed games have not been synchronized for this machine.",
         )
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             if storage.get_machine(args.machine) is None:
                 return _emit_error(
                     args,
@@ -4353,7 +4291,7 @@ def _dispatch_reclaim_rank(args: argparse.Namespace, database_path: Path) -> int
     command = "storage.rank"
     now = _utc_now()
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             if storage.get_machine(args.machine) is None:
                 return _emit_error(
                     args,
@@ -4568,7 +4506,7 @@ def _dispatch_travel_rank(args: argparse.Namespace, database_path: Path) -> int:
         )
     country = args.country.upper()
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             account = storage.get_account(args.account)
             if account is None:
                 return _emit_error(
@@ -4761,7 +4699,9 @@ def _residual_presence(game: InstalledGame | None) -> str:
     summary = _residual_summary(game)
     if summary is None:
         return "unknown"
-    return "present" if summary.kinds else "absent"
+    if summary.kinds:
+        return "present"
+    return "absent" if summary.state == "measured" else "unknown"
 
 
 def _residual_summary(game: InstalledGame | None) -> ResidualSummary | None:
@@ -4821,7 +4761,7 @@ def _dispatch_operation_plan(args: argparse.Namespace, database_path: Path) -> i
             message="The requested account alias is not configured.",
         )
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             account = storage.get_account(args.account)
             if account is None:
                 return _emit_error(
@@ -5059,7 +4999,7 @@ def _dispatch_compatibility(args: argparse.Namespace, database_path: Path) -> in
             message="The requested account alias is not configured.",
         )
     try:
-        with Storage(database_path, readonly=True) as storage:
+        with Storage(database_path, readonly=True, clock=_utc_now) as storage:
             account = storage.get_account(args.account)
             if account is None:
                 return _emit_error(
@@ -5338,6 +5278,89 @@ def _interrupt_declared_sync(storage: Storage, sync_run_id: int) -> None:
         pass
 
 
+def _dispatch_wishlist_plan(args: argparse.Namespace, database_path: Path) -> int:
+    from steam_agent.account_plans import BaselineConflict, WishlistChange, wishlist_change_plan
+
+    now = _utc_now()
+    try:
+        change = WishlistChange(args.appid, args.action, args.priority, args.baseline_sync_id)
+        with Storage(database_path, clock=_utc_now) as storage:
+            account = storage.get_account(args.account)
+            snapshot = storage.read_wishlist_snapshot(account.id) if account else None
+        result = wishlist_change_plan(
+            snapshot, account_alias=args.account, change=change, generated_at=now,
+        )
+        if account is None:
+            result["completeness"]["missing_capabilities"].append("account.identity")
+    except BaselineConflict:
+        return _emit_error(
+            args, command="wishlist.plan", code="WISHLIST_BASELINE_CONFLICT",
+            message="The requested baseline does not match the promoted wishlist snapshot.",
+            remediation="Inspect the current wishlist cache and create a new proposal.", exit_code=2,
+        )
+    except ValueError:
+        return _emit_error(
+            args, command="wishlist.plan", code=ErrorCode.INVALID_ARGUMENT,
+            message="The wishlist proposal arguments or cached baseline are invalid.", exit_code=2,
+        )
+    return _emit_success(
+        args, command="wishlist.plan", generated_at=now, context=result["context"],
+        completeness_value=result["completeness"], data=result["data"],
+    )
+
+
+def _dispatch_purchase_plan(args: argparse.Namespace, database_path: Path) -> int:
+    from steam_agent.account_plans import purchase_decision_plan
+
+    now = _utc_now()
+    if args.country.upper() != "US":
+        return _emit_error(
+            args, command="deals.plan", code="UNSUPPORTED_COUNTRY",
+            message="Cached purchase decision cards currently support US/USD only.", exit_code=2,
+        )
+    if not 1 <= args.appid <= 0xFFFFFFFF:
+        return _emit_error(
+            args, command="deals.plan", code=ErrorCode.INVALID_ARGUMENT,
+            message="AppID must be an unsigned nonzero 32-bit integer.", exit_code=2,
+        )
+    try:
+        with Storage(database_path, clock=_utc_now) as storage:
+            account = storage.get_account(args.account)
+            snapshot = storage.read_wishlist_deal_snapshot(
+                account_id=account.id, country="US", now=now,
+            ) if account else None
+            owned = storage.read_owned_snapshot(account.id) if account else None
+            compatibility = None
+            machine = storage.get_machine(args.machine) if account else None
+            if account and machine:
+                try:
+                    target = _machine_compatibility_target(machine)
+                except ValueError:
+                    target = None
+                if target is not None:
+                    inputs = storage.read_compatibility_snapshot(
+                        account.id, args.machine, "US", "english", (args.appid,), now,
+                    )
+                    assessment = assess_compatibility_snapshot(inputs, target=target)
+                    compatibility = compatibility_query_data(assessment, explain=True)
+        result = purchase_decision_plan(
+            snapshot, owned=owned, account_alias=args.account, appid=args.appid,
+            country="US", store_class=args.store_class, generated_at=now,
+            compatibility=compatibility,
+        )
+        if account is None:
+            result["completeness"]["missing_capabilities"].append("account.identity")
+    except ValueError:
+        return _emit_error(
+            args, command="deals.plan", code=ErrorCode.INVALID_ARGUMENT,
+            message="The purchase plan arguments or cached evidence are invalid.", exit_code=2,
+        )
+    return _emit_success(
+        args, command="deals.plan", generated_at=now, context={**result["context"], "machine_id": args.machine},
+        completeness_value=result["completeness"], data=result["data"],
+    )
+
+
 def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
     country = args.country.upper()
     if (
@@ -5362,7 +5385,7 @@ def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
             exit_code=2,
         )
     generated_at = _utc_now()
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -5464,7 +5487,7 @@ def _dispatch_deals_query(args: argparse.Namespace, database_path: Path) -> int:
 
 def _dispatch_sync_reviews(args: argparse.Namespace, database_path: Path) -> int:
     command = "sync.reviews"
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -5605,7 +5628,7 @@ def _dispatch_wishlist_recommendations(
             message="A wishlist recommendation override is invalid.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -5759,7 +5782,7 @@ def _dispatch_recommendations_query(
             message="The recommendation query arguments are invalid.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -6037,9 +6060,11 @@ def _dispatch_recommendations_query(
 
 
 def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
-    with _credential_operation_lock(database_path):
-        credential_ref = _steam_credential_ref(database_path)
-        with Storage(database_path) as storage:
+    with (
+        _credential_operation_lock(database_path)
+        if args.credential_source == "stored" else nullcontext()
+    ):
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -6092,24 +6117,19 @@ def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
                     accepted_at=_utc_now(),
                     backups_acknowledged=True,
                 )
-            metadata = storage.get_credential_reference(
-                provider=credential_ref.provider,
-                kind=credential_ref.kind,
-                profile_id=credential_ref.profile_id,
-            )
-            if metadata is None:
+            resolved = _resolve_refresh_credential(args, storage, database_path)
+            if resolved.state == "not_configured":
                 return _emit_error(
                     args,
                     command="sync.owned",
                     code=ErrorCode.AUTH_REQUIRED,
                     message="A Steam Web API user key has not been configured.",
                 )
-            resolved = _resolve_credential(metadata, credential_ref)
-            if resolved["state"] != "configured":
+            if resolved.state != "configured":
                 return _emit_error(
                     args,
                     command="sync.owned",
-                    code=_credential_error_code(resolved["state"]),
+                    code=_credential_error_code(resolved.state),
                     message="The Steam Web API credential is unavailable.",
                 )
 
@@ -6130,7 +6150,7 @@ def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
                     storage,
                     account_id=account.id,
                     steamid=account.provider_account_id,
-                    api_key=resolved["secret"],
+                    api_key=resolved.secret,
                     client=_steam_web_api_client(),
                     request_gate=request_gate,
                     clock=_utc_now,
@@ -6163,6 +6183,24 @@ def _dispatch_sync_owned(args: argparse.Namespace, database_path: Path) -> int:
         )
 
 
+def _resolve_refresh_credential(
+    args: argparse.Namespace, storage: Storage, database_path: Path
+) -> AcquisitionCredential:
+    def stored() -> AcquisitionCredential:
+        credential_ref = _steam_credential_ref(database_path)
+        metadata = storage.get_credential_reference(
+            provider=credential_ref.provider,
+            kind=credential_ref.kind,
+            profile_id=credential_ref.profile_id,
+        )
+        if metadata is None:
+            return AcquisitionCredential("not_configured")
+        resolved = _resolve_credential(metadata, credential_ref)
+        return AcquisitionCredential(resolved["state"], resolved["secret"])
+
+    return resolve_acquisition_credential(args.credential_source, stored=stored)
+
+
 def _credential_error_code(state: str) -> str:
     return {
         "missing": str(ErrorCode.CREDENTIAL_NOT_FOUND),
@@ -6172,9 +6210,11 @@ def _credential_error_code(state: str) -> str:
 
 
 def _dispatch_sync_wishlist(args: argparse.Namespace, database_path: Path) -> int:
-    with _credential_operation_lock(database_path):
-        credential_ref = _steam_credential_ref(database_path)
-        with Storage(database_path) as storage:
+    with (
+        _credential_operation_lock(database_path)
+        if args.credential_source == "stored" else nullcontext()
+    ):
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -6222,24 +6262,19 @@ def _dispatch_sync_wishlist(args: argparse.Namespace, database_path: Path) -> in
                     accepted_at=_utc_now(),
                     backups_acknowledged=True,
                 )
-            metadata = storage.get_credential_reference(
-                provider=credential_ref.provider,
-                kind=credential_ref.kind,
-                profile_id=credential_ref.profile_id,
-            )
-            if metadata is None:
+            resolved = _resolve_refresh_credential(args, storage, database_path)
+            if resolved.state == "not_configured":
                 return _emit_error(
                     args,
                     command="sync.wishlist",
                     code=ErrorCode.AUTH_REQUIRED,
                     message="A Steam Web API user key has not been configured.",
                 )
-            resolved = _resolve_credential(metadata, credential_ref)
-            if resolved["state"] != "configured":
+            if resolved.state != "configured":
                 return _emit_error(
                     args,
                     command="sync.wishlist",
-                    code=_credential_error_code(resolved["state"]),
+                    code=_credential_error_code(resolved.state),
                     message="The Steam Web API credential is unavailable.",
                 )
 
@@ -6260,7 +6295,7 @@ def _dispatch_sync_wishlist(args: argparse.Namespace, database_path: Path) -> in
                     storage,
                     account_id=account.id,
                     steamid=account.provider_account_id,
-                    api_key=resolved["secret"],
+                    api_key=resolved.secret,
                     client=_steam_wishlist_client(),
                     request_gate=request_gate,
                     clock=_utc_now,
@@ -6327,7 +6362,7 @@ def _dispatch_sync_prices(args: argparse.Namespace, database_path: Path) -> int:
     with _credential_operation_lock(database_path):
         spec = _CREDENTIAL_PROVIDERS["gg-deals"]
         credential_ref = _provider_credential_ref(database_path, spec)
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -6497,7 +6532,7 @@ def _dispatch_sync_prices(args: argparse.Namespace, database_path: Path) -> int:
 def _dispatch_sync_catalog(args: argparse.Namespace, database_path: Path) -> int:
     with _credential_operation_lock(database_path):
         credential_ref = _steam_credential_ref(database_path)
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = storage.get_account(args.account)
             except ValueError:
@@ -7012,7 +7047,7 @@ def _dispatch_wishlist_games_query(
             message="--include-paths is available only for installed-scope queries.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -7054,6 +7089,15 @@ def _dispatch_wishlist_games_query(
                 },
             )
         snapshot = storage.read_wishlist_snapshot(account.id)
+        names = (
+            read_cached_names(
+                storage._connection,  # noqa: SLF001
+                account_id=account.id,
+                machine_id=args.machine,
+                appids=tuple(game.appid for game in snapshot.games),
+            )
+            if args.include_names else {}
+        )
     value, metadata = _account_snapshot_completeness(
         snapshot, capability="wishlist.read", subject="Wishlist items"
     )
@@ -7074,6 +7118,10 @@ def _dispatch_wishlist_games_query(
                     "appid": game.appid,
                     "game_id": f"game:{stable_ids[game.appid]}",
                     "wishlisted": True,
+                    **(
+                        names.get(game.appid, {"name": None, "name_source": None})
+                        if args.include_names else {}
+                    ),
                     "priority": game.priority,
                     "date_added_unix": game.date_added,
                     "observed_at": game.observed_at,
@@ -7113,7 +7161,7 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
             message="--include-paths is available only for installed-scope queries.",
             exit_code=2,
         )
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -7260,6 +7308,8 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
                 items = [
                     item for item in items if item["playtime_state"] == args.playtime
                 ]
+            if args.appid:
+                items = [item for item in items if item["appid"] in args.appid]
             return _emit_success(
                 args,
                 command="games.query",
@@ -7435,7 +7485,7 @@ def _dispatch_account_games_query(args: argparse.Namespace, database_path: Path)
 
 
 def _dispatch_feedback(args: argparse.Namespace, database_path: Path) -> int:
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -7599,7 +7649,7 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
                 message="Local system-profile deletion requires exactly --machine.",
                 exit_code=2,
             )
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             deletion = storage.delete_system_profile_data(args.machine)
         return _emit_success(
             args,
@@ -7625,7 +7675,7 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
     if args.provider in {"gg-deals", "cheapshark"}:
         return _delete_price_provider_data(args, database_path)
     if args.provider == "steam-store-appdetails":
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = (
                     None if args.account is None else storage.get_account(args.account)
@@ -7666,7 +7716,7 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.provider == "steam-store-reviews":
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             try:
                 account = (
                     None if args.account is None else storage.get_account(args.account)
@@ -7705,7 +7755,7 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
         )
     with _credential_operation_lock(database_path):
         if args.account is not None:
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 try:
                     account = storage.get_account(args.account)
                 except ValueError:
@@ -7790,7 +7840,7 @@ def _dispatch_data(args: argparse.Namespace, database_path: Path) -> int:
 def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -> int:
     with _credential_operation_lock(database_path):
         if args.account is not None:
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 try:
                     account = storage.get_account(args.account)
                 except ValueError:
@@ -7850,7 +7900,7 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
             credential_ref = _provider_credential_ref(
                 database_path, _CREDENTIAL_PROVIDERS["gg-deals"]
             )
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 metadata = storage.get_credential_reference(
                     provider=credential_ref.provider,
                     kind=credential_ref.kind,
@@ -7871,7 +7921,7 @@ def _delete_price_provider_data(args: argparse.Namespace, database_path: Path) -
                 if not store.delete(credential_ref):
                     raise CredentialError(str(ErrorCode.CREDENTIAL_DELETE_FAILED))
                 credential_deleted = True
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 deletion = storage.delete_price_data(
                     provider=args.provider,
                     credential_kind=(None if metadata is None else credential_ref.kind),
@@ -7926,7 +7976,7 @@ def _delete_all_steam_web_api_data(
     args: argparse.Namespace, database_path: Path
 ) -> int:
     credential_ref = _steam_credential_ref(database_path)
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         metadata = storage.get_credential_reference(
             provider=credential_ref.provider,
             kind=credential_ref.kind,
@@ -7949,7 +7999,7 @@ def _delete_all_steam_web_api_data(
             if not store.delete(credential_ref):
                 raise CredentialError(str(ErrorCode.CREDENTIAL_DELETE_FAILED))
             credential_deleted = True
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             deletion = storage.delete_all_steam_account_data(
                 credential_provider=(
                     None if metadata is None else credential_ref.provider
@@ -8106,33 +8156,30 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
             },
         )
     if args.accounts_command == "configure":
-        discovery = discover_local_accounts(_account_steam_root(args))
         if args.from_local_most_recent:
+            discovery = discover_local_accounts(_account_steam_root(args))
             selected = select_primary_local_account(discovery)
+            steam_id64 = selected.steam_id64
+            source_kind = discovery.source_kind
         else:
-            selected = next(
-                (
-                    candidate
-                    for candidate in discovery.candidates
-                    if candidate.steam_id64 == args.steam_id64
-                ),
-                None,
-            )
-            if selected is None:
+            try:
+                steam_id64 = validate_steam_id64(args.steam_id64)
+            except ValueError:
                 return _emit_error(
                     args,
                     command="accounts.configure",
-                    code=ErrorCode.ACCOUNT_SELECTION_NOT_FOUND,
-                    message="The selected Steam identity is not present in the local registry.",
-                    remediation="Run accounts discover --include-identifiers and choose a listed identity.",
+                    code=ErrorCode.INVALID_ARGUMENT,
+                    message="SteamID64 must be a positive decimal integer within the uint64 range.",
                     exit_code=2,
                 )
+            source_kind = "explicit_steam_id"
         try:
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 account = storage.configure_steam_account(
                     alias=args.alias,
-                    steam_id64=selected.steam_id64,
+                    steam_id64=steam_id64,
                     configured_at=_utc_now(),
+                    source_kind=source_kind,
                 )
         except ValueError:
             return _emit_error(
@@ -8155,7 +8202,7 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
         )
     if args.accounts_command == "status":
         try:
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 account = storage.get_account(args.alias)
         except ValueError:
             return _emit_error(
@@ -8200,7 +8247,7 @@ def _dispatch_accounts_locked(args: argparse.Namespace, database_path: Path) -> 
                 message="Account removal requires --yes.",
             )
         try:
-            with Storage(database_path) as storage:
+            with Storage(database_path, clock=_utc_now) as storage:
                 account = storage.get_account(args.alias)
                 deletion = (
                     None
@@ -8347,7 +8394,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                 exit_code=2,
             )
         secret = SecretValue(first)
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             existing = storage.get_credential_reference(
                 provider=credential_ref.provider,
                 kind=credential_ref.kind,
@@ -8405,7 +8452,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.auth_command == "status":
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             metadata = storage.get_credential_reference(
                 provider=credential_ref.provider,
                 kind=credential_ref.kind,
@@ -8442,7 +8489,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
             },
         )
     if args.auth_command == "probe":
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             metadata = storage.get_credential_reference(
                 provider=credential_ref.provider,
                 kind=credential_ref.kind,
@@ -8515,7 +8562,7 @@ def _dispatch_auth_locked(args: argparse.Namespace, database_path: Path) -> int:
                 code=ErrorCode.CONFIRMATION_REQUIRED,
                 message="Credential removal requires --yes.",
             )
-        with Storage(database_path) as storage:
+        with Storage(database_path, clock=_utc_now) as storage:
             metadata = storage.get_credential_reference(
                 provider=credential_ref.provider,
                 kind=credential_ref.kind,
@@ -8579,7 +8626,7 @@ def _dispatch_owned(args: argparse.Namespace, database_path: Path) -> int:
 
 def _dispatch_owned_locked(args: argparse.Namespace, database_path: Path) -> int:
     credential_ref = _steam_credential_ref(database_path)
-    with Storage(database_path) as storage:
+    with Storage(database_path, clock=_utc_now) as storage:
         try:
             account = storage.get_account(args.account)
         except ValueError:
@@ -8986,7 +9033,7 @@ def _reserve_provider_request(
     requested_at: datetime,
     minimum_interval_seconds: float,
 ) -> bool:
-    with Storage(_provider_budget_database_path()) as storage:
+    with Storage(_provider_budget_database_path(), clock=_utc_now) as storage:
         return storage.reserve_provider_request(
             provider=provider,
             budget_scope="user-key",
@@ -8996,7 +9043,7 @@ def _reserve_provider_request(
 
 
 def _defer_cheapshark_requests(retry_after_seconds: int) -> None:
-    with Storage(_provider_budget_database_path()) as storage:
+    with Storage(_provider_budget_database_path(), clock=_utc_now) as storage:
         storage.defer_provider_requests(
             provider="cheapshark",
             budget_scope="user-key",
@@ -9022,6 +9069,14 @@ def _emit_success(
     completeness_value: dict[str, Any] | None = None,
     generated_at: datetime | None = None,
 ) -> int:
+    if command == "games.query" and args.appid:
+        requested = sorted(set(args.appid))
+        items = [item for item in data["items"] if item["appid"] in requested]
+        data = {**data, "items": items}
+        if "empty" in data and args.scope != "owned":
+            metadata = data.get("snapshot", {})
+            data["empty"] = bool(metadata.get("last_successful_sync_at") and not items)
+        context = {**(context or {}), "appid_filter": requested}
     envelope = success_envelope(
         command=command,
         data=data,
@@ -9074,6 +9129,7 @@ def _command_name(args: argparse.Namespace) -> str:
         "sync_command",
         "games_command",
         "deals_command",
+        "wishlist_command",
         "accounts_command",
         "auth_command",
         "owned_command",

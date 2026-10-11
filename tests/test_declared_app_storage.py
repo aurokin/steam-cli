@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import json
 from pathlib import Path
 import sqlite3
@@ -19,7 +21,47 @@ T0 = "2026-07-10T12:00:00Z"
 T1 = "2026-07-10T12:01:00Z"
 T2 = "2026-07-10T12:02:00Z"
 T3 = "2026-07-10T12:03:00Z"
+NOW = datetime(2026, 7, 10, 12, 3, tzinfo=timezone.utc)
 FIXTURES = Path(__file__).parent / "fixtures" / "steam_declared_facts"
+
+
+@pytest.mark.parametrize("count,maximum_selects", [(100, 12), (1000, 17)])
+def test_declared_demand_eligibility_and_identity_reads_scale_by_chunk(
+    configured: tuple[Storage, int], count: int, maximum_selects: int,
+) -> None:
+    storage, account_id = configured
+    statements: list[str] = []
+    storage._connection.set_trace_callback(statements.append)  # noqa: SLF001
+    try:
+        run, candidates, targeted = begin(storage, account_id, list(range(1, count + 1)), maximum=1)
+    finally:
+        storage._connection.set_trace_callback(None)  # noqa: SLF001
+    assert candidates == tuple(range(1, count + 1))
+    assert targeted == (1,)
+    assert len(demand_rows(storage, run.id)) == count
+    selects = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
+    assert len(selects) <= maximum_selects
+
+
+def test_scheduler_chunks_eligibility_below_sqlite_parameter_limit(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    previous = storage._connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 24)  # noqa: SLF001
+    try:
+        first, candidates, targeted = begin(storage, account_id, list(range(1, 101)), maximum=1)
+        assert candidates == tuple(range(1, 101))
+        assert targeted == (1,)
+        second, candidates, targeted = begin(storage, account_id, list(range(1, 101)), maximum=1, at=T1)
+        assert candidates == tuple(range(2, 101))
+        assert targeted == (2,)
+        rows = demand_rows(storage, second.id)
+        assert rows[0]["error_code"] == "ACTIVE_REQUEST"
+        assert rows[1]["targeted"] == 1
+        assert all(row["error_code"] == "MAX_ITEMS_LIMIT" for row in rows[2:])
+        assert storage.get_sync_run(first.id).status == "running"
+    finally:
+        storage._connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)  # noqa: SLF001
 
 
 class FixtureTransport:
@@ -37,7 +79,7 @@ class FixtureTransport:
 
 @pytest.fixture
 def configured(tmp_path: Path) -> tuple[Storage, int]:
-    with Storage(tmp_path / "steam-agent.sqlite3") as database:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as database:
         database.upsert_machine(
             Machine("desktop", "Gaming PC", "linux", "x86_64"), observed_at=T0
         )
@@ -98,7 +140,7 @@ def demand_rows(storage: Storage, run_id: int) -> list[dict[str, object]]:
 def test_v02_migration_allows_legacy_and_expanded_projection_ids(
     tmp_path: Path,
 ) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         sql = storage._connection.execute(  # noqa: SLF001
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='declared_app_current'"
         ).fetchone()[0]
@@ -867,8 +909,9 @@ def test_opening_storage_prunes_expired_declared_private_lineage(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "steam-agent.sqlite3"
-    old = "2020-01-01T00:00:00Z"
-    with Storage(path) as storage:
+    seeded_at = NOW - timedelta(days=30)
+    old = seeded_at.isoformat().replace("+00:00", "Z")
+    with Storage(path, clock=lambda: seeded_at) as storage:
         storage.upsert_machine(
             Machine("desktop", "Gaming PC", "linux", "x86_64"),
             observed_at=old,
@@ -895,7 +938,15 @@ def test_opening_storage_prunes_expired_declared_private_lineage(
         )
         storage.finish_declared_app_sync(run.id, completed_at=old)
 
-    with Storage(path) as reopened:
+    with Storage(path, clock=lambda: NOW) as boundary:
+        assert boundary._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_current"
+        ).fetchone()[0] == 1
+        assert boundary._connection.execute(  # noqa: SLF001
+            "SELECT COUNT(*) FROM declared_app_sync_demand"
+        ).fetchone()[0] == 1
+
+    with Storage(path, clock=lambda: NOW + timedelta(seconds=1)) as reopened:
         assert (
             reopened._connection.execute(  # noqa: SLF001
                 "SELECT COUNT(*) FROM declared_app_current"
@@ -916,7 +967,7 @@ def test_declared_retention_chunks_orphan_reclaim_to_sqlite_variable_limit(
     path = tmp_path / "steam-agent.sqlite3"
     old = "2020-01-01T00:00:00Z"
     appids = tuple(range(1, 26))
-    with Storage(path) as storage:
+    with Storage(path, clock=lambda: NOW) as storage:
         storage._connection.executemany(  # noqa: SLF001 - retention fixture
             """INSERT INTO steam_apps(appid,name,app_type,updated_at)
                VALUES (?,NULL,'unknown',?)""",
@@ -966,7 +1017,7 @@ def test_retention_prunes_old_private_run_while_preserving_fresh_public_fact(
     started = "2026-06-01T00:00:00Z"
     observed = "2026-07-20T00:00:00Z"
     pruned_at = "2026-08-01T00:00:00Z"
-    with Storage(path) as storage:
+    with Storage(path, clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("desktop", "Gaming PC", "linux", "x86_64"),
             observed_at=started,
@@ -1154,3 +1205,46 @@ def test_narrower_later_sync_does_not_mask_per_app_attempt_lineage(
     assert snapshot["latest_demand"][0]["error_code"] == "FRESH_LAST_GOOD"
     assert snapshot["latest_demand"][1]["sync_run_id"] == broad.id
     assert snapshot["latest_demand"][1]["state"] == "ready"
+
+
+def test_declared_read_defaults_use_injected_clock_and_keep_explicit_as_of(
+    configured: tuple[Storage, int],
+) -> None:
+    storage, account_id = configured
+    run, _, _ = begin(storage, account_id, [400])
+    storage.record_declared_app_result(
+        run.id,
+        account_id=account_id,
+        appid=400,
+        state="ready",
+        facts=payload(400),
+        observed_at=T1,
+    )
+    storage.finish_declared_app_sync(run.id, completed_at=T1)
+    with Storage(storage.path, readonly=True, clock=lambda: NOW) as reader:
+        context = {
+            "account_id": account_id,
+            "machine_id": "desktop",
+            "country": "US",
+            "language": "english",
+            "appids": [400],
+        }
+        default = reader.read_declared_app_snapshot(**context)
+        explicit = reader.read_declared_app_snapshot(
+            **context, as_of=NOW + timedelta(days=31)
+        )
+
+    assert default["items"][0]["facts"] is not None
+    assert explicit["items"] == ({"appid": 400, "facts": None},)
+
+
+def test_storage_clock_normalizes_aware_time_and_rejects_naive_time() -> None:
+    offset_now = NOW.astimezone(timezone(timedelta(hours=-6)))
+    with Storage(":memory:", clock=lambda: offset_now) as storage:
+        timestamps = storage._connection.execute(  # noqa: SLF001
+            "SELECT DISTINCT applied_at FROM schema_migrations"
+        ).fetchall()
+    assert [row[0] for row in timestamps] == [T3]
+
+    with pytest.raises(ValueError, match="storage clock must include a timezone"):
+        Storage(":memory:", clock=lambda: NOW.replace(tzinfo=None))

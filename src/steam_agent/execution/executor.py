@@ -9,12 +9,13 @@ verification only ever reports what manifests actually show.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Callable, Iterator, Literal
 
 from steam_agent.execution.content_plane import (
     AdoptionError,
@@ -29,8 +30,9 @@ from steam_agent.execution.content_plane import (
     manifest_state_flags,
     reconcile_adoption,
 )
-from steam_agent.execution.ledger import ExecutionLedger
-from steam_agent.execution.linux_session import LinuxSession
+from steam_agent.execution.ledger import ExecutionLedger, LedgerOperation
+from steam_agent.execution.locking import FileLockError, acquire_file_lock
+from steam_agent.execution.sessions import SessionProtocol
 
 ExecuteOutcome = Literal[
     "confirmed",
@@ -137,10 +139,13 @@ class Executor:
         self,
         *,
         ledger: ExecutionLedger,
-        session: LinuxSession,
-        content: SteamcmdAdapter,
+        session: SessionProtocol,
+        content: SteamcmdAdapter | None,
         library: Path,
         state_dir: Path,
+        lock_path: Path | None = None,
+        account_login: Callable[[str], str | None] | None = None,
+        dispatch_policy: Callable[[LedgerOperation], str | None] | None = None,
     ) -> None:
         self._ledger = ledger
         self._session = session
@@ -148,50 +153,49 @@ class Executor:
         self._library = library
         self._state_dir = state_dir
         self._journal_dir = state_dir / "journal"
+        self._lock_path = lock_path
+        self._account_login = account_login
+        self._dispatch_policy = dispatch_policy
 
-    def _lock(self) -> object:
+    def _lock(self) -> BinaryIO:
         # One lock per user, not per library or state dir: a single Steam
         # client manages every configured library, so brokers targeting
         # different libraries still contend for the same global client
         # (stop/start) and must serialize.  Keyed by euid so unrelated
         # users on a shared host do not contend.
-        # Fixed /tmp, not tempfile.gettempdir(): TMPDIR is caller-controlled
-        # and a per-process value would defeat cross-broker serialization.
-        lock_path = Path("/tmp") / f"steam-broker-u{os.geteuid()}.lock"
-        # /tmp is shared: O_NOFOLLOW refuses a planted symlink outright,
-        # ownership is checked on the opened inode, and the directory entry
-        # is re-lstat'ed after locking so an unlink/replace cannot yield two
-        # holders.  All failures are fail-closed (no execution), never
-        # fail-open.  The sticky bit stops others unlinking our own file.
+        # POSIX uses fixed /tmp, not the caller-controlled TMPDIR. Windows
+        # uses the user's LocalAppData so separate broker configurations
+        # still share one lock. Tests inject a private path.
+        lock_path = self._lock_path
+        if lock_path is None:
+            if os.name == "nt":
+                local = os.environ.get("LOCALAPPDATA")
+                root = Path(local) if local else Path.home() / "AppData" / "Local"
+                lock_path = root / "steam-agent-broker" / "execution.lock"
+                try:
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as error:
+                    raise ExecutorLockedError("cannot create the execution lock directory") from error
+            else:
+                lock_path = Path("/tmp") / f"steam-broker-u{os.geteuid()}.lock"
         try:
-            descriptor = os.open(
-                lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
-            )
-        except OSError as error:
-            raise ExecutorLockedError("cannot open the lock file safely") from error
-        handle = os.fdopen(descriptor, "r+")
-        try:
-            opened = os.fstat(descriptor)
-            if opened.st_uid not in (os.geteuid(), 0):
-                raise ExecutorLockedError("lock file owned by another user")
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            current = os.lstat(lock_path)
-            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-                raise ExecutorLockedError("lock file was replaced concurrently")
-        except OSError as error:
-            handle.close()
-            raise ExecutorLockedError("another execution holds the lock") from error
-        except ExecutorLockedError:
-            handle.close()
-            raise
-        return handle
+            return acquire_file_lock(lock_path)
+        except FileLockError as error:
+            raise ExecutorLockedError(str(error)) from error
 
     def execute(self, operation_id: int) -> ExecutionReport:
+        with self.execution_lock():
+            return self._execute_locked(operation_id)
+
+    @contextmanager
+    def execution_lock(self) -> Iterator[None]:
+        """Serialize all client-plane actions with content maintenance."""
+
         lock = self._lock()
         try:
-            return self._execute_locked(operation_id)
+            yield
         finally:
-            lock.close()  # type: ignore[attr-defined]
+            lock.close()
 
     def _execute_locked(self, operation_id: int) -> ExecutionReport:
         ledger = self._ledger
@@ -203,6 +207,35 @@ class Executor:
             )
         if operation.operation == "launch":
             return self._launch(operation_id, operation)
+        if operation.operation not in {"install", "verify"}:
+            return ExecutionReport(
+                operation_id, "aborted", "operation requires a different executor"
+            )
+        if sys.platform == "win32":
+            # Direct construction must not bypass ClientExecutor's release
+            # gate and enter POSIX ownership/adoption code on Windows.
+            from steam_agent.execution.content_backend import WindowsContentBackend
+
+            return ExecutionReport(operation_id, "deferred", WindowsContentBackend.release_denial())
+        if self._content is None:
+            return ExecutionReport(
+                operation_id, "deferred", "content execution is not provisioned"
+            )
+        denial = self._content_policy_denial(operation)
+        if denial is not None:
+            return self._defer_content_policy(operation, denial)
+        # A planner alias is not necessarily a Steam login. Provisioned
+        # brokers resolve it explicitly before taking a maintenance lease;
+        # direct legacy callers retain their existing login argument.
+        steam_login = (
+            self._account_login(operation.account_alias)
+            if self._account_login is not None
+            else operation.account_alias
+        )
+        if not steam_login:
+            return ExecutionReport(
+                operation_id, "deferred", "account has no provisioned Steam login"
+            )
         if not ledger.window_valid(operation_id):
             ledger.expire_lapsed()
             if resuming:
@@ -470,7 +503,11 @@ class Executor:
 
         if resuming:
             prior_running = operation.prior_client_running or False
-            if self._session.client_possibly_running() and not self._session.stop_client():
+            client_running = self._session.client_possibly_running()
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._defer_content_policy(operation, denial)
+            if client_running and not self._session.stop_client():
                 # The failed stop may still have taken down the main process
                 # (helper lingering, probe error); restore the recorded prior
                 # state rather than leave the client half stopped.  Best
@@ -493,12 +530,25 @@ class Executor:
                     "client presence unknown (probe error); deferred",
                 )
             prior_running = gates.client_running == "fail"
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._defer_content_policy(operation, denial)
             ledger.transition(
                 operation_id,
                 "lease_acquired",
                 prior_client_running=prior_running,
             )
             ledger.transition(operation_id, "client_stopping")
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._finish_failure(
+                    operation_id,
+                    prior_running,
+                    detail=denial,
+                    message=denial,
+                    outcome="aborted",
+                    to_state="aborted",
+                )
             if prior_running and not self._session.stop_client():
                 # The main process may already be gone with a helper (or a
                 # probe error) lingering.  A second -silent start is safe:
@@ -551,20 +601,64 @@ class Executor:
                 to_state="aborted",
             )
 
+        denial = self._content_policy_denial(operation)
+        if denial is not None:
+            return self._finish_failure(
+                operation_id,
+                prior_running,
+                detail=denial,
+                message=denial,
+                outcome="aborted",
+                to_state="aborted",
+            )
         ledger.transition(
             operation_id,
             "content_running",
             detail="resume" if resuming else None,
         )
+        poll_denial: str | None = None
+
+        def abort_content() -> bool:
+            # Latch revocation: a subsequent policy edit cannot authorize
+            # adopting the partial content after steamcmd was stopped.
+            nonlocal poll_denial
+            poll_denial = self._content_policy_denial(operation) or poll_denial
+            return (
+                poll_denial is not None
+                or self._session.client_possibly_running()
+                or not ledger.window_valid(operation_id)
+                or self._library_identity() != library_identity
+            )
+
         try:
             # Durable ownership evidence BEFORE steamcmd can write anything:
             # a run that fails after a partial download leaves no nested
             # manifest, and without this record every fresh retry would fail
             # the not-owned check above until the directory was removed by
             # hand.
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._finish_failure(
+                    operation_id,
+                    prior_running,
+                    detail=denial,
+                    message=denial,
+                    outcome="aborted",
+                    to_state="aborted",
+                )
             self._record_owned_dir(operation.appid, install_dir_name, target)
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._finish_failure(
+                    operation_id,
+                    prior_running,
+                    detail=denial,
+                    message=denial,
+                    outcome="aborted",
+                    to_state="aborted",
+                )
             result = self._content.install(
-                account=operation.account_alias,
+                account=steam_login,
                 appid=operation.appid,
                 install_dir=target,
                 operation_id=operation_id,
@@ -572,12 +666,9 @@ class Executor:
                 # The adapter polls this and kills steamcmd promptly: a
                 # client relaunched mid-download is a concurrent writer, and
                 # a lapsed window ends the authorization for further content
-                # writes — neither may wait for the post-download checks.
-                abort_when=lambda: (
-                    self._session.client_possibly_running()
-                    or not ledger.window_valid(operation_id)
-                    or self._library_identity() != library_identity
-                ),
+                # writes. Revoked/unreadable policy is the owner's kill
+                # switch and must also stop an already-running download.
+                abort_when=abort_content,
             )
         except _TargetEscapedError:
             return self._finish_failure(
@@ -603,6 +694,11 @@ class Executor:
         # Restore the client before recording a terminal state: a crash in
         # between then leaves a non-terminal row that reconciliation still
         # owns, instead of a terminal row with the client silently stopped.
+        denial = poll_denial or self._content_policy_denial(operation)
+        if denial is not None:
+            return self._finish_failure(
+                operation_id, prior_running, detail=denial, message=denial
+            )
         if result.outcome == "auth_required":
             return self._finish_failure(
                 operation_id,
@@ -671,6 +767,11 @@ class Executor:
         # respawns between this probe and the millisecond-scale adoption is
         # an accepted residual race (Steam startup takes seconds).
         if self._session.client_possibly_running():
+            denial = self._content_policy_denial(operation)
+            if denial is not None:
+                return self._finish_failure(
+                    operation_id, prior_running, detail=denial, message=denial
+                )
             stopped = self._session.stop_client()
             if not stopped or self._session.client_possibly_running():
                 # The failed stop may still have killed the main process
@@ -682,6 +783,13 @@ class Executor:
                     message="client restarted mid-operation; adoption skipped",
                 )
 
+        # Manifest reads and lease/client probes can take time. Re-read the
+        # policy after them, immediately before committing adoption intent.
+        denial = self._content_policy_denial(operation)
+        if denial is not None:
+            return self._finish_failure(
+                operation_id, prior_running, detail=denial, message=denial
+            )
         ledger.transition(operation_id, "adopting")
         try:
             adopted = adopt_manifest(
@@ -826,12 +934,12 @@ class Executor:
     # nested manifest exists yet to prove ownership).  Retired once a
     # steamcmd-written manifest provides real evidence.
 
-    def _launch(self, operation_id: int, operation) -> ExecutionReport:
+    def _launch(self, operation_id: int, operation: LedgerOperation) -> ExecutionReport:
         """Ask the client to start one allowlisted game (Phase 2c).
 
-        Nothing here touches content: no lease, no steamcmd, no manifest,
-        and no resume — an interrupted launch has no half-done state to
-        recover, so the row simply stays authorized until it lapses.
+        Nothing here touches content. Dispatch intent is durable before the
+        external command; a crash after intent is unconfirmed and never
+        replayed, because the client may already have accepted the request.
         """
 
         ledger = self._ledger
@@ -866,21 +974,53 @@ class Executor:
             return ExecutionReport(
                 operation_id, "deferred", "client would not start; deferred"
             )
+        # Startup can take 90 seconds. Recheck human activity after it, then
+        # authorization after the probes, before committing dispatch intent.
+        gates = self._session.gates()
+        if gates.game_running != "pass" or gates.remote_play != "pass":
+            return ExecutionReport(
+                operation_id, "deferred", "session became busy before launch; deferred"
+            )
+        if gates.client_running != "fail":
+            return ExecutionReport(
+                operation_id, "deferred", "client presence not confirmed before launch"
+            )
+        if not ledger.window_valid(operation_id):
+            ledger.expire_lapsed()
+            return ExecutionReport(
+                operation_id, "aborted", "execution window lapsed before launch dispatch"
+            )
+        if self._dispatch_policy is not None:
+            denial = self._dispatch_policy(operation)
+            if denial is not None:
+                ledger.transition(
+                    operation_id,
+                    "aborted",
+                    detail=denial,
+                    expected_from="authorized",
+                )
+                return ExecutionReport(operation_id, "aborted", denial)
+        ledger.transition(
+            operation_id,
+            "dispatch_pending",
+            detail="launch dispatch intent recorded",
+            expected_from="authorized",
+        )
         if not self._session.launch_app(operation.appid):
             ledger.transition(
                 operation_id,
-                "aborted",
-                detail="client rejected the launch request",
-                expected_from="authorized",
+                "unconfirmed",
+                detail="launch command did not acknowledge acceptance; not replayable",
+                expected_from="dispatch_pending",
             )
             return ExecutionReport(
-                operation_id, "aborted", "client rejected the launch request"
+                operation_id, "unconfirmed", "launch acceptance unknown; request will not be replayed"
             )
         ledger.transition(
             operation_id,
             "dispatched",
             detail="launch requested; playability not observed",
-            expected_from="authorized",
+            expected_from="dispatch_pending",
         )
         return ExecutionReport(
             operation_id,
@@ -888,6 +1028,40 @@ class Executor:
             "launch requested; this broker does not observe whether the"
             " game became playable",
         )
+
+    def _content_policy_denial(self, operation: LedgerOperation) -> str | None:
+        """Re-read owner intent without exposing callback errors or private text.
+
+        Recovery deliberately does not use this gate: an existing adoption
+        journal and prior client state must remain repairable under deny.
+        """
+
+        if self._dispatch_policy is None:
+            return None
+        try:
+            denial = self._dispatch_policy(operation)
+        except Exception:
+            return "content policy unreadable"
+        if denial is None:
+            return None
+        if denial == "policy unreadable before dispatch":
+            return "content policy unreadable"
+        return "content policy denied"
+
+    def _defer_content_policy(
+        self, operation: LedgerOperation, denial: str
+    ) -> ExecutionReport:
+        # Interrupted content may have left Steam stopped. Restore it while
+        # retaining the retryable row; policy may allow a later resume.
+        if operation.prior_client_running and self._session.steamcmd_running():
+            return ExecutionReport(
+                operation.operation_id,
+                "deferred",
+                f"{denial}; steamcmd may still be running; client restore deferred",
+            )
+        if not self._restore_client(operation.prior_client_running):
+            denial += "; client restore failed; state left for retry"
+        return ExecutionReport(operation.operation_id, "deferred", denial)
 
     def _owned_marker(self, appid: int) -> Path:
         return self._state_dir / "owned" / f"{appid}.json"
@@ -979,7 +1153,17 @@ class Executor:
         )
 
     def _restore_client(self, prior_running: bool | None) -> bool:
-        """Restore prior client run-state; False means a restart was needed but failed."""
+        """Restore only after a surviving content writer is ruled out.
+
+        Even a previously stopped client needs this check: terminalizing while
+        a writer survives would retire the row that owns later recovery.
+        """
+
+        try:
+            if self._session.steamcmd_running():
+                return False
+        except Exception:
+            return False
 
         if not prior_running:
             return True
@@ -1045,7 +1229,7 @@ class Executor:
             operation = self._ledger.get(operation_id)
             return self._restore_client(operation.prior_client_running)
         finally:
-            lock.close()  # type: ignore[attr-defined]
+            lock.close()
 
     def _verified_outcome(
         self, appid: int, prior_running: bool | None
@@ -1080,11 +1264,16 @@ class Executor:
         try:
             return self._reconcile_locked()
         finally:
-            lock.close()  # type: ignore[attr-defined]
+            lock.close()
 
     def _reconcile_locked(self) -> list[str]:
         actions: list[str] = []
         ledger = self._ledger
+        active = ledger.active()
+        if sys.platform == "win32" and active is not None and active.operation in {"install", "verify"}:
+            # Legacy POSIX or candidate Windows pending state needs its own
+            # qualified recovery coordinator; neither is guessed here.
+            return [f"{active.operation_id}: Windows content recovery unqualified; deferred"]
         ledger.expire_lapsed()
         active = ledger.active()
         if active is None:
@@ -1105,6 +1294,15 @@ class Executor:
 
         if state in {"pending_confirmation", "authorized"}:
             return actions  # no side effects yet; expiry alone governs
+        if state == "dispatch_pending":
+            ledger.transition(
+                operation_id,
+                "unconfirmed",
+                detail="reconciled: dispatch acceptance unknown; not replayable",
+                expected_from="dispatch_pending",
+            )
+            actions.append(f"{operation_id}: dispatch acceptance unknown -> unconfirmed")
+            return actions
         if state in {"lease_acquired", "client_stopping"}:
             if not restore():
                 return actions

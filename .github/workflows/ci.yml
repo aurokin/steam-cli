@@ -36,3 +36,27 @@ jobs:
         run: uv build
       - name: Smoke-test the installed wheel
         run: uv run python scripts/package_smoke.py
+
+  portable-client:
+    name: Client adapters (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+      - name: Install locked development environment
+        run: uv sync --dev --locked
+      - name: Test portable client contracts
+        run: uv run pytest -q tests/test_execution_runtime.py tests/test_execution_windows_session.py tests/test_execution_locking.py tests/test_execution_ledger.py tests/test_execution_agent_workflows.py tests/test_execution_agent_requests.py tests/test_execution_desktop_bridge.py tests/test_capability_catalog.py tests/test_broker_agent_interface.py tests/test_process_environment.py tests/test_windows_filesystem.py tests/test_windows_owned_process.py tests/test_windows_process_cleanup.py tests/test_windows_content_backend.py tests/test_windows_state_provisioning.py tests/test_desktop_scheduler_dates.py tests/test_windows_stop_qualification.py tests/test_windows_runtime_environment.py tests/test_output_capture.py tests/test_explicit_accounts.py
+      - name: Build source and wheel distributions
+        run: uv build
+      - name: Smoke-test the installed wheel
+        run: uv run python scripts/package_smoke.py

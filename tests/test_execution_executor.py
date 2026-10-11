@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import itertools
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ from steam_agent.execution.executor import (
     ExecutorLockedError,
     safe_install_dir_name,
 )
-from steam_agent.execution.ledger import ExecutionLedger
+from steam_agent.execution.ledger import ExecutionLedger, LedgerOperation
 from steam_agent.execution.linux_session import LeaseGates
 
 _MANIFEST = '''"AppState"
@@ -92,6 +93,7 @@ class FakeContent:
     log_dir: Path = field(default_factory=Path)
     write_manifest: bool = True
     validated: bool | None = None
+    login: str | None = None
 
     def install(
         self,
@@ -104,6 +106,7 @@ class FakeContent:
         abort_when=None,
     ) -> ContentResult:
         self.validated = validate
+        self.login = account
         log_path = self.log_dir / f"install-{appid}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("log", encoding="utf-8")
@@ -130,6 +133,7 @@ def harness(tmp_path: Path):
         content=content,
         library=library,
         state_dir=state_dir,
+        lock_path=tmp_path / "execution.lock",
     )
     yield ledger, session, content, executor, library
     ledger.close()
@@ -161,6 +165,271 @@ def _authorized(
         policy_version="v",
     )
     return ledger.confirm(nonce=nonce, actor="discord:owner")
+
+
+@dataclass
+class RevocableContentPolicy:
+    failure: str
+    denied: bool = False
+    checked_operations: list[str] = field(default_factory=list)
+
+    def __call__(self, operation: LedgerOperation) -> str | None:
+        self.checked_operations.append(operation.operation)
+        if not self.denied:
+            return None
+        if self.failure == "exception":
+            raise OSError("synthetic-private-policy-error")
+        if self.failure == "unreadable":
+            return "policy unreadable before dispatch"
+        return "synthetic-private-policy-denial"
+
+
+def _content_operation(
+    ledger: ExecutionLedger, library: Path, operation: str
+) -> int:
+    if operation == "verify":
+        (library / "steamapps" / "appmanifest_480.acf").write_text(
+            _MANIFEST, encoding="utf-8"
+        )
+        installed = library / "steamapps" / "common" / "Spacewar"
+        installed.mkdir(parents=True)
+        (installed / "game.bin").write_bytes(b"content")
+    return _authorized(ledger, operation=operation)
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+@pytest.mark.parametrize("failure", ["revoked", "unreadable", "exception"])
+@pytest.mark.parametrize("resuming", [False, True])
+def test_content_denied_policy_defers_without_new_effects(
+    harness, operation, failure, resuming
+) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    if resuming:
+        ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+        for state in ("client_stopping", "content_running", "interrupted"):
+            ledger.transition(operation_id, state)
+        session.running = False
+    policy = RevocableContentPolicy(failure, denied=True)
+    executor._dispatch_policy = policy
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert "content policy" in report.detail
+    assert "synthetic-private" not in report.detail
+    assert policy.checked_operations == [operation]
+    assert ledger.get(operation_id).state == ("interrupted" if resuming else "authorized")
+    assert session.stops == 0
+    assert session.starts == int(resuming)
+    assert session.running
+    assert content.validated is None
+    assert not executor._owned_marker(480).exists()
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+def test_content_rechecks_policy_after_intake_before_shutdown(harness, operation) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    policy = RevocableContentPolicy("revoked")
+    executor._dispatch_policy = policy
+    original_gates = session.gates
+
+    def gates_after_revocation():
+        policy.denied = True
+        return original_gates()
+
+    session.gates = gates_after_revocation
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert ledger.get(operation_id).state == "authorized"
+    assert session.stops == 0
+    assert content.validated is None
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+@pytest.mark.parametrize("failure", ["revoked", "unreadable", "exception"])
+@pytest.mark.parametrize(
+    "phase", ["stop", "content_intent", "ownership_recorded", "poll", "download", "late_probe"]
+)
+def test_content_policy_change_restores_client_and_prevents_adoption(
+    harness, monkeypatch, operation, failure, phase
+) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    destination = library / "steamapps" / "appmanifest_480.acf"
+    original_manifest = destination.read_bytes() if destination.exists() else None
+    target = library / "steamapps" / "common" / "Spacewar"
+    policy = RevocableContentPolicy(failure)
+    executor._dispatch_policy = policy
+
+    if phase == "stop":
+        original_stop = session.stop_client
+
+        def stop_after_revocation():
+            stopped = original_stop()
+            policy.denied = True
+            return stopped
+
+        session.stop_client = stop_after_revocation
+    elif phase == "content_intent":
+        original_transition = ledger.transition
+
+        def transition_after_revocation(oid, state, **kwargs):
+            result = original_transition(oid, state, **kwargs)
+            if state == "content_running":
+                policy.denied = True
+            return result
+
+        monkeypatch.setattr(ledger, "transition", transition_after_revocation)
+    elif phase == "ownership_recorded":
+        original_record = executor._record_owned_dir
+
+        def record_after_revocation(*args):
+            original_record(*args)
+            policy.denied = True
+
+        monkeypatch.setattr(executor, "_record_owned_dir", record_after_revocation)
+    else:
+        original_install = content.install
+
+        def install_with_revocation(**kwargs):
+            if phase == "poll":
+                partial = kwargs["install_dir"] / "partial.bin"
+                partial.write_bytes(b"partial")
+                assert kwargs["abort_when"]() is False
+                policy.denied = True
+                assert kwargs["abort_when"]() is True
+                # A later edit must not erase the abort observed during the
+                # run, even if an adapter then reports success.
+                policy.denied = False
+                assert kwargs["abort_when"]() is True
+            result = original_install(**kwargs)
+            if phase == "download":
+                policy.denied = True
+            elif phase == "late_probe":
+                original_probe = session.client_possibly_running
+
+                def probe_after_revocation():
+                    policy.denied = True
+                    return original_probe()
+
+                session.client_possibly_running = probe_after_revocation
+            return result
+
+        content.install = install_with_revocation
+
+    report = executor.execute(operation_id)
+
+    expected = "aborted" if phase in {"stop", "content_intent", "ownership_recorded"} else "failed"
+    assert report.outcome == expected
+    assert ledger.get(operation_id).state == expected
+    assert "content policy" in report.detail
+    assert "synthetic-private" not in report.detail
+    assert session.starts == 1
+    assert session.running
+    assert not (executor._journal_dir / "adoption-480.json").exists()
+    assert (destination.read_bytes() if destination.exists() else None) == original_manifest
+    if phase in {"stop", "content_intent", "ownership_recorded"}:
+        assert content.validated is None
+    if phase in {"stop", "content_intent"}:
+        assert not executor._owned_marker(480).exists()
+        if operation == "install":
+            assert not target.exists()
+    else:
+        assert executor._marker_owns_target(480, "Spacewar", target)
+    if phase == "poll":
+        assert (target / "partial.bin").read_bytes() == b"partial"
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+def test_content_policy_denial_restore_failure_stays_retryable(harness, operation) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    policy = RevocableContentPolicy("revoked")
+    executor._dispatch_policy = policy
+    original_stop = session.stop_client
+
+    def stop_after_revocation():
+        stopped = original_stop()
+        policy.denied = True
+        session.start_ok = False
+        return stopped
+
+    session.stop_client = stop_after_revocation
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert ledger.get(operation_id).state == "client_stopping"
+    assert not session.running
+    assert content.validated is None
+    session.start_ok = True
+    executor.reconcile()
+    assert session.running
+    assert ledger.get(operation_id).state == "aborted"
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+@pytest.mark.parametrize("failure", ["revoked", "unreadable", "exception"])
+def test_content_policy_change_during_resume_stop_aborts_legally(
+    harness, operation, failure
+) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "interrupted"):
+        ledger.transition(operation_id, state)
+    policy = RevocableContentPolicy(failure)
+    executor._dispatch_policy = policy
+    original_stop = session.stop_client
+
+    def stop_after_revocation():
+        stopped = original_stop()
+        policy.denied = True
+        return stopped
+
+    session.stop_client = stop_after_revocation
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert ledger.get(operation_id).state == "aborted"
+    assert session.starts == 1
+    assert session.running
+    assert content.validated is None
+    assert not executor._owned_marker(480).exists()
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+@pytest.mark.parametrize("steamcmd_alive", [False, True])
+def test_content_policy_denied_resume_retries_client_restore_safely(
+    harness, operation, steamcmd_alive
+) -> None:
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, operation)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "interrupted"):
+        ledger.transition(operation_id, state)
+    session.running = False
+    session.start_ok = False
+    session.steamcmd_alive = steamcmd_alive
+    executor._dispatch_policy = RevocableContentPolicy("revoked", denied=True)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert ledger.get(operation_id).state == "interrupted"
+    assert not session.running
+    assert session.starts == (0 if steamcmd_alive else 1)
+    assert content.validated is None
+    session.steamcmd_alive = False
+    session.start_ok = True
+    assert executor.execute(operation_id).outcome == "deferred"
+    assert session.running
+    assert ledger.get(operation_id).state == "interrupted"
 
 
 def test_happy_path_confirms_with_first_run_required(harness) -> None:
@@ -303,9 +572,19 @@ def test_reconcile_interrupted_stays_resumable(harness) -> None:
     assert any("resume" in action for action in actions)
 
 
-def _adopting_operation(ledger: ExecutionLedger, executor: Executor, library: Path) -> int:
-    operation_id = _authorized(ledger)
-    for state in ("lease_acquired", "client_stopping", "content_running", "adopting"):
+def _adopting_operation(
+    ledger: ExecutionLedger,
+    executor: Executor,
+    library: Path,
+    *,
+    operation: str = "install",
+    prior_client_running: bool | None = None,
+) -> int:
+    operation_id = _authorized(ledger, operation=operation)
+    ledger.transition(
+        operation_id, "lease_acquired", prior_client_running=prior_client_running
+    )
+    for state in ("client_stopping", "content_running", "adopting"):
         ledger.transition(operation_id, state)
     prior = library / "steamapps" / "appmanifest_480.acf"
     prior.write_text("old", encoding="utf-8")
@@ -321,6 +600,37 @@ def _adopting_operation(ledger: ExecutionLedger, executor: Executor, library: Pa
         operation_id=operation_id,
     )
     return operation_id
+
+
+@pytest.mark.parametrize("operation", ["install", "verify"])
+@pytest.mark.parametrize("failure", ["revoked", "unreadable", "exception"])
+@pytest.mark.parametrize("rolled_back", [False, True])
+def test_content_policy_denial_does_not_block_adoption_recovery(
+    harness, operation, failure, rolled_back
+) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _adopting_operation(
+        ledger, executor, library, operation=operation, prior_client_running=True
+    )
+    session.running = False
+    policy = RevocableContentPolicy(failure, denied=True)
+    executor._dispatch_policy = policy
+    destination = library / "steamapps" / "appmanifest_480.acf"
+    if rolled_back:
+        destination.write_text('"AppState" { torn', encoding="utf-8")
+
+    actions = executor.reconcile()
+
+    assert policy.checked_operations == []
+    assert session.starts == 1
+    assert session.running
+    assert ledger.get(operation_id).state == ("failed" if rolled_back else "confirmed")
+    if rolled_back:
+        assert destination.read_text(encoding="utf-8") == "old"
+        assert any("restored" in action for action in actions)
+    else:
+        assert any("completed" in action for action in actions)
+        assert not (executor._journal_dir / "adoption-480.json").exists()
 
 
 def test_reconcile_adopting_completed_confirms(harness) -> None:
@@ -382,11 +692,9 @@ def test_null_plan_name_treated_as_unspecified(harness) -> None:
 
 
 def test_symlinked_lock_file_is_rejected(harness) -> None:
-    import os
-
     ledger, _, _, executor, library = harness
-    lock_path = Path("/tmp") / f"steam-broker-u{os.geteuid()}.lock"
-    lock_path.unlink(missing_ok=True)  # earlier tests create the real lock
+    lock_path = executor._lock_path
+    assert lock_path is not None
     decoy = library.parent / "decoy"
     decoy.write_text("", encoding="utf-8")
     lock_path.symlink_to(decoy)
@@ -421,6 +729,7 @@ def test_lock_scoped_to_library_not_state_dir(harness, tmp_path: Path) -> None:
         content=content,
         library=library,
         state_dir=tmp_path / "other-state",
+        lock_path=executor._lock_path,
     )
     lock = executor._lock()
     try:
@@ -442,6 +751,7 @@ def test_lock_shared_across_libraries(harness, tmp_path: Path) -> None:
         content=content,
         library=other_library,
         state_dir=tmp_path / "other-state",
+        lock_path=executor._lock_path,
     )
     lock = executor._lock()
     try:
@@ -698,6 +1008,41 @@ def test_content_adapter_exception_restores_client(harness) -> None:
     assert session.starts == 1  # prior run-state restored
 
 
+@pytest.mark.parametrize("prior_running", [True, False])
+@pytest.mark.parametrize("writer_state", ["alive", "unreadable"])
+def test_adapter_failure_retains_recovery_while_content_writer_is_not_ruled_out(
+    harness, prior_running: bool, writer_state: str,
+) -> None:
+    ledger, session, content, executor, _ = harness
+    session.running = prior_running
+
+    def fail_with_possible_writer(**kwargs):
+        if writer_state == "alive":
+            session.steamcmd_alive = True
+        else:
+            def unreadable_writer() -> bool:
+                raise OSError("synthetic private probe text")
+            session.steamcmd_running = unreadable_writer
+        raise OSError("synthetic private adapter text")
+
+    content.install = fail_with_possible_writer
+    operation_id = _authorized(ledger)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert ledger.get(operation_id).state == "content_running"
+    assert session.starts == 0 and not session.running
+    assert "private" not in report.detail
+
+    session.steamcmd_alive = False
+    session.steamcmd_running = lambda: False
+    executor.reconcile()
+
+    assert ledger.get(operation_id).state == "interrupted"
+    assert session.starts == 0
+
+
 def test_reconcile_adopting_post_stop_regression_restores(harness) -> None:
     ledger, session, _, executor, _ = harness
     operation_id = _authorized(ledger)
@@ -754,6 +1099,55 @@ def test_misnamed_existing_manifest_aborts(harness) -> None:
     report = executor.execute(operation_id)
     assert report.outcome == "aborted"
     assert "mismatched appid" in report.detail
+
+
+@pytest.mark.parametrize(("field", "outcome"), [("appid", "failed"), ("StateFlags", "unconfirmed")])
+def test_oversized_downloaded_manifest_number_restores_client(
+    harness, field: str, outcome: str,
+) -> None:
+    ledger, session, content, executor, _ = harness
+    original_install = content.install
+
+    def install_with_invalid_manifest(**kwargs) -> ContentResult:
+        result = original_install(**kwargs)
+        manifest = kwargs["install_dir"] / "steamapps" / "appmanifest_480.acf"
+        old_value = "480" if field == "appid" else "4"
+        manifest.write_text(
+            _MANIFEST.replace(f'"{field}"\t\t"{old_value}"', f'"{field}"\t\t"' + "9" * 5000 + '"'),
+            encoding="utf-8",
+        )
+        return result
+
+    content.install = install_with_invalid_manifest
+    operation_id = _authorized(ledger)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == outcome
+    assert ledger.get(operation_id).state == outcome
+    assert session.starts == 1 and session.running
+
+
+@pytest.mark.parametrize("field", ["appid", "StateFlags"])
+def test_reconcile_oversized_manifest_number_restores_without_confirmation(
+    harness, field: str,
+) -> None:
+    ledger, session, _, executor, library = harness
+    operation_id = _authorized(ledger)
+    ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+    for state in ("client_stopping", "content_running", "adopting", "client_restart_pending"):
+        ledger.transition(operation_id, state)
+    old_value = "480" if field == "appid" else "4"
+    (library / "steamapps" / "appmanifest_480.acf").write_text(
+        _MANIFEST.replace(f'"{field}"\t\t"{old_value}"', f'"{field}"\t\t"' + "9" * 5000 + '"'),
+        encoding="utf-8",
+    )
+    session.running = False
+
+    executor.reconcile()
+
+    assert ledger.get(operation_id).state == "unconfirmed"
+    assert session.starts == 1 and session.running
 
 
 def test_reconcile_records_deferred_validation_for_stopped_client(harness) -> None:
@@ -1223,6 +1617,45 @@ def test_launch_starts_a_stopped_client_first(harness) -> None:
     assert session.launched == [480]
 
 
+def test_launch_does_not_require_content_provisioning(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    executor._content = None
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    assert executor.execute(operation_id).outcome == "dispatched"
+    assert session.launched == [480]
+
+
+def test_unprovisioned_content_operation_defers_without_stopping_client(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    executor._content = None
+    operation_id = _authorized(ledger)
+
+    assert executor.execute(operation_id).outcome == "deferred"
+    assert ledger.get(operation_id).state == "authorized"
+    assert session.stops == 0
+
+
+def test_content_uses_the_provisioned_login_for_an_account_alias(harness) -> None:
+    ledger, _, content, executor, _ = harness
+    operation_id = _authorized(ledger)
+    executor._account_login = lambda alias: "synthetic-login" if alias == "owner" else None
+
+    assert executor.execute(operation_id).outcome == "confirmed"
+    assert content.login == "synthetic-login"
+
+
+def test_unmapped_account_defers_before_client_shutdown(harness) -> None:
+    ledger, session, content, executor, _ = harness
+    operation_id = _authorized(ledger)
+    executor._account_login = lambda _alias: None
+
+    assert executor.execute(operation_id).outcome == "deferred"
+    assert ledger.get(operation_id).state == "authorized"
+    assert session.stops == 0
+    assert content.login is None
+
+
 def test_launch_defers_while_a_game_is_running(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.clear = False  # game_running fails
@@ -1249,15 +1682,135 @@ def test_launch_defers_when_the_client_will_not_start(harness) -> None:
     assert ledger.get(operation_id).state == "authorized"
 
 
-def test_a_rejected_launch_request_is_terminal(harness) -> None:
+def test_an_unacknowledged_launch_request_is_not_replayable(harness) -> None:
     ledger, session, _, executor, _ = harness
     session.launch_ok = False
     operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
 
     report = executor.execute(operation_id)
 
+    assert report.outcome == "unconfirmed"
+    assert ledger.get(operation_id).state == "unconfirmed"
+    assert executor.execute(operation_id).outcome == "aborted"
+    assert session.launched == [480]
+
+
+def test_launch_expiring_during_client_start_does_not_dispatch(harness, monkeypatch) -> None:
+    ledger, session, _, executor, _ = harness
+    session.running = False
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+    later = datetime.now(timezone.utc) + timedelta(hours=5)
+
+    def start_after_expiry():
+        session.running = True
+        monkeypatch.setattr("steam_agent.execution.ledger._utcnow", lambda: later)
+        return True
+
+    session.start_client = start_after_expiry
+
+    assert executor.execute(operation_id).outcome == "aborted"
+    assert session.launched == []
+    assert ledger.get(operation_id).state == "expired"
+
+
+@pytest.mark.parametrize("busy_gate", ["game_running", "remote_play"])
+def test_launch_rechecks_activity_after_client_start(harness, busy_gate) -> None:
+    ledger, session, _, executor, _ = harness
+    session.running = False
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    def start_into_busy_session():
+        session.running = True
+        states = {"game_running": "pass", "remote_play": "pass"}
+        states[busy_gate] = "fail"
+        session.gates = lambda: LeaseGates(
+            game_running=states["game_running"],
+            remote_play=states["remote_play"],
+            download_in_flight="pass",
+            client_running="fail",
+        )
+        return True
+
+    session.start_client = start_into_busy_session
+
+    assert executor.execute(operation_id).outcome == "deferred"
+    assert session.launched == []
+    assert ledger.get(operation_id).state == "authorized"
+
+
+def test_launch_intent_write_failure_has_no_external_effect(harness, monkeypatch) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    def fail_intent(*args, **kwargs):
+        raise RuntimeError("simulated intent write failure")
+
+    monkeypatch.setattr(ledger, "transition", fail_intent)
+    with pytest.raises(RuntimeError, match="intent write failure"):
+        executor.execute(operation_id)
+
+    assert session.launched == []
+    assert ledger.get(operation_id).state == "authorized"
+
+
+def test_launch_rechecks_policy_after_client_start(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    session.running = False
+    permitted = True
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+
+    def start_after_revocation():
+        nonlocal permitted
+        permitted = False
+        session.running = True
+        return True
+
+    session.start_client = start_after_revocation
+    executor._dispatch_policy = (
+        lambda _operation: None if permitted else "launch policy revoked before dispatch"
+    )
+
+    report = executor.execute(operation_id)
+
     assert report.outcome == "aborted"
     assert ledger.get(operation_id).state == "aborted"
+    assert session.launched == []
+
+
+def test_launch_acknowledgment_write_failure_recovers_without_replay(harness, monkeypatch) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+    transition = ledger.transition
+
+    def fail_acknowledgment(operation_id, state, **kwargs):
+        if state == "dispatched":
+            raise RuntimeError("simulated acknowledgment write failure")
+        transition(operation_id, state, **kwargs)
+
+    monkeypatch.setattr(ledger, "transition", fail_acknowledgment)
+    with pytest.raises(RuntimeError, match="acknowledgment write failure"):
+        executor.execute(operation_id)
+
+    assert session.launched == [480]
+    assert ledger.get(operation_id).state == "dispatch_pending"
+    assert executor.execute(operation_id).outcome == "aborted"
+    assert executor.reconcile() == [
+        f"{operation_id}: dispatch acceptance unknown -> unconfirmed"
+    ]
+    assert ledger.get(operation_id).state == "unconfirmed"
+    assert session.launched == [480]
+
+
+def test_crash_after_dispatch_intent_before_command_is_not_replayed(harness) -> None:
+    ledger, session, _, executor, _ = harness
+    operation_id = _authorized(ledger, operation="launch", install_dir_name=None)
+    ledger.transition(operation_id, "dispatch_pending")
+
+    executor.reconcile()
+
+    assert ledger.get(operation_id).state == "unconfirmed"
+    assert executor.execute(operation_id).outcome == "aborted"
+    assert session.launched == []
 
 
 def test_dispatched_is_never_upgraded_by_a_running_process(harness) -> None:

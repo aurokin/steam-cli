@@ -14,12 +14,24 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 import uuid
 from urllib.parse import parse_qs, urlsplit
 
 from steam_agent.groups import MemberRef
 from steam_agent.local_accounts import validate_steam_id64
+from steam_agent.storage_values import (
+    _account_alias,
+    _canonical_json,
+    _catalog_appids,
+    _group_app_fact,
+    _group_fact_key,
+    _group_fact_name,
+    _optional_timestamp,
+    _timestamp,
+    _user_trait,
+    utc_now,
+)
 
 
 SyncStatus = Literal["running", "complete", "partial", "failed"]
@@ -800,29 +812,6 @@ class CompatibilitySnapshot:
     installed: InstalledSnapshot
 
 
-def _timestamp(value: str | datetime) -> str:
-    if isinstance(value, str):
-        candidate = value
-        if candidate.endswith("Z"):
-            candidate = candidate[:-1] + "+00:00"
-        parsed = datetime.fromisoformat(candidate)
-    else:
-        parsed = value
-    if parsed.tzinfo is None:
-        raise ValueError("timestamps must include a timezone")
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _optional_timestamp(value: str | datetime | None) -> str | None:
-    return None if value is None else _timestamp(value)
-
-
-def _canonical_json(value: Mapping[str, Any] | None) -> str:
-    return json.dumps(
-        value or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
-
-
 def _validate_price_fact(
     fact: PriceFactObservation, *, provider: str, country: str
 ) -> tuple[str, str | None]:
@@ -984,9 +973,20 @@ def _validate_review_summary(appid: int, value: Mapping[str, Any]) -> None:
 
 
 class Storage:
-    """Owns a SQLite connection and exposes scanner-oriented transactions."""
+    """Own a SQLite connection and expose scanner-oriented transactions.
 
-    def __init__(self, path: str | Path, *, readonly: bool = False) -> None:
+    The injected clock supplies maintenance time and unspecified read times.
+    Explicit observation timestamps and read ``as_of`` values remain separate.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        readonly: bool = False,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self._clock = clock
         self.path = Path(path)
         self.readonly = readonly
         self._normalize_clean_wal = False
@@ -1039,6 +1039,14 @@ class Storage:
             self.path.chmod(0o600)
         self.migrate()
         self._finish_wal_maintenance()
+
+    def _now(self) -> datetime:
+        """Use one aware wall clock for maintenance and unspecified read times."""
+
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("storage clock must include a timezone")
+        return value.astimezone(timezone.utc)
 
     def _open_connection(self) -> sqlite3.Connection:
         if self.readonly:
@@ -1178,7 +1186,7 @@ class Storage:
                 for statement in _sql_statements(sql):
                     self._connection.execute(statement)
                 applied_at = (
-                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    self._now().isoformat().replace("+00:00", "Z")
                 )
                 self._connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
@@ -1195,7 +1203,7 @@ class Storage:
                 ).fetchone()
                 is not None
             ):
-                self._prune_declared_apps(_timestamp(datetime.now(timezone.utc)))
+                self._prune_declared_apps(_timestamp(self._now()))
             self._connection.commit()
         except BaseException:
             try:
@@ -3622,118 +3630,24 @@ class Storage:
                 cooldown_until = None
             candidates: list[int] = []
             skip_codes: dict[int, str] = {}
-            wall_clock = _timestamp(datetime.now(timezone.utc))
+            eligibility = self._declared_app_eligibility(
+                demanded, country=country, language=language, timestamp=timestamp,
+                wall_clock=_timestamp(self._now()), fresh_cutoff=fresh_cutoff,
+                negative_cutoff=negative_cutoff, skip_fresh_terminal=skip_fresh_terminal,
+            )
             for appid in demanded:
-                # A clock-skewed future projection is unusable to readers and
-                # would otherwise prevent a valid corrective observation from
-                # winning the monotonic promotion check. Quarantine its exact
-                # private lineage too: otherwise a future run can remain the
-                # apparent latest attempt after the public projection is gone.
-                future_lineage = tuple(
-                    int(row[0])
-                    for row in self._connection.execute(
-                        """SELECT DISTINCT d.sync_run_id
-                           FROM declared_app_current c
-                           JOIN declared_app_sync_demand d
-                             ON d.appid=c.appid AND d.country=c.country
-                            AND d.language=c.language
-                           LEFT JOIN declared_app_observations o
-                             ON o.sync_run_id=d.sync_run_id AND o.appid=d.appid
-                           WHERE c.appid=? AND c.country=? AND c.language=?
-                             AND c.provider='steam_store'
-                             AND c.observed_at>? AND c.observed_at>?
-                             AND (
-                               d.sync_run_id=c.promoted_sync_run_id
-                               OR (d.observed_at>? AND d.observed_at>?)
-                               OR (o.observed_at>? AND o.observed_at>?)
-                             )""",
-                        (
-                            appid,
-                            country,
-                            language,
-                            timestamp,
-                            wall_clock,
-                            timestamp,
-                            wall_clock,
-                            timestamp,
-                            wall_clock,
-                        ),
-                    )
-                )
-                self._connection.execute(
-                    """DELETE FROM declared_app_current
-                       WHERE appid=? AND country=? AND language=?
-                         AND provider='steam_store'
-                         AND observed_at>? AND observed_at>?""",
-                    (appid, country, language, timestamp, wall_clock),
-                )
-                for lineage_run_id in future_lineage:
-                    self._connection.execute(
-                        """DELETE FROM declared_app_observations
-                           WHERE sync_run_id=? AND appid=? AND country=?
-                             AND language=?""",
-                        (lineage_run_id, appid, country, language),
-                    )
-                    self._connection.execute(
-                        """DELETE FROM declared_app_sync_demand
-                           WHERE sync_run_id=? AND appid=? AND country=?
-                             AND language=?""",
-                        (lineage_run_id, appid, country, language),
-                    )
-                    self._connection.execute(
-                        """DELETE FROM sync_runs
-                           WHERE id=?
-                             AND capability='compatibility.declared.read'
-                             AND NOT EXISTS (
-                               SELECT 1 FROM declared_app_sync_demand d
-                               WHERE d.sync_run_id=sync_runs.id
-                             )""",
-                        (lineage_run_id,),
-                    )
-                active = self._connection.execute(
-                    """SELECT 1 FROM declared_app_sync_demand d
-                       JOIN sync_runs r ON r.id=d.sync_run_id
-                       WHERE d.appid=? AND d.country=? AND d.language=?
-                         AND d.targeted=1 AND d.state='running'
-                         AND r.status='running' LIMIT 1""",
-                    (appid, country, language),
-                ).fetchone()
-                if active is not None:
+                if appid in eligibility["active"]:
                     skip_codes[appid] = "ACTIVE_REQUEST"
-                    continue
-                if skip_fresh_terminal:
-                    current = self._connection.execute(
-                        """SELECT 1 FROM declared_app_current
-                           WHERE appid=? AND country=? AND language=?
-                             AND provider='steam_store'
-                             AND schema_id='declared-app-facts/0.2'
-                             AND observed_at>=? AND observed_at<=?""",
-                        (appid, country, language, fresh_cutoff, timestamp),
-                    ).fetchone()
-                    negative = self._connection.execute(
-                        """SELECT 1 FROM declared_app_sync_demand d
-                           JOIN sync_runs r ON r.id=d.sync_run_id
-                           WHERE d.appid=? AND d.country=? AND d.language=?
-                             AND d.evaluated=1
-                             AND d.observed_at>=? AND d.observed_at<=?
-                             AND d.state='not_found'
-                           ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
-                        (appid, country, language, negative_cutoff, timestamp),
-                    ).fetchone()
-                    if current is not None:
-                        skip_codes[appid] = "FRESH_LAST_GOOD"
-                        continue
-                    if negative is not None:
-                        skip_codes[appid] = "NOT_FOUND_CACHE"
-                        continue
-                # A provider-wide cooldown prevents new requests, but it does
-                # not invalidate a subject's still-fresh terminal cache.  Keep
-                # those more specific outcomes visible before falling back to
-                # the global provider state.
-                if cooldown_until is not None:
+                elif appid in eligibility["fresh"]:
+                    skip_codes[appid] = "FRESH_LAST_GOOD"
+                elif appid in eligibility["negative"]:
+                    skip_codes[appid] = "NOT_FOUND_CACHE"
+                elif cooldown_until is not None:
+                    # A provider cooldown does not invalidate fresh terminal
+                    # cache. Preserve its more specific subject-level reason.
                     skip_codes[appid] = "PROVIDER_COOLDOWN"
-                    continue
-                candidates.append(appid)
+                else:
+                    candidates.append(appid)
             targeted = tuple(candidates[:max_items])
             target_set = set(targeted)
             cursor = self._connection.execute(
@@ -3746,8 +3660,8 @@ class Storage:
             )
             run_id = int(cursor.lastrowid)
             candidate_set = set(candidates)
+            self._ensure_steam_application_identities(demanded, observed_at=timestamp)
             for ordinal, appid in enumerate(demanded):
-                self._ensure_steam_application_identity(appid, observed_at=timestamp)
                 targeted_value = appid in target_set
                 if targeted_value:
                     state = "running"
@@ -3785,6 +3699,99 @@ class Storage:
             self._rollback_or_reopen()
             raise
         return self.get_sync_run(run_id), tuple(candidates), targeted
+
+    def _appid_chunks(
+        self, appids: tuple[int, ...], *, extra_parameters: int = 0,
+    ) -> tuple[tuple[int, ...], ...]:
+        capacity = self._connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - extra_parameters
+        if capacity < 1:
+            raise StorageError("SQLite variable limit cannot support the bounded query")
+        size = min(_DECLARED_APP_READ_CHUNK, capacity)
+        return tuple(appids[offset:offset + size] for offset in range(0, len(appids), size))
+
+    def _declared_app_eligibility(
+        self, demanded: tuple[int, ...], *, country: str, language: str,
+        timestamp: str, wall_clock: str, fresh_cutoff: str, negative_cutoff: str,
+        skip_fresh_terminal: bool,
+    ) -> dict[str, set[int]]:
+        """Batch eligibility inside the scheduler's existing write transaction.
+
+        Future projections and their exact private lineage are quarantined
+        before reading terminal/active sets. Shared runs retain other subjects;
+        active requests remain global while their audit lineage stays private.
+        """
+        future_lineage: list[tuple[int, int]] = []
+        for chunk in self._appid_chunks(demanded, extra_parameters=8):
+            placeholders = ",".join("?" for _ in chunk)
+            future_lineage.extend(
+                (int(row[0]), int(row[1])) for row in self._connection.execute(
+                    f"""SELECT DISTINCT c.appid,d.sync_run_id
+                        FROM declared_app_current c
+                        JOIN declared_app_sync_demand d
+                          ON d.appid=c.appid AND d.country=c.country AND d.language=c.language
+                        LEFT JOIN declared_app_observations o
+                          ON o.sync_run_id=d.sync_run_id AND o.appid=d.appid
+                        WHERE c.appid IN ({placeholders}) AND c.country=? AND c.language=?
+                          AND c.provider='steam_store' AND c.observed_at>? AND c.observed_at>?
+                          AND (d.sync_run_id=c.promoted_sync_run_id
+                            OR (d.observed_at>? AND d.observed_at>?)
+                            OR (o.observed_at>? AND o.observed_at>?))
+                        ORDER BY c.appid,d.sync_run_id""",
+                    (*chunk, country, language, timestamp, wall_clock,
+                     timestamp, wall_clock, timestamp, wall_clock),
+                )
+            )
+            self._connection.execute(
+                f"""DELETE FROM declared_app_current
+                    WHERE appid IN ({placeholders}) AND country=? AND language=?
+                      AND provider='steam_store' AND observed_at>? AND observed_at>?""",
+                (*chunk, country, language, timestamp, wall_clock),
+            )
+        for appid, run_id in future_lineage:
+            self._connection.execute(
+                """DELETE FROM declared_app_observations
+                   WHERE sync_run_id=? AND appid=? AND country=? AND language=?""",
+                (run_id, appid, country, language),
+            )
+            self._connection.execute(
+                """DELETE FROM declared_app_sync_demand
+                   WHERE sync_run_id=? AND appid=? AND country=? AND language=?""",
+                (run_id, appid, country, language),
+            )
+            self._connection.execute(
+                """DELETE FROM sync_runs WHERE id=?
+                   AND capability='compatibility.declared.read'
+                   AND NOT EXISTS (SELECT 1 FROM declared_app_sync_demand d
+                                   WHERE d.sync_run_id=sync_runs.id)""",
+                (run_id,),
+            )
+        result: dict[str, set[int]] = {"active": set(), "fresh": set(), "negative": set()}
+        for chunk in self._appid_chunks(demanded, extra_parameters=4):
+            placeholders = ",".join("?" for _ in chunk)
+            result["active"].update(int(row[0]) for row in self._connection.execute(
+                f"""SELECT DISTINCT d.appid FROM declared_app_sync_demand d
+                    JOIN sync_runs r ON r.id=d.sync_run_id
+                    WHERE d.appid IN ({placeholders}) AND d.country=? AND d.language=?
+                      AND d.targeted=1 AND d.state='running' AND r.status='running'""",
+                (*chunk, country, language),
+            ))
+            if skip_fresh_terminal:
+                result["fresh"].update(int(row[0]) for row in self._connection.execute(
+                    f"""SELECT appid FROM declared_app_current
+                        WHERE appid IN ({placeholders}) AND country=? AND language=?
+                          AND provider='steam_store' AND schema_id='declared-app-facts/0.2'
+                          AND observed_at>=? AND observed_at<=?""",
+                    (*chunk, country, language, fresh_cutoff, timestamp),
+                ))
+                result["negative"].update(int(row[0]) for row in self._connection.execute(
+                    f"""SELECT DISTINCT d.appid FROM declared_app_sync_demand d
+                        JOIN sync_runs r ON r.id=d.sync_run_id
+                        WHERE d.appid IN ({placeholders}) AND d.country=? AND d.language=?
+                          AND d.evaluated=1 AND d.observed_at>=? AND d.observed_at<=?
+                          AND d.state='not_found'""",
+                    (*chunk, country, language, negative_cutoff, timestamp),
+                ))
+        return result
 
     def record_declared_app_result(
         self,
@@ -4089,7 +4096,7 @@ class Storage:
                 country=country,
                 language=language,
                 appids=appids,
-                as_of=(datetime.now(timezone.utc) if as_of is None else as_of),
+                as_of=(self._now() if as_of is None else as_of),
             )
             self._connection.commit()
             return snapshot
@@ -4114,7 +4121,7 @@ class Storage:
         self._require_steam_account(account_id)
         if self.get_machine(machine_id) is None:
             raise ValueError("declared-app machine is not configured")
-        timestamp = _timestamp(datetime.now(timezone.utc) if as_of is None else as_of)
+        timestamp = _timestamp(self._now() if as_of is None else as_of)
         cutoff = _timestamp(
             datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             - timedelta(days=30)
@@ -4164,8 +4171,7 @@ class Storage:
         if self.get_machine(machine_id) is None:
             raise ValueError("declared-app machine is not configured")
         selected_rows = []
-        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
-            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+        for chunk in self._appid_chunks(selected, extra_parameters=3):
             placeholders = ",".join("?" for _ in chunk)
             selected_rows.extend(
                 self._connection.execute(
@@ -4208,8 +4214,7 @@ class Storage:
             (account_id, machine_id, country, language, retention_cutoff),
         ).fetchone()
         demand_by_appid: dict[int, Mapping[str, Any]] = {}
-        for offset in range(0, len(selected), _DECLARED_APP_READ_CHUNK):
-            chunk = selected[offset : offset + _DECLARED_APP_READ_CHUNK]
+        for chunk in self._appid_chunks(selected, extra_parameters=5):
             placeholders = ",".join("?" for _ in chunk)
             demand_rows = self._connection.execute(
                 f"""SELECT d.appid,d.ordinal,d.targeted,d.evaluated,d.state,
@@ -5389,7 +5394,7 @@ class Storage:
         """Remove target-sourced current rows or promote another ready source."""
 
         removed = 0
-        retention_cutoff = _timestamp(datetime.now(timezone.utc) - timedelta(days=7))
+        retention_cutoff = _timestamp(self._now() - timedelta(days=7))
         promoted_appids = tuple(
             int(row[0])
             for row in self._connection.execute(
@@ -6541,18 +6546,28 @@ class Storage:
         return None if row is None else _sync_run(row)
 
     def list_owned(self, account_id: int) -> list[OwnedGame]:
-        rows = self._connection.execute(
-            """
+        return self._list_owned(account_id)
+
+    def _list_owned(
+        self, account_id: int, *, appids: tuple[int, ...] | None = None,
+    ) -> list[OwnedGame]:
+        chunks = (None,) if appids is None else self._appid_chunks(appids, extra_parameters=1)
+        games: list[OwnedGame] = []
+        for chunk in chunks:
+            filter_sql = "" if chunk is None else f" AND appid IN ({','.join('?' for _ in chunk)})"
+            rows = self._connection.execute(
+                f"""
             SELECT
                 account_id, appid, name, playtime_forever_minutes,
                 inclusion_basis, observed_at, evidence_id, promoted_sync_run_id
             FROM owned_current
-            WHERE account_id = ?
+            WHERE account_id = ? {filter_sql}
             ORDER BY appid
             """,
-            (account_id,),
-        )
-        return [OwnedGame(**dict(row)) for row in rows]
+                (account_id, *(chunk or ())),
+            )
+            games.extend(OwnedGame(**dict(row)) for row in rows)
+        return games
 
     def read_owned_snapshot(self, account_id: int) -> OwnedSnapshot:
         if self._connection.in_transaction:
@@ -7104,7 +7119,7 @@ class Storage:
         now: str | datetime | None = None,
     ) -> PriceSnapshot:
         country = country.upper()
-        evaluated_now = _timestamp(now or datetime.now(timezone.utc))
+        evaluated_now = _timestamp(self._now() if now is None else now)
         if self._connection.in_transaction:
             raise StorageError("cannot start a read snapshot inside a transaction")
         self._connection.execute("BEGIN IMMEDIATE")
@@ -7565,7 +7580,7 @@ class Storage:
         if self._connection.in_transaction:
             raise StorageError("cannot start a read snapshot inside a transaction")
         country = country.upper()
-        evaluated_now = _timestamp(now or datetime.now(timezone.utc))
+        evaluated_now = _timestamp(self._now() if now is None else now)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._expire_price_data(evaluated_now)
@@ -7778,7 +7793,9 @@ class Storage:
         """Read every M5 compatibility input in one read-only transaction.
 
         Requested identities derive directly from AppIDs, so absent subjects
-        remain explicit without mutating ``steam_apps``.
+        remain explicit without mutating ``steam_apps``. Owned and installed
+        rows contain only requested AppIDs; their snapshot metadata and owned
+        provenance still describe the complete account/machine projections.
         """
 
         if self._connection.in_transaction:
@@ -7810,9 +7827,9 @@ class Storage:
                 appids=selected,
                 as_of=as_of,
             )
-            owned = self._read_owned_snapshot(account_id)
+            owned = self._read_owned_snapshot(account_id, appids=selected)
             installed = (
-                self._read_installed_snapshot(machine_id)
+                self._read_installed_snapshot(machine_id, appids=selected)
                 if include_local_target_evidence
                 else InstalledSnapshot((), None, None)
             )
@@ -8609,8 +8626,17 @@ class Storage:
             raise
 
     def list_installed(self, machine_id: str) -> list[InstalledGame]:
-        rows = self._connection.execute(
-            """
+        return self._list_installed(machine_id)
+
+    def _list_installed(
+        self, machine_id: str, *, appids: tuple[int, ...] | None = None,
+    ) -> list[InstalledGame]:
+        chunks = (None,) if appids is None else self._appid_chunks(appids, extra_parameters=1)
+        games: list[InstalledGame] = []
+        for chunk in chunks:
+            filter_sql = "" if chunk is None else f" AND current.appid IN ({','.join('?' for _ in chunk)})"
+            rows = self._connection.execute(
+                f"""
             SELECT
                 current.machine_id,
                 current.appid,
@@ -8635,12 +8661,13 @@ class Storage:
               ON promoted.sync_run_id = current.promoted_sync_run_id
              AND promoted.machine_id = current.machine_id
              AND promoted.appid = current.appid
-            WHERE current.machine_id = ?
+            WHERE current.machine_id = ? {filter_sql}
             ORDER BY current.appid
             """,
-            (machine_id,),
-        )
-        return [InstalledGame(**dict(row)) for row in rows]
+                (machine_id, *(chunk or ())),
+            )
+            games.extend(InstalledGame(**dict(row)) for row in rows)
+        return games
 
     def read_installed_snapshot(self, machine_id: str) -> InstalledSnapshot:
         """Read projection and freshness metadata without a concurrent split view."""
@@ -8659,11 +8686,13 @@ class Storage:
             raise
         return snapshot
 
-    def _read_installed_snapshot(self, machine_id: str) -> InstalledSnapshot:
+    def _read_installed_snapshot(
+        self, machine_id: str, *, appids: tuple[int, ...] | None = None,
+    ) -> InstalledSnapshot:
         """Read installed state using the caller's active transaction."""
 
         return InstalledSnapshot(
-            games=tuple(self.list_installed(machine_id)),
+            games=tuple(self._list_installed(machine_id, appids=appids)),
             latest=self.latest_sync(capability="installed", machine_id=machine_id),
             latest_complete=self.latest_sync(
                 capability="installed", machine_id=machine_id, status="complete"
@@ -8677,8 +8706,10 @@ class Storage:
         ).fetchone()
         return None if row is None else SteamApp(**dict(row))
 
-    def _read_owned_snapshot(self, account_id: int) -> OwnedSnapshot:
-        games = tuple(self.list_owned(account_id))
+    def _read_owned_snapshot(
+        self, account_id: int, *, appids: tuple[int, ...] | None = None,
+    ) -> OwnedSnapshot:
+        games = tuple(self._list_owned(account_id, appids=appids))
         latest = self.latest_account_sync(
             capability="owned.visible.read", account_id=account_id
         )
@@ -8729,6 +8760,39 @@ class Storage:
                 values[key] = bool(values[key])
         return OwnedSnapshotProvenance(**values)
 
+    def _ensure_steam_application_identities(
+        self, appids: tuple[int, ...], *, observed_at: str,
+    ) -> None:
+        """Ensure one demanded identity batch without per-AppID lookup queries."""
+        self._connection.executemany(
+            """INSERT INTO steam_apps(appid,name,app_type,updated_at)
+               VALUES (?,NULL,'unknown',?) ON CONFLICT(appid) DO NOTHING""",
+            ((appid, observed_at) for appid in appids),
+        )
+        existing: set[int] = set()
+        for chunk in self._appid_chunks(appids):
+            placeholders = ",".join("?" for _ in chunk)
+            existing.update(int(row[0]) for row in self._connection.execute(
+                f"""SELECT external_id FROM external_game_identities
+                    WHERE provider='steam' AND identity_kind='application_appid'
+                      AND external_id IN ({placeholders})""",
+                tuple(str(appid) for appid in chunk),
+            ))
+        for appid in appids:
+            if appid in existing:
+                continue
+            cursor = self._connection.execute(
+                """INSERT INTO game_entities(entity_kind,created_at,updated_at,stable_id)
+                   VALUES ('application',?,?,?)""",
+                (observed_at, observed_at, steam_application_stable_id(appid)),
+            )
+            self._connection.execute(
+                """INSERT INTO external_game_identities(
+                     provider,identity_kind,external_id,game_entity_id,created_at)
+                   VALUES ('steam','application_appid',?,?,?)""",
+                (str(appid), int(cursor.lastrowid), observed_at),
+            )
+
     def _ensure_steam_application_identity(
         self, appid: int, *, observed_at: str
     ) -> int:
@@ -8772,13 +8836,14 @@ class Storage:
 
     def _stable_game_ids_for_appids(
         self, appids: set[int]
-    ) -> tuple[tuple[int, int], ...]:
+    ) -> tuple[tuple[int, str], ...]:
         if not appids:
             return ()
-        external_ids = tuple(str(appid) for appid in sorted(appids))
-        placeholders = ",".join("?" for _ in external_ids)
-        rows = self._connection.execute(
-            f"""
+        result: list[tuple[int, str]] = []
+        for chunk in self._appid_chunks(tuple(sorted(appids))):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._connection.execute(
+                f"""
             SELECT CAST(external_id AS INTEGER) AS appid, stable_id
             FROM external_game_identities
             JOIN game_entities ON game_entities.id = game_entity_id
@@ -8787,12 +8852,12 @@ class Storage:
               AND external_id IN ({placeholders})
             ORDER BY CAST(external_id AS INTEGER)
             """,
-            external_ids,
-        )
-        result = tuple((int(row[0]), str(row[1])) for row in rows)
+                tuple(str(appid) for appid in chunk),
+            )
+            result.extend((int(row[0]), str(row[1])) for row in rows)
         if len(result) != len(appids):
             raise StorageError("Steam application identity mapping is incomplete")
-        return result
+        return tuple(result)
 
     def _read_catalog_snapshot(
         self,
@@ -9980,97 +10045,6 @@ def _validate_group_disclosure(version: str, backups_acknowledged: bool) -> None
         raise ValueError("synthetic/group disclosure version is not current")
     if backups_acknowledged is not True:
         raise ValueError("synthetic/group storage requires backup acknowledgment")
-
-
-def _group_fact_key(fact: str) -> tuple[str, str]:
-    if fact == "players:min":
-        return "players_min", ""
-    if fact == "players:max":
-        return "players_max", ""
-    for prefix, kind in (("trait:", "trait"), ("policy:", "policy")):
-        if isinstance(fact, str) and fact.startswith(prefix):
-            slug = fact[len(prefix) :]
-            _user_trait(slug)
-            return kind, slug
-    raise ValueError("group app fact is invalid")
-
-
-def _group_app_fact(fact: str, value: int | str) -> tuple[str, str, str, int | None]:
-    kind, slug = _group_fact_key(fact)
-    if kind in {"players_min", "players_max"}:
-        if value == "unknown":
-            return kind, slug, "unknown", None
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not 1 <= value <= (1 << 32) - 1
-        ):
-            raise ValueError("player-limit assertion is invalid")
-        return kind, slug, "known", value
-    if value not in {"present", "absent", "unknown"}:
-        raise ValueError("trait/policy assertion state is invalid")
-    return kind, slug, str(value), None
-
-
-def _group_fact_name(kind: str, slug: str) -> str:
-    return {
-        "players_min": "players:min",
-        "players_max": "players:max",
-        "trait": f"trait:{slug}",
-        "policy": f"policy:{slug}",
-    }[kind]
-
-
-def _account_alias(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("account alias must be text")
-    if not 1 <= len(value) <= 64:
-        raise ValueError("account alias must be between 1 and 64 characters")
-    if not value[0].isascii() or not value[0].isalpha():
-        raise ValueError("account alias must begin with an ASCII letter")
-    if any(
-        not (character.isascii() and (character.isalnum() or character in "_-"))
-        for character in value
-    ):
-        raise ValueError(
-            "account alias may contain only ASCII letters, digits, _ and -"
-        )
-    return value
-
-
-def _user_trait(value: str) -> str:
-    if not isinstance(value, str) or not value.startswith("user:"):
-        raise ValueError("trait must use the user namespace")
-    slug = value[5:]
-    if not 1 <= len(slug) <= 59:
-        raise ValueError("user trait is invalid")
-    if not slug[0].isascii() or not slug[0].islower() and not slug[0].isdigit():
-        raise ValueError("user trait is invalid")
-    if not slug[-1].isascii() or not slug[-1].islower() and not slug[-1].isdigit():
-        raise ValueError("user trait is invalid")
-    if any(
-        not (
-            character.isascii()
-            and (character.islower() or character.isdigit() or character in "._-")
-        )
-        for character in slug
-    ):
-        raise ValueError("user trait is invalid")
-    return value
-
-
-def _catalog_appids(values: list[int] | tuple[int, ...]) -> tuple[int, ...]:
-    if any(
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 1 <= value <= (1 << 32) - 1
-        for value in values
-    ):
-        raise ValueError("catalog AppIDs must be positive unsigned 32-bit integers")
-    normalized = tuple(sorted(set(values)))
-    if len(normalized) != len(values):
-        raise ValueError("catalog demanded AppIDs must be unique")
-    return normalized
 
 
 def _catalog_observations(

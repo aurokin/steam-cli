@@ -13,13 +13,15 @@ M1–M7 are accepted. Preserve their schema `0.1` contracts and safety boundarie
   [ADR 0027](docs/adr/0027-provisioned-execution.md) as re-scoped by
   [ADR 0028](docs/adr/0028-trusted-manager-execution.md): policy-gated
   authorization (grants `deny | confirm | allow` within limits),
-  ledger-first state transitions, fail-closed gates. Exactly three
+  ledger-first state transitions, fail-closed gates. Exactly four
   executable classes, each granted independently — `install` (with update),
   `verify` ([ADR 0030](docs/adr/0030-verify-as-a-second-executable-class.md)),
   and `launch`, which additionally requires a per-AppID allowlist and
   terminates `dispatched`
   ([ADR 0031](docs/adr/0031-launch-allowlist-dispatched-terminal.md)).
-  Widening that set needs a new accepted ADR, not a code change. Uninstall
+  Attributed `stop` has an independent AppID allowlist and force permission
+  ([ADR 0032](docs/adr/0032-agent-requests-and-attributed-game-stop.md)); uncertain
+  dispatch is never replayed. Widening that set needs a new accepted ADR. Uninstall
   stays human-in-Steam and move ships as an inert plan
   ([ADR 0029](docs/adr/0029-move-as-inert-plan.md));
   store/market/wallet/credential operations are hard-denied forever.

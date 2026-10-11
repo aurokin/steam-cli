@@ -1,12 +1,12 @@
 # Actions and automation boundaries
 
 Status: accepted M7 planner read/rank/inert-plan boundary; broker execution
-classes accepted by ADR 0029-0031. External policy references last verified
+classes accepted by ADR 0029-0032. External policy references last verified
 2026-07-10.
 
 The planner observes bounded local state, ranks evidence, and returns inert
 human plans; the separately provisioned broker executes install/update,
-verify, and launch under policy grants. Read access does not imply permission to mutate Steam, and
+verify, launch, and attributed stop under policy grants. Read access does not imply permission to mutate Steam, and
 technical feasibility does not imply a supported automation contract. The
 accepted planner boundary is
 [ADR 0013](../adr/0013-m7-read-only-operation-plans.md); the execution
@@ -50,7 +50,7 @@ section is implemented and accepted.
 | Plan | Launch/install/uninstall/move/verify/update, backup, mod changes | Produce a short-lived plan with risks, size/bandwidth, target, and verification |
 | Open | Exact Steam/store/support/family/workshop UI | Return a typed official UI reference for the human; do not invoke it or claim the UI action completed |
 | Execute local reversible | Local watchlist/feedback, save snapshot | Feature-gated, auditable, idempotent where possible |
-| Execute local costly/destructive | Install, move, uninstall, delete/restore saves or mods | Install/update: broker per ADR 0027/0028, authorization per policy grant (`allow` within limits, `confirm`, `deny`); verify/repair: broker per ADR 0030, separately granted; launch: broker per ADR 0031, per-AppID allowlist, terminates `dispatched`; move: inert plan, human executes in Steam's storage UI (ADR 0029); uninstall and save/mod deletion: interactive human only |
+| Execute local costly/destructive | Install, move, uninstall, delete/restore saves or mods | Install/update: broker per ADR 0027/0028, authorization per policy grant (`allow` within limits, `confirm`, `deny`); verify/repair: broker per ADR 0030, separately granted; launch: broker per ADR 0031, per-AppID allowlist, terminates `dispatched`; stop: broker per ADR 0032, separate AppID/force policy and positive runtime attribution; move: inert plan, human executes in Steam's storage UI (ADR 0029); uninstall and save/mod deletion: interactive human only |
 | Remote mutation | Wishlist, Workshop subscription, friend/invite/chat, family controls | Human UI initially |
 | Financial/security | Purchase, cart, trade, market, key redemption, refund, account/privacy | Interactive human only |
 

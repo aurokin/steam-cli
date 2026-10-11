@@ -10,6 +10,9 @@ import pytest
 
 from steam_agent.execution.broker_main import main
 from steam_agent.execution.ledger import ExecutionLedger
+from steam_agent.execution import broker_main
+from steam_agent.execution.linux_session import LinuxSession
+from steam_agent.execution.sessions import CommandResult
 
 
 def _plan(operation: str = "install") -> str:
@@ -25,7 +28,17 @@ def _plan(operation: str = "install") -> str:
 
 
 @pytest.fixture()
-def state_dir(tmp_path: Path) -> Path:
+def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # Broker policy tests must not depend on unrelated host processes or invoke
+    # the real Steam client. An absent-process runner keeps restoration checks
+    # deterministic while package smoke or other agents run concurrently.
+    monkeypatch.setattr(broker_main.sys, "platform", "linux")
+    monkeypatch.setattr(
+        broker_main, "LinuxSession",
+        lambda *, library: LinuxSession(
+            library=library, runner=lambda _argv: CommandResult(1, ""),
+        ),
+    )
     state = tmp_path / "state"
     assert (
         main(
@@ -39,6 +52,10 @@ def state_dir(tmp_path: Path) -> Path:
                 str(tmp_path / "steamcmd.sh"),
                 "--machine-id",
                 "machine-a",
+                "--account",
+                "o",
+                "--steam-login",
+                "synthetic_login",
             ]
         )
         == 0
@@ -116,6 +133,83 @@ def test_request_confirm_status_flow(state_dir: Path, monkeypatch, capsys) -> No
     status = json.loads(capsys.readouterr().out)
     assert status["active"]["state"] == "authorized"
     assert status["active"]["appid"] == 480
+
+
+@pytest.mark.parametrize("operation", ("install", "verify"))
+@pytest.mark.parametrize("grant", ("confirm", "allow"))
+@pytest.mark.parametrize(
+    ("missing", "value", "diagnostic"),
+    (
+        ("steamcmd", "", "content execution is not provisioned"),
+        ("steam_login", "", "account has no provisioned Steam login"),
+        ("account_alias", "other", "account has no provisioned Steam login"),
+        ("platform", "win32", "content execution requires a qualified Linux host"),
+    ),
+)
+def test_legacy_content_refusal_leaves_broker_reprovisionable(
+    state_dir: Path, tmp_path: Path, monkeypatch, capsys,
+    operation: str, grant: str, missing: str, value: str, diagnostic: str,
+) -> None:
+    (state_dir / "policy.toml").write_text(
+        f'[grants]\n{operation}="{grant}"\n[limits]\nmin_free_gb=0\n',
+        encoding="utf-8",
+    )
+    configuration_path = state_dir / "broker.json"
+    configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+    if missing == "platform":
+        monkeypatch.setattr(broker_main.sys, "platform", value)
+    else:
+        configuration[missing] = value
+        configuration_path.write_text(json.dumps(configuration), encoding="utf-8")
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan(operation)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    refused = capsys.readouterr()
+    assert diagnostic in refused.err
+    assert refused.out == ""
+    assert "synthetic_login" not in refused.err
+    assert not (state_dir / "ledger.sqlite3").exists()
+
+    monkeypatch.setattr(broker_main.sys, "platform", "linux")
+    library = tmp_path / "library"
+    (library / "steamapps").mkdir(parents=True)
+    assert main([
+        "--state-dir", str(state_dir), "init", "--library", str(library),
+        "--steamcmd", str(tmp_path / "steamcmd.sh"), "--account", "o",
+        "--steam-login", "synthetic_login",
+    ]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO(_plan(operation)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    expected_state = "authorized" if grant == "allow" else "pending_confirmation"
+    assert receipt["state"] == expected_state
+    ledger = ExecutionLedger(state_dir / "ledger.sqlite3")
+    try:
+        recorded = ledger.active()
+        assert recorded is not None
+        assert recorded.operation_id == 1
+        assert recorded.operation == operation
+        assert recorded.account_alias == "o"
+        assert recorded.state == expected_state
+    finally:
+        ledger.close()
+
+
+def test_legacy_machine_mismatch_precedes_content_provisioning(
+    state_dir: Path, monkeypatch, capsys,
+) -> None:
+    _grant_install(state_dir)
+    configuration_path = state_dir / "broker.json"
+    configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+    configuration["steamcmd"] = ""
+    configuration_path.write_text(json.dumps(configuration), encoding="utf-8")
+    plan = json.loads(_plan())
+    plan["target"]["machine_id"] = "other-machine"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(plan)))
+    assert main(["--state-dir", str(state_dir), "request", "--account", "o"]) == 2
+    assert "different machine" in capsys.readouterr().err
+    assert not (state_dir / "ledger.sqlite3").exists()
 
 
 def test_unsupported_operation_rejected(state_dir: Path, monkeypatch, capsys) -> None:

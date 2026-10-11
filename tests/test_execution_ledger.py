@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 
@@ -13,6 +14,7 @@ from steam_agent.execution.ledger import (
     ExecutionLedger,
     InvalidTransition,
     LedgerError,
+    UnsupportedLedger,
 )
 
 
@@ -169,7 +171,7 @@ def test_every_terminal_state_is_a_declared_operation_state() -> None:
     assert TERMINAL_STATES <= set(get_args(OperationState))
 
 
-def test_dispatched_is_reachable_only_from_authorized() -> None:
+def test_dispatched_is_reachable_only_after_durable_intent() -> None:
     from steam_agent.execution.ledger import _TRANSITIONS
 
     sources = {
@@ -178,7 +180,7 @@ def test_dispatched_is_reachable_only_from_authorized() -> None:
         if "dispatched" in targets
     }
 
-    assert sources == {"authorized"}
+    assert sources == {"dispatch_pending"}
     # Terminal: nothing leads out of it.
     assert "dispatched" not in _TRANSITIONS
 
@@ -198,6 +200,7 @@ def test_a_dispatched_row_frees_the_single_active_slot(tmp_path: Path) -> None:
             policy_version="v",
         )
         operation_id = ledger.confirm(nonce=nonce, actor="owner")
+        ledger.transition(operation_id, "dispatch_pending")
         ledger.transition(operation_id, "dispatched")
 
         assert ledger.active() is None
@@ -214,6 +217,64 @@ def test_a_dispatched_row_frees_the_single_active_slot(tmp_path: Path) -> None:
         )
     finally:
         ledger.close()
+
+
+def test_dispatch_intent_survives_reopen_and_keeps_the_active_slot(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = ExecutionLedger(path)
+    operation_id, nonce = _request(ledger)
+    ledger.confirm(nonce=nonce, actor="owner")
+    ledger.transition(operation_id, "dispatch_pending")
+    ledger.close()
+
+    reopened = ExecutionLedger(path)
+    try:
+        assert reopened.get(operation_id).state == "dispatch_pending"
+        with pytest.raises(LedgerError, match="already active"):
+            _request(reopened, key="new-plan-key")
+        reopened.transition(operation_id, "unconfirmed")
+        assert reopened.active() is None
+        with pytest.raises(LedgerError, match="idempotency key already recorded"):
+            _request(reopened)
+    finally:
+        reopened.close()
+
+
+def test_find_request_returns_the_existing_pending_authorization(ledger: ExecutionLedger) -> None:
+    operation_id, nonce = _request(ledger)
+
+    found = ledger.find_request(
+        "k" * 8, plan_document='{"schema": "operation-plan/0.1"}'
+    )
+
+    assert found is not None
+    assert found[0].operation_id == operation_id
+    assert found[1] == nonce
+    ledger.confirm(nonce=nonce, actor="owner")
+    ledger.transition(operation_id, "dispatch_pending")
+    ledger.transition(operation_id, "dispatched")
+    receipt = ledger.find_request(
+        "k" * 8, plan_document='{"schema": "operation-plan/0.1"}'
+    )
+    assert receipt is not None
+    assert receipt[0].state == "dispatched"
+    assert receipt[1] is None
+
+
+def test_find_request_rejects_changed_plan_content(ledger: ExecutionLedger) -> None:
+    _request(ledger)
+
+    with pytest.raises(LedgerError, match="different plan content"):
+        ledger.find_request("k" * 8, plan_document='{"appid": 480}')
+
+
+def test_find_request_ignores_expired_attempts(ledger: ExecutionLedger) -> None:
+    _request(ledger, ttl=0)
+    ledger.expire_lapsed()
+
+    assert ledger.find_request(
+        "k" * 8, plan_document='{"schema": "operation-plan/0.1"}'
+    ) is None
 
 
 def test_a_ledger_predating_a_terminal_state_is_rebuilt(tmp_path: Path) -> None:
@@ -261,3 +322,84 @@ def test_concurrent_openers_rebuild_the_active_index_once(tmp_path: Path) -> Non
     finally:
         for ledger in opened:
             ledger.close()
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE operations SET schema='operation-execution/9.9'",
+        "UPDATE operations SET state='future_terminal'",
+        "UPDATE operations SET operation='future_content_operation'",
+        "PRAGMA user_version=1",
+    ],
+)
+def test_unknown_ledger_refused_before_journal_or_index_changes(
+    tmp_path: Path, readonly: bool, mutation: str,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    seeded = ExecutionLedger(path)
+    _request(seeded)
+    seeded.close()
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(mutation)
+        connection.execute("DROP INDEX one_active_operation")
+        connection.execute(
+            "CREATE UNIQUE INDEX one_active_operation ON operations(machine_id)"
+            " WHERE state NOT IN ('future_terminal')"
+        )
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        before = tuple(connection.iterdump())
+    original = path.read_bytes()
+
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger"):
+        ExecutionLedger(path, readonly=readonly)
+
+    assert path.read_bytes() == original
+    with closing(sqlite3.connect(path)) as connection, connection:
+        assert tuple(connection.iterdump()) == before
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_future_row_written_after_open_is_not_confirmed_or_expired(
+    ledger: ExecutionLedger,
+) -> None:
+    operation_id, nonce = _request(ledger)
+    with closing(sqlite3.connect(ledger._path)) as connection, connection:  # noqa: SLF001
+        connection.execute("UPDATE operations SET schema='operation-execution/9.9'")
+        before = tuple(connection.iterdump())
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger"):
+        ledger.confirm(nonce=nonce, actor="synthetic")
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger"):
+        ledger.expire_lapsed()
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger"):
+        ledger.get(operation_id)
+    with closing(sqlite3.connect(ledger._path)) as connection, connection:  # noqa: SLF001
+        assert tuple(connection.iterdump()) == before
+
+
+def test_unsupported_intake_does_not_expire_existing_request(
+    ledger: ExecutionLedger,
+) -> None:
+    operation_id, _ = _request(ledger, ttl=0)
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger operation"):
+        ledger.request(
+            plan_key="future", plan_document="{}", operation="future_content_operation",
+            appid=480, account_alias="synthetic", machine_id="other", policy_version="synthetic",
+        )
+    assert ledger.get(operation_id).state == "pending_confirmation"
+
+
+@pytest.mark.parametrize("column", ["schema", "state", "operation"])
+def test_nullable_future_layout_cannot_hide_unknown_contract(tmp_path: Path, column: str) -> None:
+    path = tmp_path / "future.sqlite3"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("CREATE TABLE operations(schema TEXT, state TEXT, operation TEXT)")
+        values = {"schema": "operation-execution/0.1", "state": "authorized", "operation": "launch"}
+        values[column] = None
+        connection.execute("INSERT INTO operations VALUES (:schema, :state, :operation)", values)
+    before = path.read_bytes()
+    with pytest.raises(UnsupportedLedger, match="unsupported ledger"):
+        ExecutionLedger(path)
+    assert path.read_bytes() == before

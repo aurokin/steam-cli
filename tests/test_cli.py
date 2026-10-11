@@ -10,10 +10,37 @@ import steam_agent.application as application
 import steam_agent.cli as cli
 import steam_agent.contracts as contracts
 from steam_agent.cli import main
-from steam_agent.storage import Machine, Storage
+from steam_agent.storage import InstalledGame, Machine, Storage
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "steam"
+
+
+@pytest.mark.parametrize(
+    ("state", "size", "expected"),
+    [
+        ("partial", 0, "unknown"),
+        ("partial", None, "unknown"),
+        ("partial", 12, "present"),
+        ("measured", 0, "absent"),
+        ("measured", 12, "present"),
+        (None, None, "unknown"),
+    ],
+)
+def test_residual_presence_requires_complete_measurement_for_absence(
+    state: str | None, size: int | None, expected: str,
+) -> None:
+    game = InstalledGame(
+        machine_id="fixture-machine", appid=480, name="Fixture",
+        app_type="game", library_root="fixture-library", install_dir="Fixture",
+        state="installed", build_id=None, size_bytes=100, manifest_path=None,
+        manifest_mtime=None, observed_at="2026-10-11T00:00:00Z", evidence_id=1,
+        promoted_sync_run_id=1, residual_state=state,
+        residual_compatdata_bytes=size, residual_shadercache_bytes=0,
+        residual_workshop_bytes=0,
+    )
+
+    assert cli._residual_presence(game) == expected
 
 
 def invoke(argv: list[str], capsys: object) -> tuple[int, dict[str, object], str]:

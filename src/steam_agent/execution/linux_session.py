@@ -7,17 +7,19 @@ runner is injected so tests never touch real processes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
-import subprocess
 import time
-from typing import Callable, Literal
+from typing import Callable
 
-GateState = Literal["pass", "fail", "unknown"]
-
-CommandRunner = Callable[[list[str]], "CommandResult"]
+from steam_agent.execution.sessions import (
+    CommandResult as CommandResult,
+    CommandRunner as CommandRunner,
+    GateState as GateState,
+    LeaseGates as LeaseGates,
+    run_command as run_command,
+)
 
 _SHUTDOWN_TIMEOUT_SECONDS = 60
 _START_CONFIRM_TIMEOUT_SECONDS = 90
@@ -26,46 +28,8 @@ _START_CONFIRM_TIMEOUT_SECONDS = 90
 _DOWNLOAD_RESIDUE_AGE_SECONDS = 60 * 60
 
 
-@dataclass(frozen=True, slots=True)
-class CommandResult:
-    returncode: int
-    stdout: str
-
-
-def run_command(argv: list[str]) -> CommandResult:
-    try:
-        completed = subprocess.run(
-            argv,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return CommandResult(returncode=127, stdout="")
-    return CommandResult(returncode=completed.returncode, stdout=completed.stdout)
-
-
 def _runtime_dir() -> str:
     return os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-
-
-@dataclass(frozen=True, slots=True)
-class LeaseGates:
-    game_running: GateState
-    remote_play: GateState
-    download_in_flight: GateState
-    client_running: GateState
-
-    def all_clear(self) -> bool:
-        """True only when every activity gate is an explicit pass."""
-
-        return (
-            self.game_running == "pass"
-            and self.remote_play == "pass"
-            and self.download_in_flight == "pass"
-        )
 
 
 class LinuxSession:

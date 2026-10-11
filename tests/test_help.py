@@ -48,7 +48,7 @@ def test_top_level_help_maps_common_questions_to_read_only_leaves(
     assert not re.search(r"\b(sync|auth|configure|set|remove|delete)\b", intent_index)
 
 
-def test_top_level_readiness_commands_are_not_a_product_index(
+def test_top_level_exposes_opt_in_catalog_and_keeps_readiness(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     help_text = compact(command_help(capsys))
@@ -58,7 +58,7 @@ def test_top_level_readiness_commands_are_not_a_product_index(
         in help_text
     )
     assert (
-        "capabilities Show M1 installed.read readiness only; not a command index."
+        "capabilities Show installed.read readiness, or the full command catalog with --all."
         in help_text
     )
     assert (

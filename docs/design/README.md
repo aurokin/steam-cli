@@ -15,7 +15,8 @@ Use this page to find the canonical design source. The broader
 | Provider support, terms, and limitations | [Evidence matrix](evidence-matrix.md) | Working, time-sensitive |
 | Data privacy, retention, acknowledgment, and deletion | [Steam data lifecycle](steam-data-lifecycle.md) | Accepted M2–M4 policy; index to M5–M6 ADRs |
 | Steam actions and confirmation classes | [Actions](actions.md) | M7 planner boundary accepted; broker classes accepted by ADR 0029-0031 |
-| Broker execution (install/update, verify, launch; uninstall and move human-executed) | [Execution plan](execution-plan.md) and [Linux session model](execution-linux-session-model.md) | [ADR 0027](../adr/0027-provisioned-execution.md) accepted 2026-08-08, re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md) (trusted-manager model, standing grants implemented), [ADR 0029](../adr/0029-move-as-inert-plan.md) (move is an inert plan), [ADR 0030](../adr/0030-verify-as-a-second-executable-class.md) (verify/repair executable), and [ADR 0031](../adr/0031-launch-allowlist-dispatched-terminal.md) (allowlisted launch, dispatched-terminal); the planned broker verb set is implemented (`steam-agent-broker`) |
+| Broker execution (install/update, verify, launch, stop; uninstall and move human-executed) | [Execution plan](execution-plan.md) and [Linux session model](execution-linux-session-model.md) | [ADR 0027](../adr/0027-provisioned-execution.md) accepted 2026-08-08, re-scoped by [ADR 0028](../adr/0028-trusted-manager-execution.md) (trusted-manager model, standing grants implemented), [ADR 0029](../adr/0029-move-as-inert-plan.md) (move is an inert plan), [ADR 0030](../adr/0030-verify-as-a-second-executable-class.md) (verify/repair executable), [ADR 0031](../adr/0031-launch-allowlist-dispatched-terminal.md) (allowlisted launch, dispatched-terminal), and [ADR 0032](../adr/0032-agent-requests-and-attributed-game-stop.md) (direct requests and attributed stop); the planned broker verb set is implemented (`steam-agent-broker`) |
+| Windows/Linux agent host support and qualification | [Agent host support](agent-host-support.md) | Working support record; [ADR 0032](../adr/0032-agent-requests-and-attributed-game-stop.md) accepts attributed stop and request receipts |
 | Historical pricing providers and fallback | [Pricing strategy](pricing-strategy.md) | M3 boundary accepted; providers time-sensitive |
 | Evaluation and acceptance | [Evaluation strategy](evaluation-strategy.md), [corpus and runner](../../evals/README.md), and [testing](../testing.md) | Working strategy; deterministic gate accepted |
 
@@ -44,6 +45,11 @@ For current commands, use the [user guide](../user-guide.md) or exact
 
 ## Research and reference material
 
+- [Agent core delivery](agent-core-delivery.md) tracks owner-directed
+  implementation and qualification of the recommendations.
+- [Agent core simplification and maturity brainstorm](agent-core-brainstorm.md)
+  is a proposed multi-agent review of cuts, refactors, additions and verification;
+  inclusion does not accept a product or authority change.
 - [Evaluation system verification and improvement brainstorm](evaluation-system-brainstorm.md)
   is a proposed, evidence-backed work inventory; none of its recommendations
   are accepted by inclusion in the document.

@@ -118,7 +118,8 @@ accepted by [ADR 0027](../adr/0027-provisioned-execution.md) as re-scoped by
 [ADR 0030](../adr/0030-verify-as-a-second-executable-class.md) and
 [ADR 0031](../adr/0031-launch-allowlist-dispatched-terminal.md). Its design is
 in the [execution plan](execution-plan.md) and the
-[CLI contract](cli-contract.md).
+[CLI contract](cli-contract.md). Attributed stop and durable client dispatch
+are accepted by [ADR 0032](../adr/0032-agent-requests-and-attributed-game-stop.md).
 
 An MCP server, library API, daemon, semantic retriever, or another game-library
 adapter could reuse the application/query layer in the future. None is accepted

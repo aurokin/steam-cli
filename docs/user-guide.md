@@ -1,6 +1,12 @@
 # User guide
 
-Status: maintained guide to the current M1–M7 command surface.
+Status: maintained guide to the current M1–M7 and core-agent command surface.
+
+For the short assistant workflow, read cached membership with an explicit
+AppID, refresh missing evidence through an explicit credential source, and use
+the broker's original request ID for action recovery. Wishlist changes and
+purchase assistance are inert human handoffs. Exact syntax and evidence are
+canonical in the [core agent contract](design/cli-contract.md#core-agent-queries-and-explicit-acquisition).
 
 This guide assumes `steam-agent` was installed from a source checkout with
 `uv tool install .`. Contributors running inside the checkout should prefix the
@@ -61,7 +67,22 @@ currently exercises Ubuntu, so reports from the other platforms are valuable.
 
 ## Add an account
 
-Local discovery redacts account names and identifiers by default:
+For a machine without the Steam desktop app, configure your SteamID64 directly:
+
+```text
+steam-agent accounts configure --steam-id64 STEAMID64 --alias primary
+steam-agent accounts status --alias primary
+```
+
+This validates and stores the identifier locally without reading Steam files,
+resolving credentials, or contacting a provider. It does not verify that the
+account exists, authenticate a Steam login, or prove API access. Subsequent API
+refreshes require the provider key and accessible account data. The
+[account contract](design/cli-contract.md#implemented-m2-capability-gate-commands)
+defines validation, provenance and identifier redaction.
+
+On a gaming host, local discovery is an optional convenience and redacts
+account names and identifiers by default:
 
 ```text
 steam-agent accounts discover
@@ -69,8 +90,8 @@ steam-agent accounts configure --from-local-most-recent --alias primary
 steam-agent accounts status --alias primary
 ```
 
-If discovery is ambiguous, rerun it with `--include-identifiers`, then select a
-listed identity with `accounts configure --steam-id64 ID --alias primary`.
+If discovery is ambiguous, rerun it with `--include-identifiers`, then configure
+the desired identity with `accounts configure --steam-id64 ID --alias primary`.
 
 Bring your own key from Valve's official
 [Steam Web API key page](https://steamcommunity.com/dev/apikey) after reviewing
@@ -202,90 +223,90 @@ gate, and `operations plan uninstall APPID` reports how much. Plans are
 inert: they return official references and instructions but never open Steam,
 launch a process, change a file, or claim completion.
 
-## Execute an install, repair, or launch with the broker
+## Run or stop a game on a gaming host
 
-`steam-agent` never changes Steam. Execution lives in a second executable,
-`steam-agent-broker`, which runs on the machine it manages and is provisioned
-separately: installing the planner does not enable it. The full contract is in
-the [CLI contract](design/cli-contract.md); the decisions behind it are
-[ADR 0027](adr/0027-provisioned-execution.md) as re-scoped by
-[ADR 0028](adr/0028-trusted-manager-execution.md),
-[ADR 0030](adr/0030-verify-as-a-second-executable-class.md), and
-[ADR 0031](adr/0031-launch-allowlist-dispatched-terminal.md).
+Use `steam-agent-broker` on the target host, as its desktop user. The planner
+continues to answer library questions and emit plans. Windows and Linux client
+adapters are implemented; Windows install/repair is still gated. Review the
+[host support record](design/agent-host-support.md) for qualification limits.
+A cached `--machine` alias does not connect to another computer.
 
-Three operation classes are executable, each granted on its own — holding one
-never implies another:
+Provision a client-only broker and inspect its deny-all policy:
 
-| Class | What it does | Note |
-| --- | --- | --- |
-| `install` | installs or updates a title | covers update; they share one mechanism |
-| `verify` | Valve's validate pass, the repair capability | replaces locally modified official files, so it removes mods over game content |
-| `launch` | asks the client to start one game | also needs the AppID on `[launch] allowed_appids` |
-
-Uninstall and move stay human-executed by decision, not by omission: the
-planner emits a plan and you finish in Steam.
-
-Provision it once, then grant an operation class:
-
-```bash
-steam-agent-broker init --library ~/.local/share/Steam --steamcmd /path/to/steamcmd.sh
-# edit ~/.local/state/steam-broker/policy.toml: install = "confirm"
+```text
+steam-agent-broker init --library PATH --machine-id gaming-host --account primary
+steam-agent-broker capabilities
 steam-agent-broker policy
 ```
 
-Produce the plan with the planner and hand the broker the plan object, not the
-response envelope. Under `install = "confirm"` the request returns a nonce that
-must be consumed before the operation may run:
+Edit the private broker `policy.toml` to grant the intended actions. Launch and
+stop have separate AppID allowlists. Force stopping additionally needs
+`[stop] allow_force = true` and `--force`; it never follows a timeout silently.
+Policy syntax and exact outcomes are in the
+[CLI contract](design/cli-contract.md#implemented-broker-execution-commands).
 
-```bash
-steam-agent operations plan install APPID --account primary --machine local \
-  --format json | jq .data.plan > plan.json
-steam-agent-broker request --account ALIAS < plan.json
+```text
+steam-agent-broker runtime --appid 480
+steam-agent-broker launch 480 --request-id evening-launch-001
+steam-agent-broker stop 480 --request-id evening-stop-001
+steam-agent-broker inspect OPERATION_ID
+steam-agent-broker status
+```
+
+Under `allow`, a direct command authorizes and runs through the normal broker
+gates. Under `confirm`, it returns a nonce and waits for approval:
+
+```text
 steam-agent-broker confirm NONCE --actor owner
-steam-agent-broker run
-steam-agent-broker status --limit 5
+steam-agent-broker run --operation-id OPERATION_ID
 ```
 
-Setting `install = "allow"` with a `[limits] min_free_gb` floor authorizes
-qualifying requests automatically, so the loop shortens to `request` then
-`run`. Setting `install = "deny"` is the kill switch: it refuses new requests
-and stops any authorized operation that has not started. The same three
-values apply to `verify` and `launch`.
+Retry the same request ID after a lost response; it returns the existing
+operation and never replays a terminal action. Use a new ID for a deliberate
+new attempt. `--request-only` prepares a request without running it. Legacy
+planner JSON intake remains available through `request --account ALIAS`.
 
-`launch` needs two permissions rather than one — the grant, and the AppID on
-the allowlist:
+A launch receipt of `dispatched` says the client accepted the request. Runtime
+observation can separately report an attributed OS process; neither proves the
+game is playable. Stop works for manually Steam-started games when their
+processes expose readable AppID evidence. Partial observations can target only positively attributed processes and
+retain unknown completion. Unknown or ambiguous evidence is not permission to
+guess a process name. Graceful stop cannot prove that a
+game saved progress. A stop timeout after dispatch is terminal `unconfirmed`;
+read the detail before choosing a new attempt.
 
-```toml
-[grants]
-launch = "confirm"
+Linux content install/update/verify additionally requires `--steamcmd PATH`
+and explicit `--account ALIAS --steam-login LOGIN` provisioning. An alias is
+not a Steam login. Verify can replace mods installed over official game files;
+Steam Guard and first-run setup remain human interactions. Client-only launch
+and stop need no SteamCMD credential cache.
 
-[launch]
-allowed_appids = [480]
-```
+If interrupted, run `reconcile` before another attempt. Durable dispatch intent
+is never replayed; content recovery still follows its existing adoption journal.
+Never delete broker state while an operation is active or recovery is pending.
 
-A launch grant with no allowlist is refused rather than read as "any game",
-and removing an AppID revokes it exactly as flipping the grant does. A launch
-ends at `dispatched`: the client accepted the request. The broker does not
-watch whether the game became playable, because a process cannot be told
-apart from a hung launcher or a DRM prompt.
+### Interrupted-operation recovery
 
-Three behaviors matter when scripting against it. A `deferred` outcome means
-no content work completed and the same operation is still authorized, so retry
-it later rather than resubmitting a new plan. Most deferrals happen before any
-side effect — a game was running, a download was in flight, or the client's
-state could not be determined — but one does not: when the broker could not
-restart a client it had stopped, it defers with a detail saying the state was
-left for reconcile, and Steam may still be stopped. Always read the detail, and
-run `reconcile` when it says so. Every plan carries an `idempotency_key` that
-may be recorded only once. And a successful install ends at `client_adopted`
-with first run still
-required: Steam install scripts, EULAs, and anti-cheat setup run on a
-human-present first launch, so the broker never claims a game is ready to
-play.
+Inspect `status`, then run `reconcile` on the same host and broker state.
+Reconciliation repairs existing durable work; it does not create a new request
+or automatically resume a download. The current recovery behavior is:
 
-If a run is interrupted, `steam-agent-broker reconcile` maps whatever it finds
-to exactly one recovery action. It works even when the policy file is broken,
-so recovery is never blocked behind repairing configuration.
+| Durable state | Recovery behavior |
+| --- | --- |
+| `pending_confirmation`, `authorized` | No execution effects yet; preserve the request subject to its authorization expiry |
+| `dispatch_pending` | Record terminal `unconfirmed`; the client may have received the request, so never replay it |
+| `lease_acquired`, `client_stopping` | Restore the recorded client state, then abort; do not continue straight into content work |
+| `content_running` | Defer while SteamCMD may still be running. Otherwise, a valid window becomes `interrupted` for an explicit same-operation resume; an expired window restores the client and fails |
+| `interrupted` | Remain resumable within the window; resume rechecks current policy and lease gates. An expired window restores the client and fails |
+| `adopting` | Under safe lease gates, use the matching adoption journal to finish or restore the manifest; an unproven adoption fails after client restoration |
+| `client_restart_pending`, `verifying` | Retire completed journal remnants, restore recorded client state, and determine the outcome from manifest evidence |
+
+Failed restoration or unreadable recovery evidence leaves work nonterminal for
+a later retry. Partial content is retained; recovery does not delete it or
+silently download repair content after authorization expires. Manifest rollback
+does not roll back game files already changed by an in-place update. Existing
+journal recovery and client restoration remain available when policy denies
+new content work.
 
 ## Network, persistence, and Steam effects
 

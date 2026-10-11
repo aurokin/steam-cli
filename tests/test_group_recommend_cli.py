@@ -21,6 +21,11 @@ ALPHA = MemberRef("synthetic", "alpha")
 BETA = MemberRef("synthetic", "beta")
 
 
+@pytest.fixture(autouse=True)
+def fixture_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+
 def test_candidate_and_seed_declared_reads_keep_independent_bounds() -> None:
     class FakeStorage:
         def __init__(self) -> None:
@@ -190,7 +195,7 @@ def payload(appid: int, *, genre: int, category: int = 38) -> dict[str, object]:
 
 
 def setup(tmp_path: Path, *, owned: tuple[int, ...] = ()) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.upsert_machine(
             Machine("local", "Machine", "linux", "x86_64"), observed_at=NOW
         )
@@ -240,7 +245,7 @@ def setup(tmp_path: Path, *, owned: tuple[int, ...] = ()) -> None:
 
 
 def seed(tmp_path: Path, facts: dict[int, dict[str, object]]) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         account = storage.get_account("primary")
         assert account is not None
         appids = sorted(facts)
@@ -268,7 +273,7 @@ def seed(tmp_path: Path, facts: dict[int, dict[str, object]]) -> None:
 
 
 def own(tmp_path: Path, ref: MemberRef, *appids: int) -> None:
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         for appid in appids:
             storage.set_group_ownership(ref, appid=appid, state="owned", updated_at=NOW)
 
@@ -388,7 +393,7 @@ def test_explicit_present_trait_excludes_but_missing_trait_remains_visible(
     seed(tmp_path, {10: payload(10, genre=1), 20: payload(20, genre=2)})
     own(tmp_path, ALPHA, 10, 20)
     own(tmp_path, BETA, 10, 20)
-    with Storage(tmp_path / "steam-agent.sqlite3") as storage:
+    with Storage(tmp_path / "steam-agent.sqlite3", clock=lambda: NOW) as storage:
         storage.set_group_app_assertion(
             ALPHA,
             appid=10,
