@@ -6,10 +6,9 @@ This file preserves M2 scope and evidence at acceptance time. Use the
 [user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
 behavior across M1–M7.
 
-This document turns the M2 outcome in Linear into bounded implementation and
-review gates. Product semantics and lifecycle rules remain canonical in the
-linked repository documents. Issue status, dependencies, and final acceptance
-remain canonical in Linear.
+This document turns the M2 outcome into bounded implementation and review
+gates. Product semantics and lifecycle rules remain canonical in the linked
+repository documents.
 
 ## Outcome and issue sequence
 
@@ -208,4 +207,3 @@ copies created by other tools.
 - [`evidence-matrix.md`](evidence-matrix.md)
 - [`architecture.md`](architecture.md)
 - [`../project-governance.md`](../project-governance.md)
-- [Steam CLI Product Roadmap](https://linear.app/aurokin/project/steam-cli-product-roadmap-dc80b02971d6)

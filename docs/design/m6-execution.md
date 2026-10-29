@@ -18,7 +18,7 @@ mechanics, player-count, or health facts:
 3. Which eligible bounded candidates best fit separate no-purchase,
    minimum-copy, and preference-fit objectives?
 
-Linear sequence:
+Issue sequence:
 
 1. AUR-634 evolves the existing appdetails projection and exposes multiplayer
    evidence before ranking.

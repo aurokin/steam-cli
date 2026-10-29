@@ -6,8 +6,6 @@ This file preserves M1 scope and evidence at acceptance time. Use the
 [user guide](../user-guide.md) and [CLI contract](cli-contract.md) for current
 behavior across M1–M7.
 
-Linear project: [Steam CLI — M1 Installed Library](https://linear.app/aurokin/project/steam-cli-m1-installed-library-e0f0bdc817cc)
-
 ## Outcome
 
 Deliver a credential-free installed-library tracer bullet:
@@ -126,20 +124,20 @@ The implementation and test suite cover these properties. AUR-605 closed with
 122 passing tests, successful source/wheel builds, an entry-point smoke test,
 and a final three-lane Diffwarden review with zero findings.
 
-## Linear work graph
+## Work graph
 
-1. [AUR-600](https://linear.app/aurokin/issue/AUR-600) — prove the stack and
+1. AUR-600 — prove the stack and
    record only M1-required decisions.
 2. After AUR-600, three parallel foundations:
-   - [AUR-602](https://linear.app/aurokin/issue/AUR-602) — CLI, JSON, errors,
+   - AUR-602 — CLI, JSON, errors,
      capabilities, and golden contracts.
-   - [AUR-601](https://linear.app/aurokin/issue/AUR-601) — SQLite migrations,
+   - AUR-601 — SQLite migrations,
      evidence, sync runs, and projection promotion.
-   - [AUR-603](https://linear.app/aurokin/issue/AUR-603) — local Steam library
+   - AUR-603 — local Steam library
      and appmanifest scanning.
-3. [AUR-604](https://linear.app/aurokin/issue/AUR-604) — integrate the full
+3. AUR-604 — integrate the full
    installed-library command path.
-4. [AUR-605](https://linear.app/aurokin/issue/AUR-605) — documentation,
+4. AUR-605 — documentation,
    adversarial review, diffwarden closure, and M1 acceptance evidence.
 
 ## Deliberately deferred

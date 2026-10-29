@@ -13,7 +13,7 @@ M5 answers two bounded questions without promising performance:
 - what is known about whether a game is compatible with this explicit target;
 - what additional evidence or condition prevents it from being playable now.
 
-Linear sequence:
+Issue sequence:
 
 1. AUR-622 captures a private portable `system-profile/0.1` for an explicit
    machine alias.

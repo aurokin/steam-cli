@@ -13,7 +13,7 @@ that answers your question, then follow links for detail.
 | Run or interpret model evaluations | [Evaluation guide](../evals/README.md) |
 | Understand the architecture or a contract | [Design map](design/README.md) |
 | Understand an accepted decision | [ADR index](adr/README.md) |
-| Understand project/Linear synchronization | [Project governance](project-governance.md) |
+| Understand planning and milestone governance | [Project governance](project-governance.md) |
 
 ## Source-of-truth order
 
@@ -72,7 +72,5 @@ sentence in a proposed document does not make a choice accepted.
 - [Research roadmap](design/roadmap.md) — sequencing hypotheses from discovery.
 - [Research handoff](../steam-library-agent-research-handoff.md) — unverified
   source material.
-- Linear — work state and acceptance links, not a duplicate specification.
-
-See [project governance](project-governance.md) for how repository evidence and
-Linear stay synchronized without copying specifications.
+See [project governance](project-governance.md) for where planning, work state,
+and acceptance evidence live.

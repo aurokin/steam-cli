@@ -11,13 +11,13 @@ hypotheses until the user explicitly selects one. Creating a milestone or issue
 does not approve an implementation, provider, credential flow, policy
 interpretation, or ADR.
 
-The completed M1 Linear project must not be repurposed for later scope. Future
-work belongs in the separate Steam CLI product-roadmap project.
+Accepted milestone records must not be repurposed for later scope. Optional
+future ideas are listed in the [research roadmap](design/roadmap.md#future-ideas);
+none is selected.
 
-Linear records:
-
-- [M1 — Installed Library](https://linear.app/aurokin/project/steam-cli-m1-installed-library-e0f0bdc817cc)
-- [Steam CLI — Product Roadmap](https://linear.app/aurokin/project/steam-cli-product-roadmap-dc80b02971d6)
+Planning and execution history before 2026-10 was tracked in Linear. Issue
+keys such as `AUR-605` that appear in historical documents are retained as
+plain references; the repository records hold the accepted outcomes.
 
 ## Sources of truth
 
@@ -26,23 +26,23 @@ Linear records:
 | Product semantics, architecture, evidence contracts, and policies | Repository design documents |
 | Accepted technical or product decisions | Repository ADRs |
 | Provider research, terms, costs, and limitations | Repository design/research documents |
-| Roadmap sequence and milestone outcomes | Linear |
-| Status, priority, ownership, dependencies, and active execution | Linear |
-| Acceptance evidence for completed work | Repository, referenced from Linear |
+| Roadmap sequence, milestone outcomes, and future ideas | Repository roadmap and milestone execution documents |
+| Status, priority, ownership, dependencies, and active execution | GitHub issues and pull requests |
+| Acceptance evidence for completed work | Repository milestone execution documents |
 
-Linear may summarize repository material for orientation, but it must not become
-a second specification. Repository documents may reference Linear execution
-history, but must remain understandable when Linear is unavailable.
+Issues and pull requests may summarize repository material for orientation, but
+they must not become a second specification.
 
-## Repository references from Linear
+## References to repository material
 
-The canonical remote is `aurokin/steam-cli` on GitHub. Linear uses
-default-branch GitHub links for living documents and commit permalinks for
-immutable acceptance evidence. Retain the repository-relative path in issue
-text so a reference remains meaningful in every checkout.
+The canonical remote is `aurokin/steam-cli` on GitHub. Use default-branch
+links for living documents and commit permalinks for immutable acceptance
+evidence. Retain the repository-relative path so a reference remains
+meaningful in every checkout.
 
 Never store an absolute local path, `file://` URL, or editor-specific link in
-Linear. A link to a moving branch is not immutable acceptance evidence.
+issues or documents. A link to a moving branch is not immutable acceptance
+evidence.
 
 ## Milestone lifecycle
 
@@ -50,8 +50,8 @@ Linear. A link to a moving branch is not immutable acceptance evidence.
 - **Selected:** explicitly chosen by the user as the next milestone.
 - **Active:** exit criteria and independently verifiable tracer bullets have
   been refined.
-- **Accepted:** repository evidence is recorded and execution is closed in
-  Linear.
+- **Accepted:** repository evidence is recorded in the milestone execution
+  document and the related issues are closed.
 - **Superseded or canceled:** retained with rationale rather than rewritten.
 
 Only the selected milestone is refined into implementation issues. Inactive
@@ -66,8 +66,8 @@ outcome or dependencies, return to the human checkpoint.
 
 ## Decisions and ADRs
 
-Linear can track that a decision is required; it cannot accept the decision.
-Completing a Linear issue does not create an ADR or make a proposed design
+An issue can track that a decision is required; it cannot accept the decision.
+Closing an issue does not create an ADR or make a proposed design
 canonical. Follow `docs/adr/README.md`: accept an ADR only when an active slice
 requires it and its evidence, consequences, migration, and reversal cost are
 understood.
@@ -82,11 +82,11 @@ or acceptance criteria to match later behavior. Append clearly dated factual
 corrections when necessary. New behavior, defects, and superseding decisions
 belong in new issues and, where appropriate, new or superseding ADRs.
 
-## Synchronization checklist
+## Planning checklist
 
-- Linear names the canonical repository-relative references.
+- Issues name the canonical repository-relative references.
 - Detailed specifications, provider matrices, schemas, and policy rules are not
-  copied into Linear.
+  copied into issues.
 - Proposed choices are not described as accepted.
 - Inactive milestones have no implementation task breakdown.
 - Each active slice produces a stable capability or query result, not merely an

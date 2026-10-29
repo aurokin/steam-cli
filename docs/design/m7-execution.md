@@ -146,6 +146,6 @@ separation, and false `NOT_SYNCED` plan diagnostics. A path-placement report was
 rejected as invalid after the normal scenario loader, repository-relative diff,
 and full test suite confirmed the files were correctly located.
 
-Linear closes AUR-623, AUR-643, AUR-628, and AUR-631 against this evidence. No
+AUR-623, AUR-643, AUR-628, and AUR-631 closed against this evidence. No
 executable action class is approved; future parsers or executors require a new
 reviewed slice and decision record.
