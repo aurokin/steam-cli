@@ -13,7 +13,7 @@ observable wishlist in an explicit country, which exact Steam application
 offers have the strongest supported deal evidence now, and what evidence is
 missing?
 
-Linear sequence:
+Issue sequence:
 
 1. AUR-619 approves the provider, identity, attribution, and retention boundary.
 2. AUR-632 synchronizes the provisional wishlist and current regional offers.

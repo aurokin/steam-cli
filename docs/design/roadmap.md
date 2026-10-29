@@ -3,12 +3,12 @@
 Status: non-canonical research snapshot, not a release commitment
 
 This document preserves the research rationale and validation order that shaped
-the product. Current milestone sequence, dependencies, and execution status are
-canonical in the
-[Steam CLI Product Roadmap](https://linear.app/aurokin/project/steam-cli-product-roadmap-dc80b02971d6)
-under the rules in [`docs/project-governance.md`](../project-governance.md).
-The phase numbers below are historical design groupings and must not be used as
-current Linear milestone identifiers.
+the product. Accepted milestone scope and evidence live in the milestone
+execution documents (`m1-execution.md` through `m7-execution.md`), under the
+rules in [`docs/project-governance.md`](../project-governance.md). The phase
+numbers below are historical design groupings and must not be used as milestone
+identifiers. Optional, unselected ideas are listed under
+[Future ideas](#future-ideas).
 
 The roadmap uses tracer-bullet slices. Each phase should answer a design question
 and leave a usable agent contract, not merely add provider integrations.
@@ -99,3 +99,31 @@ until each mechanism has a documented policy basis, confirmation class,
 postcondition, and recovery story.
 
 These are independent options, not prerequisites for the core.
+
+## Future ideas
+
+M1–M7 are accepted. The items below are optional, unsequenced ideas, not
+commitments. Each requires explicit selection under
+[`docs/project-governance.md`](../project-governance.md) before any
+implementation, and the stated gate must be met first. Former tracker keys are
+kept in parentheses as history.
+
+- **Expose the stable application layer through MCP** (AUR-624): optionally
+  expose stable CLI/application capabilities over MCP without coupling the core
+  domain to MCP; only against already-stable contracts.
+- **Replaceable SteamGridDB artwork adapter** (AUR-625): optional attributed
+  artwork evidence without making SteamGridDB a core dependency; provider terms
+  and distributed/commercial use must be approved first.
+- **Evaluate a high-trust SteamKit or SteamCMD mode** (AUR-626): decide whether
+  any high-trust client/session integration has enough product value, technical
+  stability, and policy basis; no session credentials or reverse-engineered
+  client control are implied, and a separate user decision is required.
+- **Evaluate adjacent launchers and cross-store adapters** (AUR-635): decide
+  whether Playnite, Heroic, Lutris, or similar sources should extend the
+  provider-neutral identity/evidence model; terms and platform scope need
+  approval.
+- **Evaluate guarded launch and client-action executors** (AUR-641): after the
+  executable-action boundary is approved, decide whether a narrowly guarded
+  launch or client action is worth implementing; a supported mechanism, policy
+  basis, explicit confirmation, idempotency, audit, postcondition, and recovery
+  plan are mandatory.

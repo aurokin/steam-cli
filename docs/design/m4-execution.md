@@ -17,7 +17,7 @@ behavior into user intent:
 - which wishlist candidates combine direct preference evidence with M3 deal
   evidence.
 
-Linear sequence:
+Issue sequence:
 
 1. AUR-621 captures explicit feedback, per-game user overrides, and durable
    feature rules.
@@ -189,7 +189,7 @@ model judges, real-user prompts, and M3 prose evaluation remain non-blocking.
 
 ## Acceptance evidence
 
-M4 was accepted after all four Linear slices completed:
+M4 was accepted after all four slices completed:
 
 - AUR-621: account-scoped explicit feedback, traits, estimates, snoozes, and
   durable preference rules with auditable clearing and deletion;
