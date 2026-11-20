@@ -468,3 +468,38 @@ def test_stop_preflight_stays_unknown_without_appid_attribution(state: Path, gam
     assert result["activity_clear"] is None
     assert result["readiness"] == "unknown"
     assert result["authorization"] == "not_granted"
+
+
+@pytest.mark.parametrize(("decision", "readiness"), [
+    (("windows", "installed_windows_depots"), "ready"),
+    ((None, "new_install_without_linux_depot"), "blocked"),
+])
+def test_content_preflight_reports_title_platform(state: Path, decision, readiness) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    policy_path = state / "policy.toml"
+    policy_path.write_text('[grants]\ninstall="confirm"\n')
+    config = json.loads((state / "broker.json").read_text())
+    config.update({"steamcmd": "/synthetic/steamcmd", "steam_login": "synthetic-login"})
+
+    class Session:
+        def gates(self):
+            return LeaseGates("pass", "pass", "pass", "pass")
+
+        def steamcmd_running(self):
+            return False
+
+    checked: list[int] = []
+
+    def platform(appid: int) -> PlatformDecision:
+        checked.append(appid)
+        return PlatformDecision(*decision)
+
+    result = operation_preflight(
+        config, load_policy(policy_path), DirectRequest("install", 480, "preflight-only"),
+        platform="linux", session=Session(), disk_floor=lambda *_: None,
+        content_platform=platform,
+    )
+    assert checked == [480]
+    assert result["content_platform"] == {"platform": decision[0], "reason": decision[1]}
+    assert result["readiness"] == readiness

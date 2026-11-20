@@ -7,7 +7,9 @@ documentation; product architecture remains in the design documents and ADRs.
 ## Current boundary
 
 M1 through M7 are accepted historical work. Later milestones remain roadmap
-hypotheses until the user explicitly selects one. Creating a milestone or issue
+hypotheses until the maintainer selects one. Since 2026-11-20 the owner has
+delegated maintainership to the agent working in the repository; see
+[decision authority](../AGENTS.md#decision-authority). Creating a milestone or issue
 does not approve an implementation, provider, credential flow, policy
 interpretation, or ADR.
 
@@ -47,7 +49,7 @@ evidence.
 ## Milestone lifecycle
 
 - **Proposed:** outcome-level roadmap hypothesis; no delivery commitment.
-- **Selected:** explicitly chosen by the user as the next milestone.
+- **Selected:** explicitly chosen by the maintainer as the next milestone.
 - **Active:** exit criteria and independently verifiable tracer bullets have
   been refined.
 - **Accepted:** repository evidence is recorded in the milestone execution
@@ -57,20 +59,20 @@ evidence.
 Only the selected milestone is refined into implementation issues. Inactive
 milestones receive no implementation subtasks, estimates, due dates, or implied
 technical choices. Before activation, revalidate time-sensitive provider terms
-and assumptions. Credentials, spending, policy-sensitive automation, and action
-execution always require a separate human checkpoint.
+and assumptions. Credentials, spending, external publication, and game actions on a host
+the owner may be using still require the owner's checkpoint.
 
 Refinement produces thin, demonstrable end-to-end outcomes rather than
 component-layer task trees. If refinement materially changes a milestone's
-outcome or dependencies, return to the human checkpoint.
+outcome or dependencies, record the change and its rationale.
 
 ## Decisions and ADRs
 
 An issue can track that a decision is required; it cannot accept the decision.
-Closing an issue does not create an ADR or make a proposed design
-canonical. Follow `docs/adr/README.md`: accept an ADR only when an active slice
-requires it and its evidence, consequences, migration, and reversal cost are
-understood.
+Closing an issue does not create an ADR or make a proposed design canonical.
+The maintainer accepts ADRs by following `docs/adr/README.md`: accept one only
+when an active slice requires it and its evidence, consequences, migration, and
+reversal cost are understood.
 
 Unsettled choices remain explicitly proposed, open, or deferred in design docs
 or the decision register.

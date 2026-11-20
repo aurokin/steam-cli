@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import sys
 
+from steam_agent.execution.content_platform import PlatformDecision
 from steam_agent.execution.ledger import ExecutionLedger, LedgerError
 from steam_agent.execution.policy import ExecutionPolicy, PolicyError, load_policy
 
@@ -89,8 +90,14 @@ def _permitted(policy: ExecutionPolicy, request: DirectRequest) -> bool:
 
 def require_content_provisioning(
     config: Mapping[str, str], *, operation: str, account_alias: str, platform: str,
+    appid: int | None = None,
+    content_platform: Callable[[int], PlatformDecision] | None = None,
 ) -> None:
-    """Refuse unusable new content requests before they reserve an active slot."""
+    """Refuse unusable new content requests before they reserve an active slot.
+
+    With ``content_platform``, a title whose content platform cannot be
+    established from local evidence is refused too; execution rechecks it.
+    """
     if operation not in {"install", "verify"}:
         return
     if platform != "linux":
@@ -102,6 +109,10 @@ def require_content_provisioning(
         or account_alias != config.get("account_alias")
     ):
         raise PolicyError("account has no provisioned Steam login")
+    if content_platform is not None and appid is not None:
+        decision = content_platform(appid)
+        if decision.platform is None:
+            raise PolicyError(f"title content platform is unqualified: {decision.reason}")
 
 
 def record_or_reuse(
@@ -112,6 +123,7 @@ def record_or_reuse(
     *,
     platform: str = sys.platform,
     disk_floor: Callable[[Path, int | None], str | None],
+    content_platform: Callable[[int], PlatformDecision] | None = None,
 ) -> dict[str, object]:
     """Record new intent or return its immutable receipt under the caller's lock.
 
@@ -145,6 +157,7 @@ def record_or_reuse(
         raise PolicyError("operation, AppID or force is not permitted by policy")
     require_content_provisioning(
         config, operation=request.operation, account_alias=account_alias, platform=platform,
+        appid=request.appid, content_platform=content_platform,
     )
 
     operation_id, nonce = ledger.request(

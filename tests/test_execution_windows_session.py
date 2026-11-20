@@ -24,6 +24,9 @@ class Processes:
     def read(self, pid: int) -> ProcessRecord | None:
         return next((record for record in self.records if record.pid == pid), None)
 
+    def identity_alive(self, pid: int, create_time: float) -> bool:
+        return self.read(pid) is not None
+
     def request_stop(
         self, process: ProcessRecord, *, force: bool,
         before_request: Callable[[], bool] | None = None,

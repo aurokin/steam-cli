@@ -130,6 +130,9 @@ def test_stop_rechecks_authorization_after_slow_dispatch_scan_without_replay(
         def read(self, pid: int) -> ProcessRecord:
             return ProcessRecord(pid, 1.0, "synthetic-game", {"SteamAppId": "480"}, True)
 
+        def identity_alive(self, pid: int, create_time: float) -> bool:
+            return True
+
         def request_stop(
             self, process: ProcessRecord, *, force: bool,
             before_request: Callable[[], bool] | None = None,
@@ -367,3 +370,33 @@ def test_auto_launch_request_uses_existing_run_policy_path(
     second = json.loads(capsys.readouterr().out)
     assert calls == [first["operation_id"]]
     assert second["reused"] is True
+
+
+@pytest.mark.parametrize(("exited", "expected"), [
+    (1, "requested 1 attributed processes; 1 of 1 original identities exited"),
+    (None, "requested 1 attributed processes; original identity exits unknown"),
+])
+def test_incomplete_stop_receipt_reports_original_identity_exits(
+    state: Path, monkeypatch, capsys, exited, expected,
+) -> None:
+    (state / "policy.toml").write_text(
+        '[grants]\nstop="allow"\n[stop]\nallowed_appids=[480]\n'
+    )
+
+    class Runtime:
+        def observe(self, appid: int) -> RuntimeObservation:
+            return RuntimeObservation("absent", ())
+
+        def stop_app(self, appid: int, *, force: bool, before_request=None) -> StopResult:
+            return StopResult(
+                "unknown", "target_processes_exited_scan_incomplete", 1, force, 1, exited,
+            )
+
+    monkeypatch.setattr(client_executor, "RuntimeObserver", Runtime)
+    monkeypatch.setattr(
+        broker_main.ClientExecutor, "_lock", lambda _: (state / "execution.lock").open("wb"),
+    )
+    assert invoke(state, "stop", "480", "--request-id", f"stop-exits-{exited}") == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["outcome"] == "unconfirmed"
+    assert report["detail"].endswith(expected)

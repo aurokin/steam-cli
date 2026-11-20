@@ -51,6 +51,7 @@ until evidence supports them.
 | D040 | Exact cached queries, explicit ephemeral acquisition and broker recovery contracts | [Accepted ADR 0033](0033-agent-core-query-and-recovery-contracts.md) | Additive opt-in interfaces; original request bindings preserved | Scoped cache/filter/name tests, four-route HTTP secret canaries, composed subprocess recovery and installed-wheel contract smoke |
 | D041 | Wishlist changes and purchase assistance as inert handoffs | [Accepted ADR 0034](0034-inert-account-and-purchase-handoffs.md) | Additive payload schemas; no migration or execution widening | Baseline conflicts/freshness, quote identity/context, ownership unknowns and no-acquisition/no-mutation tests |
 | D042 | Explicit account setup without a local Steam client | [Accepted ADR 0035](0035-steam-free-account-configuration.md) | Existing source-kind storage; no migration | No-local/no-provider setup, ID validation/redaction/conflicts, composed API workflow and installed-wheel absent-root smoke |
+| D043 | Linux content platform derived from installed-depot evidence | [Accepted ADR 0036](0036-evidence-derived-linux-content-platform.md); implemented and live-qualified on one host | Easy; native arguments unchanged and no migration | Synthetic appinfo/manifest classification, intake refusal and run deferral tests; one live Proton verify; new Proton installs remain refused |
 
 ## When to create an ADR
 

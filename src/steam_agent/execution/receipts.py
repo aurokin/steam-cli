@@ -27,6 +27,14 @@ def redact(value: object) -> object:
     return value
 
 
+def _platform_reason_code(message: str, *, fallback: str = "content_platform_unqualified") -> str:
+    """``content_platform_<reason>`` from the closed vocabulary, never free text."""
+    from steam_agent.execution.content_platform import UNQUALIFIED_REASONS
+
+    reason = message.split(":", 1)[-1].split(";", 1)[0].strip().lower()
+    return f"content_platform_{reason}" if reason in UNQUALIFIED_REASONS else fallback
+
+
 def reason_code(message: str | None) -> str | None:
     """A bounded vocabulary; exception text never becomes public error detail."""
     if message is None:
@@ -48,6 +56,8 @@ def reason_code(message: str | None) -> str | None:
         return "policy_denied"
     if "provision" in lowered or "steam login" in lowered:
         return "not_provisioned"
+    if "content platform is unqualified" in lowered:
+        return _platform_reason_code(lowered)
     if "qualified" in lowered or "unsupported" in lowered:
         return "unsupported"
     if "locked" in lowered or "state unavailable" in lowered:
@@ -109,7 +119,14 @@ def serialize_result(
             outcome = "receipt_reused"
         elif "outcome" in payload:
             outcome = payload["outcome"]
-            if outcome == "deferred":
+            detail = str(payload.get("detail", ""))
+            # Platform reasons stay typed whichever outcome carried them,
+            # including a deferral after a failed client restore.
+            if detail.startswith("content platform changed before content start:"):
+                code = _platform_reason_code(detail, fallback="content_platform_changed")
+            elif detail.startswith("content platform unqualified:"):
+                code = _platform_reason_code(detail)
+            elif outcome == "deferred":
                 code = "execution_deferred"
         elif command in {"request", "install", "verify", "launch", "stop", "confirm"}:
             outcome = "request_recorded"

@@ -864,6 +864,26 @@ execution additionally needs `--steamcmd` and an explicit `--account` alias to
 configuration, an unmatched account alias, or an unqualified platform before
 recording new intent; refusal leaves the broker available for provisioning.
 Direct receipt reuse remains available without rechecking those prerequisites.
+Linux content also derives the SteamCMD platform from local evidence,
+following [ADR 0036](../adr/0036-evidence-derived-linux-content-platform.md).
+The installed depots in the client manifest are matched against the client's
+`appinfo.vdf` depot `oslist`. Whenever that evidence selects Windows
+(Windows-only installed depots, a complete shared-only install of an app
+whose `oslist` lists Windows but not Linux, or the broker's own recorded
+Windows partial download), the
+command adds `+@sSteamCmdForcePlatformType windows`; native titles keep the
+unchanged command. A new install is native only. Mixed, ambiguous,
+architecture-specific Windows, missing, or unreadable evidence selects no
+platform, so preflight reports it, intake refuses with
+`title content platform is unqualified: <reason>`, and execution defers with
+`content platform unqualified: <reason>; deferred`. If the evidence changes
+while the client stops, the run aborts before any content write with the
+terminal detail `content platform changed before content start: <reason>`
+(if the client cannot be restored, the row stays retryable like any post-stop
+abort, and a retry re-derives the platform from scratch).
+JSON results carry `content_platform_<reason>`, or `content_platform_changed`
+when the new evidence still selects a platform. Reasons are fixed codes,
+never paths.
 Login names remain in private broker configuration;
 normal output includes neither logins nor private paths. Re-init preserves
 omitted configuration values and an existing policy. Windows selects the
@@ -895,7 +915,16 @@ sending a signal. SIGTERM (Linux) and WM_CLOSE (Windows) request graceful exit;
 force never follows implicitly and neither method proves a save completed.
 Stop rechecks current policy and authorization expiry after the fresh scan,
 before each exit request. Denial prevents further requests while preserving
-counts for any requests already sent.
+counts for any requests already sent. Stop waits up to its timeout for the
+original PID/creation-time targets to exit. Its detail reports
+`requested N attributed processes; M of K original identities exited`, or
+`original identity exits unknown` when no exit check ran or an original
+identity could not be reread. Stop keeps polling until its deadline for a complete confirmation
+scan. If the scan stays incomplete, every original identity exited, and no
+readable attributed process remains, the reason is
+`target_processes_exited_scan_incomplete`. The outcome is still `unconfirmed`,
+because inaccessible processes are not evidence of absence. Newly appearing
+processes are never targeted.
 
 Both launch and stop commit `dispatch_pending` before the external action.
 Unacknowledged or interrupted dispatch becomes terminal `unconfirmed`; startup
@@ -959,7 +988,9 @@ and preflight routing before creating an intent; an alias is not attestation.
 
 `preflight install|verify|launch|stop APPID [--account ALIAS] [--force]` is
 advisory. It reports implementation, provisioning, policy, relevant session
-gates and content writer/library/disk facts. Unsupported, failed and unknown
+gates and content writer/library/disk facts. Linux content preflight adds
+`content_platform` with the selected `platform` (or `null`) and its reason;
+a `null` platform makes readiness `blocked`. Unsupported, failed and unknown
 facts stay distinct. Generic session gates do not establish stop attribution,
 so stop preflight remains unknown until target-specific evidence is available.
 It grants no authorization, creates no nonce or operation, and reserves no lease.

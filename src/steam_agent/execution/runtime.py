@@ -99,6 +99,9 @@ class ProcessScan:
 class ProcessBackend(Protocol):
     def scan(self) -> ProcessScan: ...
     def read(self, pid: int) -> ProcessRecord | None: ...
+    # Whether this exact PID/creation-time identity is still running, in or
+    # out of attribution scope; raises ProbeError when that is unknowable.
+    def identity_alive(self, pid: int, create_time: float) -> bool: ...
     def request_stop(
         self, process: ProcessRecord, *, force: bool,
         before_request: Callable[[], bool] | None = None,
@@ -143,12 +146,18 @@ class StopResult:
     process_count: int
     force: bool
     requested_count: int = 0
+    # Original PID/creation-time identities later proven gone; ``None`` when
+    # no exit check ran or an identity could not be reread. This is target-level evidence only:
+    # with an incomplete scan it never implies that no other process for the
+    # AppID remains.
+    targets_exited_count: int | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
             "state": self.state, "reason_code": self.reason_code,
             "process_count": self.process_count, "force": self.force,
             "requested_count": self.requested_count,
+            "targets_exited_count": self.targets_exited_count,
         }
 
 
@@ -228,7 +237,7 @@ class RuntimeObserver:
         if observation.state == "unknown" and not observation.processes:
             return StopResult("unknown", "runtime_observation_unknown", count, force)
         if observation.state == "absent":
-            return StopResult("absent", "no_attributed_process", 0, force)
+            return StopResult("absent", "no_attributed_process", 0, force, 0, 0)
         requested = 0
         for target in observation.processes:
             try:
@@ -257,16 +266,88 @@ class RuntimeObserver:
         while True:
             after = self.observe(appid)
             if after.state == "absent":
-                return StopResult(
-                    "stopped", "attributed_processes_exited", count, force, requested,
-                )
+                # A target can keep its identity after exec'ing a program
+                # without the AppID, so absence alone is not exit. Wait while
+                # an original identity is provably alive; an unreadable reread
+                # stays an unknown count.
+                exited = self._exited_targets(observation.processes)
+                if exited is None:
+                    # An unreadable original identity could still be alive
+                    # outside attribution; that is not established exit. It
+                    # may become readable or exit, so keep polling until the
+                    # deadline when a request was sent.
+                    if requested and self._monotonic() < deadline:
+                        self._sleep(min(0.1, max(0, deadline - self._monotonic())))
+                        continue
+                    return StopResult(
+                        "unknown", "stop_confirmation_unknown", count, force, requested, None,
+                    )
+                if exited == count:
+                    return StopResult(
+                        "stopped", "attributed_processes_exited", count, force, requested,
+                        exited,
+                    )
+                if requested == 0 or self._monotonic() >= deadline:
+                    return StopResult(
+                        "deferred", "stop_timeout" if requested else "close_request_unavailable",
+                        count, force, requested, exited,
+                    )
+                self._sleep(min(0.1, max(0, deadline - self._monotonic())))
+                continue
             if after.state == "unknown":
-                return StopResult("unknown", "stop_confirmation_unknown", count, force, requested)
-            if requested == 0:
-                return StopResult("deferred", "close_request_unavailable", count, force, requested)
-            if self._monotonic() >= deadline:
-                return StopResult("deferred", "stop_timeout", count, force, requested)
+                # An incomplete scan cannot establish absence, but it can still
+                # show that every original target identity exited and that no
+                # readable process remains attributed to the AppID.
+                exited = self._exited_targets(observation.processes)
+                if exited is None:
+                    if requested and self._monotonic() < deadline:
+                        self._sleep(min(0.1, max(0, deadline - self._monotonic())))
+                        continue
+                    return StopResult(
+                        "unknown", "stop_confirmation_unknown", count, force, requested, None,
+                    )
+                done = exited == count and not after.processes
+                if requested == 0 or self._monotonic() >= deadline:
+                    # The scan stayed incomplete until the deadline.
+                    return StopResult(
+                        "unknown",
+                        "target_processes_exited_scan_incomplete" if done
+                        else "stop_confirmation_unknown",
+                        count, force, requested, exited,
+                    )
+                # Keep polling: a later complete scan can still confirm exit.
+            elif requested == 0:
+                return StopResult(
+                    "deferred", "close_request_unavailable", count, force, requested,
+                    self._exited_targets(observation.processes),
+                )
+            elif self._monotonic() >= deadline:
+                return StopResult(
+                    "deferred", "stop_timeout", count, force, requested,
+                    self._exited_targets(observation.processes),
+                )
             self._sleep(min(0.1, max(0, deadline - self._monotonic())))
+
+    def _exited_targets(self, targets: tuple[ObservedProcess, ...]) -> int | None:
+        """Count original identities that are gone; ``None`` when unreadable."""
+        exited = 0
+        for target in targets:
+            try:
+                current = self.backend.read(target.pid)
+            except ProbeError:
+                # The attribution read can fail while the identity itself is
+                # still checkable, e.g. a game turning non-dumpable on exit.
+                current = None
+            if current is not None:
+                exited += current.create_time != target.create_time
+                continue
+            # ``read`` also hides live processes that left this user or
+            # session; only a vanished identity counts as an exit.
+            try:
+                exited += not self.backend.identity_alive(target.pid, target.create_time)
+            except ProbeError:
+                return None
+        return exited
 
 
 def windows_session_id(pid: int) -> int:
@@ -396,6 +477,34 @@ class PsutilBackend:
                 return False, False
             return True, True
         raise ProbeError("unsupported_platform")
+
+    def identity_alive(self, pid: int, create_time: float) -> bool:
+        try:
+            process = psutil.Process(pid)
+            if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+                return False
+            return process.create_time() == create_time
+        except psutil.NoSuchProcess:
+            return not self._pid_absent(pid)
+        except (psutil.Error, OSError):
+            raise ProbeError("identity_probe_failed") from None
+
+    def _pid_absent(self, pid: int) -> bool:
+        """Whether the PID is really gone, not just hidden (``/proc`` hidepid).
+
+        A present but hidden PID leaves its identity unknown, so it raises.
+        Windows has no signal-0 probe (``os.kill`` terminates there), and its
+        process listing is not hidden that way.
+        """
+        if self.platform == "win32":
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            raise ProbeError("identity_probe_failed") from None
+        raise ProbeError("identity_probe_failed")
 
     def read(self, pid: int) -> ProcessRecord | None:
         if pid in {0, os.getpid()}:

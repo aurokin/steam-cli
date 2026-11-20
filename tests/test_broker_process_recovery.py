@@ -20,6 +20,7 @@ import psutil
 import pytest
 
 from steam_agent.execution.ledger import DEFAULT_EXECUTION_WINDOW_SECONDS, ExecutionLedger
+from support.appinfo_fixture import write_appinfo
 
 
 FIXTURE = Path(__file__).parent / "support" / "broker_process_fixture.py"
@@ -64,6 +65,7 @@ class BrokerProcesses:
     def initialize(self, *, grant: str = "allow") -> None:
         library = self.root / "library"
         (library / "steamapps").mkdir(parents=True)
+        write_appinfo(library)
         result = self.invoke(
             "init", "--library", str(library), "--machine-id", "synthetic-machine",
             "--account", "synthetic", "--steam-login", "synthetic_login",

@@ -26,9 +26,15 @@ from steam_agent.execution.content_plane import (
     clear_adoption_journal,
     locate_manifest,
     manifest_appid,
-    manifest_install_dir,
     manifest_state_flags,
     reconcile_adoption,
+)
+from steam_agent.execution.content_platform import (
+    ContentPlatform,
+    PlatformDecision,
+    manifest_install_dir,
+    marker_binds,
+    safe_install_dir_name,
 )
 from steam_agent.execution.ledger import ExecutionLedger, LedgerOperation
 from steam_agent.execution.locking import FileLockError, acquire_file_lock
@@ -99,32 +105,17 @@ def _holds_a_nonempty_file(root: Path) -> bool:
     return False
 
 
-def safe_install_dir_name(name: str) -> bool:
-    """True only for one path component that can be quoted into an ACF value."""
-
-    if not name or name in {".", ".."}:
-        return False
-    if any(character in name for character in ("/", "\\", '"')):
-        return False
-    # Typical filesystem component limit; a longer name would only surface
-    # as ENAMETOOLONG mid-operation, after the client was already stopped.
-    # JSON can legally carry unpaired surrogates, which no real filesystem
-    # name can hold — reject them instead of crashing intake.
-    try:
-        if len(name.encode("utf-8")) > 255:
-            return False
-    except UnicodeEncodeError:
-        return False
-    # Control characters (newlines especially) could inject VDF fields.
-    return not any(ord(character) < 32 for character in name)
-
-
 class ExecutorLockedError(RuntimeError):
     """Another executor process holds the machine lock."""
 
 
 class _TargetEscapedError(OSError):
     """The install target left library containment after the pre-checks."""
+
+
+def owned_marker_path(state_dir: Path, appid: int) -> Path:
+    """Where the broker records that it created a title's target directory."""
+    return state_dir / "owned" / f"{appid}.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +137,7 @@ class Executor:
         lock_path: Path | None = None,
         account_login: Callable[[str], str | None] | None = None,
         dispatch_policy: Callable[[LedgerOperation], str | None] | None = None,
+        content_platform: Callable[[int, Path], PlatformDecision] | None = None,
     ) -> None:
         self._ledger = ledger
         self._session = session
@@ -156,6 +148,9 @@ class Executor:
         self._lock_path = lock_path
         self._account_login = account_login
         self._dispatch_policy = dispatch_policy
+        # Provisioned brokers always supply evidence; ``None`` keeps the
+        # historical native-only behavior for directly constructed executors.
+        self._content_platform = content_platform
 
     def _lock(self) -> BinaryIO:
         # One lock per user, not per library or state dir: a single Steam
@@ -478,6 +473,23 @@ class Executor:
                     message="existing target directory is not owned by this title",
                 )
 
+        # Rechecked at run time: the client may have changed the install
+        # since intake. Unknown evidence never selects a platform.
+        platform: ContentPlatform = "linux"
+        platform_dlc: tuple[int, ...] = ()
+        if self._content_platform is not None:
+            decision = self._content_platform(operation.appid, target)
+            if decision.platform is None:
+                detail = f"content platform unqualified: {decision.reason}; deferred"
+                if resuming:
+                    # The interrupted run may have left Steam stopped, and
+                    # this evidence may not change soon: restore the client
+                    # while the row stays retryable.
+                    return self._defer_content_policy(operation, detail)
+                return ExecutionReport(operation_id, "deferred", detail)
+            platform = decision.platform
+            platform_dlc = decision.dlc_apps
+
         # Any surviving steamcmd (an orphaned child of a crashed run — even
         # one owned by a misconfigured second broker) is a concurrent
         # writer; never start another beside it.  One state dir per library
@@ -562,6 +574,47 @@ class Executor:
                     to_state="aborted",
                 )
 
+        # Snapshot whether the target is empty before the final lease checks
+        # below, so this filesystem walk cannot outlast them.
+        try:
+            was_empty = not target.exists() or not any(target.iterdir())
+        except OSError:
+            was_empty = False
+        # The first platform read happened while Steam could still rewrite
+        # the manifest. Once the client has stopped, the evidence must still
+        # select the same platform. Read it before the final lease, window and
+        # mount checks below so that slow cache reads cannot outlive them.
+        if self._content_platform is not None:
+            settled = self._content_platform(operation.appid, target)
+            # The evidence describes the client's directory; SteamCMD writes
+            # the one chosen earlier. They must still be the same directory.
+            try:
+                moved = (
+                    own_manifest.exists()
+                    and manifest_install_dir(own_manifest) != install_dir_name
+                )
+            except OSError:
+                settled = PlatformDecision(None, "installed_depots_unreadable")
+            else:
+                if moved:
+                    settled = PlatformDecision(None, "install_directory_changed")
+            if settled.platform != platform:
+                # Like every post-stop abort here, a failed client restore
+                # leaves the row retryable. The retry re-derives the platform
+                # from scratch through both checks, and this attempt wrote no
+                # content, so nothing binds it to the old platform.
+                detail = f"content platform changed before content start: {settled.reason}"
+                return self._finish_failure(
+                    operation_id,
+                    prior_running,
+                    detail=detail,
+                    message=detail,
+                    outcome="aborted",
+                    to_state="aborted",
+                )
+            # Record the DLC evidence from after the client stopped.
+            platform_dlc = settled.dlc_apps
+
         # Shutdown can take up to a minute; re-check the lease between the
         # client stopping and steamcmd starting so freshly begun user work
         # is never mutated under.  Unlike the pre-stop check, the client
@@ -600,7 +653,6 @@ class Executor:
                 outcome="aborted",
                 to_state="aborted",
             )
-
         denial = self._content_policy_denial(operation)
         if denial is not None:
             return self._finish_failure(
@@ -646,9 +698,20 @@ class Executor:
                     outcome="aborted",
                     to_state="aborted",
                 )
-            self._record_owned_dir(operation.appid, install_dir_name, target)
+            # Only a marker that already owns this directory's inode vouches
+            # for earlier writes here; a stale one for a former directory
+            # does not, and its replacement is retired after a no-write run.
+            # Bound by inode alone, as the classifier reads it: a renamed
+            # directory's marker still records its earlier writes.
+            marker_preexisting = marker_binds(self._owned_marker(operation.appid), target)
+            self._record_owned_dir(
+                operation.appid, install_dir_name, target, platform, platform_dlc,
+            )
             denial = self._content_policy_denial(operation)
             if denial is not None:
+                # SteamCMD never ran, so a marker this attempt created must
+                # not bind later runs.
+                self._retire_new_marker(operation.appid, marker_preexisting)
                 return self._finish_failure(
                     operation_id,
                     prior_running,
@@ -663,6 +726,7 @@ class Executor:
                 install_dir=target,
                 operation_id=operation_id,
                 validate=validating,
+                platform=platform,
                 # The adapter polls this and kills steamcmd promptly: a
                 # client relaunched mid-download is a concurrent writer, and
                 # a lapsed window ends the authorization for further content
@@ -700,6 +764,11 @@ class Executor:
                 operation_id, prior_running, detail=denial, message=denial
             )
         if result.outcome == "auth_required":
+            # SteamCMD refused the login before downloading anything. A marker
+            # this attempt created records no write and must not bind later
+            # runs; one that predates it still vouches for earlier writes.
+            # ``auth_required`` can follow some progress, so staged bytes keep it.
+            self._retire_new_marker(operation.appid, marker_preexisting, target, was_empty)
             return self._finish_failure(
                 operation_id,
                 prior_running,
@@ -1064,7 +1133,7 @@ class Executor:
         return ExecutionReport(operation.operation_id, "deferred", denial)
 
     def _owned_marker(self, appid: int) -> Path:
-        return self._state_dir / "owned" / f"{appid}.json"
+        return owned_marker_path(self._state_dir, appid)
 
     def _marker_owns_target(
         self, appid: int, install_dir_name: str, target: Path
@@ -1073,7 +1142,8 @@ class Executor:
             record = json.loads(
                 self._owned_marker(appid).read_text(encoding="utf-8")
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
+            # A damaged marker vouches for nothing; the gate then fails closed.
             return False
         if not isinstance(record, dict):
             return False
@@ -1114,8 +1184,33 @@ class Executor:
         except OSError:
             return False
 
+    def _retire_new_marker(
+        self, appid: int, preexisting: bool, target: Path | None = None,
+        was_empty: bool = True,
+    ) -> None:
+        """Drop a marker created by an attempt that wrote nothing.
+
+        Without ``target`` SteamCMD never ran. With it, nothing provably was
+        written only when the directory started empty and is still empty: in
+        a populated directory an in-place write is indistinguishable from no
+        write, so the marker stays. Best effort: a marker that cannot be
+        removed only over-protects, and cleanup must never skip the client
+        restoration.
+        """
+        if preexisting:
+            return
+        try:
+            if target is not None and (
+                not was_empty or (target.exists() and any(target.iterdir()))
+            ):
+                return
+            self._owned_marker(appid).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _record_owned_dir(
-        self, appid: int, install_dir_name: str, target: Path
+        self, appid: int, install_dir_name: str, target: Path,
+        platform: ContentPlatform = "linux", dlc_apps: tuple[int, ...] = (),
     ) -> None:
         # Re-check containment HERE, not only at intake: the client stop
         # between the pre-checks and this write can take up to a minute, and
@@ -1148,6 +1243,8 @@ class Executor:
                     "install_dir_name": install_dir_name,
                     "dev": identity.st_dev,
                     "ino": identity.st_ino,
+                    "platform": platform,
+                    "dlc_apps": list(dlc_apps),
                 }
             ).encode("utf-8"),
         )

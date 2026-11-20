@@ -35,6 +35,12 @@ class FakeBackend:
             raise ProbeError("synthetic")
         return self.read_replacement or self.processes.get(pid)
 
+    def identity_alive(self, pid: int, create_time: float) -> bool:
+        if self.read_error:
+            raise ProbeError("synthetic")
+        current = self.processes.get(pid)
+        return current is not None and current.create_time == create_time
+
     def request_stop(
         self, process: ProcessRecord, *, force: bool,
         before_request: Callable[[], bool] | None = None,
@@ -47,8 +53,21 @@ class FakeBackend:
         return True
 
 
+def fast_clock() -> Callable[[], float]:
+    """A monotonic clock that advances one second per reading."""
+    now = [0.0]
+
+    def monotonic() -> float:
+        now[0] += 1.0
+        return now[0]
+
+    return monotonic
+
+
 def observer(backend: FakeBackend, platform: str = "linux") -> RuntimeObserver:
-    return RuntimeObserver(platform=platform, backend=backend, sleep=lambda _: None)
+    return RuntimeObserver(
+        platform=platform, backend=backend, sleep=lambda _: None, monotonic=fast_clock(),
+    )
 
 
 @pytest.mark.parametrize("variable", ["SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID"])
@@ -91,10 +110,96 @@ def test_partial_scan_requests_only_positive_target_and_cannot_confirm_absence()
     assert len(result.processes) == 1
     stopped = observer(backend).stop_app(480)
     assert stopped.state == "unknown"
-    assert stopped.reason_code == "stop_confirmation_unknown"
-    assert stopped.process_count == stopped.requested_count == 1
+    assert stopped.reason_code == "target_processes_exited_scan_incomplete"
+    assert stopped.process_count == stopped.requested_count == stopped.targets_exited_count == 1
     assert backend.requests == [(100, False)]
     assert backend.processes == {}
+
+
+def test_partial_scan_waits_for_slow_target_exit_instead_of_returning_early() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+    backend.exit_on_request = False
+    polls = [0]
+
+    def sleep(_: float) -> None:
+        polls[0] += 1
+        if polls[0] == 3:
+            backend.processes.pop(100)
+
+    result = RuntimeObserver(
+        platform="linux", backend=backend, sleep=sleep, monotonic=fast_clock(),
+    ).stop_app(480)
+    assert result.reason_code == "target_processes_exited_scan_incomplete"
+    assert result.targets_exited_count == 1
+    # It waited for the exit, then for a complete scan until the deadline.
+    assert polls[0] >= 3
+
+
+def test_partial_scan_reused_target_pid_counts_original_identity_exit() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+    result = RuntimeObserver(
+        platform="linux", backend=backend, sleep=lambda _: None, monotonic=fast_clock(),
+    )
+    backend.request_stop = lambda process, **_: (
+        backend.processes.update({100: game(create_time=2.0, app_environment={})}) or True
+    )
+    stopped = result.stop_app(480)
+    assert stopped.reason_code == "target_processes_exited_scan_incomplete"
+    assert stopped.targets_exited_count == 1
+
+
+def test_partial_scan_with_new_attributed_process_stays_unconfirmed_and_untargeted() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+
+    def request_stop(process: ProcessRecord, **_: object) -> bool:
+        backend.requests.append((process.pid, False))
+        backend.processes = {101: game(101, create_time=5.0)}
+        return True
+
+    backend.request_stop = request_stop
+    result = observer(backend).stop_app(480, timeout=0)
+    assert result.state == "unknown"
+    assert result.reason_code == "stop_confirmation_unknown"
+    assert result.targets_exited_count == 1
+    assert backend.requests == [(100, False)]
+    assert 101 in backend.processes
+
+
+def test_complete_absence_with_unreadable_reread_reports_unknown_exits() -> None:
+    backend = FakeBackend(game())
+
+    def request_stop(process: ProcessRecord, **_: object) -> bool:
+        backend.requests.append((process.pid, False))
+        backend.processes.pop(process.pid)
+        backend.read_error = True
+        return True
+
+    backend.request_stop = request_stop
+    result = observer(backend).stop_app(480, timeout=0)  # still unreadable at the deadline
+    # Absence of attribution is not exit while an original identity is unreadable.
+    assert result.state == "unknown"
+    assert result.reason_code == "stop_confirmation_unknown"
+    assert result.targets_exited_count is None
+    assert result.to_json()["targets_exited_count"] is None
+
+
+def test_partial_scan_unreadable_target_reports_no_exit_evidence() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+
+    def request_stop(process: ProcessRecord, **_: object) -> bool:
+        backend.requests.append((process.pid, False))
+        backend.processes.pop(process.pid)
+        backend.read_error = True
+        return True
+
+    backend.request_stop = request_stop
+    result = observer(backend).stop_app(480, timeout=0)  # still unreadable at the deadline
+    assert result.reason_code == "stop_confirmation_unknown"
+    assert result.targets_exited_count is None
 
 
 def test_partial_scan_without_positive_target_refuses_stop() -> None:
@@ -120,6 +225,8 @@ def test_hidden_same_app_sibling_is_not_selected_after_partial_scan() -> None:
     assert result.state == "deferred"
     assert result.reason_code == "stop_timeout"
     assert result.process_count == result.requested_count == 1
+    # The original target exited even though a sibling remains.
+    assert result.targets_exited_count == 1
     assert backend.requests == [(100, False)]
     assert 101 in backend.processes
 
@@ -159,6 +266,7 @@ def test_identity_failure_preserves_count_of_requests_already_sent() -> None:
     assert result.reason_code == "process_identity_changed"
     assert result.process_count == 2
     assert result.requested_count == 1
+    assert result.targets_exited_count is None
     assert backend.requests == [(100, False)]
 
 
@@ -218,7 +326,10 @@ def test_partial_scan_no_window_never_escalates_and_remains_unknown() -> None:
 
 
 def test_stop_result_existing_positional_fields_remain_compatible() -> None:
-    assert StopResult("unknown", "synthetic", 1, False).to_json()["requested_count"] == 0
+    payload = StopResult("unknown", "synthetic", 1, False).to_json()
+    assert payload["requested_count"] == 0
+    # Without an exit check, the count is unknown rather than zero.
+    assert payload["targets_exited_count"] is None
 
 
 def test_stop_only_requests_selected_app_and_confirms_exit() -> None:
@@ -508,9 +619,10 @@ def test_windows_failure_before_any_native_effect_reports_zero_requests(
 
 def test_process_gone_before_backend_request_is_not_counted_as_dispatched(monkeypatch) -> None:
     record = game()
-    reads = iter((record, None))
+    reads = iter((record, None, None))
     backend = PsutilBackend(platform="linux")
     monkeypatch.setattr(backend, "read", lambda _: next(reads))
+    monkeypatch.setattr(backend, "identity_alive", lambda *_: False)
     scans = iter((ProcessScan((record,)), ProcessScan()))
     monkeypatch.setattr(backend, "scan", lambda: next(scans))
 
@@ -518,6 +630,7 @@ def test_process_gone_before_backend_request_is_not_counted_as_dispatched(monkey
 
     assert result.state == "stopped"
     assert result.requested_count == 0
+    assert result.targets_exited_count == 1
 
 
 @pytest.mark.parametrize("force", [False, True])
@@ -612,3 +725,178 @@ def test_windowless_graceful_close_does_not_force_process_exit() -> None:
     windows.owners = {11: 999}
     assert _windows_close(game(), windows=windows, identity_check=lambda: True) is False
     assert windows.closed == []
+
+
+def test_target_leaving_attribution_scope_is_not_counted_as_exited() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+    backend.exit_on_request = False
+
+    def read(pid: int) -> ProcessRecord | None:
+        # After the request the target switched user: still alive, but
+        # outside the broker's attribution scope.
+        return None if backend.requests else backend.processes.get(pid)
+
+    backend.read = read
+    result = observer(backend).stop_app(480, timeout=0)
+    assert result.reason_code == "stop_confirmation_unknown"
+    assert result.targets_exited_count == 0
+
+
+def test_psutil_identity_probe_distinguishes_gone_from_live(monkeypatch) -> None:
+    import psutil
+
+    class Live:
+        def status(self):
+            return psutil.STATUS_RUNNING
+
+        def create_time(self):
+            return 5.0
+
+    def process(pid: int):
+        if pid == 1:
+            return Live()
+        if pid == 2:
+            raise psutil.NoSuchProcess(pid)
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", process)
+
+    def kill(pid: int, signal: int) -> None:
+        raise ProcessLookupError  # the synthetic missing PID really is gone
+
+    monkeypatch.setattr("steam_agent.execution.runtime.os.kill", kill)
+    backend = PsutilBackend(platform="linux")
+    assert backend.identity_alive(1, 5.0) is True
+    assert backend.identity_alive(1, 6.0) is False
+    assert backend.identity_alive(2, 5.0) is False
+    with pytest.raises(ProbeError):
+        backend.identity_alive(3, 5.0)
+
+
+def test_complete_absence_waits_while_original_identity_lives() -> None:
+    backend = FakeBackend(game())
+    backend.exit_on_request = False
+    polls = [0]
+
+    def read(pid: int) -> ProcessRecord | None:
+        # After the request the target exec'd a helper without the AppID:
+        # absent from attribution, but the same identity is alive.
+        return backend.processes.get(pid) if not backend.requests else None
+
+    backend.read = read
+    backend.scan = lambda: ProcessScan(() if backend.requests else tuple(backend.processes.values()))
+
+    def sleep(_: float) -> None:
+        polls[0] += 1
+        if polls[0] == 2:
+            backend.processes.pop(100)
+
+    result = RuntimeObserver(platform="linux", backend=backend, sleep=sleep).stop_app(480)
+    assert result.state == "stopped"
+    assert result.targets_exited_count == 1
+    assert polls[0] == 2
+
+    lingering = FakeBackend(game())
+    lingering.exit_on_request = False
+    lingering.read = lambda pid: lingering.processes.get(pid) if not lingering.requests else None
+    lingering.scan = lambda: ProcessScan(() if lingering.requests else tuple(lingering.processes.values()))
+    timed_out = observer(lingering).stop_app(480, timeout=0)
+    assert timed_out.state == "deferred"
+    assert timed_out.reason_code == "stop_timeout"
+    assert timed_out.targets_exited_count == 0
+
+
+
+def test_unreadable_attribution_falls_back_to_identity_probe() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+    original_read = backend.read
+
+    def read(pid: int) -> ProcessRecord | None:
+        # The game turned non-dumpable after the request; identity remains checkable.
+        if backend.requests:
+            raise ProbeError("synthetic")
+        return original_read(pid)
+
+    backend.read = read
+    result = observer(backend).stop_app(480)
+    assert result.reason_code == "target_processes_exited_scan_incomplete"
+    assert result.targets_exited_count == 1
+
+
+def test_pid_hidden_by_procfs_is_not_an_exit(monkeypatch) -> None:
+    import psutil
+
+    def hidden(pid: int):
+        raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "Process", hidden)
+    backend = PsutilBackend(platform="linux")
+
+    def still_running(pid: int, signal: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr("steam_agent.execution.runtime.os.kill", still_running)
+    with pytest.raises(ProbeError):
+        backend.identity_alive(1, 5.0)
+
+    def gone(pid: int, signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr("steam_agent.execution.runtime.os.kill", gone)
+    assert backend.identity_alive(1, 5.0) is False
+    # Windows never probes with os.kill, which would terminate the process.
+    monkeypatch.setattr("steam_agent.execution.runtime.os.kill", lambda *_: pytest.fail("kill"))
+    assert PsutilBackend(platform="win32").identity_alive(1, 5.0) is False
+
+
+def test_temporarily_unreadable_identity_is_polled_until_it_exits() -> None:
+    backend = FakeBackend(game())
+    backend.reasons = ("process_probe_failed",)
+    backend.exit_on_request = False
+    polls = [0]
+    original_alive = backend.identity_alive
+
+    def identity_alive(pid: int, create_time: float) -> bool:
+        if polls[0] < 2:
+            raise ProbeError("hidden during shutdown")
+        return original_alive(pid, create_time)
+
+    backend.identity_alive = identity_alive
+    backend.read = lambda pid: None if backend.requests else backend.processes.get(pid)
+
+    def sleep(_: float) -> None:
+        polls[0] += 1
+        if polls[0] == 2:
+            backend.processes.pop(100)
+
+    clock = [0.0]
+
+    def monotonic() -> float:
+        clock[0] += 0.01
+        return clock[0]
+
+    result = RuntimeObserver(
+        platform="linux", backend=backend, sleep=sleep, monotonic=monotonic,
+    ).stop_app(480)
+    assert result.reason_code == "target_processes_exited_scan_incomplete"
+    assert result.targets_exited_count == 1
+    assert polls[0] >= 2
+
+
+def test_transiently_incomplete_scan_still_confirms_a_complete_stop() -> None:
+    backend = FakeBackend(game())
+    scans = [0]
+    original_scan = backend.scan
+
+    def scan() -> ProcessScan:
+        scans[0] += 1
+        result = original_scan()
+        # Only the first confirmation scan is incomplete.
+        return ProcessScan(result.processes, ("process_probe_failed",)) if scans[0] == 2 else result
+
+    backend.scan = scan
+    result = observer(backend).stop_app(480)
+    assert result.state == "stopped"
+    assert result.targets_exited_count == 1

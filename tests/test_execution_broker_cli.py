@@ -13,6 +13,7 @@ from steam_agent.execution.ledger import ExecutionLedger
 from steam_agent.execution import broker_main
 from steam_agent.execution.linux_session import LinuxSession
 from steam_agent.execution.sessions import CommandResult
+from support.appinfo_fixture import write_appinfo
 
 
 def _plan(operation: str = "install") -> str:
@@ -40,6 +41,7 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         ),
     )
     state = tmp_path / "state"
+    write_appinfo(tmp_path / "library")
     assert (
         main(
             [
@@ -626,3 +628,30 @@ def test_policy_verb_reports_the_launch_allowlist(state_dir: Path, capsys) -> No
     assert main(["--state-dir", str(state_dir), "policy"]) == 0
 
     assert json.loads(capsys.readouterr().out)["launch_allowlist"] == [220, 480]
+
+
+def test_direct_install_intake_reads_nested_steamcmd_evidence(state_dir: Path, tmp_path: Path, capsys) -> None:
+    library = tmp_path / "library"
+    write_appinfo(library, {480: ("windows", {481: "windows"})})
+    _grant_install(state_dir)
+    capsys.readouterr()
+    command = ["--state-dir", str(state_dir), "install", "480", "--request-only"]
+
+    # A new Windows-only title is an unqualified Proton install.
+    assert main([*command, "--request-id", "nested-0001"]) == 2
+    assert "new_install_without_linux_depot" in capsys.readouterr().err
+
+    # An earlier Windows-depot SteamCMD run left its manifest in the default target.
+    nested = library / "steamapps" / "common" / "app_480" / "steamapps"
+    nested.mkdir(parents=True)
+    (nested / "appmanifest_480.acf").write_text(
+        '"AppState"\n{\n\t"appid"\t\t"480"\n\t"installdir"\t\t"app_480"\n'
+        '\t"InstalledDepots"\n\t{\n\t\t"481"\n\t\t{\n\t\t\t"manifest"\t\t"1"\n\t\t}\n\t}\n}\n',
+        encoding="utf-8",
+    )
+    (nested.parent / "game.exe").write_bytes(b"MZ")  # the depot's files are present
+    assert main(["--state-dir", str(state_dir), "preflight", "install", "480"]) == 0
+    preflight = json.loads(capsys.readouterr().out)
+    assert preflight["content_platform"] == {"platform": "windows", "reason": "installed_windows_depots"}
+    assert main([*command, "--request-id", "nested-0002"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "pending_confirmation"

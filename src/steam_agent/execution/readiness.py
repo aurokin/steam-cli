@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from steam_agent.execution.agent_requests import DirectRequest, _permitted
+from steam_agent.execution.content_platform import PlatformDecision
 from steam_agent.execution.policy import ExecutionPolicy
 from steam_agent.execution.sessions import SessionProtocol
 
@@ -14,6 +15,7 @@ def operation_preflight(
     config: Mapping[str, str], policy: ExecutionPolicy, request: DirectRequest,
     *, platform: str, session: SessionProtocol | None,
     disk_floor: Callable[[Path, int | None], str | None],
+    content_platform: Callable[[int], PlatformDecision] | None = None,
 ) -> dict[str, object]:
     """Observe existing gates without ledger, nonce, client start or dispatch.
 
@@ -32,8 +34,12 @@ def operation_preflight(
     activity_clear: bool | None = None
     writer_absent: bool | None = None
     library_available: bool | None = None
+    platform_evidence: dict[str, object] | None = None
     if content and implemented:
         library_available = (Path(config["library"]) / "steamapps").is_dir()
+        if content_platform is not None:
+            decision = content_platform(request.appid)
+            platform_evidence = {"platform": decision.platform, "reason": decision.reason}
         if session is not None:
             writer_absent = not session.steamcmd_running()
     if gates is not None:
@@ -64,6 +70,7 @@ def operation_preflight(
         not implemented or not provisioned or not policy_permitted
         or activity_clear is False or floor is False
         or writer_absent is False or library_available is False
+        or (platform_evidence is not None and platform_evidence["platform"] is None)
     )
     return {
         "schema": "broker-preflight/0.1", "advisory": True,
@@ -77,5 +84,6 @@ def operation_preflight(
         "content_disk_floor_clear": floor,
         "content_writer_absent": writer_absent,
         "content_library_available": library_available,
+        "content_platform": platform_evidence,
         "authorization": "not_granted",
     }

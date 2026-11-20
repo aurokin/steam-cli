@@ -89,6 +89,13 @@ class ClientExecutor(Executor):
         outcome = (
             "dispatched" if result.state in {"stopped", "absent"} else "unconfirmed"
         )
-        detail = f"stop {result.state}: {result.reason_code}; requested {result.requested_count} attributed processes"
+        exited = (
+            "original identity exits unknown" if result.targets_exited_count is None
+            else f"{result.targets_exited_count} of {result.process_count} original identities exited"
+        )
+        detail = (
+            f"stop {result.state}: {result.reason_code}; "
+            f"requested {result.requested_count} attributed processes; {exited}"
+        )
         self._ledger.transition(operation_id, outcome, detail=detail)
         return ExecutionReport(operation_id, outcome, detail)

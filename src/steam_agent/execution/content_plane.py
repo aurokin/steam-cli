@@ -23,6 +23,7 @@ import time
 from typing import Literal, TYPE_CHECKING, BinaryIO
 
 from steam_agent.process_environment import child_environment
+from steam_agent.execution.content_platform import ContentPlatform, local_nested_manifest
 from steam_agent.execution.windows_process import WindowsJobProcess
 from steam_agent.execution.output_capture import BoundedOutputCapture
 
@@ -188,6 +189,7 @@ class SteamcmdAdapter:
         operation_id: int,
         validate: bool = False,
         abort_when: Callable[[], bool] | None = None,
+        platform: ContentPlatform = "linux",
     ) -> ContentResult:
         """Run ``app_update``, optionally with Valve's ``validate`` pass.
 
@@ -195,6 +197,10 @@ class SteamcmdAdapter:
         button uses: it re-checks every file against the depot manifest and
         replaces whatever differs, which is why it is a separately granted
         capability rather than a flag on install.
+
+        ``platform="windows"`` selects Windows depots for a Proton install on
+        Linux. Callers derive it from evidence (``content_platform``); the
+        native default leaves the command unchanged.
         """
 
         self._prepare_directories()
@@ -211,6 +217,7 @@ class SteamcmdAdapter:
             str(self._script),
             "+@NoPromptForPassword",
             "1",
+            *(["+@sSteamCmdForcePlatformType", platform] if platform != "linux" else []),
             "+force_install_dir",
             str(install_dir),
             "+login",
@@ -413,7 +420,10 @@ class WindowsSteamcmdAdapter(SteamcmdAdapter):
     def install(
         self, *, account: str, appid: int, install_dir: Path, operation_id: int,
         validate: bool = False, abort_when: Callable[[], bool] | None = None,
+        platform: ContentPlatform = "windows",
     ) -> WindowsContentResult:
+        # Windows SteamCMD already selects Windows depots; only the Linux
+        # adapter needs an explicit platform override, so none is forwarded.
         # A private executable alone does not make its write target safe.
         # The candidate coordinator additionally binds this NTFS identity to
         # a library/AppID before ever treating it as game ownership evidence.
@@ -434,8 +444,8 @@ class WindowsSteamcmdAdapter(SteamcmdAdapter):
 def locate_manifest(*, install_dir: Path, appid: int) -> Path | None:
     """Find the Valve-written manifest under the force_install_dir target."""
 
-    candidate = install_dir / "steamapps" / f"appmanifest_{appid}.acf"
-    return candidate if candidate.is_file() else None
+    # A linked manifest or ``steamapps`` would describe another directory.
+    return local_nested_manifest(install_dir, appid)
 
 
 def manifest_appid(manifest: Path) -> int | None:
@@ -453,15 +463,6 @@ def _manifest_u32(value: str) -> int | None:
         return None
     parsed = int(value)
     return parsed if parsed <= 0xFFFFFFFF else None
-
-
-def manifest_install_dir(manifest: Path) -> str | None:
-    try:
-        text = manifest.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    match = re.search(r'"installdir"\s+"([^"]*)"', text)
-    return None if match is None else match.group(1)
 
 
 def manifest_state_flags(manifest: Path) -> int | None:

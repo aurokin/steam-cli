@@ -94,6 +94,7 @@ class FakeContent:
     write_manifest: bool = True
     validated: bool | None = None
     login: str | None = None
+    platform: str | None = None
 
     def install(
         self,
@@ -104,9 +105,11 @@ class FakeContent:
         operation_id: int,
         validate: bool = False,
         abort_when=None,
+        platform: str = "linux",
     ) -> ContentResult:
         self.validated = validate
         self.login = account
+        self.platform = platform
         log_path = self.log_dir / f"install-{appid}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("log", encoding="utf-8")
@@ -334,9 +337,10 @@ def test_content_policy_change_restores_client_and_prevents_adoption(
     assert (destination.read_bytes() if destination.exists() else None) == original_manifest
     if phase in {"stop", "content_intent", "ownership_recorded"}:
         assert content.validated is None
-    if phase in {"stop", "content_intent"}:
+    if phase in {"stop", "content_intent", "ownership_recorded"}:
+        # SteamCMD never ran: no marker binds later runs.
         assert not executor._owned_marker(480).exists()
-        if operation == "install":
+        if operation == "install" and phase != "ownership_recorded":
             assert not target.exists()
     else:
         assert executor._marker_owns_target(480, "Spacewar", target)
@@ -464,6 +468,8 @@ def test_auth_required_fails_fast_and_restores_client(harness) -> None:
     assert report.outcome == "auth_required"
     assert ledger.get(operation_id).state == "failed"
     assert session.starts == 1
+    # The login failed before any download: no marker binds later runs.
+    assert not executor._owned_marker(480).exists()
 
 
 def test_unknown_client_probe_defers_fresh_execution(harness) -> None:
@@ -1823,3 +1829,219 @@ def test_dispatched_is_never_upgraded_by_a_running_process(harness) -> None:
     session.clear = False  # a game process now appears
     assert executor.reconcile() == []
     assert ledger.get(operation_id).state == "dispatched"
+
+
+def test_windows_depot_install_verifies_with_explicit_platform(harness) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    ledger, _, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, "verify")
+    executor._content_platform = lambda appid, target: PlatformDecision("windows", "installed_windows_depots")
+    recorded: list[str] = []
+    original_install = content.install
+
+    def install(**kwargs):
+        # The marker remembers which platform's depots this run writes.
+        recorded.append(json.loads(executor._owned_marker(480).read_text())["platform"])
+        return original_install(**kwargs)
+
+    content.install = install
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "confirmed"
+    assert content.validated is True
+    assert content.platform == "windows"
+    assert recorded == ["windows"]
+
+
+@pytest.mark.parametrize("resuming", [False, True])
+def test_unqualified_content_platform_defers_without_content_effect(harness, resuming) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, "verify")
+    if resuming:
+        ledger.transition(operation_id, "lease_acquired", prior_client_running=True)
+        for state in ("client_stopping", "content_running", "interrupted"):
+            ledger.transition(operation_id, state)
+        session.running = False  # still stopped by the interrupted run
+    executor._content_platform = lambda appid, target: PlatformDecision(None, "installed_depots_mixed_platforms")
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "deferred"
+    assert report.detail == "content platform unqualified: installed_depots_mixed_platforms; deferred"
+    assert session.stops == 0
+    # A resumed row restores the client it stopped; a fresh row touches nothing.
+    assert session.starts == int(resuming)
+    assert content.validated is None
+    assert ledger.get(operation_id).state == ("interrupted" if resuming else "authorized")
+
+
+def test_platform_change_while_client_stops_aborts_before_content(harness) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, "verify")
+    # Steam finishes a platform switch between the first read and its exit.
+    decisions = iter([
+        PlatformDecision("linux", "installed_linux_depots"),
+        PlatformDecision("windows", "installed_windows_depots"),
+    ])
+    targets: list[Path] = []
+
+    def platform(appid: int, target: Path) -> PlatformDecision:
+        targets.append(target)
+        return next(decisions)
+
+    executor._content_platform = platform
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert "content platform changed before content start" in report.detail
+    assert content.validated is None
+    assert session.stops == 1 and session.starts == 1
+    assert ledger.get(operation_id).state == "aborted"
+    assert targets == [library / "steamapps" / "common" / "Spacewar"] * 2
+
+
+def test_install_directory_change_while_client_stops_aborts_before_content(harness) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    ledger, session, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, "verify")
+    manifest = library / "steamapps" / "appmanifest_480.acf"
+    calls = [0]
+
+    def platform(appid: int, target: Path) -> PlatformDecision:
+        calls[0] += 1
+        if calls[0] == 2:
+            # Steam moved the install while it shut down.
+            manifest.write_text(_MANIFEST.replace('"Spacewar"', '"Spacewar2"'), encoding="utf-8")
+        return PlatformDecision("linux", "installed_linux_depots")
+
+    executor._content_platform = platform
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "aborted"
+    assert report.detail.endswith("install_directory_changed")
+    assert content.validated is None
+    assert session.starts == 1
+
+
+def test_auth_required_keeps_a_marker_from_an_earlier_attempt(harness) -> None:
+    ledger, _, content, executor, library = harness
+    operation_id = _authorized(ledger)
+    target = library / "steamapps" / "common" / "Spacewar"
+    executor._record_owned_dir(480, "Spacewar", target)
+    (target / "partial.bin").write_bytes(b"x")  # an earlier run's writes
+    content.outcome = "auth_required"
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "auth_required"
+    assert executor._owned_marker(480).exists()
+
+
+def test_marker_cleanup_failure_still_restores_the_client(harness, monkeypatch) -> None:
+    ledger, session, content, executor, _ = harness
+    content.outcome = "auth_required"
+    operation_id = _authorized(ledger)
+    original_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self.parent.name == "owned":
+            raise PermissionError("synthetic")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    report = executor.execute(operation_id)
+
+    assert report.outcome == "auth_required"
+    assert session.starts == 1 and session.running
+
+
+def test_stale_marker_for_a_former_directory_is_retired_after_no_write(harness) -> None:
+    ledger, _, content, executor, library = harness
+    operation_id = _authorized(ledger)
+    marker = executor._owned_marker(480)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"install_dir_name": "Spacewar", "dev": 0, "ino": 0}))
+    content.outcome = "auth_required"
+
+    executor.execute(operation_id)
+
+    assert not marker.exists()
+
+
+def test_auth_required_after_staging_keeps_the_new_marker(harness) -> None:
+    ledger, _, content, executor, library = harness
+    operation_id = _authorized(ledger)
+    original_install = content.install
+
+    def install_then_auth(**kwargs):
+        staged = kwargs["install_dir"] / "steamapps" / "downloading" / "480"
+        staged.mkdir(parents=True)
+        (staged / "chunk").write_bytes(b"x")
+        return original_install(**kwargs)
+
+    content.install = install_then_auth
+    content.outcome = "auth_required"
+
+    executor.execute(operation_id)
+
+    assert executor._owned_marker(480).exists()
+
+
+def test_auth_required_after_in_place_writes_keeps_the_new_marker(harness) -> None:
+    ledger, _, content, executor, library = harness
+    operation_id = _authorized(ledger)
+    original_install = content.install
+
+    def install_in_place_then_auth(**kwargs):
+        kwargs["install_dir"].mkdir(parents=True, exist_ok=True)
+        (kwargs["install_dir"] / "game.bin").write_bytes(b"x")  # preallocated in place
+        return original_install(**kwargs)
+
+    content.install = install_in_place_then_auth
+    content.outcome = "auth_required"
+
+    executor.execute(operation_id)
+
+    assert executor._owned_marker(480).exists()
+
+
+def test_auth_required_after_empty_entries_keeps_the_new_marker(harness) -> None:
+    ledger, _, content, executor, library = harness
+    first = _authorized(ledger)
+    original_install = content.install
+
+    def install_with_empty_entries(**kwargs):
+        (kwargs["install_dir"] / "steamapps" / "downloading" / "480").mkdir(parents=True)
+        return original_install(**kwargs)
+
+    content.install = install_with_empty_entries
+    content.outcome = "auth_required"
+    executor.execute(first)
+    # The intake gate accepts an unmarked directory only when it is empty.
+    assert executor._owned_marker(480).exists()
+
+    content.install = original_install
+    content.outcome = "installed"
+    report = executor.execute(_authorized(ledger))
+    assert report.outcome != "aborted"
+
+
+def test_auth_required_on_a_populated_directory_keeps_the_new_marker(harness) -> None:
+    ledger, _, content, executor, library = harness
+    operation_id = _content_operation(ledger, library, "verify")  # existing install
+    content.outcome = "auth_required"
+
+    executor.execute(operation_id)
+
+    # An in-place write cannot be ruled out, so the platform binding stays.
+    assert executor._owned_marker(480).exists()

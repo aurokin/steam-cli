@@ -96,7 +96,11 @@ retryable and the client untouched); **mutual exclusion PASS** (a second
 installed to completion under the platform override into the disposable
 spike library — Windows binaries present, Valve-written manifest at the
 expected nested location). Guard-token longevity is now instrumented by a
-weekly systemd user timer rather than tracked by hand.
+weekly systemd user timer rather than tracked by hand. **Correction
+2026-11-20:** that timer's check matched a line printed before the logon
+result, so it reported PASS while the cached token had been refused since
+2026-08-31. See the
+[host support record](../../docs/design/agent-host-support.md#linux-content-and-stop-qualification-2026-11-20-utc).
 
 ## Safety rails
 

@@ -30,7 +30,11 @@ AppID allowlists. Stop force permission is separate and defaults to false.
 Never widen policy to make a refused operation pass. Install/update and verify
 are Linux content operations; Windows content execution remains gated. Verify
 replaces official files and can overwrite mods; explain that consequence when
-relevant. Steam Guard and first-run setup are human interactions.
+relevant. Steam Guard and first-run setup are human interactions. Proton titles
+use Windows depots only when installed-depot evidence proves it. Report
+`content platform unqualified` refusals, and terminal
+`content platform changed before content start` aborts, as needing Steam
+itself; never retry under another platform.
 
 Prefer direct verbs with a request ID chosen once for the intended attempt:
 
@@ -69,7 +73,9 @@ Interpret results according to their evidence:
 - `deferred`: still retryable in place. Use `run` later, not a fresh request ID.
   Read details: content recovery may still need to restore the client.
 - `unconfirmed`: terminal uncertainty, including a crash or stop timeout after
-  durable dispatch intent. Inspect/reconcile; never replay that request.
+  durable dispatch intent. Inspect/reconcile; never replay that request. Stop
+  `target_processes_exited_scan_incomplete` means the targeted processes exited
+  but hidden processes could remain; say exactly that.
 - `expired`, `aborted`, `failed`, `contradicted`, `auth_required`: report the
   specific reason. Steam Guard needs the owner; do not retry-loop it.
 

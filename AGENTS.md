@@ -36,8 +36,27 @@ M1–M7 are accepted. Preserve their schema `0.1` contracts and safety boundarie
   logs, reports, and committed files.
 - Keep JSON deterministic and diagnostics on stderr. Preserve the distinction
   between `return_url`, `open_for_human`, `agent_read`, and `automated_ingest`.
-- Do not treat research or proposed design as accepted. Record consequential
-  decisions and evidence in [docs/adr/README.md](docs/adr/README.md).
+- Do not treat research or proposed design as accepted until it is decided.
+  Record consequential decisions and evidence in
+  [docs/adr/README.md](docs/adr/README.md).
+
+## Decision authority
+
+The owner has delegated maintainership to the agent working in this
+repository (2026-11-20). Act as the maintainer:
+
+- Select and refine work, and accept or supersede ADRs yourself. An ADR must
+  meet the threshold in [docs/adr/README.md](docs/adr/README.md); record who
+  accepted it and the evidence.
+- Commit and push reviewed work to `main` once the complete gate passes.
+- Stop for the owner only for what the owner alone can provide or approve:
+  - passwords, Steam Guard, and other credentials;
+  - spending money;
+  - publishing outside this repository, such as package registries;
+  - game actions on a host the owner may be using.
+- The boundaries above still bind the maintainer. Widening the executable set
+  needs an accepted ADR. Store, market, wallet, and credential operations stay
+  denied.
 
 ## Test changes
 

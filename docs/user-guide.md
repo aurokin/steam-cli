@@ -279,7 +279,16 @@ Linux content install/update/verify additionally requires `--steamcmd PATH`
 and explicit `--account ALIAS --steam-login LOGIN` provisioning. An alias is
 not a Steam login. Verify can replace mods installed over official game files;
 Steam Guard and first-run setup remain human interactions. Client-only launch
-and stop need no SteamCMD credential cache.
+and stop need no SteamCMD credential cache. SteamCMD's cached sign-in expires.
+When content work reports `auth_required`, sign in again under the broker's
+private SteamCMD HOME.
+
+A Proton-installed title is verified or updated with Windows depots only when
+its installed depots prove it. New Proton installs, and titles whose depot
+evidence is mixed or missing, are refused with a fixed reason. Install or
+repair those titles in Steam instead. A stop whose final process scan stays
+incomplete is still `unconfirmed`, but its detail reports how many original
+processes exited.
 
 If interrupted, run `reconcile` before another attempt. Durable dispatch intent
 is never replayed; content recovery still follows its existing adoption journal.

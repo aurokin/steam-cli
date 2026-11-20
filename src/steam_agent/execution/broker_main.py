@@ -38,9 +38,11 @@ from steam_agent.execution.agent_requests import (
     require_content_provisioning,
 )
 from steam_agent.execution.content_plane import SteamcmdAdapter
+from steam_agent.execution.content_platform import library_content_platform
 from steam_agent.execution.executor import (
     Executor,
     ExecutorLockedError,
+    owned_marker_path,
     safe_install_dir_name,
 )
 from steam_agent.execution.ledger import (
@@ -293,6 +295,11 @@ def _dispatch_denial(state_dir: Path, operation: LedgerOperation) -> str | None:
     return None
 
 
+def _default_target(library: Path, appid: int, install_dir_name: str | None) -> Path:
+    """The target execution uses when the title has no client manifest yet."""
+    return library / "steamapps" / "common" / (install_dir_name or f"app_{appid}")
+
+
 def _components(state_dir: Path) -> tuple[ExecutionLedger, Executor]:
     config = _load_config(state_dir)
     library = Path(config["library"])
@@ -325,6 +332,9 @@ def _components(state_dir: Path) -> tuple[ExecutionLedger, Executor]:
         dispatch_policy=lambda operation: _dispatch_denial(state_dir, operation),
         account_login=lambda alias: (
             config.get("steam_login") if alias == config.get("account_alias") else None
+        ),
+        content_platform=lambda appid, target: library_content_platform(
+            library, appid, target=target, owned_marker=owned_marker_path(state_dir, appid),
         ),
     )
     return ledger, executor
@@ -396,6 +406,11 @@ def _main(argv: list[str] | None = None) -> int:
             config, policy, DirectRequest(arguments.operation, arguments.appid, "preflight-only",
                                          account_alias=arguments.account, force=arguments.force),
             platform=sys.platform, session=session, disk_floor=_floor_denial,
+            content_platform=lambda appid: library_content_platform(
+                Path(config["library"]), appid,
+                target=_default_target(Path(config["library"]), appid, None),
+                owned_marker=owned_marker_path(state_dir, appid),
+            ),
         ))
         return 0
 
@@ -426,6 +441,13 @@ def _main(argv: list[str] | None = None) -> int:
                     ),
                     platform=sys.platform,
                     disk_floor=_floor_denial,
+                    # Direct intents name no directory, so execution uses the
+                    # default target; intake reads the same nested evidence.
+                    content_platform=lambda appid: library_content_platform(
+                        Path(config["library"]), appid,
+                        target=_default_target(Path(config["library"]), appid, None),
+                        owned_marker=owned_marker_path(state_dir, appid),
+                    ),
                 )
             except (PolicyError, LedgerError) as error:
                 return _fail(str(error))
@@ -669,7 +691,14 @@ def _main(argv: list[str] | None = None) -> int:
             try:
                 require_content_provisioning(
                     config, operation=operation, account_alias=str(arguments.account),
-                    platform=sys.platform,
+                    platform=sys.platform, appid=appid,
+                    content_platform=lambda title: library_content_platform(
+                        Path(config["library"]), title,
+                        target=_default_target(
+                            Path(config["library"]), title, install_dir_name or None,
+                        ),
+                        owned_marker=owned_marker_path(state_dir, title),
+                    ),
                 )
             except PolicyError as error:
                 return _fail(str(error))

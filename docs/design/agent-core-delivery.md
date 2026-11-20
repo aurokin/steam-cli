@@ -16,7 +16,8 @@ tested. This page tracks delivery, not hypothetical support claims.
 | Explicit ephemeral credentials | Implemented | Stored default/no fallback, four-route synthetic canaries absent from output/persistence/native children |
 | Broker results and lost-response recovery | Implemented | Opt-in versioned result, legacy output preserved, typed desktop refusal, read-only original-request lookup/collection |
 | Advisory preflight/version/intended host | Implemented | Reused gates, writer/library certainty, no request/nonce/Steam mutation, dispatch rechecks remain authoritative |
-| Native client qualification | Partially qualified | Haste read-only scheduler/receipt and four owned hidden-window stop cases passed; actual Windows title classes remain unqualified |
+| Native client qualification | Partially qualified | Haste read-only scheduler/receipt and four owned hidden-window stop cases passed; actual Windows title classes remain unqualified. Herb launch/stop with offline client and target-exit stop evidence passed for one title |
+| Linux content qualification | Qualified for tested titles | Herb native and Proton verify, broker-kill resume, mid-download revocation and projection checks passed ([record](agent-host-support.md#linux-content-and-stop-qualification-2026-11-20-utc)); Proton platform rule accepted in [ADR 0036](../adr/0036-evidence-derived-linux-content-platform.md) |
 | Windows content backend | Candidate implemented; unsupported | Native owned-job/NTFS primitives passed; private authenticated cache, lease/provisioning and prepared-title verification remain |
 | Wishlist and purchase handoffs | Implemented | Inert baseline-bound wishlist changes and product/price/ownership uncertainty; no account/store mutation |
 | Measured refactoring | Implemented bounded slices | Lazy credential import, portable session types, pure installed handler, batched names/eligibility and exact compatibility inventories |
@@ -69,7 +70,11 @@ writer status. It does not delete unknown files.
 
 ## Validation record
 
-Final delivery gate on 2026-10-11: **4,186 passed, 50 skipped** in 71.74 seconds.
+Linux qualification gate on 2026-11-20 UTC: **4,487 passed, 50 skipped**,
+plus locked sync, Ruff, source/wheel build and installed-wheel smoke. The live Herb results are in the
+[host support record](agent-host-support.md#linux-content-and-stop-qualification-2026-11-20-utc).
+
+Previous delivery gate on 2026-10-11: **4,186 passed, 50 skipped** in 71.74 seconds.
 Locked dependency sync, Ruff, source/wheel build, installed-wheel smoke,
 documentation checks and diff hygiene passed. The installed smoke runs outside
 the checkout and verifies original-request recovery, binding conflicts,

@@ -1,6 +1,7 @@
 # Agent host support and remaining qualification
 
-Status: working support and research record, verified 2026-10-11 UTC. Decisions
+Status: working support and research record. Windows observations were
+verified 2026-10-11 UTC; Linux content and stop observations 2026-11-20 UTC. Decisions
 are accepted only where linked to an ADR; automated account mutation remains
 unimplemented. Exact commands belong to the [CLI contract](cli-contract.md).
 
@@ -27,7 +28,7 @@ still required for refreshes, and setup does not attest a Steam login.
 | Runtime observation | AppID environment attribution on Linux/Windows | Only readable, positively attributed processes; never proof of playability |
 | Launch | Policy/allowlist, durable dispatch intent, Linux/Windows session adapters | Requires a usable same-user desktop session; game-action qualification remains separate |
 | Stop game | Separate stop/force policy, fresh process identity checks | Manual launches can be observed; games without attribution cannot be stopped |
-| Install/update/verify | Existing Linux SteamCMD content plane, explicit alias-to-login mapping | Windows content execution is deferred; no automatic platform/depot guess for Proton |
+| Install/update/verify | Existing Linux SteamCMD content plane, explicit alias-to-login mapping; Proton depots selected only from installed-depot evidence ([ADR 0036](../adr/0036-evidence-derived-linux-content-platform.md)) | Windows content execution is deferred; new Proton installs and mixed/unknown depot evidence are refused; SteamCMD sign-in expires and needs the owner |
 | Wishlist edits | Baseline-bound inert add/remove/reprioritize proposals | Human change and separate refresh; no write API or mutation implementation |
 | Purchase assistance | Cached price/ownership/compatibility decision cards | Human checkout; license/edition/DLC/checkout total unknown |
 
@@ -211,6 +212,53 @@ for the owner; do not automatically choose a save to overwrite.
 Partial runtime observations may target only fresh positive AppID identities;
 completion remains unknown when the subsequent scan is incomplete. A graceful
 termination request cannot establish that a game saved progress.
+
+## Linux content and stop qualification, 2026-11-20 UTC
+
+Herb was qualified using a wheel built from this change and staged in an
+isolated environment. The Steam client stayed in offline mode throughout.
+Every client restart came back offline, and the client never logged on to
+Steam. SteamCMD signs in separately; that sign-in is required for downloads and
+does not take the desktop client online.
+
+The SteamCMD cached sign-in had been refused since 2026-08-31, about three
+weeks after it was seeded. The weekly longevity check outside the repository
+kept recording PASS, because it matched the "Logging in user" line that prints
+before the result. The owner re-authenticated with a mobile Steam Guard
+approval, and the check now requires the logon `OK` itself. Unattended content
+work therefore depends on a sign-in that expires; when it does, the broker
+reports `auth_required`.
+
+The existing August broker ledger opened under the new build with its receipts
+intact. Every operation below used direct request IDs with explicit
+confirmation:
+
+| Check | Title | Result |
+| --- | --- | --- |
+| Native verify | Spacewar (480) | `confirmed`; build/StateFlags unchanged; client restored offline |
+| Proton verify | Zuma Deluxe (3330, Windows depot) | `confirmed` under the evidence-derived Windows override, again on the final build; same depot manifest ID and build |
+| Platform refusal | Heroes of Hammerwatch II (619820) | Intake refused `windows_depot_architecture_unqualified`; no ledger row |
+| Interrupted verify | Parking Garage Rally Circuit (2737300) | Broker SIGKILLed with 91 MB staged; orphaned SteamCMD exited within ~15 s; row stayed `content_running` with the client stopped; `reconcile` chose one resume; resume `confirmed`; a 239 MB file restored hash-identical; client restored |
+| Revocation mid-download | Same title | SteamCMD killed 6.2 s after the grant changed to `deny` (poll bound 15 s); terminal `failed: content policy denied`; client restored; same-ID retry reused the receipt; a new ID repaired the file hash-identically |
+| Installed projection | All | Complete scan, 70 of 70 records, tested titles at unchanged builds |
+| Launch/stop | Super Hexagon (221640) | Launch `dispatched` and same-ID reuse; reached the owner's profile chooser. Stop of the attributed chooser: `unconfirmed` with `target_processes_exited_scan_incomplete`, 1 of 1 original identity exited; same-ID reuse |
+
+Runtime scans stayed `process_probe_failed`, because some same-user processes
+deny environment reads. The new target-exit detail records that the original
+identities exited, but global completion stays unknown. The profile chooser was
+not driven; selecting a profile needs desktop input automation, which stays
+outside this spine. No gameplay occurred. The six files under the title's save
+directory and Steam userdata were unchanged, which shows no damage, not saved
+progress. An offline client cannot start downloads, so its clean restart
+weakens the "no re-download" evidence; the unchanged depot manifest IDs carry
+it instead. SteamCMD leaves its own nested manifest under each target
+directory, as the existing adoption design expects.
+
+Still not qualified on Linux: arbitrary titles, new Proton installs, gameplay
+saves, power-loss durability, online client re-indexing after a Proton verify,
+and a sign-in that lasts longer than about three weeks. Temporary policy,
+scripts, inventories, and the screenshot were removed afterward. The original
+policy was restored, while the broker kept its account-to-login mapping.
 
 ## Research decisions
 

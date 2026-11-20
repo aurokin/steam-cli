@@ -247,3 +247,32 @@ def test_invalid_direct_request_does_not_write_ledger(
         )
     assert ledger.active() is None
     assert ledger.recent(10) == []
+
+
+def test_unqualified_title_platform_is_refused_before_recording_intent(
+    ledger: ExecutionLedger, config: dict[str, str], policy_path: Path,
+) -> None:
+    from steam_agent.execution.content_platform import PlatformDecision
+
+    policy_path.write_text('[grants]\nverify="confirm"\n')
+    provisioned = {**config, "steamcmd": "/synthetic/steamcmd.sh", "steam_login": "synthetic"}
+    checked: list[int] = []
+
+    def undetermined(appid: int) -> PlatformDecision:
+        checked.append(appid)
+        return PlatformDecision(None, "installed_depots_mixed_platforms")
+
+    with pytest.raises(PolicyError, match="installed_depots_mixed_platforms"):
+        record_or_reuse(
+            ledger, provisioned, policy_path, DirectRequest("verify", 480, "request-0002"),
+            platform="linux", disk_floor=no_floor, content_platform=undetermined,
+        )
+    assert checked == [480]
+    assert ledger.active() is None
+
+    receipt = record_or_reuse(
+        ledger, provisioned, policy_path, DirectRequest("verify", 480, "request-0002"),
+        platform="linux", disk_floor=no_floor,
+        content_platform=lambda _: PlatformDecision("windows", "installed_windows_depots"),
+    )
+    assert receipt["state"] == "pending_confirmation"
